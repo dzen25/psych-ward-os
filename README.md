@@ -64,6 +64,14 @@ qemu-system-aarch64 \
     -kernel images/sel4test-driver-image-arm-qemu-arm-virt
 ```
 
+### Пуш в GitHub:
+```bash
+git add .
+git commit -a -m "."
+git push origin main
+
+```
+
 ---
 
 ## 📈 План развития (Roadmap)
