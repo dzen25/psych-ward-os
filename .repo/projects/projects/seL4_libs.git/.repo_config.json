@@ -1,0 +1,23 @@
+{
+  "core.repositoryformatversion": [
+    "0"
+  ],
+  "core.filemode": [
+    "true"
+  ],
+  "filter.lfs.smudge": [
+    "git-lfs smudge --skip -- %f"
+  ],
+  "filter.lfs.process": [
+    "git-lfs filter-process --skip"
+  ],
+  "remote.seL4.url": [
+    "https://github.com/seL4/seL4_libs.git"
+  ],
+  "remote.seL4.projectname": [
+    "seL4_libs.git"
+  ],
+  "remote.seL4.fetch": [
+    "+refs/heads/*:refs/remotes/seL4/*"
+  ]
+}

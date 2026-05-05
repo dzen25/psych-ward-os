@@ -1,0 +1,1 @@
+regen /home/nikita/psych-ward-os/build/kernel/gen_headers/plat/machine/devices_gen.h /home/nikita/psych-ward-os/build/kernel/kernel.dtb;/home/nikita/psych-ward-os/kernel/tools/hardware.yml;/home/nikita/psych-ward-os/kernel/tools/hardware_schema.yml;/home/nikita/psych-ward-os/kernel/tools/hardware_gen.py

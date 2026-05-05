@@ -1,0 +1,23 @@
+{
+  "core.repositoryformatversion": [
+    "0"
+  ],
+  "core.filemode": [
+    "true"
+  ],
+  "filter.lfs.smudge": [
+    "git-lfs smudge --skip -- %f"
+  ],
+  "filter.lfs.process": [
+    "git-lfs filter-process --skip"
+  ],
+  "remote.nanopb.url": [
+    "https://github.com/nanopb/nanopb"
+  ],
+  "remote.nanopb.projectname": [
+    "nanopb"
+  ],
+  "remote.nanopb.fetch": [
+    "+refs/heads/*:refs/remotes/nanopb/*"
+  ]
+}

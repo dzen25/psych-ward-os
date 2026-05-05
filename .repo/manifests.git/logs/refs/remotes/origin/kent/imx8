@@ -1,0 +1,1 @@
+0000000000000000000000000000000000000000 4b2f3d765d58d3516675238ed79d64505ce7d700 dzen25 <nikita22dobry@gmail.com> 1777671953 +0300	fetch --quiet origin --recurse-submodules=no --tags +refs/heads/*:refs/remotes/origin/* +refs/heads/master:refs/remotes/origin/master +refs/tags/*:refs/tags/*: storing head

@@ -1,0 +1,1 @@
+regen /home/nikita/psych-ward-os/build/kernel/kernel.dtb /home/nikita/psych-ward-os/build/qemu-arm-virt.dts;/home/nikita/psych-ward-os/kernel/src/plat/qemu-arm-virt/overlay-qemu-arm-virt.dts

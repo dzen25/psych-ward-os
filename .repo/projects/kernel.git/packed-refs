@@ -1,0 +1,82 @@
+# pack-refs with: peeled fully-peeled sorted 
+c466f0394992619f3b34e28761c2346e6d00963e refs/remotes/seL4/aos
+bf02b59c4650582a61ebe51f660beb2cc71b0c8c refs/remotes/seL4/axel-h/ci-base
+32263d02a83659bcc56d4ff04b5380bfeacbd184 refs/remotes/seL4/cmillar/asid-map
+35e91f397e45ccca70130ba35de06157c611c023 refs/remotes/seL4/df-public
+5cf20448b8962ac0ec616805f00de6d1217bf7bb refs/remotes/seL4/exynos5-ver
+453ad135e2bea30f3b22d5d5236048ad04f29e24 refs/remotes/seL4/imx8-fpu-ver
+f47302168625d9a4b7c052ee07ff8bb5d6612c85 refs/remotes/seL4/imx8-fpu-ver-v11
+41c77999f6d31a834e4e3d002cc651011eb0c9fc refs/remotes/seL4/jade/msi
+ed9dfda529eec2a2b461ab784ed28c464c728d96 refs/remotes/seL4/kent/riscv-fp-clear-res
+621b2fd23b2179b62de65065194d578a0879768d refs/remotes/seL4/lsf37/cython
+478372b62d123a5bd533ef25cf0acb1524805cbd refs/remotes/seL4/lsf37/no-clock-sync-riscv
+6b204b3fe48b3f37fa361ed62306861bf1035a63 refs/remotes/seL4/lsf37/riscv-clock-test
+daa0dfb1470c5ffbf13b3778f93111679574e80c refs/remotes/seL4/master
+17b6d0ed0749fdff717fc539ac497e8fa486c429 refs/remotes/seL4/mbrcknl/bv-ci
+c3d77ea0b34a2fdb6f0fd90f924f9b3dee7180b7 refs/remotes/seL4/mbrcknl/mcs-grant-via-reply
+75d3f970858598cd4b066be193aa7f93aec6cf48 refs/remotes/seL4/mbrcknl/mcs-grant-via-reply-alt
+be0f0156361f5e8524d59f6629439f86681b5a24 refs/remotes/seL4/mbrcknl/preprocess-deploy-mcs
+a97b3f6ae598b930524b35c93b5b253a8283a4d0 refs/remotes/seL4/michaelm/ipc_queues
+21c1a2ca7a9786d1297e1ff0a132bc57eeb55530 refs/remotes/seL4/misra-12.1.0-changes
+5cc4d9d5e1624e00970eeebfbe701a48dd9e2612 refs/remotes/seL4/python-types
+e907d70757fa42a4457be51afc08cdb6a17704cd refs/remotes/seL4/qge/arm-smmu-v2
+6aae25e96d4a03fb81fa24a324c1f34fcf637a59 refs/remotes/seL4/riscv-binary-verification
+611ac422660cd420f3128efd6a7dfe25eb64ad05 refs/remotes/seL4/riscv_he_v0.6
+85c2f1d59582c2ddaa1615a7240cffbad55e8f0e refs/remotes/seL4/riscv_hyp
+2d4f3b6db68b136ae34b448b6d1a11d450090e33 refs/remotes/seL4/rk3288
+973825aff93c90943ee724f9c554d2324247a41a refs/remotes/seL4/smc-ifdef
+c03c308dc9988691322f9d9b612bf0a665197383 refs/remotes/seL4/sylvain/gic-v3
+d55b1020347420b0a73a16144f79adc6b59e2b65 refs/remotes/seL4/sylvain/zynqmp
+6637be827dd07f06a0b516b4af64a379c4526701 refs/remotes/seL4/xu4_vmm_wip
+ba7d826615ce99083ea7e9f13fcd0db0f70637f1 refs/remotes/seL4/zynqmp-12.0.0
+53d98b468715559e52b41d0e7ebfe0936d1c2eea refs/remotes/seL4/zynqmp-fpu-ver-v11
+7f2fc76ce2222ce23f4a66ec2d34516146125015 refs/tags/0.0.1-rt-dev
+b0797ce40b0e42aaada70805754341c891bd7985 refs/tags/1.0.0-rt-dev
+e88fe4e356d3f1858dd142bf2da8ae393824a0c1 refs/tags/1.0.3
+5f30512da2237a065d6dfb1eae14c9e42ca20156 refs/tags/1.0.4
+5c7f7844a6225acd0865d4c063ddac4c1a518963 refs/tags/10.0.0
+7a19c37212cec5839efba7589586b0e61767870a refs/tags/10.0.0-mcs
+a3c341adc4ee61cdfe68d64245c71ca9b171dd15 refs/tags/10.1.0
+57e5417ce24ad6a37912dda47495f02b8c7eb60f refs/tags/10.1.1
+f88d58aa8dc599e372a6138a29df19e456eacf74 refs/tags/10.1.1-mcs
+ff216025041bfab6a45080eaabda2ff4af5db3e9 refs/tags/11.0.0
+dc83859f6a220c04f272be17406a8d59de9c8fbf refs/tags/12.0.0
+21c1a2ca7a9786d1297e1ff0a132bc57eeb55530 refs/tags/12.1.0
+30dbf3aa829c205c12d5e98a4b4051859dd15b3a refs/tags/13.0.0
+^cd6d3b8c25d49be2b100b0608cf0613483a6fffa
+cc73dde21350d6cfe0b02064f511e609d609c0c4 refs/tags/14.0.0
+^c0fc32450fb5e8460083b89a84d067249b109cfc
+71b12086973e4414e22ee394f535cf68798374c7 refs/tags/15.0.0
+^881de507fe528490dc5e570c7810a149bad5880f
+2a4ee9ba912c195f526163dca27d48e06d8a81f8 refs/tags/2.0.0
+0115ad1d0d7a871d637f8ceb79e37b46f9981249 refs/tags/2.1.0
+634d4681a88bdb43fa1e1f8fd8c330f43f6d6712 refs/tags/3.0.0
+94e13b7e605676b4d5bd61497d38f0858cf2bb2f refs/tags/3.0.1
+8150e914c377bb2d94796c6857d08f64973a7295 refs/tags/3.1.0
+e70cd7613bb3aed71d3df58c72146cc44a60190e refs/tags/3.2.0
+7d1df6af0027e87a66351d01804b00eb2637b63e refs/tags/4.0.0
+5453060b9530567d2709d0815c1b114cb1a2be6a refs/tags/5.0.0
+598c9d1efc2b10c475a92fd5775d8280c766b77f refs/tags/5.1.0
+3695232f9603af60d56f97072082d90f30e98b0e refs/tags/5.2.0
+6c0dff0affd45bcf57c0f6f14f3b0c0d6df10ddb refs/tags/5.2.0-mcs
+8564ace4dfb622ec69e0f7d762ebfbc8552ec918 refs/tags/6.0.0
+220ed968b1b1569586b26f297f37a8f7e7d7b961 refs/tags/7.0.0
+396315f3bfb2592e2fe61eaaeee916b626f26e68 refs/tags/8.0.0
+f58d22af8b6ce8bfccaa4bac393a31cad670e7c1 refs/tags/9.0.0
+b285a262751a74efe5a0521937f4fcc18a612349 refs/tags/9.0.0-mcs
+0dd40b6c43a290173ea7782b97afbbbddfa23b36 refs/tags/9.0.1
+93aa7e3264041c8aeaf53af2d523ac59a3a37ef1 refs/tags/API-experimental-01-03--release-2014-07-29
+^50e219ecb96933369345f0594c3336a37d39521c
+764a3c8dfbb5f2a09afe18e3bfb449799a55f4a9 refs/tags/API-experimental-01-03--release-2014-08-10
+^2213b9fe0facf3e3ceabe4adda581bed515be163
+2315f4ce797b8bd0a8fd9efc5ed92d02d4a4baa6 refs/tags/API-master-01-03--release-2014-07-29
+^9711f8134f1e4b48010b1168f4b1acd94f4c2ee4
+4961cb66a484b4d3a436ac72a6fc286b23912e52 refs/tags/API-master-01-03--release-2014-08-10
+^e88fe4e356d3f1858dd142bf2da8ae393824a0c1
+e38288f805a434faf9052ecf96dd12838f8bf2bd refs/tags/arm_hyp-deprecated
+acba4755fb7ce89c80568fd90d7fda9887ac8db1 refs/tags/experimental-deprecated
+986cd9805f6327e388ce0056592f5a0dcd93f922 refs/tags/mcs-tutorials
+15e0f4d98a3fd43f7f7060ea8f9c12ff6fb68368 refs/tags/microkit-pre-2.1.0
+^08871fea6f037aa6874771346ae957651c5e6931
+8a4227b5759b85809abac29fb2dae9b77f55117f refs/tags/rt-deprecated
+ec0a41fed7d7f937b57bd2ccea562d886196e2b0 refs/tags/x86_64-deprecated

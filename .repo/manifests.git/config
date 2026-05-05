@@ -1,0 +1,46 @@
+[core]
+	repositoryFormatVersion = 1
+	filemode = true
+[filter "lfs"]
+	smudge = git-lfs smudge --skip -- %f
+	process = git-lfs filter-process --skip
+[remote "origin"]
+	url = https://github.com/seL4/sel4test-manifest.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[manifest]
+	platform = auto
+[extensions]
+	preciousObjects = true
+[branch "default"]
+	remote = origin
+	merge = refs/heads/master
+[repo]
+	existingprojectcount = 0
+	newprojectcount = 10
+[repo "syncstate.main"]
+	synctime = 2026-05-01T21:45:57.446555+00:00
+	version = 1
+[repo "syncstate.sys"]
+	argv = ['/home/nikita/psych-ward-os/.repo/repo/main.py', '--repo-dir=/home/nikita/psych-ward-os/.repo', '--wrapper-version=2.54', '--wrapper-path=/home/nikita/.bin/repo', '--', 'sync']
+[repo "syncstate.options"]
+	jobs = 20
+	outermanifest = true
+	jobsnetwork = 1
+	jobscheckout = 8
+	mpupdate = true
+	interleaved = true
+	clonebundle = true
+	retryfetches = 0
+	prune = true
+	repoverify = true
+	quiet = false
+	verbose = false
+[repo "syncstate.remote.origin"]
+	url = https://github.com/seL4/sel4test-manifest.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[repo "syncstate.branch.default"]
+	remote = origin
+	merge = refs/heads/master
+[repo "syncstate.repo"]
+	existingprojectcount = 0
+	newprojectcount = 10
