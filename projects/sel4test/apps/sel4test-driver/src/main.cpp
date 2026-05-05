@@ -16,9 +16,10 @@ extern char _cpio_archive_end[];
 enum SyscallID {
     SYS_PRINT = 1, SYS_YIELD = 2, SYS_GET_TIME = 3, SYS_SLEEP = 4, 
     SYS_PUTCHAR = 5, SYS_READ = 6, SYS_ALLOC = 7,
-    SYS_READFILE = 98, SYS_DOCTOR = 99, SYS_EXEC = 100, SYS_LS = 101,
-    SYS_EXIT = 102, SYS_KILL = 103, SYS_PS = 104,
-    UART_IRQ_BADGE = (1 << 16), TIMER_IRQ_BADGE = (1 << 17)
+    SYS_PUTS = 8, // <--- НОВЫЙ СИСКОЛЛ
+    SYS_READFILE = 98, SYS_DOCTOR = 99,
+    SYS_EXEC = 100, SYS_LS = 101, SYS_KILL = 102, SYS_EXIT = 103, SYS_PS = 104, // (оставь свои добавленные, если есть)
+    UART_IRQ_BADGE = (1 << 0), TIMER_IRQ_BADGE = (1 << 1)
 };
 
 static void uart_putdec(uint64_t val) {
@@ -96,7 +97,9 @@ static int next_pid = 1;
 
 static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
                           PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace,
-                          seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root) {
+                          seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
+                          int is_driver, seL4_CPtr console_ep, seL4_CPtr driver_ntfn, seL4_CPtr uart_irq_handler, seL4_CPtr uart_frame
+                            ) {
     unsigned long elf_size = 0;
     unsigned long archive_len = _cpio_archive_end - _cpio_archive;
     char *elf_file = (char*)cpio_get_file(_cpio_archive, archive_len, elf_name, &elf_size);
@@ -165,14 +168,47 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frame, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
 
-    seL4_ARM_Page_Map(ipc_frame, root_vspace, temp_window, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    check_err(seL4_ARM_Page_Map(ipc_frame, root_vspace, temp_window, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Root");
     seL4_IPCBuffer *child_ipc_ptr = (seL4_IPCBuffer*)temp_window;
     memset(child_ipc_ptr, 0, 4096);
-    child_ipc_ptr->userData = ep;
-    child_ipc_ptr->caps_or_badges[0] = ep;
-    seL4_ARM_Page_Unmap(ipc_frame);
-    seL4_ARM_Page_Map(stack_frame, child_vspace, child_stack, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-    seL4_ARM_Page_Map(ipc_frame, child_vspace, child_ipc, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+
+    // === НАСТРОЙКА РОЛЕЙ: ДРАЙВЕР vs ОБОЛОЧКА ===
+    if (is_driver) {
+        // === ИСПРАВЛЕНИЕ: Строим таблицы страниц для адреса 0x200000000 ===
+        seL4_CPtr drv_pud = alloc.alloc_slot();
+        seL4_CPtr drv_pd  = alloc.alloc_slot();
+        seL4_CPtr drv_pt  = alloc.alloc_slot();
+        
+        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, drv_pud, 1), "Retype Drv PUD");
+        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
+        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
+        
+        seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, 0x200000000ULL, seL4_ARM_Default_VMAttributes);
+        seL4_ARM_PageDirectory_Map(drv_pd, child_vspace, 0x200000000ULL, seL4_ARM_Default_VMAttributes);
+        seL4_ARM_PageTable_Map(drv_pt, child_vspace, 0x200000000ULL, seL4_ARM_Default_VMAttributes);
+        // ===================================================================
+
+        // 1. Мапим физические регистры UART в память драйвера
+        seL4_CPtr uart_frame_child = alloc.alloc_slot();
+        check_err(seL4_CNode_Copy(root_cnode, uart_frame_child, seL4_WordBits, 
+                                  root_cnode, uart_frame, seL4_WordBits, seL4_AllRights), "Copy UART Frame Cap");
+        
+        check_err(seL4_ARM_Page_Map(uart_frame_child, child_vspace, 0x200000000ULL, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map UART HW to Driver");
+        
+        // 3. Выдаем нужные Cap'ы через IPC-буфер
+        child_ipc_ptr->msg[0] = 1;                     
+        child_ipc_ptr->caps_or_badges[0] = console_ep; 
+        child_ipc_ptr->caps_or_badges[1] = uart_irq_handler; 
+    } else {
+        child_ipc_ptr->msg[0] = 0;                     // Флаг: "Ты оболочка"
+        child_ipc_ptr->userData = ep;                  // Root Endpoint (для системных вызовов вроде exec, ls)
+        child_ipc_ptr->caps_or_badges[0] = console_ep; // Линия связи с драйвером (для puts/read)
+    }
+    // ===========================================
+
+    check_err(seL4_ARM_Page_Unmap(ipc_frame), "Unmap IPC from Root");
+    check_err(seL4_ARM_Page_Map(stack_frame, child_vspace, child_stack, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map Stack to Child");
+    check_err(seL4_ARM_Page_Map(ipc_frame, child_vspace, child_ipc, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Child");
 
     // Shared memory
     seL4_CPtr shm_frame_child = alloc.alloc_slot();
@@ -198,8 +234,12 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     size_t reg_count = sizeof(seL4_UserContext) / sizeof(seL4_Word);
     seL4_TCB_WriteRegisters(tcb, 0, 0, reg_count, &regs);
     seL4_TCB_SetPriority(tcb, seL4_CapInitThreadTCB, 254);
-    seL4_TCB_Resume(tcb);
 
+    if (is_driver) {
+        check_err(seL4_TCB_BindNotification(tcb, driver_ntfn), "Bind IRQ to Driver");
+    }
+
+    seL4_TCB_Resume(tcb);
     return pid;
 }
 
@@ -292,37 +332,54 @@ int main(int argc, char *argv[]) {
     seL4_TCB_WriteRegisters(doc_tcb, 0, 0, reg_count, &doc_regs);
     seL4_TCB_Resume(doc_tcb);
 
-    // Shared memory (Оставляем ROOT себе, раздаем копии детям)
+// 1. Shared memory (Оставляем ROOT себе, раздаем копии детям)
     seL4_CPtr shm_frame_root = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, shm_frame_root, 1);
     uintptr_t root_shm  = 0x200006000ULL;
     seL4_ARM_Page_Map(shm_frame_root, root_vspace, root_shm, seL4_AllRights, seL4_ARM_Default_VMAttributes);
 
-    // --- Загрузка ELF ---
-    if (spawn_process("patient_app", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root) < 0) {
-        uart_puts("PANIC: patient_app not found!\n");
-        while(1);
-    }
+    // 2. Создаем точку связи (Endpoint) для прямого общения Shell <-> Driver
+    seL4_CPtr console_ep = alloc.alloc_slot();
+    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, console_ep, 1);
 
-    // Прерывания
+    // 3. Прерывания ЯДРА (Оставляем только Таймер)
     seL4_CPtr global_hub = alloc.alloc_slot();
-    seL4_CPtr badged_irq_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
-    seL4_CPtr irq_handler = alloc.alloc_slot();
     seL4_CPtr timer_handler = alloc.alloc_slot();
 
     seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, global_hub, 1);
-    seL4_CNode_Mint(root_cnode, badged_irq_ntfn, seL4_WordBits, root_cnode, global_hub, seL4_WordBits, seL4_AllRights, UART_IRQ_BADGE);
     seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, global_hub, seL4_WordBits, seL4_AllRights, TIMER_IRQ_BADGE);
-    seL4_IRQControl_Get(seL4_CapIRQControl, 33, root_cnode, irq_handler, seL4_WordBits);
-    seL4_IRQHandler_SetNotification(irq_handler, badged_irq_ntfn);
-    uart_enable_interrupts();
-    seL4_IRQHandler_Ack(irq_handler);
+    
     seL4_IRQControl_Get(seL4_CapIRQControl, 34, root_cnode, timer_handler, seL4_WordBits);
     seL4_IRQHandler_SetNotification(timer_handler, badged_timer_ntfn);
-    seL4_TCB_BindNotification(seL4_CapInitThreadTCB, global_hub);
+    seL4_TCB_BindNotification(seL4_CapInitThreadTCB, global_hub); // Ядро слушает только таймер
 
-    uart_puts("Patient Sandbox spawned. Kernel is now serving syscalls...\n");
+    // 4. Прерывания ДРАЙВЕРА (Отдаем ему UART)
+    seL4_CPtr driver_ntfn = alloc.alloc_slot();
+    seL4_CPtr badged_irq_ntfn = alloc.alloc_slot(); 
+    seL4_CPtr uart_irq_handler = alloc.alloc_slot();
+
+    seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, driver_ntfn, 1);
+    seL4_CNode_Mint(root_cnode, badged_irq_ntfn, seL4_WordBits, root_cnode, driver_ntfn, seL4_WordBits, seL4_AllRights, 1); 
+    
+    seL4_IRQControl_Get(seL4_CapIRQControl, 33, root_cnode, uart_irq_handler, seL4_WordBits);
+    seL4_IRQHandler_SetNotification(uart_irq_handler, badged_irq_ntfn);
+    uart_enable_interrupts();
+    seL4_IRQHandler_Ack(uart_irq_handler);
+
+    // 5. Запуск процессов (Сначала Драйвер, потом Оболочка)
+    // Мы передаем все созданные Endpoint и IRQ Handler внутрь spawn_process
+    if (spawn_process("patient_app", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+                      1, console_ep, driver_ntfn, uart_irq_handler, uart_frame) < 0) {
+        uart_puts("PANIC: Driver failed to load!\n"); while(1);
+    }
+
+    if (spawn_process("patient_app", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+                      0, console_ep, driver_ntfn, uart_irq_handler, uart_frame) < 0) {
+        uart_puts("PANIC: Shell failed to load!\n"); while(1);
+    }
+
+    uart_puts("Driver and Shell spawned. Kernel is now serving management syscalls...\n");
 
     // --- ЕДИНЫЙ ЦИКЛ ЯДРА ---
     while (1) {
@@ -330,33 +387,14 @@ int main(int argc, char *argv[]) {
         seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
         seL4_Word sender_pid = 0;
 
-        if (sender_badge & UART_IRQ_BADGE) {
-            if (uart_havechar()) {
-                    char c = uart_getchar();
-                    if (reader_waiting) {
-                        seL4_MessageInfo_t reply_msg = seL4_MessageInfo_new(0, 0, 0, 1);
-                        seL4_SetMR(0, c);
-                        seL4_Send(reader_reply_slot, reply_msg);
-                        check_err(seL4_CNode_Delete(root_cnode, reader_reply_slot, seL4_WordBits), "Delete reader cap");
-                        reader_waiting = false;
-                    } else {
-                        int next_head = (kbd_buffer_head + 1) % KBD_BUFFER_SIZE;
-                        if (next_head != kbd_buffer_tail) {
-                            kbd_buffer[kbd_buffer_head] = c;
-                            kbd_buffer_head = next_head;
-                        }
-                    }
+        if (sender_badge & TIMER_IRQ_BADGE) {
+            pl031_clear_interrupt();
+            if (sleeper_waiting) {
+                seL4_SetMR(0, 0);
+                seL4_Send(sleeper_reply_slot, seL4_MessageInfo_new(0, 0, 0, 1));
+                check_err(seL4_CNode_Delete(root_cnode, sleeper_reply_slot, seL4_WordBits), "Delete sleeper cap");
+                sleeper_waiting = false;
             }
-            seL4_IRQHandler_Ack(irq_handler);
-            continue;
-        } else if (sender_badge & TIMER_IRQ_BADGE) {
-                pl031_clear_interrupt();
-                if (sleeper_waiting) {
-                    seL4_SetMR(0, 0);
-                    seL4_Send(sleeper_reply_slot, seL4_MessageInfo_new(0, 0, 0, 1));
-                    check_err(seL4_CNode_Delete(root_cnode, sleeper_reply_slot, seL4_WordBits), "Delete sleeper cap");
-                    sleeper_waiting = false;
-                }
             seL4_IRQHandler_Ack(timer_handler);
             continue;
         } else if (sender_badge != 0 && sender_badge < 256 && pcbs[sender_badge].active) {
@@ -410,6 +448,7 @@ int main(int argc, char *argv[]) {
                 uart_puts("Sandbox Time: [ "); print_human_time(arg1); uart_puts(" ]\n");
                 seL4_SetMR(0, 0); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
+
             case SYS_GET_TIME: {
                 uint64_t ms = pl031_get_time() * 1000; 
                 seL4_SetMR(0, (seL4_Word)ms); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -434,6 +473,19 @@ int main(int argc, char *argv[]) {
                 pl011_putchar((char)arg1);
                 seL4_SetMR(0, 0); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
+
+            // === БЛОК НАЧАЛО ===
+            case SYS_PUTS: {
+                int msg_len = seL4_MessageInfo_get_length(recv_info);
+                for (int i = 1; i < msg_len; i++) {
+                    pl011_putchar((char)seL4_GetMR(i));
+                }
+                seL4_SetMR(0, 0); 
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+            // === БЛОК КОНЕЦ ===
+
             case SYS_READ:
                 if (kbd_buffer_head != kbd_buffer_tail) {
                     char c = kbd_buffer[kbd_buffer_tail];
@@ -493,8 +545,11 @@ int main(int argc, char *argv[]) {
             }
             case SYS_EXEC: {
                 char *shm = (char*)0x200006000ULL;
-                uart_puts("\n[KERNEL] Executing new program: "); uart_puts(shm); uart_puts("\n");
-                int new_pid = spawn_process(shm, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root);
+                // К Ядру лучше больше не обращаться через uart_puts (теперь это делает драйвер)
+                
+                // Передаем 0, так как запускаем Оболочку, а не Драйвер
+                int new_pid = spawn_process(shm, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+                                            0, console_ep, driver_ntfn, uart_irq_handler, uart_frame);
                 if (new_pid > 0) {
                     seL4_SetMR(0, (seL4_Word)new_pid); // Возвращаем PID
                 } else {
@@ -506,48 +561,63 @@ int main(int argc, char *argv[]) {
             }
             case SYS_PS: {
                 char *shm = (char*)0x200006000ULL;
-                strcpy(shm, "  PID NAME\n");
-                int len = strlen(shm);
-                for (int i = 1; i < 256; i++) {
+                int offset = 0;
+                
+                strcpy(shm, "  PID STATUS    NAME\n");
+                offset = strlen(shm);
+                
+                // PID 1 - это всегда Rootserver/Doctor
+                strcpy(shm + offset, "    1 [RUNNING] rootserver\n");
+                offset = strlen(shm);
+                
+                // Проходимся по всем возможным процессам Пациента
+                for (int i = 2; i < 256; i++) {
                     if (pcbs[i].active) {
-                        char num_buf[16];
-                        int val = pcbs[i].pid;
-                        int n = 0;
-                        if (val == 0) { num_buf[n++] = '0'; }
-                        else {
-                            while(val > 0) { num_buf[n++] = (val % 10) + '0'; val /= 10; }
-                        }
-                        num_buf[n] = '\0';
-                        for(int j=0; j<n/2; j++) { char t=num_buf[j]; num_buf[j]=num_buf[n-1-j]; num_buf[n-1-j]=t; }
-                        strcpy(shm + len, "    "); len += 4;
-                        strcpy(shm + len, num_buf); len += n;
-                        strcpy(shm + len, " "); len += 1;
-                        strcpy(shm + len, pcbs[i].name); len += strlen(pcbs[i].name);
-                        strcpy(shm + len, "\n"); len += 1;
+                        // Форматируем строку (примитивный sprintf)
+                        char pid_str[8];
+                        int temp = i, j = 0;
+                        while(temp > 0) { pid_str[j++] = (temp % 10) + '0'; temp /= 10; }
+                        
+                        strcpy(shm + offset, "    "); offset += 4;
+                        while(j > 0) { shm[offset++] = pid_str[--j]; }
+                        strcpy(shm + offset, " [RUNNING] patient_app\n");
+                        offset = strlen(shm);
                     }
                 }
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
+
             case SYS_KILL: {
-                seL4_Word target_pid = arg1;
-                if (target_pid > 0 && target_pid < 256 && pcbs[target_pid].active) {
-                    seL4_TCB_Suspend(pcbs[target_pid].tcb);
-                    seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
-                    pcbs[target_pid].active = false;
-                    seL4_CNode_Delete(root_cnode, pcbs[target_pid].badged_ep, seL4_WordBits);
-                    seL4_CNode_Delete(root_cnode, pcbs[target_pid].tcb, seL4_WordBits);
-                    if (pcbs[target_pid].vspace != root_vspace) {
-                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].vspace, seL4_WordBits);
-                    }
-                    seL4_SetMR(0, 0);
-                } else {
+                int target_pid = arg1;
+                
+                if (target_pid == 1) {
+                    uart_puts("\n[KERNEL PANIC] Attempted to kill Rootserver (PID 1)!\n");
+                    // В реальной ОС тут ребут. Мы просто игнорируем или крашимся.
                     seL4_SetMR(0, (seL4_Word)-1);
+                } 
+                else if (target_pid > 1 && target_pid < 256 && pcbs[target_pid].active) {
+                    uart_puts("\n[KERNEL] Terminating PID: "); uart_putdec(target_pid); uart_puts("\n");
+                    
+                    // 1. Физически замораживаем поток на уровне микроядра!
+                    seL4_TCB_Suspend(pcbs[target_pid].tcb);
+                    
+                    // 2. Отвязываем IPC, чтобы он больше не мог слать сообщения
+                    seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
+                    
+                    // 3. Помечаем слот как свободный (чтобы PID можно было использовать снова)
+                    pcbs[target_pid].active = false;
+                    
+                    seL4_SetMR(0, 0); // Success
+                } else {
+                    seL4_SetMR(0, (seL4_Word)-1); // Процесс не найден
                 }
+                
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
+
             case SYS_EXIT: {
                 if (sender_pid > 0) {
                     seL4_TCB_Suspend(pcbs[sender_pid].tcb);
@@ -563,44 +633,43 @@ int main(int argc, char *argv[]) {
             }
             case SYS_LS: {
                 char *shm = (char*)0x200006000ULL;
-                char *ptr = _cpio_archive;
-                char *end = _cpio_archive_end;
-                int shm_offset = 0;
+                unsigned long archive_len = _cpio_archive_end - _cpio_archive;
                 
-                // Парсим заголовки формата CPIO (newc)
-                while (ptr + 110 <= end) {
-                    if (strncmp(ptr, "070701", 6) != 0 && strncmp(ptr, "070702", 6) != 0) break;
+                int offset = 0;
+                strcpy(shm, "Files in RAM disk (VFS):\n");
+                offset = strlen(shm);
+
+                int entry_index = 0;
+                while (1) {
+                    const char *file_name = nullptr;
+                    unsigned long file_size = 0;
                     
-                    unsigned long namesize = 0, filesize = 0;
-                    for (int i = 0; i < 8; i++) {
-                        char c = ptr[94 + i];
-                        int v = (c >= '0' && c <= '9') ? (c - '0') : ((c >= 'a' && c <= 'f') ? (c - 'a' + 10) : ((c >= 'A' && c <= 'F') ? (c - 'A' + 10) : 0));
-                        namesize = (namesize << 4) | v;
-                    }
-                    for (int i = 0; i < 8; i++) {
-                        char c = ptr[54 + i];
-                        int v = (c >= '0' && c <= '9') ? (c - '0') : ((c >= 'a' && c <= 'f') ? (c - 'a' + 10) : ((c >= 'A' && c <= 'F') ? (c - 'A' + 10) : 0));
-                        filesize = (filesize << 4) | v;
-                    }
+                    // ИСПРАВЛЕНИЕ: Передаем entry_index (0, 1, 2...)
+                    const void *file_data = cpio_get_entry(_cpio_archive, archive_len, entry_index, &file_name, &file_size);
                     
-                    char *name = ptr + 110;
-                    if (strcmp(name, "TRAILER!!!") == 0) break; // Конец архива
-                    
-                    int len = strlen(name);
-                    if (shm_offset + len + 2 < 4096) {
-                        strcpy(shm + shm_offset, name);
-                        shm_offset += len;
-                        shm[shm_offset++] = '\n';
+                    // Если файлов больше нет или мы дошли до конца (TRAILER!!!)
+                    if (!file_data || !file_name || strcmp(file_name, "TRAILER!!!") == 0) {
+                        break; 
                     }
                     
-                    ptr += (110 + namesize + 3) & ~3; // Выравниваем до 4 байт
-                    ptr += (filesize + 3) & ~3;
+                    strcpy(shm + offset, "- "); offset += 2;
+                    strcpy(shm + offset, file_name); offset = strlen(shm);
+                    
+                    strcpy(shm + offset, " ("); offset += 2;
+                    char sz_str[16]; int temp = file_size, j = 0;
+                    if (temp == 0) { sz_str[j++] = '0'; }
+                    while(temp > 0) { sz_str[j++] = (temp % 10) + '0'; temp /= 10; }
+                    while(j > 0) { shm[offset++] = sz_str[--j]; }
+                    strcpy(shm + offset, " bytes)\n"); offset = strlen(shm);
+                    
+                    entry_index++; // Переходим к следующему файлу
                 }
-                shm[shm_offset] = '\0';
+                
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
+
             default:
                 seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
