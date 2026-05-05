@@ -1,2 +1,0 @@
-#!/bin/sh
-exec "${REALGCC:-/usr/bin/aarch64-linux-gnu-gcc}" "$@" -specs "/home/nikita/psych-ward-os/build/apps/sel4test-driver/musllibc/build-temp/stage/lib/musl-gcc.specs"
