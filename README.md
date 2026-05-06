@@ -39,7 +39,7 @@
 ### Не решено:
 
 
-## Решено
+### Решено
 
 
 ## 🐜 Post-Mortem: Анатомия "Матрешки" (The Exit Hang & IPC Blackhole)
