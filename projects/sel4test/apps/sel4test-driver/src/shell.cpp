@@ -165,16 +165,45 @@ extern "C" void __sel4_start_c(void) {
     // Запрашиваем свой PID у Rootserver'а
     int my_pid = sys_getpid(root_ep);
     
+    // --- Оригинальный интерактивный цикл (для Foreground) ---
     while (1) {
-        sys_puts(console_ep, "sandbox> ");
+        // 1. Формируем динамический промпт локально в буфере (чтобы не спамить IPC-вызовами)
+        char prompt[32];
+        my_strcpy(prompt, "sandbox[");
+        
+        int temp_pid = my_pid, p_idx = 0;
+        char pid_buf[8];
+        if (temp_pid == 0) pid_buf[p_idx++] = '0';
+        while (temp_pid > 0) { pid_buf[p_idx++] = (temp_pid % 10) + '0'; temp_pid /= 10; }
+        
+        int len = my_strlen(prompt);
+        while (p_idx > 0) { prompt[len++] = pid_buf[--p_idx]; }
+        
+        prompt[len++] = ']';
+        prompt[len++] = '>';
+        prompt[len++] = ' ';
+        prompt[len] = '\0';
+        
+        // Отправляем готовую строку одним системным вызовом!
+        sys_puts(console_ep, prompt);
+        
         char cmd[64]; int i = 0;
         
+        // 2. Читаем ввод с защитой от непечатных символов и ANSI-мусора
         while (i < 63) {
             char c = sys_read(console_ep); 
+            
             if (c == (char)-1 || c == (char)255) { seL4_Yield(); continue; }
             if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; }
-            else if (c == 127 || c == '\b') { if (i > 0) { i--; sys_puts(console_ep, "\b \b"); } } 
-            else { char tmp[2] = {c, 0}; sys_puts(console_ep, tmp); cmd[i++] = c; }
+            else if (c == 127 || c == '\b') { 
+                if (i > 0) { i--; sys_puts(console_ep, "\b \b"); } 
+            } 
+            // ИСПРАВЛЕНИЕ: Берем только печатные символы (игнорируем стрелочки и спецкоды)
+            else if (c >= 32 && c <= 126) { 
+                char tmp[2] = {c, 0}; 
+                sys_puts(console_ep, tmp); 
+                cmd[i++] = c; 
+            }
         }
         cmd[i] = '\0';
         
