@@ -213,7 +213,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
         child_ipc_ptr->caps_or_badges[1] = irq_handler; 
     } else {
         // Процесс - Оболочка (Shell)
-        child_ipc_ptr->userData = ep;                  // Команды Ядру (ls, ps)
+        child_ipc_ptr->userData = badged_ep;           // Команды Ядру (ls, ps)
         child_ipc_ptr->caps_or_badges[0] = console_ep; // Связь с UART Драйвером
         child_ipc_ptr->caps_or_badges[1] = timer_ep;   // Связь с Timer Драйвером
     }
@@ -275,6 +275,9 @@ int main(int argc, char *argv[]) {
     seL4_CPtr root_cnode = seL4_CapInitThreadCNode;
     seL4_CPtr root_vspace = seL4_CapInitThreadVSpace;
     seL4_CPtr normal_untyped = alloc.get_untyped_cap(normal_idx);
+
+    memset(pcbs, 0, sizeof(pcbs));
+    next_pid = 1;
 
     // Резервируем слоты для всех объектов
     reader_reply_slot = alloc.alloc_slot();
@@ -375,17 +378,7 @@ int main(int argc, char *argv[]) {
         seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
         seL4_Word sender_pid = 0;
 
-        if (sender_badge & TIMER_IRQ_BADGE) {
-            pl031_clear_interrupt();
-            if (sleeper_waiting) {
-                seL4_SetMR(0, 0);
-                seL4_Send(sleeper_reply_slot, seL4_MessageInfo_new(0, 0, 0, 1));
-                check_err(seL4_CNode_Delete(root_cnode, sleeper_reply_slot, seL4_WordBits), "Delete sleeper cap");
-                sleeper_waiting = false;
-            }
-            seL4_IRQHandler_Ack(timer_irq_handler);
-            continue;
-        } else if (sender_badge != 0 && sender_badge < 256 && pcbs[sender_badge].active) {
+        if (sender_badge != 0 && sender_badge < 256 && pcbs[sender_badge].active) {
             sender_pid = sender_badge;
         }
 
