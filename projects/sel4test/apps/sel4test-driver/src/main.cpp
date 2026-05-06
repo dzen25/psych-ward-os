@@ -23,10 +23,10 @@ extern char _cpio_archive_end[];
 enum SyscallID {
     SYS_PRINT = 1, SYS_YIELD = 2, SYS_GET_TIME = 3, SYS_SLEEP = 4, 
     SYS_PUTCHAR = 5, SYS_READ = 6, SYS_ALLOC = 7,
-    SYS_PUTS = 8, // <--- НОВЫЙ СИСКОЛЛ
-    SYS_READFILE = 98, SYS_DOCTOR = 99,
+    SYS_PUTS = 8,
+    SYS_READFILE = 98, SYS_DOCTOR = 99, SYS_GETPID = 108,
     SYS_EXEC = 100, SYS_LS = 101, SYS_KILL = 102, SYS_EXIT = 103, SYS_PS = 104,
-    SYS_WRITEFILE = 105, SYS_WAIT = 106,
+    SYS_WRITEFILE = 105, SYS_WAIT = 106, SYS_SHM_GET = 107,
     UART_IRQ_BADGE = (1 << 0), TIMER_IRQ_BADGE = (1 << 1)
 };
 
@@ -105,11 +105,18 @@ struct ProcessControlBlock {
 static ProcessControlBlock pcbs[256];
 static int next_pid = 1;
 
+struct SharedMemoryRegion {
+    bool active;
+    seL4_CPtr frame_cap; // Физический фрейм памяти
+};
+static SharedMemoryRegion shm_regions[16];
+
 static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace,
                          seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
                          int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep, 
-                         seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame) {
+                         seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame,
+                         const char *args_payload = nullptr) {
     
     unsigned long elf_size = 0;
     unsigned long archive_len = _cpio_archive_end - _cpio_archive;
@@ -184,6 +191,11 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     check_err(seL4_ARM_Page_Map(ipc_frame, root_vspace, temp_window, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Root");
     seL4_IPCBuffer *child_ipc_ptr = (seL4_IPCBuffer*)temp_window;
     memset(child_ipc_ptr, 0, 4096);
+    // === STARTUP PAYLOAD ===
+    // Копируем строку аргументов в массив msg IPC-буфера ребенка
+    if (args_payload && args_payload[0] != '\0') {
+        strcpy((char*)&child_ipc_ptr->msg[0], args_payload);
+    }
 
     // ===================================================================
     // НАСТРОЙКА РОЛЕЙ ПРОЦЕССА В ЗАВИСИМОСТИ ОТ is_driver
@@ -278,6 +290,7 @@ int main(int argc, char *argv[]) {
 
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
+    memset(shm_regions, 0, sizeof(shm_regions));
 
     // Резервируем слоты для всех объектов
     reader_reply_slot = alloc.alloc_slot();
@@ -558,11 +571,24 @@ int main(int argc, char *argv[]) {
             case SYS_EXEC: {
                 char *shm = (char*)0x200006000ULL;
                 
-                // ИСПРАВЛЕНИЕ: Передаем 0 для всех аппаратных штук, но даем доступ к console_ep и timer_ep
-                int new_pid = spawn_process(shm, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
-                                            0, console_ep, timer_ep, 0, 0, 0);
+                // 1. Извлекаем имя ELF-файла (до первого пробела)
+                char *elf_name = shm;
+                char *args = shm; 
+                while (*args && *args != ' ') args++;
+                
+                if (*args == ' ') { 
+                    *args = '\0'; // Отрезаем имя программы
+                    args++;       // Указатель на начало аргументов
+                } else {
+                    args = nullptr; // Аргументов нет
+                }
+                
+                // 2. Передаем args в spawn_process как последний параметр
+                int new_pid = spawn_process(elf_name, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+                                            0, console_ep, timer_ep, 0, 0, 0, args);
+                
                 if (new_pid > 0) {
-                    seL4_SetMR(0, (seL4_Word)new_pid); // Возвращаем PID
+                    seL4_SetMR(0, (seL4_Word)new_pid);
                 } else {
                     uart_puts("[KERNEL] Program not found in VFS.\n");
                     seL4_SetMR(0, (seL4_Word)-1);
@@ -680,6 +706,12 @@ int main(int argc, char *argv[]) {
                 continue; 
             }
 
+            case SYS_GETPID: {
+                seL4_SetMR(0, sender_pid); // Возвращаем PID вызывающего процесса
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
             case SYS_LS: {
                 char *shm = (char*)0x200006000ULL;
                 int offset = 0;
@@ -736,6 +768,44 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, 0);
                 } else {
                     seL4_SetMR(0, (seL4_Word)-1); // Нет свободных слотов
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_SHM_GET: {
+                int shm_id = arg1;                  // ID региона (например, от 0 до 15)
+                seL4_Word vaddr = seL4_GetMR(2);    // Виртуальный адрес в пространстве процесса
+
+                if (shm_id < 0 || shm_id >= 16) {
+                    seL4_SetMR(0, (seL4_Word)-1); // Ошибка: неверный ID
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                // 1. Если этот фрейм еще не был создан — аллоцируем физическую память
+                if (!shm_regions[shm_id].active) {
+                    seL4_CPtr frame = alloc.alloc_slot();
+                    check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, 
+                                                  root_cnode, 0, 0, frame, 1), "Alloc SHM frame");
+                    shm_regions[shm_id].frame_cap = frame;
+                    shm_regions[shm_id].active = true;
+                    uart_puts("[KERNEL] Created new SHM region ID: "); uart_putdec(shm_id); uart_puts("\n");
+                }
+
+                // 2. Копируем капу фрейма для конкретного ребенка
+                seL4_CPtr child_frame_cap = alloc.alloc_slot();
+                check_err(seL4_CNode_Copy(root_cnode, child_frame_cap, seL4_WordBits, 
+                                          root_cnode, shm_regions[shm_id].frame_cap, seL4_WordBits, seL4_AllRights), "Copy SHM cap");
+
+                // 3. Маппим скопированный фрейм в виртуальное пространство процесса-отправителя
+                seL4_Error map_err = seL4_ARM_Page_Map(child_frame_cap, pcbs[sender_pid].vspace, vaddr, 
+                                                       seL4_AllRights, seL4_ARM_Default_VMAttributes);
+                
+                if (map_err == seL4_NoError) {
+                    seL4_SetMR(0, 0); // Успех
+                } else {
+                    seL4_SetMR(0, (seL4_Word)-1); // Ошибка маппинга (например, адрес уже занят)
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
