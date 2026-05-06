@@ -86,7 +86,7 @@ git push origin main
 - [x] Корректная идентификация процессов (Badged Endpoints)[cite: 1]
 - [x] Передача аргументов командной строки (`argc/argv`)[cite: 1]
 - [x] Background Execution (Символ `&` и фоновые демоны)[cite: 1]
-- [ ] **Inter-Process Communication (Pipes):** Перенаправление потоков ввода-вывода между процессами (например, `ls | grep`).
+- [ ] **Inter-Process Communication (Pipes):** Перенаправление потоков ввода-вывода между процессами (например, `ls | grep`),(echo "secret" > /vfs/key.txt (перенаправление вывода прямо в файл)).
 - [ ] **Сетевой стек (virtio-net):** Базовая сетевая подсистема для будущего обхода DPI.
 - [ ] **Real Filesystem (FAT32/ext2):** Полноценная блочная ФС вместо RAM-диска.
 - [ ] **Портирование на реальное железо:** Поддержка Raspberry Pi 4[cite: 1].
