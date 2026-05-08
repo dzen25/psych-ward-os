@@ -5,4 +5,5 @@ build/
 fat32.img
 /mnt
 /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/fat32.img
-.repo/
+.repo/*
+.sel4_cache/*
