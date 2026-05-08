@@ -1,4 +1,3 @@
-
 # 🧠 Psych Ward OS: True Microkernel Edition
 
 **Psych Ward OS** — это экспериментальная операционная система на базе микроядра **seL4**, реализующая принцип наименьших привилегий и полную изоляцию компонентов. В отличие от монолитных систем, здесь даже драйверы устройств и системные службы вынесены в пространство пользователя (User-space).
@@ -19,8 +18,8 @@
 ## 🚀 Ключевые возможности
 
 * **User-Space Driver Isolation:** Драйверы работают как обычные процессы. Ошибки в коде драйвера не приводят к панике ядра.
-* **Virtio & DMA Integration:** Настоящее рукопожатие с «железом» на шине MMIO. Чтение секторов диска напрямую в защищенную Shared Memory без участия процессора.
-* **Real FAT32 Support:** Парсинг загрузочного сектора (Boot Sector) и корневой директории диска с автоматическим монтированием в точку `/mnt`.
+* **Virtio & DMA Integration:** Настоящее рукопожатие с «железом» на шине MMIO. Чтение и запись секторов диска напрямую в защищенную Shared Memory без участия процессора.
+* **Real FAT32 Support:** Полная поддержка файловой системы FAT32. Парсинг Boot Sector, Root Directory, чтение файлов, обновление метаданных и динамическая аллокация кластеров для создания новых файлов.
 * **Process Lifecycle (POSIX-like):** Реализованы системные вызовы `SYS_EXEC` (запуск ELF с передачей `argc/argv`), `SYS_WAIT` (ожидание завершения) и `SYS_EXIT` (самозавершение).
 * **Demand Paging:** Динамический аллокатор страниц выделяет память на лету при возникновении Page Fault.
 * **Zero-Copy Shared Memory Heap:** Процессы могут динамически запрашивать общие физические фреймы памяти (`SYS_SHM_GET`) для мгновенного обмена данными напрямую друг с другом, минуя ядро.
@@ -45,7 +44,7 @@
 | `cd <path>` | Смена директории (поддерживаются `..`, `/` и `/mnt`) |
 | `mkdir <path>` | Создание дерева директорий в RAM (работает как `mkdir -p`) |
 | `touch <file>` | Создание пустого файла |
-| `echo <text> [> file]` | Вывод текста в консоль или его перенаправление в файл |
+| `echo <text> [> file]` | Вывод текста в консоль или прозрачная запись/создание файла на FAT32 |
 | `cat <file>` | Чтение содержимого файла (в том числе скачивание данных с FAT32 через DMA) |
 | `<cmd> \| grep <text>` | Конвейерная фильтрация вывода команд (например, `ps | grep shell`) |
 | `kill <pid>` | Принудительная терминация процесса |
@@ -67,22 +66,47 @@
 ### Компиляция:
 
 ```bash
-mkdir build && cd build
+# Активация виртуального окружения (если используется)
+source ~/sel4-vibe/sel4-vibe/bin/activate
+
+# Подготовка и сборка
+mkdir -p build && cd build
 ../init-build.sh -DPLATFORM=qemu-arm-virt -DAARCH64=1
 ninja
 
 ```
 
-### Запуск в QEMU (с монтированием диска):
+### 💽 Создание образа диска (fat32.img)
+
+Для работы драйвера файловой системы QEMU требуется заранее подготовленный образ диска. По умолчанию скрипт запуска ищет его в директории исходников драйвера:
+`projects/sel4test/apps/sel4test-driver/fat32.img`
+
+Выполните эти команды в терминале Linux, чтобы создать образ на 64 МБ, отформатировать его и закинуть туда тестовый файл:
 
 ```bash
- source sel4-vibe/sel4-vibe/bin/activate && cd psych-ward-os/build/
- 
- ninja  | tee /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/src/qemu_output.log
+# 1. Переходим в нужную директорию
+cd ~/psych-ward-os/projects/sel4test/apps/sel4test-driver/
 
- qemu-system-aarch64     -machine virt,virtualization=on     -cpu cortex-a53     -nographic     -serial mon:stdio     -m size=1024M     -kernel images/sel4test-driver-image-arm-qemu-arm-virt     -drive file=/home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/fat32.img,format=raw,if=none,id=mydrive     -device virtio-blk-device,drive=mydrive | tee /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/src/qemu_output.log
+# 2. Создаем пустой файл размером 16 Мегабайт
+dd if=/dev/zero of=fat32.img bs=1M count=16
 
+# 3. Форматируем его в FAT32 (требуется пакет dosfstools)
+mkfs.fat -F 32 fat32.img
 
+# 4. Монтируем образ во временную папку, чтобы добавить файлы
+mkdir -p /tmp/fat32_mount
+sudo mount -o loop fat32.img /tmp/fat32_mount
+
+# 5. Создаем тестовый файл для проверки чтения (SYS_READ_FILE)
+sudo bash -c 'echo "Welcome to FAT32" > /tmp/fat32_mount/HELLO.TXT'
+
+# 6. Отмонтируем диск (ОБЯЗАТЕЛЬНО перед запуском QEMU!)
+sudo umount /tmp/fat32_mount
+rm -rf /tmp/fat32_mount
+
+### Запуск в QEMU (с монтированием диска FAT32):
+
+```bash
 qemu-system-aarch64 \
     -machine virt,virtualization=on \
     -cpu cortex-a53 \
@@ -95,11 +119,13 @@ qemu-system-aarch64 \
 
 ```
 
+*(Для сохранения логов в файл можно добавить пайп `| tee qemu_output.log` в конец команды).*
+
 ### Пуш в GitHub:
 
 ```bash
 git add .
-git commit -a -m "."
+git commit -a -m "Added FAT32 write support via DMA"
 git push origin main
 
 ```
@@ -118,10 +144,10 @@ git push origin main
 * [x] Background Execution (Символ `&` и фоновые демоны)
 * [x] **Иерархическая ФС (VFS 2.0):** Древовидная файловая система в RAM.
 * [x] **I/O Redirection & IPC Pipes:** Перенаправление потоков ввода-вывода в файлы (`>`) и между утилитами (`|`).
-* [x] **Real Filesystem (FAT32):** Блочный драйвер (Virtio) с поддержкой очередей DMA и сквозного чтения файлов с реального накопителя в User-space.
+* [x] **Real Filesystem (FAT32):** Блочный драйвер (Virtio) с поддержкой очередей DMA и сквозного чтения файлов с накопителя.
+* [x] **FAT32 Write Support:** Гибридный системный вызов `SYS_WRITE_FILE`, поддерживающий In-Place Write, обновление метаданных Root Directory и динамическую аллокацию кластеров для создания новых файлов.
 
 **В планах:**
 
-* [ ] **FAT32 Write Support:** Поддержка записи блоков через DMA для изменения файлов и директорий на диске.
 * [ ] **Сетевой стек (virtio-net):** Базовая сетевая подсистема для будущего обхода DPI.
 * [ ] **Портирование на реальное железо:** Поддержка Raspberry Pi 4.

@@ -12,6 +12,11 @@ void __assert_fail(const char *expr, const char *file, int line, const char *fun
     }
 }
 
+static void my_memcpy(void *dest, const void *src, int n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) *d++ = *s++;
+}
 static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return len; }
 static void my_strcpy(char *dest, const char *src) { while ((*dest++ = *src++)); }
 static int my_strcmp(const char *s1, const char *s2) {
@@ -49,6 +54,8 @@ static void my_strncpy(char *dest, const char *src, int n) {
 #define strncmp my_strncmp
 #define strchr my_strchr
 #define memset my_memset
+#define memcpy my_memcpy
+
 
 // ==========================================
 // VFS 2.0: Virtual File System Registry
@@ -182,6 +189,53 @@ static void virtio_read_sector(uint64_t sector, uint32_t dest_offset, uint32_t l
     g_disk_regs->queue_notify = 0; 
 
     while (vq_used->idx < g_vq_avail_idx) { seL4_Yield(); }
+}
+// Функция-помощник: записывает данные из нашей памяти на физический диск!
+static void virtio_write_sector(uint64_t sector, uint32_t src_offset, uint32_t len) {
+    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(0x502000 + 0x400);
+    volatile virtq_avail* vq_avail = (volatile virtq_avail*)(0x502000 + 0x500);
+    volatile virtq_used* vq_used = (volatile virtq_used*)(0x502000 + 0x540);
+    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(0x502000 + 0x5E0);
+    volatile uint8_t* blk_status = (volatile uint8_t*)(0x502000 + 0x5F0);
+
+    // ВАЖНО: 1 = VIRTIO_BLK_T_OUT (Запись на диск)
+    blk_req->type = 1; 
+    blk_req->reserved = 0;
+    blk_req->sector = sector;
+    *blk_status = 0xFF; 
+    
+    // Дескриптор 0 (Заголовок: Железо ЧИТАЕТ тип запроса)
+    vq_desc[0].addr = 0x60000000 + 0x5E0; 
+    vq_desc[0].len = sizeof(virtio_blk_req);
+    vq_desc[0].flags = 1; // NEXT
+    vq_desc[0].next = 1;
+
+    // Дескриптор 1 (Данные: Железо ЧИТАЕТ из нашей RAM, чтобы записать на диск)
+    vq_desc[1].addr = 0x60000000 + src_offset;
+    vq_desc[1].len = len;
+    vq_desc[1].flags = 1; // ТОЛЬКО NEXT! (Флага WRITE больше нет)
+    vq_desc[1].next = 2;
+
+    // Дескриптор 2 (Статус: Железо ПИШЕТ статус операции 0 в нашу RAM)
+    vq_desc[2].addr = 0x60000000 + 0x5F0; 
+    vq_desc[2].len = 1;
+    vq_desc[2].flags = 2; // WRITE
+    vq_desc[2].next = 0;
+
+    // Сообщаем диску о новой задаче
+    vq_avail->ring[g_vq_avail_idx % 16] = 0; 
+    g_vq_avail_idx++;
+    vq_avail->idx = g_vq_avail_idx;
+
+    g_disk_regs->queue_notify = 0; // ПИНГУЕМ ДИСК НА ЗАПИСЬ!
+
+    while (vq_used->idx < g_vq_avail_idx) {
+        seL4_Yield(); // Ждем окончания физической записи
+    }
+
+    // ВОЗВРАЩАЕМ настройки дескрипторов по умолчанию для будущих операций ЧТЕНИЯ (cat, ls)
+    blk_req->type = 0; 
+    vq_desc[1].flags = 1 | 2; // NEXT | WRITE
 }
 static FAT32_BPB* fat32_bpb = nullptr;
 static uint32_t fat32_first_data_sector = 0;
@@ -442,12 +496,100 @@ extern "C" void __sel4_start_c(void) {
                     break;
                 }
 
-                case 113: { // SYS_WRITE_FILE
+                case 113: { // SYS_WRITE_FILE (Гибридный: VFS RAM + FAT32 DMA)
                     char *shm = (char*)0x502000;
                     char *path = shm;          
                     char *text = shm + 128;
-                    int target = -1;
+                    
+                    // ==========================================
+                    // МАГИЯ FAT32: ЕСЛИ ПУТЬ НАЧИНАЕТСЯ С /mnt/
+                    // ==========================================
+                    if (strncmp(path, "/mnt/", 5) == 0 && fat32_image_ptr) {
+                        char* target_file = path + 5;
+                        char fat_name[11];
+                        
+                        // Конвертируем "my_file.txt" в формат "MY_FILE TXT"
+                        for(int i=0; i<11; i++) fat_name[i] = ' ';
+                        int idx = 0;
+                        for(int i=0; target_file[i] && target_file[i] != '.'; i++) {
+                            char c = target_file[i];
+                            if (c >= 'a' && c <= 'z') c -= 32;
+                            if (idx < 8) fat_name[idx++] = c;
+                        }
+                        char* ext = strchr(target_file, '.');
+                        if (ext) {
+                            ext++; idx = 8;
+                            for(int i=0; ext[i]; i++) {
+                                char c = ext[i];
+                                if (c >= 'a' && c <= 'z') c -= 32;
+                                if (idx < 11) fat_name[idx++] = c;
+                            }
+                        }
 
+                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                        int existing_idx = -1;
+                        int free_idx = -1;
+                        
+                        // Ищем файл или свободное место в Корневой Директории
+                        for (int i = 0; i < 16; i++) {
+                            if (entry[i].name[0] == 0x00 || entry[i].name[0] == 0xE5) {
+                                if (free_idx == -1) free_idx = i;
+                                if (entry[i].name[0] == 0x00) break; // Конец списка
+                            } else if (strncmp((const char*)entry[i].name, fat_name, 11) == 0) {
+                                existing_idx = i;
+                                break;
+                            }
+                        }
+
+                        uint32_t file_cluster = 0;
+
+                        if (existing_idx >= 0) {
+                            // 1. ФАЙЛ СУЩЕСТВУЕТ (Перезаписываем поверх)
+                            file_cluster = (entry[existing_idx].fst_clus_hi << 16) | entry[existing_idx].fst_clus_lo;
+                            entry[existing_idx].file_size = strlen(text);
+                        } else if (free_idx >= 0) {
+                            // 2. НОВЫЙ ФАЙЛ (Выделяем кластер)
+                            virtio_read_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
+                            uint32_t* fat_table = (uint32_t*)(0x502000 + 0xE00);
+                            for (int c = 3; c < 128; c++) {
+                                if ((fat_table[c] & 0x0FFFFFFF) == 0x00000000) {
+                                    file_cluster = c;
+                                    fat_table[c] = 0x0FFFFFFF; // Помечаем как занятый
+                                    break;
+                                }
+                            }
+                            if (file_cluster > 0) {
+                                virtio_write_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
+                                memcpy(entry[free_idx].name, fat_name, 11);
+                                entry[free_idx].attr = 0x20; 
+                                entry[free_idx].fst_clus_hi = (file_cluster >> 16) & 0xFFFF;
+                                entry[free_idx].fst_clus_lo = file_cluster & 0xFFFF;
+                                entry[free_idx].file_size = strlen(text);
+                            }
+                        }
+
+                        if (file_cluster > 0) {
+                            // Сбрасываем Текст на диск (Сектор Данных)
+                            uint32_t data_sector = fat32_first_data_sector + ((file_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                            char* file_data = (char*)(0x502000 + 0xC00);
+                            for(int k=0; k<512; k++) file_data[k] = 0; 
+                            strcpy(file_data, text);
+                            virtio_write_sector(data_sector, 0xC00, 512);
+
+                            // Сбрасываем Метаданные на диск (Root Directory)
+                            uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                            virtio_write_sector(root_sector, 0x800, 1024); 
+                            ret_val = 0;
+                        } else {
+                            ret_val = -1; // Диск или Директория заполнены
+                        }
+                        break;
+                    }
+
+                    // ==========================================
+                    // ИНАЧЕ: ЗАПИСЬ НА RAM-ДИСК (VFS)
+                    // ==========================================
+                    int target = -1;
                     for(int k=0; k<128; k++) {
                         if(vfs[k].active && strcmp(vfs[k].path, path) == 0 && !vfs[k].is_dir) { target = k; break; }
                     }
@@ -549,6 +691,130 @@ extern "C" void __sel4_start_c(void) {
                     }
                     break;
                 }
+
+                case 115: { // SYS_WRITE_IN_PLACE & METADATA UPDATE
+                    char *shm = (char*)0x502000;
+                    char target_file[12] = "HELLO   TXT"; 
+                    
+                    if (fat32_image_ptr) {
+                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                        bool hacked = false;
+                        for (int i = 0; i < 16; i++) {
+                            if (strncmp((const char*)entry[i].name, target_file, 11) == 0) {
+                                uint32_t file_cluster = (entry[i].fst_clus_hi << 16) | entry[i].fst_clus_lo;
+                                uint32_t file_sector = fat32_first_data_sector + ((file_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                                
+                                // Шаг 1: Читаем сектор файла
+                                virtio_read_sector(file_sector, 0xC00, 512);
+                                
+                                // Шаг 2: Изменяем данные в памяти
+                                char* file_data = (char*)(0x502000 + 0xC00);
+                                for(int k=0; k<512; k++) file_data[k] = 0; 
+                                
+                                const char* new_text = "Psych Ward OS has HACKED this physical disk!\n";
+                                strcpy(file_data, new_text);
+                                
+                                // Шаг 3: Записываем сектор ДАННЫХ на диск
+                                virtio_write_sector(file_sector, 0xC00, 512);
+                                
+                                // ==========================================
+                                // ШАГ 4: ОБНОВЛЯЕМ МЕТАДАННЫЕ И ROOT DIRECTORY
+                                // ==========================================
+                                // Увеличиваем размер файла в структуре FAT32
+                                entry[i].file_size = strlen(new_text);
+                                
+                                // Вычисляем сектор Root Directory
+                                uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                                
+                                // Записываем обновленный Root Directory (буфер 0x800) обратно на жесткий диск!
+                                virtio_write_sector(root_sector, 0x800, 1024); 
+                                // ==========================================
+
+                                strcpy(shm, "SUCCESS: HELLO.TXT rewritten AND size updated!\n");
+                                ret_val = 0;
+                                hacked = true;
+                                break;
+                            }
+                        }
+                        if (!hacked) strcpy(shm, "ERROR: HELLO.TXT not found!\n");
+                    }
+                    break;
+                }
+
+                case 116: { // SYS_CREATE_FAT_FILE
+                    char *shm = (char*)0x502000;
+                    
+                    // Парсим входные данные: "NEWFILE TXT|Привет, мир!"
+                    char filename[12];
+                    strncpy(filename, shm, 11);
+                    filename[11] = '\0';
+                    char* file_content = shm + 12; // Текст начинается после 11 символов имени и 1 разделителя
+                    
+                    if (fat32_image_ptr) {
+                        // ==========================================
+                        // ШАГ 1: АЛЛОКАЦИЯ КЛАСТЕРА В ТАБЛИЦЕ FAT
+                        // ==========================================
+                        // Читаем первый сектор таблицы FAT (она идет сразу после Boot Sector)
+                        virtio_read_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
+                        uint32_t* fat_table = (uint32_t*)(0x502000 + 0xE00);
+                        
+                        uint32_t free_cluster = 0;
+                        for (int c = 3; c < 128; c++) { // Ищем с 3-го кластера (0 и 1 зарезервированы, 2 - Root)
+                            if ((fat_table[c] & 0x0FFFFFFF) == 0x00000000) {
+                                free_cluster = c;
+                                fat_table[c] = 0x0FFFFFFF; // Помечаем кластер как занятый (End of File)
+                                break;
+                            }
+                        }
+                        
+                        if (free_cluster == 0) {
+                            strcpy(shm, "ERROR: No free clusters on disk!\n");
+                            break;
+                        }
+
+                        // Сохраняем обновленную таблицу FAT обратно на диск
+                        virtio_write_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
+
+                        // ==========================================
+                        // ШАГ 2: ЗАПИСЬ ДАННЫХ ФАЙЛА
+                        // ==========================================
+                        uint32_t data_sector = fat32_first_data_sector + ((free_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                        char* file_data = (char*)(0x502000 + 0xC00);
+                        for(int k=0; k<512; k++) file_data[k] = 0; // Очищаем сектор
+                        
+                        strcpy(file_data, file_content); // Копируем наш текст
+                        virtio_write_sector(data_sector, 0xC00, 512); // Сбрасываем на диск!
+
+                        // ==========================================
+                        // ШАГ 3: ОБНОВЛЕНИЕ ROOT DIRECTORY
+                        // ==========================================
+                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                        bool created = false;
+                        for (int i = 0; i < 16; i++) {
+                            // 0x00 = никогда не использовался, 0xE5 = файл был удален (свободное место)
+                            if (entry[i].name[0] == 0x00 || entry[i].name[0] == 0xE5) { 
+                                memcpy(entry[i].name, filename, 11);
+                                entry[i].attr = 0x20; // 0x20 = Обычный архивный файл
+                                entry[i].fst_clus_hi = (free_cluster >> 16) & 0xFFFF;
+                                entry[i].fst_clus_lo = free_cluster & 0xFFFF;
+                                entry[i].file_size = strlen(file_content);
+                                created = true;
+                                break;
+                            }
+                        }
+
+                        if (created) {
+                            uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                            virtio_write_sector(root_sector, 0x800, 1024); // Перезаписываем директорию
+                            strcpy(shm, "SUCCESS: File successfully created on FAT32!\n");
+                        } else {
+                            strcpy(shm, "ERROR: Root Directory is full!\n");
+                        }
+                    }
+                    ret_val = 0;
+                    break;
+                }
+
             }
             
             // Завершаем транзакцию: кладем ответ и поднимаем флаг готовности

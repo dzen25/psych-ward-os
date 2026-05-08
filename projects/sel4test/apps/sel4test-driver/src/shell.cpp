@@ -3,16 +3,18 @@
 __attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
 
+static void my_strcpy(char *dest, const char *src) {
+    while ((*dest++ = *src++));
+}
+
+#define strcpy my_strcpy
+
 static int my_strcmp(const char *s1, const char *s2) { 
     while (*s1 && (*s1 == *s2)) { s1++; s2++; } return *(const unsigned char*)s1 - *(const unsigned char*)s2; 
 }
 
 static seL4_Word my_strlen(const char *s) {
     seL4_Word len = 0; while (*s++) len++; return len;
-}
-
-static void my_strcpy(char *dest, const char *src) {
-    while ((*dest++ = *src++));
 }
 
 static int simple_atoi(const char *str) {
@@ -91,8 +93,6 @@ static int sys_getpid(seL4_CPtr root_ep) {
 
 static char current_working_dir[64] = "/";
 
-
-
 static void build_absolute_path(char* target, const char* arg) {
     if (arg[0] == '/') {
         my_strcpy(target, arg); // Уже абсолютный
@@ -104,7 +104,6 @@ static void build_absolute_path(char* target, const char* arg) {
     my_strcpy(target + my_strlen(target), arg);
 }
 
-// Прямая связь с blk_driver в обход Ядра
 static int vfs_syscall(int syscall_num) {
     volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12);
     mailbox[2] = 0; // Сбрасываем флаг готовности
@@ -566,6 +565,22 @@ extern "C" void __sel4_start_c(void) {
             else if (my_strcmp(cmd, "exit") == 0) {
                 sys_puts(console_ep, "Exiting sandbox...\n");
                 sys_exit(root_ep);
+            }
+
+            else if (my_strcmp(cmd, "hack_disk") == 0) {
+                // Вызываем наш тестовый сисколл на перезапись!
+                vfs_syscall(115);
+                char *shm = (char*)0x502000;
+                sys_puts(console_ep, shm);
+            }
+
+            else if (my_strcmp(cmd, "create_file") == 0) {
+                char *shm = (char*)0x502000;
+                // Формат: ИМЯ(11 символов) + '|' + Текст
+                strcpy(shm, "NEWFILE TXT|This file was built from SCRATCH by Psych Ward OS using raw DMA cluster allocation!");
+                
+                vfs_syscall(116); // Вызываем наш новый код создания!
+                sys_puts(console_ep, shm);
             }
 
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
