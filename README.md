@@ -76,6 +76,13 @@ ninja
 ### Запуск в QEMU (с монтированием диска):
 
 ```bash
+ source sel4-vibe/sel4-vibe/bin/activate && cd psych-ward-os/build/
+ 
+ ninja  | tee /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/src/qemu_output.log
+
+ qemu-system-aarch64     -machine virt,virtualization=on     -cpu cortex-a53     -nographic     -serial mon:stdio     -m size=1024M     -kernel images/sel4test-driver-image-arm-qemu-arm-virt     -drive file=/home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/fat32.img,format=raw,if=none,id=mydrive     -device virtio-blk-device,drive=mydrive | tee /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/src/qemu_output.log
+
+
 qemu-system-aarch64 \
     -machine virt,virtualization=on \
     -cpu cortex-a53 \
