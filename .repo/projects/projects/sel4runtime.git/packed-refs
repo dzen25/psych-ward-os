@@ -1,8 +1,0 @@
-# pack-refs with: peeled fully-peeled sorted 
-7b71e82ca6802a712475d0e523e689f190303bd3 refs/remotes/seL4/11.0.x-compatible
-2755b9d840a4600a09cb9e880b6c14c7d2177d09 refs/remotes/seL4/12.0.x-compatible
-e1c51c9b506708398bb1ffbf9098ae82855d3c14 refs/remotes/seL4/12.1.x-compatible
-bb75358167fe8bdc0e3df565bb419dc6eb150a60 refs/remotes/seL4/13.0.x-compatible
-86489cf6efab9f314964e79468c036e9035394c7 refs/remotes/seL4/15.0.x-compatible
-c13d776b756e6dab8467965ec636890858dd8cc0 refs/remotes/seL4/cmake_version
-86489cf6efab9f314964e79468c036e9035394c7 refs/remotes/seL4/master

@@ -1,1 +1,0 @@
-0000000000000000000000000000000000000000 6e900cb2d8503fbaef73b2809bea9ddad79afd4a dzen25 <nikita22dobry@gmail.com> 1777671955 +0300	fetch --quiet --progress nanopb --prune --recurse-submodules=no --tags +refs/heads/*:refs/remotes/nanopb/* +refs/heads/master:refs/remotes/nanopb/master +refs/tags/*:refs/tags/*: storing head

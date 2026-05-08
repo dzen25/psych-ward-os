@@ -1,1 +1,0 @@
-0000000000000000000000000000000000000000 87642544dbb767806d9c1f0fb673eb5ac86c242b dzen25 <nikita22dobry@gmail.com> 1777671955 +0300	fetch --quiet --progress seL4 --prune --recurse-submodules=no --tags +refs/heads/*:refs/remotes/seL4/* +refs/heads/master:refs/remotes/seL4/master +refs/tags/*:refs/tags/*: storing head

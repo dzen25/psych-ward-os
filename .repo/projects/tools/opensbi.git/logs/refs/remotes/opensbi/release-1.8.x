@@ -1,1 +1,0 @@
-0000000000000000000000000000000000000000 74434f255873d74e56cc50aa762d1caf24c099f8 dzen25 <nikita22dobry@gmail.com> 1777671955 +0300	fetch --quiet --progress opensbi --prune --recurse-submodules=no --tags +refs/heads/*:refs/remotes/opensbi/* +refs/tags/v0.9:refs/tags/v0.9 +refs/tags/*:refs/tags/*: storing head
