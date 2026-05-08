@@ -92,6 +92,22 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
     return frame;
 }
 
+// ==========================================
+// VFS 2.0: Virtual File System Registry
+// ==========================================
+struct VfsNode {
+    bool active;
+    char path[64];  // Полный абсолютный путь (например, "/home" или "/uart_driver")
+    bool is_dir;    // Это папка или файл?
+    bool is_rom;    // Защита от записи (встроенные драйверы)
+    char data[256]; // Буфер для хранения текста файла
+    int size;       // Размер файла
+};
+
+static VfsNode vfs[128];
+static int vfs_count = 0;
+// ==========================================
+
 struct ProcessControlBlock {
     seL4_Word pid;
     char name[32];
@@ -267,6 +283,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_TCB_Resume(tcb);
     return pid;
 }
+
 int main(int argc, char *argv[]) {
     seL4_BootInfo *info = platsupport_get_bootinfo();
     if (!info) while (1);
@@ -291,6 +308,15 @@ int main(int argc, char *argv[]) {
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
+
+    memset(vfs, 0, sizeof(vfs));
+    
+    // Инициализация VFS 2.0
+    vfs[0] = {true, "/", true, true};
+    vfs[1] = {true, "/uart_driver", false, true};
+    vfs[2] = {true, "/timer_driver", false, true};
+    vfs[3] = {true, "/shell", false, true};
+    vfs_count = 4;
 
     // Резервируем слоты для всех объектов
     reader_reply_slot = alloc.alloc_slot();
@@ -712,34 +738,154 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            case SYS_LS: {
+            case 109: { // SYS_MKDIR (Создание папки с проверкой дубликатов)
                 char *shm = (char*)0x200006000ULL;
-                int offset = 0;
-                strcpy(shm, "Files in VFS (CPIO + RAM):\n");
-                offset = strlen(shm);
+                int found = -1;
+                
+                // Ищем, нет ли уже такого пути
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0) { 
+                        found = k; break; 
+                    }
+                }
+                
+                if (found >= 0) {
+                    // Если путь есть и это папка — возвращаем УСПЕХ (нужно для mkdir -p)
+                    if (vfs[found].is_dir) seL4_SetMR(0, 0); 
+                    else seL4_SetMR(0, -1); // Ошибка: имя занято файлом
+                } else if (vfs_count < 128) {
+                    // Создаем новую папку
+                    vfs[vfs_count].active = true;
+                    strcpy(vfs[vfs_count].path, shm);
+                    vfs[vfs_count].is_dir = true;
+                    vfs[vfs_count].is_rom = false;
+                    vfs_count++;
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, -1); // VFS переполнен
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
 
-                // 1. Сначала выводим файлы из RAM
-                for (int i = 0; i < 16; i++) {
-                    if (ram_vfs[i].active) {
-                        strcpy(shm + offset, "- [RAM] "); offset += 8;
-                        strcpy(shm + offset, ram_vfs[i].name); offset = strlen(shm);
-                        strcpy(shm + offset, "\n"); offset++;
+            case 110: { // SYS_LS (Умный листинг папки)
+                char *shm = (char*)0x200006000ULL;
+                char target_dir[64];
+                strcpy(target_dir, shm); // Оболочка запрашивает папку
+                
+                strcpy(shm, "Directory listing:\n");
+                char *curr = shm + strlen(shm);
+                int t_len = strlen(target_dir);
+                
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strncmp(vfs[k].path, target_dir, t_len) == 0) {
+                        char *rest = vfs[k].path + t_len; // Отрезаем базовый путь
+                        // Если в остатке пути нет слешей (или это корень) - значит файл лежит прямо здесь!
+                        if (strlen(rest) > 0 && strchr(rest, '/') == nullptr) {
+                            strcpy(curr, vfs[k].is_dir ? " [DIR] " : (vfs[k].is_rom ? " [ROM] " : " [RAM] "));
+                            curr += 7;
+                            strcpy(curr, rest); curr += strlen(rest);
+                            strcpy(curr, "\n"); curr += 1;
+                        }
+                    }
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 111: { // SYS_STAT (Проверка существования папки для команды cd)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0 && vfs[k].is_dir) {
+                        found = 0; break;
+                    }
+                }
+                seL4_SetMR(0, found);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 112: { // SYS_TOUCH (Создание пустого файла)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                for(int k=0; k<128; k++) {
+                    if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
+                }
+                if (found >= 0) {
+                    seL4_SetMR(0, 0); // Файл уже есть, все ок
+                } else if (vfs_count < 128) {
+                    vfs[vfs_count].active = true;
+                    strcpy(vfs[vfs_count].path, shm);
+                    vfs[vfs_count].is_dir = false;
+                    vfs[vfs_count].is_rom = false;
+                    vfs[vfs_count].size = 0;
+                    memset(vfs[vfs_count].data, 0, sizeof(vfs[vfs_count].data));
+                    vfs_count++;
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, -1); // Место в VFS кончилось
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 113: { // SYS_WRITE_FILE (Запись текста в файл)
+                char *shm = (char*)0x200006000ULL;
+                char *path = shm;          // Путь лежит в начале SHM
+                char *text = shm + 128;    // Текст лежит со смещением 128 байт
+                int target = -1;
+
+                for(int k=0; k<128; k++) {
+                    if(vfs[k].active && strcmp(vfs[k].path, path) == 0 && !vfs[k].is_dir) {
+                        target = k; break;
                     }
                 }
 
-                // 2. Затем файлы из CPIO
-                unsigned long archive_len = _cpio_archive_end - _cpio_archive;
-                int entry_index = 0;
-                while (1) {
-                    const char *file_name = nullptr; unsigned long file_size = 0;
-                    const void *file_data = cpio_get_entry(_cpio_archive, archive_len, entry_index++, &file_name, &file_size);
-                    if (!file_data || !file_name || strcmp(file_name, "TRAILER!!!") == 0) break;
-                    
-                    strcpy(shm + offset, "- [ROM] "); offset += 8;
-                    strcpy(shm + offset, file_name); offset = strlen(shm);
-                    strcpy(shm + offset, "\n"); offset++;
+                // Если файла не было - неявно создаем его (как это делает > в bash)
+                if (target == -1 && vfs_count < 128) {
+                    target = vfs_count;
+                    vfs[target].active = true;
+                    strcpy(vfs[target].path, path);
+                    vfs[target].is_dir = false;
+                    vfs[target].is_rom = false;
+                    vfs_count++;
                 }
-                seL4_SetMR(0, 0); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+
+                if (target >= 0) {
+                    if (vfs[target].is_rom) {
+                        seL4_SetMR(0, -1); // Ошибка: ROM-файлы защищены от записи
+                    } else {
+                        strncpy(vfs[target].data, text, 255);
+                        vfs[target].data[255] = '\0';
+                        vfs[target].size = strlen(vfs[target].data);
+                        seL4_SetMR(0, 0);
+                    }
+                } else {
+                    seL4_SetMR(0, -1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 114: { // SYS_READ_FILE (Чтение файла для cat)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                for(int k=0; k<128; k++) {
+                    if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
+                }
+                
+                if (found >= 0 && !vfs[found].is_dir) {
+                    if (vfs[found].is_rom) {
+                        strcpy(shm, "<ELF Binary Data...>"); // Заглушка, чтобы не выводить бинарник в консоль
+                    } else {
+                        strcpy(shm, vfs[found].data);
+                    }
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, -1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 
