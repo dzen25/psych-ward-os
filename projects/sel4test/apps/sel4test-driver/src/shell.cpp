@@ -91,11 +91,7 @@ static int sys_getpid(seL4_CPtr root_ep) {
 
 static char current_working_dir[64] = "/";
 
-static int sys_vfs_cmd(seL4_CPtr root_ep, int cmd) {
-    __sel4_ipc_buffer->msg[0] = cmd;
-    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    return (int)seL4_GetMR(0);
-}
+
 
 static void build_absolute_path(char* target, const char* arg) {
     if (arg[0] == '/') {
@@ -106,6 +102,18 @@ static void build_absolute_path(char* target, const char* arg) {
     int len = my_strlen(target);
     if (target[len-1] != '/') { target[len] = '/'; target[len+1] = '\0'; }
     my_strcpy(target + my_strlen(target), arg);
+}
+
+// Прямая связь с blk_driver в обход Ядра
+static int vfs_syscall(int syscall_num) {
+    volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12);
+    mailbox[2] = 0; // Сбрасываем флаг готовности
+    mailbox[0] = syscall_num; // Кладем команду в ящик
+    
+    while (mailbox[2] == 0) {
+        seL4_Yield(); // Ждем, пока blk_driver не сделает работу
+    }
+    return mailbox[1]; // Возвращаем статус (0 или -1)
 }
 
 // --- Точка входа ---
@@ -297,9 +305,14 @@ extern "C" void __sel4_start_c(void) {
             }
 
             else if (my_strcmp(cmd, "ls") == 0) {
-                char *shm = (char*)0x502000; // Твой актуальный адрес SHM
-                build_absolute_path(shm, ""); // Передаем текущую папку в ядро
-                sys_vfs_cmd(root_ep, 110);
+                char *shm = (char*)0x502000; 
+                // Если есть аргумент - берем его, иначе берем текущую папку (пустую строку)
+                if (arg) {
+                    build_absolute_path(shm, arg);
+                } else {
+                    build_absolute_path(shm, "");
+                }
+                vfs_syscall(110);
                 sys_puts(console_ep, shm);
             }
 
@@ -318,13 +331,13 @@ extern "C" void __sel4_start_c(void) {
                 for (int i = 1; shm[i] != '\0'; i++) {
                     if (shm[i] == '/') {
                         shm[i] = '\0'; // Временно отрезаем хвост пути
-                        if (sys_vfs_cmd(root_ep, 109) != 0) fail = 1;
+                        if (vfs_syscall(109) != 0) fail = 1;
                         shm[i] = '/';  // Приклеиваем слэш обратно
                     }
                 }
                 
                 // Создаем финальную папку (весь путь целиком)
-                if (sys_vfs_cmd(root_ep, 109) != 0) fail = 1;
+                if (vfs_syscall(109) != 0) fail = 1;
                 
                 if (!fail) sys_puts(console_ep, "Directory tree created.\n");
                 else sys_puts(console_ep, "Failed to create directory tree.\n");
@@ -369,7 +382,7 @@ extern "C" void __sel4_start_c(void) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (sys_vfs_cmd(root_ep, 111) == 0) {
+                if (vfs_syscall(111) == 0) {
                     my_strcpy(current_working_dir, shm);
                 } else {
                     sys_puts(console_ep, "No such directory.\n");
@@ -483,7 +496,7 @@ extern "C" void __sel4_start_c(void) {
                 if (!arg) { sys_puts(console_ep, "Usage: touch <file>\n"); continue; }
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
-                if (sys_vfs_cmd(root_ep, 112) == 0) sys_puts(console_ep, "File created.\n");
+                if (vfs_syscall(112) == 0) sys_puts(console_ep, "File created.\n");
                 else sys_puts(console_ep, "Failed to create file.\n");
             }
 
@@ -492,7 +505,7 @@ extern "C" void __sel4_start_c(void) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (sys_vfs_cmd(root_ep, 114) == 0) {
+                if (vfs_syscall(114) == 0) {
                     sys_puts(console_ep, shm);
                     sys_puts(console_ep, "\n");
                 } else {
@@ -535,7 +548,7 @@ extern "C" void __sel4_start_c(void) {
                     build_absolute_path(path_ptr, redir);
                     my_strcpy(text_ptr, arg);
                     
-                    if (sys_vfs_cmd(root_ep, 113) != 0) {
+                    if (vfs_syscall(113) != 0) {
                         sys_puts(console_ep, "Failed to write to file.\n");
                     }
                     // Если все ок - молчим, как настоящий bash!

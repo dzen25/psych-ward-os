@@ -3,13 +3,7 @@
 #include "uart.h"
 #include "hw_timer.h" 
 
-struct RAMFile {
-    char name[32];
-    char content[4096]; // <-- Статический буфер на 4 КБ
-    size_t size;
-    bool active;
-};
-RAMFile ram_vfs[16]; // Резервируем место под 16 новых файлов
+#include <sel4/sel4.h>
 
 extern "C" {
 #include <cpio/cpio.h>
@@ -21,13 +15,30 @@ extern char _cpio_archive[];
 extern char _cpio_archive_end[];
 
 enum SyscallID {
-    SYS_PRINT = 1, SYS_YIELD = 2, SYS_GET_TIME = 3, SYS_SLEEP = 4, 
-    SYS_PUTCHAR = 5, SYS_READ = 6, SYS_ALLOC = 7,
+    // --- БАЗОВЫЕ КЕРНЕЛ-ВЫЗОВЫ ---
+    SYS_PRINT = 1, 
+    SYS_YIELD = 2, 
+    SYS_GET_TIME = 3, 
+    SYS_SLEEP = 4, 
+    SYS_PUTCHAR = 5, 
+    SYS_READ = 6, 
+    SYS_ALLOC = 7,
     SYS_PUTS = 8,
-    SYS_READFILE = 98, SYS_DOCTOR = 99, SYS_GETPID = 108,
-    SYS_EXEC = 100, SYS_LS = 101, SYS_KILL = 102, SYS_EXIT = 103, SYS_PS = 104,
-    SYS_WRITEFILE = 105, SYS_WAIT = 106, SYS_SHM_GET = 107,
-    UART_IRQ_BADGE = (1 << 0), TIMER_IRQ_BADGE = (1 << 1)
+    
+    // --- УПРАВЛЕНИЕ ПРОЦЕССАМИ И ПАМЯТЬЮ ---
+    SYS_DOCTOR = 99, 
+    SYS_EXEC = 100, 
+    SYS_KILL = 102, 
+    SYS_EXIT = 103, 
+    SYS_PS = 104,
+    SYS_WAIT = 106, 
+    SYS_SHM_GET = 107,
+    SYS_GETPID = 108,
+
+    // --- ПРЕРЫВАНИЯ ЖЕЛЕЗА  ---
+    UART_IRQ_BADGE = (1 << 0), 
+    TIMER_IRQ_BADGE = (1 << 1)
+
 };
 
 static void uart_putdec(uint64_t val) {
@@ -91,22 +102,6 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
     untyped_watermarks[idx] += 4096;
     return frame;
 }
-
-// ==========================================
-// VFS 2.0: Virtual File System Registry
-// ==========================================
-struct VfsNode {
-    bool active;
-    char path[64];  // Полный абсолютный путь (например, "/home" или "/uart_driver")
-    bool is_dir;    // Это папка или файл?
-    bool is_rom;    // Защита от записи (встроенные драйверы)
-    char data[256]; // Буфер для хранения текста файла
-    int size;       // Размер файла
-};
-
-static VfsNode vfs[128];
-static int vfs_count = 0;
-// ==========================================
 
 struct ProcessControlBlock {
     seL4_Word pid;
@@ -216,8 +211,8 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     // ===================================================================
     // НАСТРОЙКА РОЛЕЙ ПРОЦЕССА В ЗАВИСИМОСТИ ОТ is_driver
     // ===================================================================
-    if (is_driver == 1 || is_driver == 2) {
-        // Процесс - Драйвер (UART или Timer)
+    if (is_driver == 1 || is_driver == 2 || is_driver == 3) {
+        // Процесс - Драйвер (UART, Timer или Block)
         seL4_CPtr drv_pud = alloc.alloc_slot();
         seL4_CPtr drv_pd  = alloc.alloc_slot();
         seL4_CPtr drv_pt  = alloc.alloc_slot();
@@ -225,21 +220,36 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
         
-        // Разные адреса оборудования для UART и RTC
-        uintptr_t hw_vaddr = (is_driver == 1) ? 0x200000000ULL : 0x200002000ULL;
+        uintptr_t hw_vaddr = (is_driver == 1) ? 0x200000000ULL : 
+                             ((is_driver == 2) ? 0x200002000ULL : 0x200004000ULL);
         
-        seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, seL4_ARM_Default_VMAttributes);
-        seL4_ARM_PageDirectory_Map(drv_pd, child_vspace, hw_vaddr, seL4_ARM_Default_VMAttributes);
-        seL4_ARM_PageTable_Map(drv_pt, child_vspace, hw_vaddr, seL4_ARM_Default_VMAttributes);
+        // Мапим структуры таблиц страниц (они покроют 2МБ диапазон, чего нам за глаза)
+        seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
+        seL4_ARM_PageDirectory_Map(drv_pd, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
+        seL4_ARM_PageTable_Map(drv_pt, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
 
-        seL4_CPtr frame_child = alloc.alloc_slot();
-        check_err(seL4_CNode_Copy(root_cnode, frame_child, seL4_WordBits, root_cnode, hw_frame, seL4_WordBits, seL4_AllRights), "Copy HW Frame Cap");
-        check_err(seL4_ARM_Page_Map(frame_child, child_vspace, hw_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map HW to Driver");
+        // --- НОВАЯ ЛОГИКА МАППИНГА ---
+        // Если это драйвер диска (3), мапим 4 страницы (16КБ). Иначе — 1 страницу.
+        int num_pages = (is_driver == 3) ? 4 : 1;
         
-        // Выдаем драйверу Endpoint связи (в 0 слоте) и IRQ Handler (в 1 слоте)
+        for (int i = 0; i < num_pages; i++) {
+            seL4_CPtr frame_child = alloc.alloc_slot();
+            // Копируем i-ю страницу из набора (они должны лежать в CNode подряд)
+            check_err(seL4_CNode_Copy(root_cnode, frame_child, seL4_WordBits, 
+                                      root_cnode, hw_frame + i, seL4_WordBits, seL4_AllRights), "Copy HW Frame Cap");
+            
+            // Мапим физическую страницу на виртуальный адрес со смещением
+            check_err(seL4_ARM_Page_Map(frame_child, child_vspace, hw_vaddr + (i * 4096), 
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map HW to Driver");
+        }
+        // -----------------------------
+        
         child_ipc_ptr->caps_or_badges[0] = (is_driver == 1) ? console_ep : timer_ep;
         child_ipc_ptr->caps_or_badges[1] = irq_handler; 
+        child_ipc_ptr->userData = badged_ep;
+
     } else {
+        
         // Процесс - Оболочка (Shell)
         child_ipc_ptr->userData = badged_ep;           // Команды Ядру (ls, ps)
         child_ipc_ptr->caps_or_badges[0] = console_ep; // Связь с UART Драйвером
@@ -309,14 +319,7 @@ int main(int argc, char *argv[]) {
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
 
-    memset(vfs, 0, sizeof(vfs));
     
-    // Инициализация VFS 2.0
-    vfs[0] = {true, "/", true, true};
-    vfs[1] = {true, "/uart_driver", false, true};
-    vfs[2] = {true, "/timer_driver", false, true};
-    vfs[3] = {true, "/shell", false, true};
-    vfs_count = 4;
 
     // Резервируем слоты для всех объектов
     reader_reply_slot = alloc.alloc_slot();
@@ -330,6 +333,10 @@ int main(int argc, char *argv[]) {
     // Фреймы устройств
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, 0x09000000, root_cnode);
     seL4_CPtr rtc_frame  = alloc_device_frame(info, alloc, 0x09010000, root_cnode);
+    seL4_CPtr virtio_frames[4];
+    for (int i = 0; i < 4; i++) {
+        virtio_frames[i] = alloc_device_frame(info, alloc, 0x0a000000 + (i * 4096), root_cnode);
+    }
 
     uintptr_t uart_vaddr = 0x200000000ULL;
     seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
@@ -354,12 +361,11 @@ int main(int argc, char *argv[]) {
 
     
 
-// 1. Shared memory (Оставляем ROOT себе, раздаем копии детям)
-    seL4_CPtr shm_frame_root = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, shm_frame_root, 1);
+    // 1. Shared memory (Оставляем ROOT себе, раздаем копии детям)
+    seL4_CPtr shm_frame_root = alloc_device_frame(info, alloc, 0x60000000, root_cnode);
     uintptr_t root_shm  = 0x200006000ULL;
     seL4_ARM_Page_Map(shm_frame_root, root_vspace, root_shm, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-
+    
     // 2. Каналы связи (Endpoints) для драйверов
     seL4_CPtr console_ep = alloc.alloc_slot();
     seL4_CPtr timer_ep = alloc.alloc_slot();
@@ -387,10 +393,6 @@ int main(int argc, char *argv[]) {
     uart_enable_interrupts();
     seL4_IRQHandler_Ack(uart_irq_handler);
 
-    // ===================================================================
-    // 5. ЗАПУСК ТРЕХ НЕЗАВИСИМЫХ ПРОЦЕССОВ (Микроядерная чистота!)
-    // ===================================================================
-
     // Запускаем Драйвер UART (is_driver = 1)
     if (spawn_process("uart_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       1, console_ep, timer_ep, uart_ntfn, uart_irq_handler, uart_frame) < 0) {
@@ -403,13 +405,20 @@ int main(int argc, char *argv[]) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
 
+
+    // Запускаем Драйвер Диска и ФС (is_driver = 3)
+    if (spawn_process("blk_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+                      3, console_ep, timer_ep, 0, 0, virtio_frames[0]) < 0) {
+        uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
+    }
+
     // Запускаем Оболочку (is_driver = 0)
     if (spawn_process("shell", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       0, console_ep, timer_ep, 0, 0, 0) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
 
-    uart_puts("Triple Sandboxes Spawned! Kernel is purified and serving IPC...\n");
+    uart_puts("Quadruple Sandboxes Spawned! Kernel is purified and serving IPC...\n");
 
     // --- ЕДИНЫЙ ЦИКЛ ЯДРА ---
     while (1) {
@@ -423,15 +432,10 @@ int main(int argc, char *argv[]) {
 
         seL4_Word label = seL4_MessageInfo_get_label(recv_info);
         
-        // ==========================================================
-        // ИСПРАВЛЕНИЕ: ПЕРЕХВАТ ПАДЕНИЙ ПАМЯТИ (DEMAND PAGING!)
-        // ==========================================================
         if (label == seL4_Fault_VMFault) {
             seL4_Word pc = seL4_GetMR(0);
             seL4_Word addr = seL4_GetMR(1);
             
-            // Если Пациент обратился к памяти в диапазоне 0x510000 - 0x5FFFFF,
-            // мы выделяем ему ОЗУ "на лету" и возобновляем выполнение!
             if (addr >= 0x510000 && addr < 0x600000 && sender_pid != 0) {
                 uart_puts("\n[KERNEL PAGER] Page Fault at 0x"); uart_puthex(addr);
                 uart_puts(" for PID "); uart_putdec(sender_pid);
@@ -544,37 +548,6 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, 0); // Процесс уже умер, сразу возвращаем успех
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 }
-                break;
-            }
-
-            case SYS_READFILE: { 
-                char *shm = (char*)0x200006000ULL; 
-                bool found = false;
-
-                // 1. Сначала ищем в RAM
-                for (int i = 0; i < 16; i++) {
-                    if (ram_vfs[i].active && strcmp(ram_vfs[i].name, shm) == 0) {
-                        memcpy(shm, ram_vfs[i].content, ram_vfs[i].size);
-                        shm[ram_vfs[i].size] = '\0';
-                        seL4_SetMR(0, ram_vfs[i].size);
-                        found = true; break;
-                    }
-                }
-
-                // 2. Если в RAM нет, ищем в CPIO (твой старый код)
-                if (!found) {
-                    unsigned long file_size = 0;
-                    unsigned long archive_len = _cpio_archive_end - _cpio_archive;
-                    char *file_data = (char*)cpio_get_file(_cpio_archive, archive_len, shm, &file_size);
-                    if (file_data) {
-                        memcpy(shm, file_data, (file_size > 4095) ? 4095 : file_size);
-                        shm[file_size] = '\0';
-                        seL4_SetMR(0, file_size); found = true;
-                    }
-                }
-
-                if (!found) seL4_SetMR(0, (seL4_Word)-1);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 
@@ -734,187 +707,6 @@ int main(int argc, char *argv[]) {
 
             case SYS_GETPID: {
                 seL4_SetMR(0, sender_pid); // Возвращаем PID вызывающего процесса
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 109: { // SYS_MKDIR (Создание папки с проверкой дубликатов)
-                char *shm = (char*)0x200006000ULL;
-                int found = -1;
-                
-                // Ищем, нет ли уже такого пути
-                for (int k = 0; k < 128; k++) {
-                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0) { 
-                        found = k; break; 
-                    }
-                }
-                
-                if (found >= 0) {
-                    // Если путь есть и это папка — возвращаем УСПЕХ (нужно для mkdir -p)
-                    if (vfs[found].is_dir) seL4_SetMR(0, 0); 
-                    else seL4_SetMR(0, -1); // Ошибка: имя занято файлом
-                } else if (vfs_count < 128) {
-                    // Создаем новую папку
-                    vfs[vfs_count].active = true;
-                    strcpy(vfs[vfs_count].path, shm);
-                    vfs[vfs_count].is_dir = true;
-                    vfs[vfs_count].is_rom = false;
-                    vfs_count++;
-                    seL4_SetMR(0, 0);
-                } else {
-                    seL4_SetMR(0, -1); // VFS переполнен
-                }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 110: { // SYS_LS (Умный листинг папки)
-                char *shm = (char*)0x200006000ULL;
-                char target_dir[64];
-                strcpy(target_dir, shm); // Оболочка запрашивает папку
-                
-                strcpy(shm, "Directory listing:\n");
-                char *curr = shm + strlen(shm);
-                int t_len = strlen(target_dir);
-                
-                for (int k = 0; k < 128; k++) {
-                    if (vfs[k].active && strncmp(vfs[k].path, target_dir, t_len) == 0) {
-                        char *rest = vfs[k].path + t_len; // Отрезаем базовый путь
-                        // Если в остатке пути нет слешей (или это корень) - значит файл лежит прямо здесь!
-                        if (strlen(rest) > 0 && strchr(rest, '/') == nullptr) {
-                            strcpy(curr, vfs[k].is_dir ? " [DIR] " : (vfs[k].is_rom ? " [ROM] " : " [RAM] "));
-                            curr += 7;
-                            strcpy(curr, rest); curr += strlen(rest);
-                            strcpy(curr, "\n"); curr += 1;
-                        }
-                    }
-                }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 111: { // SYS_STAT (Проверка существования папки для команды cd)
-                char *shm = (char*)0x200006000ULL;
-                int found = -1;
-                for (int k = 0; k < 128; k++) {
-                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0 && vfs[k].is_dir) {
-                        found = 0; break;
-                    }
-                }
-                seL4_SetMR(0, found);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 112: { // SYS_TOUCH (Создание пустого файла)
-                char *shm = (char*)0x200006000ULL;
-                int found = -1;
-                for(int k=0; k<128; k++) {
-                    if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
-                }
-                if (found >= 0) {
-                    seL4_SetMR(0, 0); // Файл уже есть, все ок
-                } else if (vfs_count < 128) {
-                    vfs[vfs_count].active = true;
-                    strcpy(vfs[vfs_count].path, shm);
-                    vfs[vfs_count].is_dir = false;
-                    vfs[vfs_count].is_rom = false;
-                    vfs[vfs_count].size = 0;
-                    memset(vfs[vfs_count].data, 0, sizeof(vfs[vfs_count].data));
-                    vfs_count++;
-                    seL4_SetMR(0, 0);
-                } else {
-                    seL4_SetMR(0, -1); // Место в VFS кончилось
-                }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 113: { // SYS_WRITE_FILE (Запись текста в файл)
-                char *shm = (char*)0x200006000ULL;
-                char *path = shm;          // Путь лежит в начале SHM
-                char *text = shm + 128;    // Текст лежит со смещением 128 байт
-                int target = -1;
-
-                for(int k=0; k<128; k++) {
-                    if(vfs[k].active && strcmp(vfs[k].path, path) == 0 && !vfs[k].is_dir) {
-                        target = k; break;
-                    }
-                }
-
-                // Если файла не было - неявно создаем его (как это делает > в bash)
-                if (target == -1 && vfs_count < 128) {
-                    target = vfs_count;
-                    vfs[target].active = true;
-                    strcpy(vfs[target].path, path);
-                    vfs[target].is_dir = false;
-                    vfs[target].is_rom = false;
-                    vfs_count++;
-                }
-
-                if (target >= 0) {
-                    if (vfs[target].is_rom) {
-                        seL4_SetMR(0, -1); // Ошибка: ROM-файлы защищены от записи
-                    } else {
-                        strncpy(vfs[target].data, text, 255);
-                        vfs[target].data[255] = '\0';
-                        vfs[target].size = strlen(vfs[target].data);
-                        seL4_SetMR(0, 0);
-                    }
-                } else {
-                    seL4_SetMR(0, -1);
-                }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case 114: { // SYS_READ_FILE (Чтение файла для cat)
-                char *shm = (char*)0x200006000ULL;
-                int found = -1;
-                for(int k=0; k<128; k++) {
-                    if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
-                }
-                
-                if (found >= 0 && !vfs[found].is_dir) {
-                    if (vfs[found].is_rom) {
-                        strcpy(shm, "<ELF Binary Data...>"); // Заглушка, чтобы не выводить бинарник в консоль
-                    } else {
-                        strcpy(shm, vfs[found].data);
-                    }
-                    seL4_SetMR(0, 0);
-                } else {
-                    seL4_SetMR(0, -1);
-                }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case SYS_WRITEFILE: {
-                char *shm = (char*)0x200006000ULL;
-                // Формат в SHM: "filename\0content"
-                char *filename = shm;
-                char *content = shm + strlen(filename) + 1;
-                size_t content_size = seL4_GetMR(1);
-
-                int slot = -1;
-                for(int i=0; i<16; i++) { if(!ram_vfs[i].active) { slot=i; break; } }
-
-                if (slot != -1) {
-                    ram_vfs[slot].active = true;
-                    strcpy(ram_vfs[slot].name, filename);
-                    
-                    // Защита от переполнения: пишем не больше 4095 байт
-                    size_t safe_size = (content_size > 4095) ? 4095 : content_size;
-                    
-                    // Копируем прямо во внутренний буфер
-                    memcpy(ram_vfs[slot].content, content, safe_size);
-                    ram_vfs[slot].content[safe_size] = '\0';
-                    ram_vfs[slot].size = safe_size;
-                    
-                    seL4_SetMR(0, 0);
-                } else {
-                    seL4_SetMR(0, (seL4_Word)-1); // Нет свободных слотов
-                }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }

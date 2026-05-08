@@ -1,0 +1,493 @@
+struct RAMFile {
+    char name[32];
+    char content[4096]; // <-- Статический буфер на 4 КБ
+    size_t size;
+    bool active;
+};
+
+
+static int sys_vfs_cmd(seL4_CPtr root_ep, int cmd) {
+    __sel4_ipc_buffer->msg[0] = cmd;
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (int)seL4_GetMR(0);
+}
+
+// ==========================================
+// VFS 2.0: Virtual File System Registry
+// ==========================================
+struct VfsNode {
+    bool active;
+    char path[64];  // Полный абсолютный путь (например, "/home" или "/uart_driver")
+    bool is_dir;    // Это папка или файл?
+    bool is_rom;    // Защита от записи (встроенные драйверы)
+    char data[256]; // Буфер для хранения текста файла
+    int size;       // Размер файла
+};
+
+
+
+
+// ==========================================
+// FAT32 File System Structures
+// ==========================================
+struct __attribute__((packed)) FAT32_BPB {
+    uint8_t  jmp[3];            // Jump code
+    char     oem_name[8];       // OEM Name
+    uint16_t bytes_per_sector;  // Обычно 512
+    uint8_t  sectors_per_cluster;// Секторов в кластере
+    uint16_t reserved_sectors;  // Зарезервированные сектора (здесь лежит сам Boot Sector)
+    uint8_t  fat_count;         // Количество таблиц FAT (обычно 2)
+    uint16_t dir_entries;       // Для FAT32 всегда 0
+    uint16_t total_sectors_16;  // Для FAT32 всегда 0
+    uint8_t  media_descriptor;  // Тип носителя
+    uint16_t fat_size_16;       // Для FAT32 всегда 0
+    uint16_t sectors_per_track; 
+    uint16_t heads;
+    uint32_t hidden_sectors;
+    uint32_t total_sectors_32;  // Всего секторов на диске
+    
+    // Специфика FAT32 начинается отсюда:
+    uint32_t fat_size_32;       // Размер одной таблицы FAT в секторах
+    uint16_t ext_flags;
+    uint16_t fs_version;
+    uint32_t root_cluster;      // Номер первого кластера корневой директории! (Обычно 2)
+    uint16_t fs_info;
+    uint16_t backup_boot_sector;
+    uint8_t  reserved[12];
+    uint8_t  drive_number;
+    uint8_t  reserved1;
+    uint8_t  boot_signature;    // Должно быть 0x28 или 0x29
+    uint32_t volume_id;
+    char     volume_label[11];  // Метка тома (например "NO NAME    ")
+    char     fs_type[8];        // Тип ФС (строка "FAT32   ")
+};
+
+
+
+
+// НОВАЯ СТРУКТУРА ДЛЯ ФАЙЛОВ И ПАПОК
+struct __attribute__((packed)) FAT32_DirEntry {
+    uint8_t  name[11];      // Имя (8 байт) + Расширение (3 байта) без точки!
+    uint8_t  attr;          // Атрибуты (Скрытый, Системный, Папка и т.д.)
+    uint8_t  nt_res;
+    uint8_t  crt_time_tenth;
+    uint16_t crt_time;
+    uint16_t crt_date;
+    uint16_t lst_acc_date;
+    uint16_t fst_clus_hi;   // Старшие 16 бит номера кластера файла
+    uint16_t wrt_time;
+    uint16_t wrt_date;
+    uint16_t fst_clus_lo;   // Младшие 16 бит номера кластера файла
+    uint32_t file_size;     // Размер файла в байтах
+};
+
+
+#define VIRTIO_MMIO_BASE 0x0a000000
+
+struct volatile __attribute__((packed)) VirtioMmioRegs {
+    uint32_t magic_value;       // 0x000 (Должно быть 0x74726976 - "virt")
+    uint32_t version;           // 0x004 (1 - Legacy, 2 - Modern)
+    uint32_t device_id;         // 0x008 (1 - Net, 2 - Block, 3 - Console)
+    uint32_t vendor_id;         // 0x00c
+    uint32_t host_features;     // 0x010
+    uint32_t host_features_sel; // 0x014
+    uint32_t guest_features;    // 0x020
+    uint32_t guest_features_sel;// 0x024
+    uint32_t guest_page_size;   // 0x028
+};
+
+
+// ==========================================
+// Глобальное состояние FAT32
+// ==========================================
+static char* fat32_image_ptr = nullptr;
+static FAT32_BPB* fat32_bpb = nullptr;
+static uint32_t fat32_first_data_sector = 0;
+static uint32_t fat32_root_offset = 0;
+
+
+static VfsNode vfs[128];
+static int vfs_count = 0;
+// ==========================================
+
+
+
+
+
+            case 109: { // SYS_MKDIR (Создание папки с проверкой дубликатов)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                
+                // Ищем, нет ли уже такого пути
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0) { 
+                        found = k; break; 
+                    }
+                }
+                
+                if (found >= 0) {
+                    // Если путь есть и это папка — возвращаем УСПЕХ (нужно для mkdir -p)
+                    if (vfs[found].is_dir) seL4_SetMR(0, 0); 
+                    else seL4_SetMR(0, -1); // Ошибка: имя занято файлом
+                } else if (vfs_count < 128) {
+                    // Создаем новую папку
+                    vfs[vfs_count].active = true;
+                    strcpy(vfs[vfs_count].path, shm);
+                    vfs[vfs_count].is_dir = true;
+                    vfs[vfs_count].is_rom = false;
+                    vfs_count++;
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, -1); // VFS переполнен
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 110: { // SYS_LS (Умный листинг: RAM + FAT32)
+                char *shm = (char*)0x200006000ULL;
+                char target_dir[64];
+                strcpy(target_dir, shm);
+                
+                strcpy(shm, "Directory listing:\n");
+                char *curr = shm + strlen(shm);
+                int t_len = strlen(target_dir);
+                
+                // 1. Читаем файлы из оперативной памяти (старая логика)
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strncmp(vfs[k].path, target_dir, t_len) == 0) {
+                        char *rest = vfs[k].path + t_len;
+                        if (strlen(rest) > 0 && strchr(rest, '/') == nullptr) {
+                            strcpy(curr, vfs[k].is_dir ? " [DIR] " : (vfs[k].is_rom ? " [ROM] " : " [RAM] "));
+                            curr += 7;
+                            strcpy(curr, rest); curr += strlen(rest);
+                            strcpy(curr, "\n"); curr += 1;
+                        }
+                    }
+                }
+
+                // 2. МУЛЬТИПЛЕКСОР: Если мы делаем ls /mnt, добавляем файлы с FAT32!
+                if (strcmp(target_dir, "/mnt/") == 0 || strcmp(target_dir, "/mnt") == 0) {
+                    if (fat32_image_ptr) {
+                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                        for (int i = 0; i < 16; i++) {
+                            if (entry[i].name[0] == 0x00) break;
+                            if (entry[i].name[0] == 0xE5 || entry[i].attr == 0x0F) continue;
+                            
+                            strcpy(curr, " [FAT] "); curr += 7;
+                            for(int j=0; j<11; j++) {
+                                if (entry[i].name[j] != ' ') *curr++ = entry[i].name[j];
+                                if (j == 7 && entry[i].name[8] != ' ') *curr++ = '.';
+                            }
+                            *curr++ = '\n';
+                        }
+                    }
+                }
+                *curr = '\0';
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 111: { // SYS_STAT (Проверка существования папки для команды cd)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                for (int k = 0; k < 128; k++) {
+                    if (vfs[k].active && strcmp(vfs[k].path, shm) == 0 && vfs[k].is_dir) {
+                        found = 0; break;
+                    }
+                }
+                seL4_SetMR(0, found);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 112: { // SYS_TOUCH (Создание пустого файла)
+                char *shm = (char*)0x200006000ULL;
+                int found = -1;
+                for(int k=0; k<128; k++) {
+                    if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
+                }
+                if (found >= 0) {
+                    seL4_SetMR(0, 0); // Файл уже есть, все ок
+                } else if (vfs_count < 128) {
+                    vfs[vfs_count].active = true;
+                    strcpy(vfs[vfs_count].path, shm);
+                    vfs[vfs_count].is_dir = false;
+                    vfs[vfs_count].is_rom = false;
+                    vfs[vfs_count].size = 0;
+                    memset(vfs[vfs_count].data, 0, sizeof(vfs[vfs_count].data));
+                    vfs_count++;
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, -1); // Место в VFS кончилось
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 113: { // SYS_WRITE_FILE (Запись текста в файл)
+                char *shm = (char*)0x200006000ULL;
+                char *path = shm;          // Путь лежит в начале SHM
+                char *text = shm + 128;    // Текст лежит со смещением 128 байт
+                int target = -1;
+
+                for(int k=0; k<128; k++) {
+                    if(vfs[k].active && strcmp(vfs[k].path, path) == 0 && !vfs[k].is_dir) {
+                        target = k; break;
+                    }
+                }
+
+                // Если файла не было - неявно создаем его (как это делает > в bash)
+                if (target == -1 && vfs_count < 128) {
+                    target = vfs_count;
+                    vfs[target].active = true;
+                    strcpy(vfs[target].path, path);
+                    vfs[target].is_dir = false;
+                    vfs[target].is_rom = false;
+                    vfs_count++;
+                }
+
+                if (target >= 0) {
+                    if (vfs[target].is_rom) {
+                        seL4_SetMR(0, -1); // Ошибка: ROM-файлы защищены от записи
+                    } else {
+                        strncpy(vfs[target].data, text, 255);
+                        vfs[target].data[255] = '\0';
+                        vfs[target].size = strlen(vfs[target].data);
+                        seL4_SetMR(0, 0);
+                    }
+                } else {
+                    seL4_SetMR(0, -1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case 114: { // SYS_READ_FILE (Чтение файлов из RAM или FAT32)
+                char *shm = (char*)0x200006000ULL;
+                
+                // 1. МУЛЬТИПЛЕКСОР: Читаем с диска FAT32
+                if (strncmp(shm, "/mnt/", 5) == 0 && fat32_image_ptr) {
+                    char* target_file = shm + 5; // Имя файла (например, "HELLO.TXT")
+                    
+                    // Конвертируем обычное имя в суровый формат FAT32 "HELLO   TXT"
+                    char fat_name[11];
+                    for(int i=0; i<11; i++) fat_name[i] = ' ';
+                    int idx = 0;
+                    for(int i=0; target_file[i] && target_file[i] != '.'; i++) {
+                        char c = target_file[i];
+                        if (c >= 'a' && c <= 'z') c -= 32; // ToUpper
+                        if (idx < 8) fat_name[idx++] = c;
+                    }
+                    char* ext = strchr(target_file, '.');
+                    if (ext) {
+                        ext++; idx = 8;
+                        for(int i=0; ext[i]; i++) {
+                            char c = ext[i];
+                            if (c >= 'a' && c <= 'z') c -= 32; // ToUpper
+                            if (idx < 11) fat_name[idx++] = c;
+                        }
+                    }
+
+                    // Ищем файл в директории
+                    FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                    bool found = false;
+                    for (int i = 0; i < 16; i++) {
+                        if (entry[i].name[0] == 0x00) break;
+                        if (entry[i].name[0] == 0xE5 || entry[i].attr == 0x0F) continue;
+                        
+                        if (strncmp((const char*)entry[i].name, fat_name, 11) == 0) {
+                            uint32_t file_cluster = (entry[i].fst_clus_hi << 16) | entry[i].fst_clus_lo;
+                            uint32_t file_sector = fat32_first_data_sector + ((file_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                            uint32_t file_offset = file_sector * fat32_bpb->bytes_per_sector;
+                            
+                            // Копируем текст файла в Shared Memory!
+                            uint32_t copy_size = entry[i].file_size < 1024 ? entry[i].file_size : 1024;
+                            for(uint32_t k = 0; k < copy_size; k++) {
+                                shm[k] = (fat32_image_ptr + file_offset)[k];
+                            }
+                            shm[copy_size] = '\0';
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) seL4_SetMR(0, 0);
+                    else seL4_SetMR(0, -1);
+                
+                // 2. Читаем из виртуального RAM-диска (старая логика)
+                } else {
+                    int found = -1;
+                    for(int k=0; k<128; k++) {
+                        if(vfs[k].active && strcmp(vfs[k].path, shm) == 0) { found = k; break; }
+                    }
+                    
+                    if (found >= 0 && !vfs[found].is_dir) {
+                        if (vfs[found].is_rom) strcpy(shm, "<ELF Binary Data...>");
+                        else strcpy(shm, vfs[found].data);
+                        seL4_SetMR(0, 0);
+                    } else {
+                        seL4_SetMR(0, -1);
+                    }
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+
+
+
+
+
+memset(vfs, 0, sizeof(vfs));
+    
+    // Инициализация VFS 2.0
+    vfs[0] = {true, "/", true, true};
+    vfs[1] = {true, "/uart_driver", false, true};
+    vfs[2] = {true, "/timer_driver", false, true};
+    vfs[3] = {true, "/shell", false, true};
+    vfs_count = 4;
+
+
+// 1. ЗАПУСК БЛОЧНОГО ДРАЙВЕРА (VFS + FAT32)
+    if (spawn_process("blk_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+                      0, console_ep, timer_ep, 0, 0, 0) < 0) {
+        uart_puts("PANIC: BLK Driver failed to load!\n"); while(1);
+    }
+
+
+
+// ==========================================
+    // --- ДЕТЕКТ ЖЕЛЕЗА: VIRTIO-BLK ---
+    // ==========================================
+    uart_puts("\n[VIRTIO] Scanning MMIO bus at 0x0a000000...\n");
+    
+    // В seL4test у нас есть удобная функция для маппинга устройств:
+    // ps_io_ops_t io_ops; (она должна быть инициализирована выше в main.cpp)
+    // ps_io_mapper_t mapper = io_ops.io_mapper;
+    
+    // ВНИМАНИЕ: Если у тебя нет готового io_mapper, мы можем попробовать 
+    // прямой доступ (иногда в qemu-arm-virt этот регион уже замаплен 1:1)
+    
+    void* virtio_vaddr = (void*)VIRTIO_MMIO_BASE; 
+
+    // Добавим небольшую задержку/защиту, чтобы увидеть, не упадет ли здесь система
+    uart_puts("[VIRTIO] Attempting to read magic value...\n");
+
+    VirtioMmioRegs* regs = (VirtioMmioRegs*)virtio_vaddr;
+    
+    uint32_t magic = regs->magic_value; // ЧИТАЕМ ИЗ РЕГИСТРА!
+
+    uart_puts("[VIRTIO] Magic Value: 0x");
+    uart_puthex(magic);
+    uart_puts("\n");
+    
+    if (magic == 0x74726976) { // "virt"
+        uart_puts("[VIRTIO] Hardware contact ESTABLISHED!\n");
+        uart_puts("[VIRTIO] Device Version: "); uart_putdec(regs->version); uart_puts("\n");
+        uart_puts("[VIRTIO] Device ID: "); uart_putdec(regs->device_id); uart_puts("\n");
+        
+        if (regs->device_id == 2) {
+            uart_puts("[VIRTIO] YES! Found a Block Device (Hard Drive).\n");
+        } else if (regs->device_id == 1) {
+             uart_puts("[VIRTIO] Found a Network Card.\n");
+        }
+    } else {
+        uart_puts("[VIRTIO] Unknown device or MMIO mapping failed.\n");
+    }
+    // ==========================================
+
+
+
+
+RAMFile ram_vfs[16]; // Резервируем место под 16 новых файлов
+
+case SYS_READFILE: { 
+                char *shm = (char*)0x200006000ULL; 
+                bool found = false;
+
+                // 1. Сначала ищем в RAM
+                for (int i = 0; i < 16; i++) {
+                    if (ram_vfs[i].active && strcmp(ram_vfs[i].name, shm) == 0) {
+                        memcpy(shm, ram_vfs[i].content, ram_vfs[i].size);
+                        shm[ram_vfs[i].size] = '\0';
+                        seL4_SetMR(0, ram_vfs[i].size);
+                        found = true; break;
+                    }
+                }
+
+                // 2. Если в RAM нет, ищем в CPIO (твой старый код)
+                if (!found) {
+                    unsigned long file_size = 0;
+                    unsigned long archive_len = _cpio_archive_end - _cpio_archive;
+                    char *file_data = (char*)cpio_get_file(_cpio_archive, archive_len, shm, &file_size);
+                    if (file_data) {
+                        memcpy(shm, file_data, (file_size > 4095) ? 4095 : file_size);
+                        shm[file_size] = '\0';
+                        seL4_SetMR(0, file_size); found = true;
+                    }
+                }
+
+                if (!found) seL4_SetMR(0, (seL4_Word)-1);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+
+case SYS_EXEC: {
+                char *shm = (char*)0x200006000ULL;
+                
+                // 1. Извлекаем имя ELF-файла (до первого пробела)
+                char *elf_name = shm;
+                char *args = shm; 
+                while (*args && *args != ' ') args++;
+                
+                if (*args == ' ') { 
+                    *args = '\0'; // Отрезаем имя программы
+                    args++;       // Указатель на начало аргументов
+                } else {
+                    args = nullptr; // Аргументов нет
+                }
+                
+                // 2. Передаем args в spawn_process как последний параметр
+                int new_pid = spawn_process(elf_name, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+                                            0, console_ep, timer_ep, 0, 0, 0, args);
+                
+                if (new_pid > 0) {
+                    seL4_SetMR(0, (seL4_Word)new_pid);
+                } else {
+                    uart_puts("[KERNEL] Program not found in VFS.\n");
+                    seL4_SetMR(0, (seL4_Word)-1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+case SYS_WRITEFILE: {
+                char *shm = (char*)0x200006000ULL;
+                // Формат в SHM: "filename\0content"
+                char *filename = shm;
+                char *content = shm + strlen(filename) + 1;
+                size_t content_size = seL4_GetMR(1);
+
+                int slot = -1;
+                for(int i=0; i<16; i++) { if(!ram_vfs[i].active) { slot=i; break; } }
+
+                if (slot != -1) {
+                    ram_vfs[slot].active = true;
+                    strcpy(ram_vfs[slot].name, filename);
+                    
+                    // Защита от переполнения: пишем не больше 4095 байт
+                    size_t safe_size = (content_size > 4095) ? 4095 : content_size;
+                    
+                    // Копируем прямо во внутренний буфер
+                    memcpy(ram_vfs[slot].content, content, safe_size);
+                    ram_vfs[slot].content[safe_size] = '\0';
+                    ram_vfs[slot].size = safe_size;
+                    
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, (seL4_Word)-1); // Нет свободных слотов
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
