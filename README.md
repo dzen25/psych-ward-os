@@ -103,6 +103,7 @@ sudo bash -c 'echo "Welcome to FAT32" > /tmp/fat32_mount/HELLO.TXT'
 # 6. Отмонтируем диск (ОБЯЗАТЕЛЬНО перед запуском QEMU!)
 sudo umount /tmp/fat32_mount
 rm -rf /tmp/fat32_mount
+```
 
 ### Запуск в QEMU (с монтированием диска FAT32):
 
