@@ -7,3 +7,10 @@ fat32.img
 /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/fat32.img
 .repo/
 .sel4_cache/
+.venv/
+env/
+venv/
+bin/
+obj/
+*.o
+*.a
