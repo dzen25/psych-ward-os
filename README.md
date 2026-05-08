@@ -68,6 +68,28 @@ sudo apt install -y build-essential git cmake ninja-build \
 
 ```
 
+
+```
+
+### Установка проекта и виртуального окружения:
+
+```bash
+# 1. Клонирование репозитория
+cd ~
+git clone https://github.com/dzen25/psych-ward-os.git
+cd psych-ward-os
+
+# 2. Создание и активация изолированного виртуального окружения Python
+python3 -m venv ~/sel4-vibe
+source ~/sel4-vibe/bin/activate
+
+# 3. Установка Python-зависимостей, необходимых для сборки seL4
+pip install -r requirements.txt
+
+# 4. Подготовка конфигурации CMake и сборка проекта
+
+```
+
 ### 💽 Создание образа диска (fat32.img)
 
 Для работы драйвера файловой системы в QEMU требуется заранее подготовленный образ диска. По умолчанию скрипт запуска ищет его в директории исходников драйвера.
@@ -97,22 +119,9 @@ rm -rf /tmp/fat32_mount
 
 ```
 
-### Компиляция:
-
+### Компиляция образа:
 ```bash
-# 1. Клонирование репозитория
-cd ~
-git clone https://github.com/dzen25/psych-ward-os.git
-cd psych-ward-os
 
-# 2. Создание и активация изолированного виртуального окружения Python
-python3 -m venv ~/sel4-vibe
-source ~/sel4-vibe/bin/activate
-
-# 3. Установка Python-зависимостей, необходимых для сборки seL4
-pip install -r requirements.txt
-
-# 4. Подготовка конфигурации CMake и сборка проекта
 mkdir -p build && cd build
 
 ../init-build.sh -DPLATFORM=qemu-arm-virt -DAARCH64=1
@@ -120,6 +129,9 @@ mkdir -p build && cd build
 ninja
 
 ```
+
+---
+
 
 ### Запуск в QEMU (с монтированием диска FAT32):
 
@@ -169,11 +181,9 @@ qemu-system-aarch64 \
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 [![Open Source Love](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red.svg?style=flat-square)](CONTRIBUTING.md)
 
-Мы приветствуем новые идеи, форки и Pull Requests! Будь то новый системный вызов или полноценный сетевой драйвер — мы рады вашей помощи.
+Приветствуются новые идеи и форки.
 
-В нашем руководстве мы подробно расписали:
-* 🧬 Базовую философию архитектуры Psych Ward OS.
-* 🔑 Пошаговую шпаргалку по настройке Git и SSH-ключей с нуля.
-* 🔄 Инструкцию, как правильно сделать форк или создать свою независимую ОС.
+В руководстве подробно расписано:
+* 🧬 Базовую идея архитектуры Psych Ward OS.
 
 👉 **[Ознакомиться с руководством (CONTRIBUTING.md)](CONTRIBUTING.md)**
