@@ -68,9 +68,6 @@ sudo apt install -y build-essential git cmake ninja-build \
 
 ```
 
-
-```
-
 ### Установка проекта и виртуального окружения:
 
 ```bash
@@ -85,8 +82,6 @@ source ~/sel4-vibe/bin/activate
 
 # 3. Установка Python-зависимостей, необходимых для сборки seL4
 pip install -r requirements.txt
-
-# 4. Подготовка конфигурации CMake и сборка проекта
 
 ```
 
