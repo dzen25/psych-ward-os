@@ -169,7 +169,7 @@ qemu-system-aarch64 \
 * [ ] **Сетевой стек (virtio-net):** Базовая сетевая подсистема.
 * [ ] **Портирование на реальное железо**
 
-## 🤝 Контрибьютинг и работа с кодом
+## Работа с кодом
 
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
