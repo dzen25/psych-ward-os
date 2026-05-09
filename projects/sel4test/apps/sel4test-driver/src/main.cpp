@@ -211,7 +211,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     // ===================================================================
     // НАСТРОЙКА РОЛЕЙ ПРОЦЕССА В ЗАВИСИМОСТИ ОТ is_driver
     // ===================================================================
-    if (is_driver == 1 || is_driver == 2 || is_driver == 3) {
+    if (is_driver == 1 || is_driver == 2 || is_driver == 3 || is_driver == 4) {
         // Процесс - Драйвер (UART, Timer или Block)
         seL4_CPtr drv_pud = alloc.alloc_slot();
         seL4_CPtr drv_pd  = alloc.alloc_slot();
@@ -230,7 +230,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
 
         // --- НОВАЯ ЛОГИКА МАППИНГА ---
         // Если это драйвер диска (3), мапим 4 страницы (16КБ). Иначе — 1 страницу.
-        int num_pages = (is_driver == 3) ? 4 : 1;
+        int num_pages = (is_driver == 3 || is_driver == 4) ? 4 : 1;
         
         for (int i = 0; i < num_pages; i++) {
             seL4_CPtr frame_child = alloc.alloc_slot();
@@ -261,11 +261,13 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     check_err(seL4_ARM_Page_Map(stack_frame, child_vspace, child_stack, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map Stack to Child");
     check_err(seL4_ARM_Page_Map(ipc_frame, child_vspace, child_ipc, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Child");
 
-    // Выдаем Shared Memory VFS
-    seL4_CPtr shm_frame_child = alloc.alloc_slot();
-    seL4_CNode_Copy(root_cnode, shm_frame_child, seL4_WordBits, root_cnode, shm_frame_root, seL4_WordBits, seL4_AllRights);
+    // Выдаем Shared Memory VFS (Сразу 4 страницы = 16 КБ!)
     uintptr_t child_shm = 0x502000;
-    seL4_ARM_Page_Map(shm_frame_child, child_vspace, child_shm, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    for (int i = 0; i < 4; i++) {
+        seL4_CPtr shm_frame_child = alloc.alloc_slot();
+        seL4_CNode_Copy(root_cnode, shm_frame_child, seL4_WordBits, root_cnode, shm_frame_root + i, seL4_WordBits, seL4_AllRights);
+        seL4_ARM_Page_Map(shm_frame_child, child_vspace, child_shm + (i * 4096), seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    }
 
     seL4_CPtr tcb = alloc.alloc_slot();
     pcb.tcb = tcb;
@@ -362,9 +364,16 @@ int main(int argc, char *argv[]) {
     
 
     // 1. Shared memory (Оставляем ROOT себе, раздаем копии детям)
+    // Аллоцируем 4 страницы подряд, чтобы они лежали в CNode одна за другой
     seL4_CPtr shm_frame_root = alloc_device_frame(info, alloc, 0x60000000, root_cnode);
+    alloc_device_frame(info, alloc, 0x60001000, root_cnode);
+    alloc_device_frame(info, alloc, 0x60002000, root_cnode);
+    alloc_device_frame(info, alloc, 0x60003000, root_cnode);
+    
     uintptr_t root_shm  = 0x200006000ULL;
-    seL4_ARM_Page_Map(shm_frame_root, root_vspace, root_shm, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    for (int i = 0; i < 4; i++) {
+        seL4_ARM_Page_Map(shm_frame_root + i, root_vspace, root_shm + (i * 4096), seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    }
     
     // 2. Каналы связи (Endpoints) для драйверов
     seL4_CPtr console_ep = alloc.alloc_slot();
@@ -410,6 +419,13 @@ int main(int argc, char *argv[]) {
     if (spawn_process("blk_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       3, console_ep, timer_ep, 0, 0, virtio_frames[0]) < 0) {
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
+    }
+
+    // Запускаем Драйвер Сети (is_driver = 4)
+    // Передаем ему virtio_frames[0], так как сеть и диск сидят на одной физической шине
+    if (spawn_process("net_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+                      4, console_ep, timer_ep, 0, 0, virtio_frames[0]) < 0) {
+        uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Оболочку (is_driver = 0)

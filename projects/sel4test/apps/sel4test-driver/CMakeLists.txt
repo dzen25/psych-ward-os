@@ -38,6 +38,12 @@ target_include_directories(blk_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoc
 target_link_options(blk_driver PRIVATE "-nostdlib" "-static")
 target_link_libraries(blk_driver sel4 sel4runtime muslc)
 
+# 4. НОВЫЙ СЕТЕВОЙ ДРАЙВЕР
+add_executable(net_driver src/net_driver.cpp)
+target_include_directories(net_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+target_link_options(net_driver PRIVATE "-nostdlib" "-static")
+target_link_libraries(net_driver sel4 sel4runtime muslc)
+
 # ===================================================================
 # --- СБОРКА VFS (RAM-ДИСКА) ВРУЧНУЮ ---
 # ===================================================================
@@ -51,7 +57,8 @@ cd ${CMAKE_CURRENT_BINARY_DIR}
 echo 'uart_driver' > file_list.txt
 echo 'timer_driver' >> file_list.txt
 echo 'shell' >> file_list.txt
-echo 'blk_driver' >> file_list.txt 
+echo 'blk_driver' >> file_list.txt
+echo 'net_driver' >> file_list.txt # <--- ДОБАВЬ ЭТУ СТРОКУ
 cat file_list.txt | cpio -o -H newc > archive.cpio
 
 echo '.section ._archive_cpio,\"aw\"' > archive.S
@@ -67,8 +74,9 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:timer_driver>" "${CMAKE_CURRENT_BINARY_DIR}/timer_driver"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:shell>" "${CMAKE_CURRENT_BINARY_DIR}/shell"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:blk_driver>" "${CMAKE_CURRENT_BINARY_DIR}/blk_driver"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:net_driver>" "${CMAKE_CURRENT_BINARY_DIR}/net_driver"
     COMMAND bash "${CMAKE_CURRENT_BINARY_DIR}/pack_vfs.sh"
-    DEPENDS uart_driver timer_driver shell blk_driver
+    DEPENDS uart_driver timer_driver shell blk_driver net_driver
 )
 
 # ===================================================================
