@@ -127,7 +127,6 @@ ninja
 
 ---
 
-
 ### Запуск в QEMU (с монтированием диска FAT32):
 
 Убедитесь, что вы находитесь в директории `build` и активировали виртуальное окружение, затем выполните:
@@ -145,7 +144,7 @@ qemu-system-aarch64 \
 
 ```
 
-*(Совет: для сохранения логов запуска в текстовый файл, добавьте пайп `| tee qemu_output.log` в конец команды запуска QEMU).*
+*(Совет: для сохранения логов запуска в текстовый файл, добавьте пайп `| tee qemu_output.log` в конец команды запуска QEMU и/или ninja).*
 
 ---
 
@@ -166,7 +165,6 @@ qemu-system-aarch64 \
 
 **В планах:**
 
-
 * [ ] **Написание своих исполняемых внутренних программ**
 * [ ] **Сетевой стек (virtio-net):** Базовая сетевая подсистема.
 * [ ] **Портирование на реальное железо**
@@ -174,7 +172,6 @@ qemu-system-aarch64 \
 ## 🤝 Контрибьютинг и работа с кодом
 
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
-[![Open Source Love](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red.svg?style=flat-square)](CONTRIBUTING.md)
 
 Приветствуются новые идеи и форки.
 
