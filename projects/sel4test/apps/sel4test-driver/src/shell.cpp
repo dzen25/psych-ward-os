@@ -402,17 +402,27 @@ extern "C" void __sel4_start_c(void) {
             }
 
             else if (my_strcmp(cmd, "ping") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: ping <ip_address>\n"); continue; }
+                if (!arg) { sys_puts(console_ep, "Usage: ping <ip_address> [count]\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
+                char *cursor = arg;
+                char *ip_str = next_token(&cursor);
+                char *count_str = next_token(&cursor);
                 uint8_t ip[4];
-                if (parse_ipv4(arg, ip) != 0) {
+                uint16_t count = 1;
+
+                if (!ip_str || parse_ipv4(ip_str, ip) != 0) {
                     sys_puts(console_ep, "Invalid IPv4 address.\n");
                     continue;
                 }
+                if (count_str && parse_port(count_str, &count) != 0) {
+                    sys_puts(console_ep, "Invalid ping count.\n");
+                    continue;
+                }
+                if (count > 16) count = 16;
 
                 sys_puts(console_ep, "Ping command queued.\n");
-                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), 0, nullptr);
+                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
             }
 
             else if (my_strcmp(cmd, "send") == 0) {

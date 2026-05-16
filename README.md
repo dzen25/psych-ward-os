@@ -48,7 +48,7 @@
 | `touch <file>` | Создание пустого файла |
 | `echo <text> [> file]` | Вывод текста в консоль или прозрачная запись/создание файла на FAT32 |
 | `cat <file>` | Чтение содержимого файла (в том числе скачивание данных с FAT32 через DMA) |
-| `ping <ip>` | Отправка ICMP Echo Request через изолированный сетевой драйвер |
+| `ping <ip> [count]` | Отправка ICMP Echo Request через изолированный сетевой драйвер, вывод `icmp_seq`, `ttl` и RTT |
 | `send <text>` | Отправка UDP-датаграммы на хост QEMU SLIRP по умолчанию (`10.0.2.2:8080`) |
 | `sendto <ip> <port> <text>` | Отправка UDP-датаграммы на указанный IPv4/порт |
 | `netstat` | Печать состояния сетевого драйвера: Virtio, ARP/MAC, TX/RX индексы и default UDP target |
@@ -174,7 +174,7 @@ sendto 10.0.2.2 8080 Hello again
 
 Ожидаемый результат:
 
-* `ping 10.0.2.2` вызывает ARP при первом запуске, затем отправляет ICMP Echo Request и печатает `SUCCESS! PING REPLY RECEIVED!`.
+* `ping 10.0.2.2` вызывает ARP при первом запуске, затем отправляет ICMP Echo Request и печатает ответ в стиле `icmp_seq`, `ttl`, `time=... ms`. Для серии можно вызвать `ping 10.0.2.2 4`.
 * `send <text>` и `sendto <ip> <port> <text>` отправляют UDP-датаграмму через Virtio-Net; текст должен появиться в `nc`.
 * `netstat` печатает состояние сетевого драйвера, включая наличие MAC роутера, TX/RX индексы и default UDP target.
 
@@ -183,6 +183,8 @@ sendto 10.0.2.2 8080 Hello again
 ```bash
 tcpdump -nn -r traffic.pcap 'arp or icmp or udp'
 ```
+
+Для точного RTT используется AArch64 virtual counter (`cntvct_el0`). В настройках сборки включен `KernelArmExportVCNTUser=ON`; если вы пересобираете существующий `build`, выполните reconfigure или создайте build-директорию заново, чтобы kernel config обновился.
 
 ---
 

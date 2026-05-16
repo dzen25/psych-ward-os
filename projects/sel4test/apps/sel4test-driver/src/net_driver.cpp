@@ -1,6 +1,7 @@
 // net_driver.cpp
 #include <sel4/sel4.h>
 #include <stdint.h>
+#include <kernel/gen_config.h>
 
 __attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
 
@@ -28,6 +29,37 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
+static seL4_Word sys_get_time_ms(seL4_CPtr ep) {
+    seL4_SetMR(0, 3);
+    seL4_Call(ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return seL4_GetMR(0);
+}
+
+#ifdef CONFIG_EXPORT_VCNT_USER
+static uint64_t read_cntvct(void) {
+    uint64_t val = 0;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+}
+
+static uint64_t read_cntfrq(void) {
+    uint64_t val = 0;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
+}
+#endif
+
+static uint64_t net_now_us(seL4_CPtr root_ep) {
+#ifdef CONFIG_EXPORT_VCNT_USER
+    uint64_t freq = read_cntfrq();
+    if (freq != 0) {
+        uint64_t ticks = read_cntvct();
+        return (ticks / freq) * 1000000ULL + ((ticks % freq) * 1000000ULL) / freq;
+    }
+#endif
+    return (uint64_t)sys_get_time_ms(root_ep) * 1000ULL;
+}
+
 static void put_dec(seL4_CPtr ep, uint32_t val) {
     char buf[12];
     int i = 11;
@@ -38,6 +70,35 @@ static void put_dec(seL4_CPtr ep, uint32_t val) {
         val /= 10;
     }
     sys_puts(ep, &buf[i]);
+}
+
+static void put_u64(seL4_CPtr ep, uint64_t val) {
+    char buf[24];
+    int i = 23;
+    buf[i] = '\0';
+    if (val == 0) { sys_puts(ep, "0"); return; }
+    while (val > 0 && i > 0) {
+        buf[--i] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+    sys_puts(ep, &buf[i]);
+}
+
+static void put_three_digits(seL4_CPtr ep, uint32_t val) {
+    char buf[4];
+    if (val > 999) val = 999;
+    buf[0] = (char)('0' + (val / 100));
+    buf[1] = (char)('0' + ((val / 10) % 10));
+    buf[2] = (char)('0' + (val % 10));
+    buf[3] = '\0';
+    sys_puts(ep, buf);
+}
+
+static void put_duration_us(seL4_CPtr ep, uint64_t us) {
+    put_u64(ep, us / 1000ULL);
+    sys_puts(ep, ".");
+    put_three_digits(ep, (uint32_t)(us % 1000ULL));
+    sys_puts(ep, " ms");
 }
 
 static void put_ip(seL4_CPtr ep, const uint8_t ip[4]) {
@@ -103,6 +164,21 @@ static uint8_t pending_udp_ip[4] = {10, 0, 2, 2};
 static uint16_t pending_udp_port = 8080;
 static char pending_udp[64];
 static int pending_cmd = NET_CMD_NONE;
+static uint32_t pending_ping_count = 1;
+
+static uint8_t g_ping_target_ip[4] = {10, 0, 2, 2};
+static uint16_t g_ping_next_seq = 0;
+static uint16_t g_ping_outstanding_seq = 0;
+static bool g_ping_outstanding = false;
+static uint32_t g_ping_series_remaining = 0;
+static uint64_t g_ping_sent_us = 0;
+static uint32_t g_ping_sent_count = 0;
+static uint32_t g_ping_reply_count = 0;
+static uint32_t g_ping_timeout_count = 0;
+static uint64_t g_ping_last_rtt_us = 0;
+static uint64_t g_ping_min_rtt_us = 0;
+static uint64_t g_ping_max_rtt_us = 0;
+static uint64_t g_ping_total_rtt_us = 0;
 
 
 // ==========================================
@@ -140,6 +216,9 @@ static void net_send_arp_request(seL4_CPtr root_ep) {
 }
 
 static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
+    uint16_t seq = ++g_ping_next_seq;
+    if (seq == 0) seq = ++g_ping_next_seq;
+
     volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + 0x280 + sizeof(virtio_net_hdr));
@@ -156,12 +235,62 @@ static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
     volatile icmp_header* icmp = (volatile icmp_header*)(eth->payload + sizeof(ipv4_header));
-    icmp->type = 8; icmp->code = 0; icmp->id = htons(0x1337); icmp->sequence = htons(1); icmp->checksum = 0;
+    icmp->type = 8; icmp->code = 0; icmp->id = htons(0x1337); icmp->sequence = htons(seq); icmp->checksum = 0;
     char* data = (char*)icmp + sizeof(icmp_header); data[0] = 'P'; data[1] = 'O'; data[2] = 'N'; data[3] = 'G';
     icmp->checksum = calculate_checksum((void*)icmp, sizeof(icmp_header) + 4);
 
-    sys_puts(root_ep, "[NET DRIVER] Sending ICMP Ping (Echo Request) to Router...\n");
+    sys_puts(root_ep, "[NET DRIVER] ICMP Echo Request to ");
+    put_ip(root_ep, dst_ip);
+    sys_puts(root_ep, ": icmp_seq=");
+    put_dec(root_ep, seq);
+    sys_puts(root_ep, "\n");
+
+    g_ping_sent_us = net_now_us(root_ep);
+    g_ping_outstanding_seq = seq;
+    g_ping_outstanding = true;
+    g_ping_sent_count++;
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(icmp_header) + 4);
+}
+
+static void net_send_next_ping(seL4_CPtr root_ep) {
+    if (g_ping_outstanding || g_ping_series_remaining == 0) return;
+    g_ping_series_remaining--;
+    net_send_ping(root_ep, g_ping_target_ip);
+}
+
+static void net_start_ping_series(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint32_t count) {
+    if (count == 0) count = 1;
+    if (count > 16) count = 16;
+    for (int i = 0; i < 4; i++) g_ping_target_ip[i] = dst_ip[i];
+    g_ping_series_remaining = count;
+    g_ping_outstanding = false;
+    net_send_next_ping(root_ep);
+}
+
+static void net_record_ping_rtt(uint64_t rtt_us) {
+    g_ping_reply_count++;
+    g_ping_last_rtt_us = rtt_us;
+    g_ping_total_rtt_us += rtt_us;
+    if (g_ping_min_rtt_us == 0 || rtt_us < g_ping_min_rtt_us) g_ping_min_rtt_us = rtt_us;
+    if (rtt_us > g_ping_max_rtt_us) g_ping_max_rtt_us = rtt_us;
+}
+
+static void net_check_ping_timeout(seL4_CPtr root_ep) {
+    if (!g_ping_outstanding) return;
+#ifndef CONFIG_EXPORT_VCNT_USER
+    static uint32_t fallback_poll_div = 0;
+    fallback_poll_div++;
+    if ((fallback_poll_div & 0x3FFF) != 0) return;
+#endif
+    uint64_t now = net_now_us(root_ep);
+    if (now - g_ping_sent_us < 1000000ULL) return;
+
+    sys_puts(root_ep, "[NET PING] Request timeout for icmp_seq=");
+    put_dec(root_ep, g_ping_outstanding_seq);
+    sys_puts(root_ep, "\n");
+    g_ping_outstanding = false;
+    g_ping_timeout_count++;
+    net_send_next_ping(root_ep);
 }
 
 // НОВОЕ: Функция отправки текста через UDP!
@@ -243,12 +372,18 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
     if (cmd == NET_CMD_PING && len >= 3) {
         uint8_t dst_ip[4];
         unpack_ipv4(seL4_GetMR(1), dst_ip);
+        uint32_t count = (uint32_t)seL4_GetMR(2);
+        if (count == 0) count = 1;
+        if (count > 16) count = 16;
 
-        sys_puts(root_ep, "[NET DRIVER] Shell requested ICMP Ping.\n");
+        sys_puts(root_ep, "[NET DRIVER] Shell requested ICMP Ping x");
+        put_dec(root_ep, count);
+        sys_puts(root_ep, ".\n");
         if (have_router_mac) {
-            net_send_ping(root_ep, dst_ip);
+            net_start_ping_series(root_ep, dst_ip, count);
         } else {
             for (int i = 0; i < 4; i++) pending_ip[i] = dst_ip[i];
+            pending_ping_count = count;
             pending_cmd = NET_CMD_PING;
             net_send_arp_request(root_ep);
         }
@@ -294,6 +429,22 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
         put_ip(root_ep, default_udp_ip);
         sys_puts(root_ep, ":");
         put_dec(root_ep, default_udp_port);
+        sys_puts(root_ep, " ping_sent=");
+        put_dec(root_ep, g_ping_sent_count);
+        sys_puts(root_ep, " ping_reply=");
+        put_dec(root_ep, g_ping_reply_count);
+        sys_puts(root_ep, " ping_timeout=");
+        put_dec(root_ep, g_ping_timeout_count);
+        if (g_ping_reply_count > 0) {
+            sys_puts(root_ep, " rtt_last=");
+            put_duration_us(root_ep, g_ping_last_rtt_us);
+            sys_puts(root_ep, " rtt_avg=");
+            put_duration_us(root_ep, g_ping_total_rtt_us / g_ping_reply_count);
+            sys_puts(root_ep, " rtt_min=");
+            put_duration_us(root_ep, g_ping_min_rtt_us);
+            sys_puts(root_ep, " rtt_max=");
+            put_duration_us(root_ep, g_ping_max_rtt_us);
+        }
         sys_puts(root_ep, "\n");
     } else {
         sys_puts(root_ep, "[NET DRIVER] Unknown Shell command.\n");
@@ -322,8 +473,9 @@ static void net_poll(seL4_CPtr root_ep) {
                 have_router_mac = true;
 
                 if (pending_cmd == NET_CMD_PING) {
-                    net_send_ping(root_ep, pending_ip);
+                    uint32_t count = pending_ping_count;
                     pending_cmd = NET_CMD_NONE;
+                    net_start_ping_series(root_ep, pending_ip, count);
                 } else if (pending_cmd == NET_CMD_SEND) {
                     net_send_udp(root_ep, pending_udp_ip, pending_udp_port, pending_udp);
                     pending_cmd = NET_CMD_NONE;
@@ -334,12 +486,41 @@ static void net_poll(seL4_CPtr root_ep) {
             volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
             if (ip->protocol == 1) { 
                 volatile icmp_header* icmp = (volatile icmp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);
-                if (icmp->type == 0) { 
-                    sys_puts(root_ep, "\n===============================================\n");
-                    sys_puts(root_ep, "   >>> SUCCESS! PING REPLY RECEIVED! <<< \n");
-                    sys_puts(root_ep, "===============================================\n\n");
-                    
-                    // Reply is logged only; user-space shell decides what to send next.
+                if (icmp->type == 0 && htons(icmp->id) == 0x1337) { 
+                    uint16_t seq = htons(icmp->sequence);
+                    uint32_t ip_header_len = (ip->ihl_version & 0x0F) * 4;
+                    uint32_t ip_total_len = htons(ip->tot_len);
+                    uint32_t icmp_bytes = (ip_total_len > ip_header_len) ? (ip_total_len - ip_header_len) : 0;
+                    uint64_t now = net_now_us(root_ep);
+                    bool matched = g_ping_outstanding && seq == g_ping_outstanding_seq;
+                    uint64_t rtt_us = matched ? (now - g_ping_sent_us) : 0;
+                    uint8_t src_ip[4];
+                    for (int i = 0; i < 4; i++) src_ip[i] = ip->saddr[i];
+
+                    sys_puts(root_ep, "[NET PING] ");
+                    put_dec(root_ep, icmp_bytes);
+                    sys_puts(root_ep, " bytes from ");
+                    put_ip(root_ep, src_ip);
+                    sys_puts(root_ep, ": icmp_seq=");
+                    put_dec(root_ep, seq);
+                    sys_puts(root_ep, " ttl=");
+                    put_dec(root_ep, ip->ttl);
+                    sys_puts(root_ep, " time=");
+                    if (matched) {
+                        put_duration_us(root_ep, rtt_us);
+                    } else {
+                        sys_puts(root_ep, "unknown");
+                    }
+                    if (!matched) {
+                        sys_puts(root_ep, " late/unmatched");
+                    }
+                    sys_puts(root_ep, "\n");
+
+                    if (matched) {
+                        g_ping_outstanding = false;
+                        net_record_ping_rtt(rtt_us);
+                        net_send_next_ping(root_ep);
+                    }
                 }
             }
         }
@@ -391,6 +572,7 @@ extern "C" void __sel4_start_c(void) {
         if (g_net_regs) {
             net_poll(root_ep);
             net_handle_command(root_ep, net_cmd_ep);
+            net_check_ping_timeout(root_ep);
         }
         seL4_Yield();
     }
