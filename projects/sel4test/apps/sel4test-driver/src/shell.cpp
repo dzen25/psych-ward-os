@@ -1,4 +1,5 @@
 #include <sel4/sel4.h>
+#include <stdint.h>
 
 __attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
@@ -25,6 +26,102 @@ static int simple_atoi(const char *str) {
 
 static bool is_piping = false;
 static char pipe_buffer[4096];
+
+enum NetCommand {
+    NET_CMD_PING = 1,
+    NET_CMD_SEND = 2,
+    NET_CMD_STATUS = 3,
+};
+
+static char *next_token(char **cursor) {
+    if (!cursor || !*cursor) return nullptr;
+    char *tok = *cursor;
+    while (*tok == ' ') tok++;
+    if (*tok == '\0') { *cursor = tok; return nullptr; }
+
+    char *end = tok;
+    while (*end && *end != ' ') end++;
+    if (*end == ' ') {
+        *end = '\0';
+        end++;
+        while (*end == ' ') end++;
+    }
+    *cursor = end;
+    return tok;
+}
+
+static int parse_port(const char *str, uint16_t *out) {
+    if (!str || !*str) return -1;
+    int value = 0;
+    while (*str >= '0' && *str <= '9') {
+        value = value * 10 + (*str - '0');
+        if (value > 65535) return -1;
+        str++;
+    }
+    if (*str != '\0' || value <= 0) return -1;
+    *out = (uint16_t)value;
+    return 0;
+}
+
+static int parse_ipv4(const char *str, uint8_t out[4]) {
+    for (int part = 0; part < 4; part++) {
+        if (!str || *str < '0' || *str > '9') return -1;
+        int value = 0;
+        int digits = 0;
+        while (*str >= '0' && *str <= '9') {
+            value = value * 10 + (*str - '0');
+            if (value > 255) return -1;
+            str++;
+            digits++;
+        }
+        if (digits == 0) return -1;
+        out[part] = (uint8_t)value;
+        if (part < 3) {
+            if (*str != '.') return -1;
+            str++;
+        }
+    }
+    return *str == '\0' ? 0 : -1;
+}
+
+static seL4_Word pack_ipv4(const uint8_t ip[4]) {
+    return ((seL4_Word)ip[0] << 24) | ((seL4_Word)ip[1] << 16) |
+           ((seL4_Word)ip[2] << 8) | (seL4_Word)ip[3];
+}
+
+static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip, seL4_Word port, const char *text) {
+    const int word_bytes = sizeof(seL4_Word);
+    const int max_text = 48;
+    char clipped[max_text];
+    int text_len = 0;
+
+    if (text) {
+        while (text[text_len] && text_len < max_text) {
+            clipped[text_len] = text[text_len];
+            text_len++;
+        }
+    }
+
+    seL4_SetMR(0, cmd);
+    seL4_SetMR(1, ip);
+    seL4_SetMR(2, port);
+    seL4_SetMR(3, (seL4_Word)text_len);
+
+    int word_count = (text_len + word_bytes - 1) / word_bytes;
+    for (int w = 0; w < word_count; w++) {
+        seL4_Word packed = 0;
+        for (int b = 0; b < word_bytes; b++) {
+            int idx = w * word_bytes + b;
+            if (idx < text_len) {
+                packed |= ((seL4_Word)(uint8_t)clipped[idx]) << (b * 8);
+            }
+        }
+        seL4_SetMR(4 + w, packed);
+    }
+
+    seL4_Send(net_ep, seL4_MessageInfo_new(0, 0, 0, 4 + word_count));
+    seL4_Yield();
+}
 
 static void sys_puts_direct(seL4_CPtr console_ep, const char *str) {
     while (*str) {
@@ -124,6 +221,7 @@ extern "C" void __sel4_start_c(void) {
     seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
     seL4_CPtr console_ep = __sel4_ipc_buffer->caps_or_badges[0];
     seL4_CPtr timer_ep = __sel4_ipc_buffer->caps_or_badges[1];
+    seL4_CPtr net_ep = __sel4_ipc_buffer->caps_or_badges[2];
 
     // ==========================================================
     // СБОРКА ARGC И ARGV ИЗ PAYLOAD
@@ -301,6 +399,64 @@ extern "C" void __sel4_start_c(void) {
                 sys_puts(console_ep, "Sleeping 3 seconds...\n");
                 sys_sleep(timer_ep, 3000);
                 sys_puts(console_ep, "Woke up!\n");
+            }
+
+            else if (my_strcmp(cmd, "ping") == 0) {
+                if (!arg) { sys_puts(console_ep, "Usage: ping <ip_address>\n"); continue; }
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                uint8_t ip[4];
+                if (parse_ipv4(arg, ip) != 0) {
+                    sys_puts(console_ep, "Invalid IPv4 address.\n");
+                    continue;
+                }
+
+                sys_puts(console_ep, "Ping command queued.\n");
+                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), 0, nullptr);
+            }
+
+            else if (my_strcmp(cmd, "send") == 0) {
+                if (!arg) { sys_puts(console_ep, "Usage: send <text>\n"); continue; }
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                uint8_t ip[4] = {10, 0, 2, 2};
+                sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
+                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), 8080, arg);
+            }
+
+            else if (my_strcmp(cmd, "sendto") == 0) {
+                if (!arg) { sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n"); continue; }
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                char *cursor = arg;
+                char *ip_str = next_token(&cursor);
+                char *port_str = next_token(&cursor);
+                char *text = cursor;
+                while (text && *text == ' ') text++;
+
+                uint8_t ip[4];
+                uint16_t port = 0;
+                if (!ip_str || parse_ipv4(ip_str, ip) != 0) {
+                    sys_puts(console_ep, "Invalid IPv4 address.\n");
+                    continue;
+                }
+                if (!port_str || parse_port(port_str, &port) != 0) {
+                    sys_puts(console_ep, "Invalid UDP port.\n");
+                    continue;
+                }
+                if (!text || text[0] == '\0') {
+                    sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n");
+                    continue;
+                }
+
+                sys_puts(console_ep, "UDP datagram queued.\n");
+                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), port, text);
+            }
+
+            else if (my_strcmp(cmd, "netstat") == 0) {
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+                sys_puts(console_ep, "Net status requested.\n");
+                net_send_text_command(net_ep, NET_CMD_STATUS, 0, 0, nullptr);
             }
 
             else if (my_strcmp(cmd, "ls") == 0) {
@@ -559,7 +715,7 @@ extern "C" void __sel4_start_c(void) {
             }
 
             else if (my_strcmp(cmd, "help") == 0) {
-                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd\n");
+                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat\n");
             }
 
             else if (my_strcmp(cmd, "exit") == 0) {

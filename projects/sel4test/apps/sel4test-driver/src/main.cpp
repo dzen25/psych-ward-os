@@ -127,7 +127,9 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
                          seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
                          int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep, 
                          seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame,
-                         const char *args_payload = nullptr) {
+                         const char *args_payload = nullptr,
+                         seL4_CPtr net_cmd_recv_ep = 0,
+                         seL4_CPtr net_cmd_send_ep = 0) {
     
     unsigned long elf_size = 0;
     unsigned long archive_len = _cpio_archive_end - _cpio_archive;
@@ -246,6 +248,9 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
         
         child_ipc_ptr->caps_or_badges[0] = (is_driver == 1) ? console_ep : timer_ep;
         child_ipc_ptr->caps_or_badges[1] = irq_handler; 
+        if (is_driver == 4) {
+            child_ipc_ptr->caps_or_badges[2] = net_cmd_recv_ep;
+        }
         child_ipc_ptr->userData = badged_ep;
 
     } else {
@@ -254,6 +259,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
         child_ipc_ptr->userData = badged_ep;           // Команды Ядру (ls, ps)
         child_ipc_ptr->caps_or_badges[0] = console_ep; // Связь с UART Драйвером
         child_ipc_ptr->caps_or_badges[1] = timer_ep;   // Связь с Timer Драйвером
+        child_ipc_ptr->caps_or_badges[2] = net_cmd_send_ep; // Команды Net Driver
     }
     // ===================================================================
 
@@ -378,8 +384,16 @@ int main(int argc, char *argv[]) {
     // 2. Каналы связи (Endpoints) для драйверов
     seL4_CPtr console_ep = alloc.alloc_slot();
     seL4_CPtr timer_ep = alloc.alloc_slot();
+    seL4_CPtr net_cmd_ep = alloc.alloc_slot();
+    seL4_CPtr net_cmd_recv_ep = alloc.alloc_slot();
+    seL4_CPtr net_cmd_send_ep = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, console_ep, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, timer_ep, 1);
+    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, net_cmd_ep, 1);
+    seL4_CNode_Copy(root_cnode, net_cmd_recv_ep, seL4_WordBits,
+                    root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanRead);
+    seL4_CNode_Mint(root_cnode, net_cmd_send_ep, seL4_WordBits,
+                    root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanWrite, 5);
 
     // 3. Прерывания ДЛЯ ДРАЙВЕРА ТАЙМЕРА (IRQ 34)
     seL4_CPtr timer_ntfn = alloc.alloc_slot();
@@ -424,13 +438,15 @@ int main(int argc, char *argv[]) {
     // Запускаем Драйвер Сети (is_driver = 4)
     // Передаем ему virtio_frames[0], так как сеть и диск сидят на одной физической шине
     if (spawn_process("net_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
-                      4, console_ep, timer_ep, 0, 0, virtio_frames[0]) < 0) {
+                      4, console_ep, timer_ep, 0, 0, virtio_frames[0], nullptr,
+                      net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Оболочку (is_driver = 0)
     if (spawn_process("shell", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
-                      0, console_ep, timer_ep, 0, 0, 0) < 0) {
+                      0, console_ep, timer_ep, 0, 0, 0, nullptr,
+                      0, net_cmd_send_ep) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
 

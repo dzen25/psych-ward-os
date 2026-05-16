@@ -28,6 +28,25 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
+static void put_dec(seL4_CPtr ep, uint32_t val) {
+    char buf[12];
+    int i = 11;
+    buf[i] = '\0';
+    if (val == 0) { sys_puts(ep, "0"); return; }
+    while (val > 0 && i > 0) {
+        buf[--i] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+    sys_puts(ep, &buf[i]);
+}
+
+static void put_ip(seL4_CPtr ep, const uint8_t ip[4]) {
+    for (int i = 0; i < 4; i++) {
+        if (i > 0) sys_puts(ep, ".");
+        put_dec(ep, ip[i]);
+    }
+}
+
 static uint16_t calculate_checksum(void* vdata, uint32_t length) {
     uint8_t* data = (uint8_t*)vdata; uint32_t acc = 0xffff;
     for (uint32_t i = 0; i + 1 < length; i += 2) {
@@ -70,6 +89,21 @@ static uint16_t g_rx_avail_idx = 0;
 static uint16_t g_last_rx_used_idx = 0; 
 static uintptr_t rx_buffer_offsets[4] = { 0x2800, 0x2E00, 0x3400, 0x3A00 };
 
+enum NetCommand {
+    NET_CMD_NONE = 0,
+    NET_CMD_PING = 1,
+    NET_CMD_SEND = 2,
+    NET_CMD_STATUS = 3,
+};
+
+static uint8_t default_udp_ip[4] = {10, 0, 2, 2};
+static uint16_t default_udp_port = 8080;
+static uint8_t pending_ip[4] = {10, 0, 2, 2};
+static uint8_t pending_udp_ip[4] = {10, 0, 2, 2};
+static uint16_t pending_udp_port = 8080;
+static char pending_udp[64];
+static int pending_cmd = NET_CMD_NONE;
+
 
 // ==========================================
 // Сетевые функции
@@ -105,7 +139,7 @@ static void net_send_arp_request(seL4_CPtr root_ep) {
     net_send_packet(sizeof(virtio_net_hdr) + 14 + 28);
 }
 
-static void net_send_ping(seL4_CPtr root_ep) {
+static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + 0x280 + sizeof(virtio_net_hdr));
@@ -118,7 +152,7 @@ static void net_send_ping(seL4_CPtr root_ep) {
     ip->ihl_version = 0x45; ip->tos = 0; ip->tot_len = htons(sizeof(ipv4_header) + sizeof(icmp_header) + 4); 
     ip->id = htons(0x1234); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 1; ip->check = 0; 
     ip->saddr[0] = 10; ip->saddr[1] = 0; ip->saddr[2] = 2; ip->saddr[3] = 15; 
-    ip->daddr[0] = 10; ip->daddr[1] = 0; ip->daddr[2] = 2; ip->daddr[3] = 2;  
+    for (int i = 0; i < 4; i++) ip->daddr[i] = dst_ip[i];
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
     volatile icmp_header* icmp = (volatile icmp_header*)(eth->payload + sizeof(ipv4_header));
@@ -131,7 +165,7 @@ static void net_send_ping(seL4_CPtr root_ep) {
 }
 
 // НОВОЕ: Функция отправки текста через UDP!
-static void net_send_udp(seL4_CPtr root_ep, const char* message) {
+static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
     volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
     
@@ -150,13 +184,13 @@ static void net_send_udp(seL4_CPtr root_ep, const char* message) {
     ip->protocol = 17; // 17 = UDP
     ip->check = 0; 
     ip->saddr[0] = 10; ip->saddr[1] = 0; ip->saddr[2] = 2; ip->saddr[3] = 15; 
-    ip->daddr[0] = 10; ip->daddr[1] = 0; ip->daddr[2] = 2; ip->daddr[3] = 2; // Шлем на роутер, QEMU прокинет на Хост!
+    for (int i = 0; i < 4; i++) ip->daddr[i] = dst_ip[i];
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
     // UDP Заголовок
     volatile udp_header* udp = (volatile udp_header*)(eth->payload + sizeof(ipv4_header));
     udp->src_port = htons(50000);  // Любой случайный порт
-    udp->dst_port = htons(8080);   // Порт 8080, который слушает твой netcat!
+    udp->dst_port = htons(dst_port);
     udp->len = htons(sizeof(udp_header) + msg_len);
     udp->checksum = 0; // Для UDP контрольная сумма необязательна! (Лень - двигатель прогресса)
 
@@ -164,8 +198,106 @@ static void net_send_udp(seL4_CPtr root_ep, const char* message) {
     char* data = (char*)udp + sizeof(udp_header);
     my_memcpy(data, message, msg_len);
 
-    sys_puts(root_ep, "[NET DRIVER] Firing UDP Datagram to Host (10.0.2.2:8080)...\n");
+    sys_puts(root_ep, "[NET DRIVER] Firing UDP Datagram to ");
+    put_ip(root_ep, dst_ip);
+    sys_puts(root_ep, ":");
+    put_dec(root_ep, dst_port);
+    sys_puts(root_ep, "...\n");
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + msg_len);
+}
+
+
+static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
+    out[0] = (uint8_t)((packed >> 24) & 0xFF);
+    out[1] = (uint8_t)((packed >> 16) & 0xFF);
+    out[2] = (uint8_t)((packed >> 8) & 0xFF);
+    out[3] = (uint8_t)(packed & 0xFF);
+}
+
+static void copy_text_from_mrs(char *dst, int max_len, int text_len, int msg_words) {
+    const int word_bytes = sizeof(seL4_Word);
+    int available = (msg_words - 4) * word_bytes;
+    if (text_len > available) text_len = available;
+    if (text_len < 0) text_len = 0;
+    if (text_len >= max_len) text_len = max_len - 1;
+
+    for (int i = 0; i < text_len; i++) {
+        seL4_Word word = seL4_GetMR(4 + (i / word_bytes));
+        dst[i] = (char)((word >> ((i % word_bytes) * 8)) & 0xFF);
+    }
+    dst[text_len] = '\0';
+}
+
+static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
+    if (net_cmd_ep == 0) return;
+
+    seL4_Word sender_badge = 0;
+    seL4_MessageInfo_t info = seL4_NBRecv(net_cmd_ep, &sender_badge);
+    if (sender_badge == 0) return;
+
+    int len = seL4_MessageInfo_get_length(info);
+    if (len == 0) return;
+
+    seL4_Word cmd = seL4_GetMR(0);
+
+    if (cmd == NET_CMD_PING && len >= 3) {
+        uint8_t dst_ip[4];
+        unpack_ipv4(seL4_GetMR(1), dst_ip);
+
+        sys_puts(root_ep, "[NET DRIVER] Shell requested ICMP Ping.\n");
+        if (have_router_mac) {
+            net_send_ping(root_ep, dst_ip);
+        } else {
+            for (int i = 0; i < 4; i++) pending_ip[i] = dst_ip[i];
+            pending_cmd = NET_CMD_PING;
+            net_send_arp_request(root_ep);
+        }
+    } else if (cmd == NET_CMD_SEND && len >= 4) {
+        uint8_t dst_ip[4];
+        unpack_ipv4(seL4_GetMR(1), dst_ip);
+        uint16_t dst_port = (uint16_t)seL4_GetMR(2);
+        int text_len = (int)seL4_GetMR(3);
+        char msg[64];
+        copy_text_from_mrs(msg, sizeof(msg), text_len, len);
+
+        if (dst_port == 0) dst_port = default_udp_port;
+        if (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0 && dst_ip[3] == 0) {
+            for (int i = 0; i < 4; i++) dst_ip[i] = default_udp_ip[i];
+        }
+
+        sys_puts(root_ep, "[NET DRIVER] Shell requested UDP send.\n");
+        if (have_router_mac) {
+            net_send_udp(root_ep, dst_ip, dst_port, msg);
+        } else {
+            for (int i = 0; i < 4; i++) pending_udp_ip[i] = dst_ip[i];
+            pending_udp_port = dst_port;
+            my_memcpy(pending_udp, msg, my_strlen(msg) + 1);
+            pending_cmd = NET_CMD_SEND;
+            net_send_arp_request(root_ep);
+        }
+    } else if (cmd == NET_CMD_STATUS) {
+        sys_puts(root_ep, "[NET DRIVER] Status: virtio=up router_mac=");
+        if (have_router_mac) {
+            sys_puts(root_ep, "known ");
+            for (int i = 0; i < 6; i++) {
+                if (i > 0) sys_puts(root_ep, ":");
+                put_hex_byte(root_ep, router_mac[i]);
+            }
+        } else {
+            sys_puts(root_ep, "unknown");
+        }
+        sys_puts(root_ep, " tx_idx=");
+        put_dec(root_ep, g_tx_avail_idx);
+        sys_puts(root_ep, " rx_used_idx=");
+        put_dec(root_ep, g_last_rx_used_idx);
+        sys_puts(root_ep, " default_udp=");
+        put_ip(root_ep, default_udp_ip);
+        sys_puts(root_ep, ":");
+        put_dec(root_ep, default_udp_port);
+        sys_puts(root_ep, "\n");
+    } else {
+        sys_puts(root_ep, "[NET DRIVER] Unknown Shell command.\n");
+    }
 }
 
 // ==========================================
@@ -188,7 +320,14 @@ static void net_poll(seL4_CPtr root_ep) {
                 sys_puts(root_ep, ">>> [NET RX] ARP Reply Received! Saving Router MAC.\n");
                 for(int i=0; i<6; i++) router_mac[i] = arp_reply->sha[i];
                 have_router_mac = true;
-                net_send_ping(root_ep); // Триггерим Пинг
+
+                if (pending_cmd == NET_CMD_PING) {
+                    net_send_ping(root_ep, pending_ip);
+                    pending_cmd = NET_CMD_NONE;
+                } else if (pending_cmd == NET_CMD_SEND) {
+                    net_send_udp(root_ep, pending_udp_ip, pending_udp_port, pending_udp);
+                    pending_cmd = NET_CMD_NONE;
+                }
             }
         } 
         else if (type == 0x0800) { 
@@ -200,8 +339,7 @@ static void net_poll(seL4_CPtr root_ep) {
                     sys_puts(root_ep, "   >>> SUCCESS! PING REPLY RECEIVED! <<< \n");
                     sys_puts(root_ep, "===============================================\n\n");
                     
-                    // ЦЕПНАЯ РЕАКЦИЯ: Пинг прошел? БЬЕМ ИЗ ГЛАВНОГО КАЛИБРА!
-                    net_send_udp(root_ep, "GREETINGS FROM PSYCH WARD OS USER-SPACE!\n");
+                    // Reply is logged only; user-space shell decides what to send next.
                 }
             }
         }
@@ -217,6 +355,7 @@ static void net_poll(seL4_CPtr root_ep) {
 extern "C" void __sel4_start_c(void) {
     seL4_Word fake_tls_base = 0x501800; asm volatile("msr tpidr_el0, %0" :: "r"(fake_tls_base));
     __sel4_ipc_buffer = (seL4_IPCBuffer*)0x501000; seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
+    seL4_CPtr net_cmd_ep = __sel4_ipc_buffer->caps_or_badges[2];
 
     sys_puts(root_ep, "\n[NET DRIVER] Network Server Online!\n");
     uintptr_t base_addr = 0;
@@ -243,12 +382,16 @@ extern "C" void __sel4_start_c(void) {
 
         g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (0x60000000 + 0x200) / 64; 
         g_net_regs->status |= 8; g_net_regs->status |= 4; 
-        sys_puts(root_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized.\n");
+        sys_puts(root_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized. Waiting for Shell commands.\n");
         g_net_regs->queue_notify = 0; 
         for(volatile int i=0; i<10000000; i++); 
-        
-        net_send_arp_request(root_ep);
     }
 
-    while(1) { if (g_net_regs) net_poll(root_ep); seL4_Yield(); }
+    while(1) {
+        if (g_net_regs) {
+            net_poll(root_ep);
+            net_handle_command(root_ep, net_cmd_ep);
+        }
+        seL4_Yield();
+    }
 }
