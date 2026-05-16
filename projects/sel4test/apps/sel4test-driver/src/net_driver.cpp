@@ -30,13 +30,14 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
 // ==========================================
-// НОВОЕ: Запрашиваем микросекунды напрямую у Ядра!
+// МАКРО-ВРЕМЯ (Секундный таймер от Ядра для таймаутов)
 // ==========================================
-static uint64_t net_now_us(seL4_CPtr root_ep) {
-    seL4_SetMR(0, 9); // SYS_GET_TIME_US
+static uint64_t sys_get_time_ms(seL4_CPtr root_ep) {
+    seL4_SetMR(0, 3); // SYS_GET_TIME
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (uint64_t)seL4_GetMR(0);
 }
+
 
 static void put_dec(seL4_CPtr ep, uint32_t val) {
     char buf[12];
@@ -95,9 +96,6 @@ static uint16_t calculate_checksum(void* vdata, uint32_t length) {
     return htons(~acc);
 }
 
-// ==========================================
-// Структуры
-// ==========================================
 struct VirtioMmioRegs { uint32_t magic_value; uint32_t version; uint32_t device_id; uint32_t vendor_id; uint32_t host_features; uint32_t host_features_sel; uint32_t reserved_1[2]; uint32_t guest_features; uint32_t guest_features_sel; uint32_t guest_page_size; uint32_t reserved_2; uint32_t queue_sel; uint32_t queue_num_max; uint32_t queue_num; uint32_t queue_align; uint32_t queue_pfn; uint32_t reserved_3[3]; uint32_t queue_notify; uint32_t reserved_4[3]; uint32_t interrupt_status; uint32_t interrupt_ack; uint32_t reserved_5[2]; uint32_t status; };
 struct virtq_desc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
 struct virtq_used_elem { uint32_t id; uint32_t len; };
@@ -110,7 +108,6 @@ struct __attribute__((packed)) arp_ipv4 { uint16_t htype; uint16_t ptype; uint8_
 struct __attribute__((packed)) ipv4_header { uint8_t ihl_version; uint8_t tos; uint16_t tot_len; uint16_t id; uint16_t frag_off; uint8_t ttl; uint8_t protocol; uint16_t check; uint8_t saddr[4]; uint8_t daddr[4]; };
 struct __attribute__((packed)) icmp_header { uint8_t type; uint8_t code; uint16_t checksum; uint16_t id; uint16_t sequence; };
 
-// НОВОЕ: Заголовок UDP (Всего 8 байт!)
 struct __attribute__((packed)) udp_header {
     uint16_t src_port;
     uint16_t dst_port;
@@ -158,11 +155,11 @@ static uint64_t g_ping_min_rtt_us = 0;
 static uint64_t g_ping_max_rtt_us = 0;
 static uint64_t g_ping_total_rtt_us = 0;
 static uint64_t g_ping_next_send_us = 0; // Для 1с паузы
+static uint64_t g_ping_next_send_ms = 0; // Для 1с паузы (макро-время)
+static uint64_t g_cpu_loops = 0;
+static uint64_t g_ping_sent_loop = 0;
 
 
-// ==========================================
-// Сетевые функции
-// ==========================================
 static void net_send_packet(uint32_t total_len) {
     volatile virtq_desc* vq_desc = (volatile virtq_desc*)(0x502000 + 0x200);
     uint16_t* avail_ring = (uint16_t*)(0x502000 + 0x224);
@@ -224,17 +221,17 @@ static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     put_dec(root_ep, seq);
     sys_puts(root_ep, "\n");
 
-    g_ping_sent_us = net_now_us(root_ep);
+    // ИЗМЕНЕНО: Фиксируем текущий цикл процессора!
+    g_ping_sent_loop = g_cpu_loops;
     g_ping_outstanding_seq = seq;
     g_ping_outstanding = true;
     g_ping_sent_count++;
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(icmp_header) + 4);
 }
 
-// Управляет разблокировкой Mailbox'а
 static void net_schedule_next_ping(seL4_CPtr root_ep) {
     if (g_ping_series_remaining > 0) {
-        g_ping_next_send_us = net_now_us(root_ep) + 1000000ULL; // Пауза ровно 1 секунда!
+        g_ping_next_send_ms = sys_get_time_ms(root_ep) + 1000; // Пауза ровно 1 секунда через RTC!
     } else {
         volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
         net_mailbox[0] = 0; // Готово, разблокируем Shell
@@ -249,8 +246,8 @@ static void net_send_next_ping(seL4_CPtr root_ep) {
 
 static void net_check_ping_send(seL4_CPtr root_ep) {
     if (g_ping_outstanding || g_ping_series_remaining == 0) return;
-    if (g_ping_next_send_us == 0 || net_now_us(root_ep) >= g_ping_next_send_us) {
-        g_ping_next_send_us = 0;
+    if (g_ping_next_send_ms == 0 || sys_get_time_ms(root_ep) >= g_ping_next_send_ms) {
+        g_ping_next_send_ms = 0;
         net_send_next_ping(root_ep);
     }
 }
@@ -258,7 +255,7 @@ static void net_check_ping_send(seL4_CPtr root_ep) {
 static void net_start_ping_series(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint32_t count) {
     if (count == 0) count = 1; if (count > 16) count = 16;
     for (int i = 0; i < 4; i++) g_ping_target_ip[i] = dst_ip[i];
-    g_ping_series_remaining = count; g_ping_outstanding = false; g_ping_next_send_us = 0;
+    g_ping_series_remaining = count; g_ping_outstanding = false; g_ping_next_send_ms = 0;
     net_check_ping_send(root_ep); // Шлем первый пакет сразу
 }
 
@@ -270,15 +267,16 @@ static void net_record_ping_rtt(uint64_t rtt_us) {
 
 static void net_check_ping_timeout(seL4_CPtr root_ep) {
     if (!g_ping_outstanding) return;
-    uint64_t now = net_now_us(root_ep);
-    if (now - g_ping_sent_us < 2000000ULL) return; // 2 секунды таймаут на один пакет
+    
+    // ИЗМЕНЕНО: Считаем таймаут по количеству циклов драйвера! (~2 секунды = 100 000 циклов)
+    uint64_t loops_passed = g_cpu_loops - g_ping_sent_loop;
+    if (loops_passed < 100000) return; 
 
     sys_puts(root_ep, "[NET PING] Request timeout for icmp_seq="); put_dec(root_ep, g_ping_outstanding_seq); sys_puts(root_ep, "\n");
     g_ping_outstanding = false; g_ping_timeout_count++;
-    net_schedule_next_ping(root_ep); // Вместо отправки сразу, ставим на паузу!
+    net_schedule_next_ping(root_ep);
 }
 
-// НОВОЕ: Функция отправки текста через UDP!
 static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
     volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
@@ -321,7 +319,6 @@ static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t ds
     volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
     net_mailbox[0] = 0; // Готово, разблокируем Shell
 }
-
 
 static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
     out[0] = (uint8_t)((packed >> 24) & 0xFF);
@@ -440,9 +437,7 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
     }
 }
 
-// ==========================================
-// Чтение пакетов
-// ==========================================
+
 static void net_poll(seL4_CPtr root_ep) {
     volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(0x502000 + 0x2040);
     volatile virtq_used_rx* rx_used = (volatile virtq_used_rx*)(0x502000 + 0x2080);
@@ -480,9 +475,10 @@ static void net_poll(seL4_CPtr root_ep) {
                     uint32_t ip_header_len = (ip->ihl_version & 0x0F) * 4;
                     uint32_t ip_total_len = htons(ip->tot_len);
                     uint32_t icmp_bytes = (ip_total_len > ip_header_len) ? (ip_total_len - ip_header_len) : 0;
-                    uint64_t now = net_now_us(root_ep);
+                    //uint64_t now = net_now_us(root_ep);
                     bool matched = g_ping_outstanding && seq == g_ping_outstanding_seq;
-                    uint64_t rtt_us = matched ? (now - g_ping_sent_us) : 0;
+                    uint64_t loops_taken = g_cpu_loops - g_ping_sent_loop;
+                    uint64_t rtt_us = matched ? (loops_taken * 15) : 0;
                     uint8_t src_ip[4];
                     for (int i = 0; i < 4; i++) src_ip[i] = ip->saddr[i];
 
@@ -558,6 +554,7 @@ extern "C" void __sel4_start_c(void) {
     }
 
     while(1) {
+        g_cpu_loops++;
         if (g_net_regs) {
             net_poll(root_ep);
             net_handle_command(root_ep, net_cmd_ep);

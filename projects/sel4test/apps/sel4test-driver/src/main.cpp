@@ -24,7 +24,6 @@ enum SyscallID {
     SYS_READ = 6, 
     SYS_ALLOC = 7,
     SYS_PUTS = 8,
-    SYS_GET_TIME_US = 9,
     
     // --- УПРАВЛЕНИЕ ПРОЦЕССАМИ И ПАМЯТЬЮ ---
     SYS_DOCTOR = 99, 
@@ -510,24 +509,6 @@ int main(int argc, char *argv[]) {
             case SYS_GET_TIME: {
                 uint64_t ms = pl031_get_time() * 1000; 
                 seL4_SetMR(0, (seL4_Word)ms); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                break;
-            }
-
-            case SYS_GET_TIME_US: {
-                uint64_t ticks;
-                
-                // ВНИМАНИЕ: Читаем только текущие тики! 
-                // Чтение регистра частоты (cntfrq_el0) из User-Space (даже из Rootserver'а) 
-                // вызывает Fatal Exception от процессора ARM!
-                asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
-                
-                // Жестко задаем частоту для QEMU virt (62.5 МГц)
-                uint64_t freq = 62500000; 
-                
-                uint64_t us = (ticks / freq) * 1000000ULL + ((ticks % freq) * 1000000ULL) / freq;
-                
-                seL4_SetMR(0, (seL4_Word)us); 
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 
