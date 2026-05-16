@@ -162,6 +162,25 @@ static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
     while (sys_get_time(timer_ep) - start < ms) { seL4_Yield(); }
 }
 
+// Ожидание сети с таймаутом
+static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
+    volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+    int elapsed = 0;
+    while (net_mailbox[0] == 1 && elapsed < timeout_ms) {
+        sys_sleep(timer_ep, 100);
+        elapsed += 100;
+    }
+    if (net_mailbox[0] == 1) {
+        sys_puts(console_ep, "\n[SHELL] Error: Network operation timed out (");
+        char buf[10]; int s = timeout_ms / 1000, j = 0;
+        if (s == 0) buf[j++] = '0';
+        while(s > 0) { buf[j++] = (s % 10) + '0'; s /= 10; }
+        while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
+        sys_puts(console_ep, "s). Unblocking shell.\n");
+        net_mailbox[0] = 0; // Снимаем блокировку насильно
+    }
+}
+
 static void sys_wait(seL4_CPtr root_ep, int pid) {
     __sel4_ipc_buffer->msg[0] = 106; // SYS_WAIT
     __sel4_ipc_buffer->msg[1] = pid;
@@ -421,8 +440,15 @@ extern "C" void __sel4_start_c(void) {
                 }
                 if (count > 16) count = 16;
 
+                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+                
                 sys_puts(console_ep, "Ping command queued.\n");
                 net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
+                
+                int timeout = 5000; // Базовый таймаут 10 секунд
+                if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000; // Увеличиваем, если пингов много
+                wait_for_net_mailbox(console_ep, timer_ep, timeout);
             }
 
             else if (my_strcmp(cmd, "send") == 0) {
@@ -430,8 +456,14 @@ extern "C" void __sel4_start_c(void) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
                 uint8_t ip[4] = {10, 0, 2, 2};
+                
+                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+
                 sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
                 net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), 8080, arg);
+
+                wait_for_net_mailbox(console_ep, timer_ep, 5000); // Ждем до 10 секунд
             }
 
             else if (my_strcmp(cmd, "sendto") == 0) {
@@ -459,14 +491,25 @@ extern "C" void __sel4_start_c(void) {
                     continue;
                 }
 
+                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+
                 sys_puts(console_ep, "UDP datagram queued.\n");
                 net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), port, text);
+
+                wait_for_net_mailbox(console_ep, timer_ep, 5000); // Ждем до 10 секунд
             }
 
             else if (my_strcmp(cmd, "netstat") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+                
+                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+                
                 sys_puts(console_ep, "Net status requested.\n");
                 net_send_text_command(net_ep, NET_CMD_STATUS, 0, 0, nullptr);
+                
+                wait_for_net_mailbox(console_ep, timer_ep, 2000); // Для статуса достаточно 2-х секунд
             }
 
             else if (my_strcmp(cmd, "ls") == 0) {

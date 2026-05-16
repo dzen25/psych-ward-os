@@ -29,35 +29,13 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
-static seL4_Word sys_get_time_ms(seL4_CPtr ep) {
-    seL4_SetMR(0, 3);
-    seL4_Call(ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    return seL4_GetMR(0);
-}
-
-#ifdef CONFIG_EXPORT_VCNT_USER
-static uint64_t read_cntvct(void) {
-    uint64_t val = 0;
-    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
-    return val;
-}
-
-static uint64_t read_cntfrq(void) {
-    uint64_t val = 0;
-    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
-    return val;
-}
-#endif
-
+// ==========================================
+// НОВОЕ: Запрашиваем микросекунды напрямую у Ядра!
+// ==========================================
 static uint64_t net_now_us(seL4_CPtr root_ep) {
-#ifdef CONFIG_EXPORT_VCNT_USER
-    uint64_t freq = read_cntfrq();
-    if (freq != 0) {
-        uint64_t ticks = read_cntvct();
-        return (ticks / freq) * 1000000ULL + ((ticks % freq) * 1000000ULL) / freq;
-    }
-#endif
-    return (uint64_t)sys_get_time_ms(root_ep) * 1000ULL;
+    seL4_SetMR(0, 9); // SYS_GET_TIME_US
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (uint64_t)seL4_GetMR(0);
 }
 
 static void put_dec(seL4_CPtr ep, uint32_t val) {
@@ -179,6 +157,7 @@ static uint64_t g_ping_last_rtt_us = 0;
 static uint64_t g_ping_min_rtt_us = 0;
 static uint64_t g_ping_max_rtt_us = 0;
 static uint64_t g_ping_total_rtt_us = 0;
+static uint64_t g_ping_next_send_us = 0; // Для 1с паузы
 
 
 // ==========================================
@@ -252,45 +231,51 @@ static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(icmp_header) + 4);
 }
 
+// Управляет разблокировкой Mailbox'а
+static void net_schedule_next_ping(seL4_CPtr root_ep) {
+    if (g_ping_series_remaining > 0) {
+        g_ping_next_send_us = net_now_us(root_ep) + 1000000ULL; // Пауза ровно 1 секунда!
+    } else {
+        volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+        net_mailbox[0] = 0; // Готово, разблокируем Shell
+    }
+}
+
 static void net_send_next_ping(seL4_CPtr root_ep) {
     if (g_ping_outstanding || g_ping_series_remaining == 0) return;
     g_ping_series_remaining--;
     net_send_ping(root_ep, g_ping_target_ip);
 }
 
+static void net_check_ping_send(seL4_CPtr root_ep) {
+    if (g_ping_outstanding || g_ping_series_remaining == 0) return;
+    if (g_ping_next_send_us == 0 || net_now_us(root_ep) >= g_ping_next_send_us) {
+        g_ping_next_send_us = 0;
+        net_send_next_ping(root_ep);
+    }
+}
+
 static void net_start_ping_series(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint32_t count) {
-    if (count == 0) count = 1;
-    if (count > 16) count = 16;
+    if (count == 0) count = 1; if (count > 16) count = 16;
     for (int i = 0; i < 4; i++) g_ping_target_ip[i] = dst_ip[i];
-    g_ping_series_remaining = count;
-    g_ping_outstanding = false;
-    net_send_next_ping(root_ep);
+    g_ping_series_remaining = count; g_ping_outstanding = false; g_ping_next_send_us = 0;
+    net_check_ping_send(root_ep); // Шлем первый пакет сразу
 }
 
 static void net_record_ping_rtt(uint64_t rtt_us) {
-    g_ping_reply_count++;
-    g_ping_last_rtt_us = rtt_us;
-    g_ping_total_rtt_us += rtt_us;
+    g_ping_reply_count++; g_ping_last_rtt_us = rtt_us; g_ping_total_rtt_us += rtt_us;
     if (g_ping_min_rtt_us == 0 || rtt_us < g_ping_min_rtt_us) g_ping_min_rtt_us = rtt_us;
     if (rtt_us > g_ping_max_rtt_us) g_ping_max_rtt_us = rtt_us;
 }
 
 static void net_check_ping_timeout(seL4_CPtr root_ep) {
     if (!g_ping_outstanding) return;
-#ifndef CONFIG_EXPORT_VCNT_USER
-    static uint32_t fallback_poll_div = 0;
-    fallback_poll_div++;
-    if ((fallback_poll_div & 0x3FFF) != 0) return;
-#endif
     uint64_t now = net_now_us(root_ep);
-    if (now - g_ping_sent_us < 1000000ULL) return;
+    if (now - g_ping_sent_us < 2000000ULL) return; // 2 секунды таймаут на один пакет
 
-    sys_puts(root_ep, "[NET PING] Request timeout for icmp_seq=");
-    put_dec(root_ep, g_ping_outstanding_seq);
-    sys_puts(root_ep, "\n");
-    g_ping_outstanding = false;
-    g_ping_timeout_count++;
-    net_send_next_ping(root_ep);
+    sys_puts(root_ep, "[NET PING] Request timeout for icmp_seq="); put_dec(root_ep, g_ping_outstanding_seq); sys_puts(root_ep, "\n");
+    g_ping_outstanding = false; g_ping_timeout_count++;
+    net_schedule_next_ping(root_ep); // Вместо отправки сразу, ставим на паузу!
 }
 
 // НОВОЕ: Функция отправки текста через UDP!
@@ -333,6 +318,8 @@ static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t ds
     put_dec(root_ep, dst_port);
     sys_puts(root_ep, "...\n");
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + msg_len);
+    volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+    net_mailbox[0] = 0; // Готово, разблокируем Shell
 }
 
 
@@ -446,6 +433,8 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
             put_duration_us(root_ep, g_ping_max_rtt_us);
         }
         sys_puts(root_ep, "\n");
+        volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+        net_mailbox[0] = 0;
     } else {
         sys_puts(root_ep, "[NET DRIVER] Unknown Shell command.\n");
     }
@@ -519,7 +508,7 @@ static void net_poll(seL4_CPtr root_ep) {
                     if (matched) {
                         g_ping_outstanding = false;
                         net_record_ping_rtt(rtt_us);
-                        net_send_next_ping(root_ep);
+                        net_schedule_next_ping(root_ep);
                     }
                 }
             }
@@ -573,6 +562,7 @@ extern "C" void __sel4_start_c(void) {
             net_poll(root_ep);
             net_handle_command(root_ep, net_cmd_ep);
             net_check_ping_timeout(root_ep);
+            net_check_ping_send(root_ep);
         }
         seL4_Yield();
     }
