@@ -86,7 +86,7 @@ sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 ```bash
 # 1. Клонирование репозитория
 cd ~
-git clone [https://github.com/dzen25/psych-ward-os.git](https://github.com/dzen25/psych-ward-os.git)
+git clone https://github.com/dzen25/psych-ward-os.git
 cd psych-ward-os
 
 # 2. Создание и активация изолированного виртуального окружения Python
