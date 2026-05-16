@@ -475,9 +475,9 @@ static void net_poll(seL4_CPtr root_ep) {
                     uint32_t ip_header_len = (ip->ihl_version & 0x0F) * 4;
                     uint32_t ip_total_len = htons(ip->tot_len);
                     uint32_t icmp_bytes = (ip_total_len > ip_header_len) ? (ip_total_len - ip_header_len) : 0;
-                    //uint64_t now = net_now_us(root_ep);
                     bool matched = g_ping_outstanding && seq == g_ping_outstanding_seq;
                     uint64_t loops_taken = g_cpu_loops - g_ping_sent_loop;
+                    if (loops_taken == 0) loops_taken = 1;
                     uint64_t rtt_us = matched ? (loops_taken * 15) : 0;
                     uint8_t src_ip[4];
                     for (int i = 0; i < 4; i++) src_ip[i] = ip->saddr[i];

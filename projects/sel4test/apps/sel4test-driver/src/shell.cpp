@@ -162,7 +162,17 @@ static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
     while (sys_get_time(timer_ep) - start < ms) { seL4_Yield(); }
 }
 
-// Ожидание сети с таймаутом
+// ==========================================
+// НОВОЕ: ВЫЗОВ СИСТЕМНОГО ВОССТАНОВЛЕНИЯ
+// ==========================================
+static void sys_recover(const char* driver_name) {
+    seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
+    char *shm = (char*)0x502000;
+    my_strcpy(shm, driver_name);      // Передаем имя упавшего драйвера
+    __sel4_ipc_buffer->msg[0] = 117;  // SYS_RECOVER
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
 static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
     volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
     int elapsed = 0;
@@ -178,6 +188,10 @@ static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int t
         while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
         sys_puts(console_ep, "s). Unblocking shell.\n");
         net_mailbox[0] = 0; // Снимаем блокировку насильно
+        
+        // НОВОЕ: Перезапуск зависшего сетевого драйвера!
+        sys_puts(console_ep, "[SHELL] Initiating emergency recovery for net_driver...\n");
+        sys_recover("net_driver");
     }
 }
 
@@ -190,7 +204,7 @@ static void sys_wait(seL4_CPtr root_ep, int pid) {
 static void sys_exit(seL4_CPtr root_ep) {
     __sel4_ipc_buffer->msg[0] = 103; // SYS_EXIT
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    while(1) seL4_Yield(); // Сюда мы никогда не дойдем, Ядро нас убьет
+    while(1) seL4_Yield();
 }
 
 static int sys_shm_get(seL4_CPtr root_ep, int shm_id, seL4_Word vaddr) {
@@ -220,15 +234,36 @@ static void build_absolute_path(char* target, const char* arg) {
     my_strcpy(target + my_strlen(target), arg);
 }
 
-static int vfs_syscall(int syscall_num) {
+//Общий блок таймаута для всех команд работы с диском (VFS)
+static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
     volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12);
     mailbox[2] = 0; // Сбрасываем флаг готовности
     mailbox[0] = syscall_num; // Кладем команду в ящик
     
-    while (mailbox[2] == 0) {
-        seL4_Yield(); // Ждем, пока blk_driver не сделает работу
+    int elapsed = 0;
+    // Ждем пока драйвер диска ответит, но не дольше timeout_ms
+    while (mailbox[2] == 0 && elapsed < timeout_ms) {
+        sys_sleep(timer_ep, 100);
+        elapsed += 100;
     }
-    return mailbox[1]; // Возвращаем статус (0 или -1)
+    
+    if (mailbox[2] == 0) {
+        sys_puts_direct(console_ep, "\n[SHELL] Error: Disk/VFS operation timed out (");
+        char buf[10]; int s = timeout_ms / 1000, j = 0;
+        if (s == 0) buf[j++] = '0';
+        while(s > 0) { buf[j++] = (s % 10) + '0'; s /= 10; }
+        while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts_direct(console_ep, c); }
+        sys_puts_direct(console_ep, "s). Unblocking shell.\n");
+        mailbox[2] = 1; // Насильно снимаем блокировку
+        
+        // НОВОЕ: Перезапуск зависшего дискового драйвера!
+        sys_puts_direct(console_ep, "[SHELL] Initiating emergency recovery for blk_driver...\n");
+        sys_recover("blk_driver");
+        
+        return -1; 
+    }
+    
+    return mailbox[1]; // Нормальный возврат статуса
 }
 
 // --- Точка входа ---
@@ -242,13 +277,6 @@ extern "C" void __sel4_start_c(void) {
     seL4_CPtr timer_ep = __sel4_ipc_buffer->caps_or_badges[1];
     seL4_CPtr net_ep = __sel4_ipc_buffer->caps_or_badges[2];
 
-    // ==========================================================
-    // СБОРКА ARGC И ARGV ИЗ PAYLOAD
-    // ==========================================================
-    // ==========================================================
-    // ИСПРАВЛЕНИЕ: СПАСАЕМ АРГУМЕНТЫ ИЗ IPC-БУФЕРА
-    // ==========================================================
-    // Локальное хранилище для строки аргументов, чтобы сисколлы её не затерли
     static char arg_buffer[512]; 
     my_strcpy(arg_buffer, (char*)&__sel4_ipc_buffer->msg[0]);
 
@@ -446,7 +474,7 @@ extern "C" void __sel4_start_c(void) {
                 sys_puts(console_ep, "Ping command queued.\n");
                 net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
                 
-                int timeout = 5000; // Базовый таймаут 10 секунд
+                int timeout = 5000;
                 if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000; // Увеличиваем, если пингов много
                 wait_for_net_mailbox(console_ep, timer_ep, timeout);
             }
@@ -463,7 +491,7 @@ extern "C" void __sel4_start_c(void) {
                 sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
                 net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), 8080, arg);
 
-                wait_for_net_mailbox(console_ep, timer_ep, 5000); // Ждем до 10 секунд
+                wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
             else if (my_strcmp(cmd, "sendto") == 0) {
@@ -497,7 +525,7 @@ extern "C" void __sel4_start_c(void) {
                 sys_puts(console_ep, "UDP datagram queued.\n");
                 net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), port, text);
 
-                wait_for_net_mailbox(console_ep, timer_ep, 5000); // Ждем до 10 секунд
+                wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
             else if (my_strcmp(cmd, "netstat") == 0) {
@@ -514,13 +542,10 @@ extern "C" void __sel4_start_c(void) {
 
             else if (my_strcmp(cmd, "ls") == 0) {
                 char *shm = (char*)0x502000; 
-                // Если есть аргумент - берем его, иначе берем текущую папку (пустую строку)
-                if (arg) {
-                    build_absolute_path(shm, arg);
-                } else {
-                    build_absolute_path(shm, "");
-                }
-                vfs_syscall(110);
+                if (arg) { build_absolute_path(shm, arg); } 
+                else { build_absolute_path(shm, ""); }
+                
+                vfs_syscall(110, console_ep, timer_ep, 2000); // Таймаут 2 сек
                 sys_puts(console_ep, shm);
             }
 
@@ -534,18 +559,16 @@ extern "C" void __sel4_start_c(void) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                // МАГИЯ "mkdir -p": идем по строке и создаем папки шаг за шагом
                 int fail = 0;
                 for (int i = 1; shm[i] != '\0'; i++) {
                     if (shm[i] == '/') {
-                        shm[i] = '\0'; // Временно отрезаем хвост пути
-                        if (vfs_syscall(109) != 0) fail = 1;
-                        shm[i] = '/';  // Приклеиваем слэш обратно
+                        shm[i] = '\0'; 
+                        if (vfs_syscall(109, console_ep, timer_ep, 5000) != 0) fail = 1; // Таймаут 5 сек
+                        shm[i] = '/';  
                     }
                 }
                 
-                // Создаем финальную папку (весь путь целиком)
-                if (vfs_syscall(109) != 0) fail = 1;
+                if (vfs_syscall(109, console_ep, timer_ep, 5000) != 0) fail = 1; // Таймаут 5 сек
                 
                 if (!fail) sys_puts(console_ep, "Directory tree created.\n");
                 else sys_puts(console_ep, "Failed to create directory tree.\n");
@@ -590,7 +613,7 @@ extern "C" void __sel4_start_c(void) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(111) == 0) {
+                if (vfs_syscall(111, console_ep, timer_ep, 5000) == 0) {
                     my_strcpy(current_working_dir, shm);
                 } else {
                     sys_puts(console_ep, "No such directory.\n");
@@ -704,7 +727,8 @@ extern "C" void __sel4_start_c(void) {
                 if (!arg) { sys_puts(console_ep, "Usage: touch <file>\n"); continue; }
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
-                if (vfs_syscall(112) == 0) sys_puts(console_ep, "File created.\n");
+                
+                if (vfs_syscall(112, console_ep, timer_ep, 5000) == 0) sys_puts(console_ep, "File created.\n"); // 5 сек
                 else sys_puts(console_ep, "Failed to create file.\n");
             }
 
@@ -713,7 +737,7 @@ extern "C" void __sel4_start_c(void) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(114) == 0) {
+                if (vfs_syscall(114, console_ep, timer_ep, 5000) == 0) { // Чтение: 5 сек
                     sys_puts(console_ep, shm);
                     sys_puts(console_ep, "\n");
                 } else {
@@ -756,7 +780,7 @@ extern "C" void __sel4_start_c(void) {
                     build_absolute_path(path_ptr, redir);
                     my_strcpy(text_ptr, arg);
                     
-                    if (vfs_syscall(113) != 0) {
+                    if (vfs_syscall(113, console_ep, timer_ep, 5000) != 0) { // Запись текста: 5 сек
                         sys_puts(console_ep, "Failed to write to file.\n");
                     }
                     // Если все ок - молчим, как настоящий bash!
@@ -775,22 +799,37 @@ extern "C" void __sel4_start_c(void) {
                 sys_puts(console_ep, "Exiting sandbox...\n");
                 sys_exit(root_ep);
             }
+            
+            // ==========================================
+            // НОВОЕ: ТРИГГЕРЫ АППАРАТНЫХ КРАШЕЙ // Краш-тест - удалить
+            // ==========================================
+            else if (my_strcmp(cmd, "crash_shell") == 0) {
+                sys_puts(console_ep, "[SHELL] Initiating intentional Segfault (Null Pointer Dereference)...\n");
+                volatile int* boom = (volatile int*)0x0;
+                *boom = 0xDEAD; // Оболочка умрет на этой строке
+            }
+
+            else if (my_strcmp(cmd, "crash_disk") == 0) {
+                sys_puts(console_ep, "[SHELL] Sending poison pill to blk_driver...\n");
+                vfs_syscall(118, console_ep, timer_ep, 5000); // Оправляем команду умереть
+            }
+            // ==========================================
 
             else if (my_strcmp(cmd, "hack_disk") == 0) {
-                // Вызываем наш тестовый сисколл на перезапись!
-                vfs_syscall(115);
+                vfs_syscall(115, console_ep, timer_ep, 7000); // Жесткая операция: 7 сек
                 char *shm = (char*)0x502000;
                 sys_puts(console_ep, shm);
             }
 
             else if (my_strcmp(cmd, "create_file") == 0) {
                 char *shm = (char*)0x502000;
-                // Формат: ИМЯ(11 символов) + '|' + Текст
                 strcpy(shm, "NEWFILE TXT|This file was built from SCRATCH by Psych Ward OS using raw DMA cluster allocation!");
                 
-                vfs_syscall(116); // Вызываем наш новый код создания!
+                vfs_syscall(116, console_ep, timer_ep, 7000); // Поиск кластеров FAT32: 7 сек
                 sys_puts(console_ep, shm);
             }
+
+            
 
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 

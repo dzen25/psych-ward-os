@@ -34,6 +34,7 @@ enum SyscallID {
     SYS_WAIT = 106, 
     SYS_SHM_GET = 107,
     SYS_GETPID = 108,
+    SYS_RECOVER = 117,
 
     // --- ПРЕРЫВАНИЯ ЖЕЛЕЗА  ---
     UART_IRQ_BADGE = (1 << 0), 
@@ -71,7 +72,6 @@ static seL4_CPtr sleeper_reply_slot = 0; static bool sleeper_waiting = false;
 
 static uintptr_t untyped_watermarks[256] = {0};
 
-// Исправленная версия: ищет подходящий untyped (включая device) и выделяет страницу
 static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, uintptr_t target_paddr, seL4_CPtr root_cnode) {
     size_t idx = (size_t)-1;
     size_t num_untyped = info->untyped.end - info->untyped.start;
@@ -112,6 +112,14 @@ struct ProcessControlBlock {
     bool active;
     int waiting_for;      // <--- Какого PID мы ждем?
     seL4_CPtr reply_cap;  // <--- Куда отправить ответ, чтобы разбудить
+
+    // --- ГЕНЕРИЧЕСКИЕ МЕТАДАННЫЕ ДЛЯ АВТОПЕРЕЗАПУСКА ---
+    int is_driver;
+    seL4_CPtr irq_ntfn;
+    seL4_CPtr irq_handler;
+    seL4_CPtr hw_frame;
+    seL4_CPtr net_cmd_recv_ep;
+    seL4_CPtr net_cmd_send_ep;
 };
 static ProcessControlBlock pcbs[256];
 static int next_pid = 1;
@@ -143,6 +151,14 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     pcb.active = true;
     pcb.waiting_for = 0;  // <--- Инициализация
     pcb.reply_cap = 0;    // <--- Инициализация
+
+    // СОХРАНЯЕМ АППАРАТНЫЙ ПРОФИЛЬ В PCB:
+    pcb.is_driver = is_driver;
+    pcb.irq_ntfn = irq_ntfn;
+    pcb.irq_handler = irq_handler;
+    pcb.hw_frame = hw_frame;
+    pcb.net_cmd_recv_ep = net_cmd_recv_ep;
+    pcb.net_cmd_send_ep = net_cmd_send_ep;
 
     // Badged Endpoint для идентификации процесса Ядром
     seL4_CPtr badged_ep = alloc.alloc_slot();
@@ -300,6 +316,57 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
 
     seL4_TCB_Resume(tcb);
     return pid;
+}
+
+static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc, 
+                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped, 
+                                    seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    if (pid <= 0 || pid >= 256 || !pcbs[pid].active) return;
+
+    // 1. Копируем метаданные упавшего процесса во временный буфер
+    ProcessControlBlock meta = pcbs[pid];
+
+    uart_puts("\n[WATCHDOG] Emergency recovery initiated for PID: "); uart_putdec(pid);
+    uart_puts(" ("); uart_puts(meta.name); uart_puts(")\n");
+
+    // 2. Освобождаем потоки, заблокированные на sys_wait для этого PID (например, Shell)
+    for (int i = 1; i < 256; i++) {
+        if (pcbs[i].active && pcbs[i].waiting_for == pid) { 
+            pcbs[i].waiting_for = 0; 
+            seL4_SetMR(0, 0);        
+            seL4_Send(pcbs[i].reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+            seL4_CNode_Delete(root_cnode, pcbs[i].reply_cap, seL4_WordBits);
+        }
+    }
+
+    // 3. Полная изоляция и уничтожение старых Capabilities в архитектуре seL4
+    seL4_TCB_Suspend(pcbs[pid].tcb);
+    seL4_TCB_UnbindNotification(pcbs[pid].tcb);
+    pcbs[pid].active = false;
+
+    seL4_CNode_Delete(root_cnode, pcbs[pid].badged_ep, seL4_WordBits);
+    seL4_CNode_Delete(root_cnode, pcbs[pid].tcb, seL4_WordBits);
+    if (pcbs[pid].vspace != root_vspace) {
+        seL4_CNode_Delete(root_cnode, pcbs[pid].vspace, seL4_WordBits);
+    }
+
+    // 4. Критерий системного компонента: перезапускаем только системные драйверы и Shell.
+    // Обычные пользовательские программы, запущенные через exec, перезапускать не нужно.
+    if (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0) {
+        uart_puts("[WATCHDOG] Respawning critical system component...\n");
+        
+        int new_pid = spawn_process(meta.name, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+                                    meta.is_driver, console_ep, timer_ep, meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
+                                    nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep);
+        
+        if (new_pid > 0) {
+            uart_puts("[WATCHDOG] Service restored successfully. New PID: "); uart_putdec(new_pid); uart_puts("\n");
+        } else {
+            uart_puts("[WATCHDOG] CRITICAL ERROR: Failed to respawn component!\n");
+        }
+    } else {
+        uart_puts("[WATCHDOG] Non-critical user process terminated permanently.\n");
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -479,7 +546,6 @@ int main(int argc, char *argv[]) {
                 uintptr_t page_aligned = addr & ~0xFFFULL;
                 check_err(seL4_ARM_Page_Map(frame, pcbs[sender_pid].vspace, page_aligned, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Pager Map");
                 
-                // Перезапускаем упавшую инструкцию (Пациент даже не узнает, что падал)
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
                 continue;
             } else {
@@ -487,12 +553,11 @@ int main(int argc, char *argv[]) {
                 uart_puts("\nPC: "); uart_puthex(pc);
                 uart_puts("\nMem Addr: "); uart_puthex(addr);
                 uart_puts("\n");
+
                 if (sender_pid != 0) {
-                    seL4_TCB_Suspend(pcbs[sender_pid].tcb);
-                    pcbs[sender_pid].active = false;
-                    uart_puts("Process terminated.\n");
+                    generic_recover_process(sender_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, console_ep, timer_ep);
                 }
-                continue; 
+                continue;
             }
         }
 
@@ -663,51 +728,30 @@ int main(int argc, char *argv[]) {
             case SYS_KILL: {
                 int target_pid = arg1;
                 
-                if (target_pid == 1) {
-                    uart_puts("\n[KERNEL PANIC] Attempted to kill Rootserver (PID 1)!\n");
+                if (target_pid == 0) {
+                    uart_puts("\n[KERNEL PANIC] Attempted to kill Rootserver!\n");
                     seL4_SetMR(0, (seL4_Word)-1);
                 } 
-                else if (target_pid > 1 && target_pid < 256 && pcbs[target_pid].active) {
-                    uart_puts("\n[KERNEL] Terminating PID: "); uart_putdec(target_pid); uart_puts("\n");
-                    
-                    // ==========================================================
-                    // МАГИЯ ПРОБУЖДЕНИЯ (Точно так же, как в SYS_EXIT)
-                    // ==========================================================
-                    // Ищем всех, кто ждал смерти target_pid (например, родительскую оболочку)
-                    for (int i = 1; i < 256; i++) {
-                        if (pcbs[i].active && pcbs[i].waiting_for == target_pid) { 
-                            pcbs[i].waiting_for = 0; // Сбрасываем ожидание
-                            seL4_SetMR(0, 0);        // Готовим код успеха для заснувшего процесса
-                            // Отправляем IPC спящему процессу, чтобы он проснулся!
-                            seL4_Send(pcbs[i].reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
-                            // Удаляем временный канал связи
-                            seL4_CNode_Delete(root_cnode, pcbs[i].reply_cap, seL4_WordBits);
+                else if (target_pid > 0 && target_pid < 256 && pcbs[target_pid].active) {
+                    // Если это критический системный компонент, пропускаем через Watchdog
+                    if (pcbs[target_pid].is_driver > 0 || strcmp(pcbs[target_pid].name, "shell") == 0) {
+                        uart_puts("\n[KERNEL] Critical process killed manually. Triggering recovery...\n");
+                        generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, console_ep, timer_ep);
+                    } else {
+                        // Обычное пользовательское приложение (убиваем насовсем)
+                        seL4_TCB_Suspend(pcbs[target_pid].tcb);
+                        seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
+                        pcbs[target_pid].active = false;
+                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].badged_ep, seL4_WordBits);
+                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].tcb, seL4_WordBits);
+                        if (pcbs[target_pid].vspace != root_vspace) {
+                            seL4_CNode_Delete(root_cnode, pcbs[target_pid].vspace, seL4_WordBits);
                         }
                     }
-                    // ==========================================================
-                    
-                    // 1. Физически замораживаем поток
-                    seL4_TCB_Suspend(pcbs[target_pid].tcb);
-                    
-                    // 2. Отвязываем прерывания (если это драйвер)
-                    seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
-                    
-                    // 3. Помечаем слот как свободный
-                    pcbs[target_pid].active = false;
-
-                    // 4. Очищаем память, чтобы убитые процессы не текли (как в SYS_EXIT)
-                    seL4_CNode_Delete(root_cnode, pcbs[target_pid].badged_ep, seL4_WordBits);
-                    seL4_CNode_Delete(root_cnode, pcbs[target_pid].tcb, seL4_WordBits);
-                    if (pcbs[target_pid].vspace != root_vspace) {
-                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].vspace, seL4_WordBits);
-                    }
-                    
-                    seL4_SetMR(0, 0); // Успех для того, кто вызвал команду kill
+                    seL4_SetMR(0, 0);
                 } else {
-                    seL4_SetMR(0, (seL4_Word)-1); // Процесс не найден
+                    seL4_SetMR(0, (seL4_Word)-1);
                 }
-                
-                // Отвечаем тому процессу, который вызвал команду kill (если это не сам убитый)
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
@@ -777,6 +821,29 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, 0); // Успех
                 } else {
                     seL4_SetMR(0, (seL4_Word)-1); // Ошибка маппинга (например, адрес уже занят)
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_RECOVER: {
+                char *shm = (char*)0x200006000ULL;
+                char driver_name[32];
+                strncpy(driver_name, shm, 31); driver_name[31] = '\0';
+
+                int target_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, driver_name) == 0) {
+                        target_pid = i;
+                        break;
+                    }
+                }
+
+                if (target_pid != -1) {
+                    generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, console_ep, timer_ep);
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, (seL4_Word)-1);
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
