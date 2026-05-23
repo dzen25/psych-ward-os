@@ -31,6 +31,7 @@ enum NetCommand {
     NET_CMD_PING = 1,
     NET_CMD_SEND = 2,
     NET_CMD_STATUS = 3,
+    NET_CMD_RESOLVE = 4,
 };
 
 static char *next_token(char **cursor) {
@@ -162,9 +163,6 @@ static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
     while (sys_get_time(timer_ep) - start < ms) { seL4_Yield(); }
 }
 
-// ==========================================
-// НОВОЕ: ВЫЗОВ СИСТЕМНОГО ВОССТАНОВЛЕНИЯ
-// ==========================================
 static void sys_recover(const char* driver_name) {
     seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
     char *shm = (char*)0x502000;
@@ -284,7 +282,6 @@ extern "C" void __sel4_start_c(void) {
     char *argv[16];
     argv[0] = (char*)"shell";
     
-    // Теперь парсим нашу СПАСЕННУЮ копию, а не сам IPC-буфер!
     char *cmd_args = arg_buffer; 
     
     if (cmd_args[0] != '\0') {
@@ -294,7 +291,6 @@ extern "C" void __sel4_start_c(void) {
             if (*cmd_args == ' ') {
                 *cmd_args = '\0';
                 
-                // Пропускаем лишние пробелы (если пользователь ввел два пробела подряд)
                 while (*(cmd_args + 1) == ' ') cmd_args++;
                 
                 if (*(cmd_args + 1) != '\0') {
@@ -306,7 +302,6 @@ extern "C" void __sel4_start_c(void) {
         }
     }
     argv[argc] = nullptr;
-    // ==========================================================
     
     sys_puts(console_ep, "\n======================================================\n");
     sys_puts(console_ep, "  TRUE MICROKERNEL: ALL MODULES ONLINE & FUNCTIONAL!  \n");
@@ -324,9 +319,6 @@ extern "C" void __sel4_start_c(void) {
         }
     }
 
-    // ==========================================================
-    // ПРАГМАТИЧНЫЙ ФОНОВЫЙ РЕЖИМ (DAEMON MODE)
-    // ==========================================================
     bool is_daemon = false;
     for (int j = 1; j < argc; j++) {
         if (my_strcmp(argv[j], "--daemon") == 0) {
@@ -397,9 +389,7 @@ extern "C" void __sel4_start_c(void) {
         cmd[i] = '\0';
         
         if (i > 0) {
-            // ==========================================
-            // ПАРСЕР КОНВЕЙЕРА (PIPES)
-            // ==========================================
+
             char *pipe_sym = cmd;
             while (*pipe_sym && *pipe_sym != '|') pipe_sym++;
             
@@ -424,9 +414,7 @@ extern "C" void __sel4_start_c(void) {
             } else {
                 is_piping = false;
             }
-            // ==========================================
 
-            // Разделяем команду и аргументы
             char *arg = cmd; while (*arg && *arg != ' ') arg++;
             if (*arg == ' ') { *arg = '\0'; arg++; while (*arg == ' ') arg++; } else { arg = nullptr; }
 
@@ -449,33 +437,46 @@ extern "C" void __sel4_start_c(void) {
             }
 
             else if (my_strcmp(cmd, "ping") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: ping <ip_address> [count]\n"); continue; }
-                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
-
+                if (!arg) { sys_puts(console_ep, "Usage: ping <domain_or_ip> [count]\n"); continue; }
+                
                 char *cursor = arg;
-                char *ip_str = next_token(&cursor);
+                char *target_str = next_token(&cursor);
                 char *count_str = next_token(&cursor);
                 uint8_t ip[4];
                 uint16_t count = 1;
 
-                if (!ip_str || parse_ipv4(ip_str, ip) != 0) {
-                    sys_puts(console_ep, "Invalid IPv4 address.\n");
-                    continue;
-                }
-                if (count_str && parse_port(count_str, &count) != 0) {
-                    sys_puts(console_ep, "Invalid ping count.\n");
-                    continue;
-                }
-                if (count > 16) count = 16;
+                if (count_str && parse_port(count_str, &count) != 0) count = 1;
 
                 volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
-                net_mailbox[0] = 1; // Запираем Mailbox!
                 
-                sys_puts(console_ep, "Ping command queued.\n");
+                // Пытаемся распарсить как IP. Если не вышло — это домен!
+                if (parse_ipv4(target_str, ip) != 0) {
+                    sys_puts(console_ep, "[SHELL] Target looks like a domain. Starting DNS resolution...\n");
+                    net_mailbox[0] = 1;
+                    net_send_text_command(net_ep, NET_CMD_RESOLVE, 0, 0, target_str);
+                    
+                    wait_for_net_mailbox(console_ep, timer_ep, 10000);
+                    
+                    if (net_mailbox[0] == 0) {
+                        seL4_Word packed_ip = *((seL4_Word*)(0x502000 + 4064));
+                        if (packed_ip == 0) {
+                            sys_puts(console_ep, "[SHELL] DNS Error: Domain not found.\n");
+                            continue;
+                        }
+                        ip[0] = (packed_ip >> 24) & 0xFF; ip[1] = (packed_ip >> 16) & 0xFF;
+                        ip[2] = (packed_ip >> 8) & 0xFF;  ip[3] = packed_ip & 0xFF;
+                    } else {
+                        sys_puts(console_ep, "[SHELL] DNS Resolution failed.\n");
+                        continue;
+                    }
+                }
+
+                // Теперь у нас точно есть IP (распарсенный или полученный от DNS)
+                net_mailbox[0] = 1;
                 net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
                 
                 int timeout = 5000;
-                if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000; // Увеличиваем, если пингов много
+                if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000;
                 wait_for_net_mailbox(console_ep, timer_ep, timeout);
             }
 
@@ -828,8 +829,6 @@ extern "C" void __sel4_start_c(void) {
                 vfs_syscall(116, console_ep, timer_ep, 7000); // Поиск кластеров FAT32: 7 сек
                 sys_puts(console_ep, shm);
             }
-
-            
 
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 

@@ -394,9 +394,6 @@ int main(int argc, char *argv[]) {
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
 
-    
-
-    // Резервируем слоты для всех объектов
     reader_reply_slot = alloc.alloc_slot();
     sleeper_reply_slot = alloc.alloc_slot();
 
@@ -421,23 +418,16 @@ int main(int argc, char *argv[]) {
     uintptr_t rtc_vaddr = 0x200002000ULL;
     seL4_ARM_Page_Map(rtc_frame, root_vspace, rtc_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
 
-    // Инициализация UART и таймера – после этого можно пользоваться uart_puts
     uart_init((void*)uart_vaddr);
     timer_init((void*)rtc_vaddr);
 
-    // Теперь можно выводить сообщения
     uart_puts("\n=== Psych Ward OS: TRUE MICROKERNEL EDITION ===\n");
 
-    // Endpoint'ы
     seL4_CPtr ep = alloc.alloc_slot();
     seL4_CPtr med_ep = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, ep, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, med_ep, 1);
 
-    
-
-    // 1. Shared memory (Оставляем ROOT себе, раздаем копии детям)
-    // Аллоцируем 4 страницы подряд, чтобы они лежали в CNode одна за другой
     seL4_CPtr shm_frame_root = alloc_device_frame(info, alloc, 0x60000000, root_cnode);
     alloc_device_frame(info, alloc, 0x60001000, root_cnode);
     alloc_device_frame(info, alloc, 0x60002000, root_cnode);
@@ -447,8 +437,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < 4; i++) {
         seL4_ARM_Page_Map(shm_frame_root + i, root_vspace, root_shm + (i * 4096), seL4_AllRights, seL4_ARM_Default_VMAttributes);
     }
-    
-    // 2. Каналы связи (Endpoints) для драйверов
+
     seL4_CPtr console_ep = alloc.alloc_slot();
     seL4_CPtr timer_ep = alloc.alloc_slot();
     seL4_CPtr net_cmd_ep = alloc.alloc_slot();
@@ -462,7 +451,6 @@ int main(int argc, char *argv[]) {
     seL4_CNode_Mint(root_cnode, net_cmd_send_ep, seL4_WordBits,
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanWrite, 5);
 
-    // 3. Прерывания ДЛЯ ДРАЙВЕРА ТАЙМЕРА (IRQ 34)
     seL4_CPtr timer_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
     seL4_CPtr timer_irq_handler = alloc.alloc_slot();
@@ -472,7 +460,6 @@ int main(int argc, char *argv[]) {
     seL4_IRQHandler_SetNotification(timer_irq_handler, badged_timer_ntfn);
     seL4_IRQHandler_Ack(timer_irq_handler);
 
-    // 4. Прерывания ДЛЯ ДРАЙВЕРА UART (IRQ 33)
     seL4_CPtr uart_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_uart_ntfn = alloc.alloc_slot(); 
     seL4_CPtr uart_irq_handler = alloc.alloc_slot();

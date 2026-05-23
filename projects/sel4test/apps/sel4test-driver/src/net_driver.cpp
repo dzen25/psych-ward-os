@@ -29,15 +29,11 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
-// ==========================================
-// МАКРО-ВРЕМЯ (Секундный таймер от Ядра для таймаутов)
-// ==========================================
 static uint64_t sys_get_time_ms(seL4_CPtr root_ep) {
     seL4_SetMR(0, 3); // SYS_GET_TIME
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (uint64_t)seL4_GetMR(0);
 }
-
 
 static void put_dec(seL4_CPtr ep, uint32_t val) {
     char buf[12];
@@ -114,6 +110,23 @@ struct __attribute__((packed)) udp_header {
     uint16_t len;
     uint16_t checksum;
 };
+
+struct __attribute__((packed)) dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t q_count;
+    uint16_t ans_count;
+    uint16_t auth_count;
+    uint16_t add_count;
+};
+
+// Глобальные переменные для DNS-сессии
+static char g_dns_pending_domain[64];
+static bool g_dns_outstanding = false;
+static uint16_t g_dns_id = 0xDEAF;
+
+// Константы для команд
+#define NET_CMD_RESOLVE 4
 
 static volatile VirtioMmioRegs* g_net_regs = nullptr;
 static uint8_t my_mac[6] = {0};
@@ -341,6 +354,121 @@ static void copy_text_from_mrs(char *dst, int max_len, int text_len, int msg_wor
     dst[text_len] = '\0';
 }
 
+static int dns_format_name(char* dst, const char* src) {
+    int pos = 0, len_pos = 0, count = 0;
+    for (int i = 0; src[i] != '\0'; i++) {
+        if (src[i] == '.') {
+            dst[len_pos] = (char)count;
+            len_pos = pos + 1;
+            count = 0;
+        } else {
+            dst[pos + 1] = src[i];
+            count++;
+        }
+        pos++;
+    }
+    dst[len_pos] = (char)count;
+    dst[pos + 1] = 0; // Нулевой байт в конце имени
+    return pos + 2;
+}
+
+static void net_send_dns_query(seL4_CPtr root_ep, const char* domain) {
+    // 1. Используем безопасное смещение 0x1000 для TX (4KB от начала SHM)
+    // Это предотвращает наложение данных на vring структуры (0x2000+)
+    uint32_t tx_offset = 0x1000;
+    uintptr_t base_vaddr = 0x502000; // Базовый адрес Shared Memory в net_driver
+    uintptr_t base_paddr = 0x60000000; // Физическая база для Virtio
+
+    // 2. Инициализация заголовка Virtio-Net
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(base_vaddr + tx_offset);
+    net_hdr->flags = 0;
+    net_hdr->gso_type = 0;
+    net_hdr->hdr_len = 0;
+    net_hdr->gso_size = 0;
+    net_hdr->csum_start = 0;
+    net_hdr->csum_offset = 0;
+
+    // 3. Формирование Ethernet кадра
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(base_vaddr + tx_offset + sizeof(virtio_net_hdr));
+    for(int i = 0; i < 6; i++) eth->dest_mac[i] = router_mac[i];
+    for(int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
+    eth->ethertype = htons(0x0800); // IPv4
+
+    // 4. Подготовка DNS данных (пропускаем IP и UDP заголовки)
+    char* qname = (char*)eth->payload + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(dns_header);
+    int name_len = dns_format_name(qname, domain);
+    int dns_payload_len = sizeof(dns_header) + name_len + 4; // Header + Name + Type/Class
+    int total_udp_len = sizeof(udp_header) + dns_payload_len;
+
+    // 5. Заполнение UDP заголовка
+    volatile udp_header* udp = (volatile udp_header*)(eth->payload + sizeof(ipv4_header));
+    udp->src_port = htons(50053);
+    udp->dst_port = htons(53); // DNS Port
+    udp->len = htons(total_udp_len);
+    udp->checksum = 0;
+
+    // 6. Заполнение IP заголовка
+    volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
+    ip->ihl_version = 0x45; // IPv4, Header Length 20 bytes
+    ip->tos = 0;
+    ip->tot_len = htons(sizeof(ipv4_header) + total_udp_len);
+    ip->id = htons(0xABCD);
+    ip->frag_off = 0;
+    ip->ttl = 64;
+    ip->protocol = 17; // UDP
+    ip->saddr[0] = 10; ip->saddr[1] = 0; ip->saddr[2] = 2; ip->saddr[3] = 15;
+    ip->daddr[0] = 8; ip->daddr[1] = 8; ip->daddr[2] = 8; ip->daddr[3] = 8; // Google DNS
+    ip->check = 0;
+    ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
+
+    // 7. Заполнение DNS заголовка
+    volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
+    dns->id = htons(g_dns_id);
+    dns->flags = htons(0x0100); // Standard query with recursion
+    dns->q_count = htons(1);
+    dns->ans_count = 0;
+    dns->auth_count = 0;
+    dns->add_count = 0;
+
+    // 8. DNS Question (Type A, Class IN)
+    uint16_t* qtype = (uint16_t*)(qname + name_len);
+    qtype[0] = htons(1); // Type A
+    qtype[1] = htons(1); // Class IN
+
+    // 9. Финальный расчет длины кадра
+    uint32_t eth_data_len = 14 + sizeof(ipv4_header) + total_udp_len;
+    uint32_t virtio_packet_len = sizeof(virtio_net_hdr) + eth_data_len;
+
+    sys_puts(root_ep, "[NET] Sending DNS Query (");
+    put_dec(root_ep, eth_data_len);
+    sys_puts(root_ep, " bytes) via TX offset 0x1000\n");
+
+    // 10. Прямое управление дескриптором (в обход старой net_send_packet)
+    // Чтобы QEMU не падал, дескриптор должен указывать на правильный адрес в 0x60000000...
+    volatile virtq_desc* tx_vq_desc = (volatile virtq_desc*)(base_vaddr + 0x200); // TX desc база
+    uint16_t* tx_avail_ring = (uint16_t*)(base_vaddr + 0x224);
+    volatile uint16_t* tx_avail_idx = (volatile uint16_t*)(base_vaddr + 0x222);
+    volatile uint16_t* tx_used_idx = (volatile uint16_t*)(base_vaddr + 0x242);
+
+    // Используем дескриптор 0 для этой отправки
+    tx_vq_desc[0].addr = base_paddr + tx_offset; 
+    tx_vq_desc[0].len = virtio_packet_len;
+    tx_vq_desc[0].flags = 0;
+    tx_vq_desc[0].next = 0;
+
+    tx_avail_ring[g_tx_avail_idx % 2] = 0; 
+    g_tx_avail_idx++;
+    *tx_avail_idx = g_tx_avail_idx;
+
+    // Уведомляем QEMU об обновлении очереди
+    g_net_regs->queue_notify = 1; 
+
+    // Ждем подтверждения обработки (чтобы не перетереть память)
+    while (*tx_used_idx < g_tx_avail_idx) { seL4_Yield(); }
+
+    g_dns_outstanding = true;
+}
+
 static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
     if (net_cmd_ep == 0) return;
 
@@ -432,11 +560,22 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
         sys_puts(root_ep, "\n");
         volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
         net_mailbox[0] = 0;
+
+    } else if (cmd == NET_CMD_RESOLVE) {
+        int text_len = (int)seL4_GetMR(3);
+        copy_text_from_mrs(g_dns_pending_domain, sizeof(g_dns_pending_domain), text_len, len);
+        
+        if (have_router_mac) {
+            net_send_dns_query(root_ep, g_dns_pending_domain);
+        } else {
+            pending_cmd = NET_CMD_RESOLVE;
+            net_send_arp_request(root_ep);
+        }
+
     } else {
         sys_puts(root_ep, "[NET DRIVER] Unknown Shell command.\n");
     }
 }
-
 
 static void net_poll(seL4_CPtr root_ep) {
     volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(0x502000 + 0x2040);
@@ -449,14 +588,22 @@ static void net_poll(seL4_CPtr root_ep) {
 
         uint16_t type = htons(eth->ethertype);
 
-        if (type == 0x0806) { 
+        if (type == 0x0806) { // ARP
             volatile arp_ipv4* arp_reply = (volatile arp_ipv4*)eth->payload;
             if (htons(arp_reply->oper) == 2 && !have_router_mac) { 
                 sys_puts(root_ep, ">>> [NET RX] ARP Reply Received! Saving Router MAC.\n");
                 for(int i=0; i<6; i++) router_mac[i] = arp_reply->sha[i];
                 have_router_mac = true;
 
-                if (pending_cmd == NET_CMD_PING) {
+                // --- НОВАЯ ЛОГИКА ДЛЯ DNS ---
+                if (pending_cmd == NET_CMD_RESOLVE) {
+                    sys_puts(root_ep, "[NET] ARP ready. Launching DNS Query...\n");
+                    pending_cmd = NET_CMD_NONE;
+                    // Вызываем функцию отправки запроса, которую мы написали раньше
+                    net_send_dns_query(root_ep, g_dns_pending_domain); 
+                } 
+                // --- СУЩЕСТВУЮЩАЯ ЛОГИКА ---
+                else if (pending_cmd == NET_CMD_PING) {
                     uint32_t count = pending_ping_count;
                     pending_cmd = NET_CMD_NONE;
                     net_start_ping_series(root_ep, pending_ip, count);
@@ -465,7 +612,8 @@ static void net_poll(seL4_CPtr root_ep) {
                     pending_cmd = NET_CMD_NONE;
                 }
             }
-        } 
+        }
+
         else if (type == 0x0800) { 
             volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
             if (ip->protocol == 1) { 
@@ -507,7 +655,43 @@ static void net_poll(seL4_CPtr root_ep) {
                         net_schedule_next_ping(root_ep);
                     }
                 }
+
+            else if (ip->protocol == 17) { // UDP
+                volatile udp_header* udp = (volatile udp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);
+
+                if (htons(udp->src_port) == 53) {
+                    volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
+                    
+                    if (htons(dns->id) == g_dns_id && htons(dns->ans_count) > 0) {
+                        uint8_t* reader = (uint8_t*)dns + sizeof(dns_header);
+                        
+                        while (*reader != 0) reader += (*reader) + 1;
+                        reader += 5; // Пропускаем нулевой байт конца имени и 4 байта Type/Class
+
+                        reader += 10;
+                        uint16_t data_len = (reader[0] << 8) | reader[1];
+                        reader += 2;
+
+                        if (data_len == 4) { // Это точно IPv4 адрес!
+                            uint8_t resolved_ip[4] = {reader[0], reader[1], reader[2], reader[3]};
+                            
+                            sys_puts(root_ep, ">>> [NET RX] DNS SUCCESS: ");
+                            put_ip(root_ep, resolved_ip); sys_puts(root_ep, "\n");
+
+                            // Сохраняем и разблокируем Shell
+                            seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) | 
+                                                (resolved_ip[2] << 8) | resolved_ip[3];
+                            *((seL4_Word*)(0x502000 + 4064)) = packed_ip;
+                            
+                            volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                            net_mailbox[0] = 0;
+                            g_dns_outstanding = false;
+                        }
+                    }
+                }
             }
+            }
+        
         }
 
         rx_avail->ring[g_rx_avail_idx % 4] = desc_id;
@@ -562,5 +746,5 @@ extern "C" void __sel4_start_c(void) {
             net_check_ping_send(root_ep);
         }
         seL4_Yield();
-    }
+    } 
 }
