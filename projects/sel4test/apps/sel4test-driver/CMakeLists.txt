@@ -27,7 +27,7 @@ target_include_directories(timer_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/aut
 target_link_options(timer_driver PRIVATE "-nostdlib" "-static")
 target_link_libraries(timer_driver sel4 sel4runtime muslc)
 
-add_executable(shell src/shell.cpp)
+add_executable(shell src/shell.cpp src/pipe.cpp)
 target_include_directories(shell PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(shell PRIVATE "-nostdlib" "-static")
 target_link_libraries(shell sel4 sel4runtime muslc)

@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include <stdint.h>
+#include "pipe.h"
 
 __attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
@@ -25,7 +26,7 @@ static int simple_atoi(const char *str) {
 }
 
 static bool is_piping = false;
-static char pipe_buffer[4096];
+static volatile ipc_pipe global_pipe;
 
 enum NetCommand {
     NET_CMD_PING = 1,
@@ -134,16 +135,42 @@ static void sys_puts_direct(seL4_CPtr console_ep, const char *str) {
 
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     if (is_piping) {
-        // Если труба открыта — складываем текст в буфер Оболочки
-        int curr_len = my_strlen(pipe_buffer);
-        int str_len = my_strlen(str);
-        if (curr_len + str_len < 4095) {
-            my_strcpy(pipe_buffer + curr_len, str);
-        }
+        int len = my_strlen(str);
+        // Пишем в трубу. Передаем 0 вместо Endpoints, т.к. пока работаем в одном потоке
+        pipe_write(&global_pipe, 0, 0, (const uint8_t*)str, len);
     } else {
-        // Если трубы нет — печатаем на экран по-настоящему
         sys_puts_direct(console_ep, str);
     }
+}
+
+struct ThreadArgs {
+    void (*func)(void*);
+    seL4_CPtr timer_ep;
+    seL4_CPtr console_ep;
+};
+
+static void internal_thread_wrapper(void* raw_args) {
+    ThreadArgs* args = (ThreadArgs*)raw_args;
+    // Вызываем реальную функцию ls_thread_func
+    args->func((void*)(uintptr_t)args->timer_ep);
+    // Поток должен остановиться, когда функция завершится
+    while(1) seL4_Yield();
+}
+
+static int spawn_thread(void (*func)(void*), seL4_CPtr timer, seL4_CPtr console) {
+    // Используем выделенный участок в Shared Memory (0x502000) для передачи аргументов
+    ThreadArgs* args = (ThreadArgs*)0x502000; 
+    args->func = func;
+    args->timer_ep = timer;
+    args->console_ep = console;
+    
+    seL4_SetMR(0, (seL4_Word)internal_thread_wrapper); 
+    seL4_SetMR(1, (seL4_Word)args);
+    
+    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 2);
+    // Вызов в ядро по Endpoint 8
+    seL4_Call(8, info); 
+    return seL4_GetMR(0);
 }
 
 static char sys_read(seL4_CPtr console_ep) {
@@ -232,7 +259,6 @@ static void build_absolute_path(char* target, const char* arg) {
     my_strcpy(target + my_strlen(target), arg);
 }
 
-//Общий блок таймаута для всех команд работы с диском (VFS)
 static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
     volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12);
     mailbox[2] = 0; // Сбрасываем флаг готовности
@@ -263,6 +289,37 @@ static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep
     
     return mailbox[1]; // Нормальный возврат статуса
 }
+
+
+// Функция, которая будет крутиться в фоновом потоке
+static void ls_thread_func(void* arg) {
+    // Получаем Endpoint консоли (хардкод для простоты, или передать через arg)
+    seL4_CPtr console_ep = 8; 
+    
+    // Включаем вывод в трубу
+    is_piping = true;
+    
+    // Твоя логика команды ls (просто дергаем блочный драйвер)
+    volatile int* blk_mailbox = (volatile int*)(0x502000 + 8188); // Пример адреса
+    blk_mailbox[1] = 0; // CMD_READ_DIR
+    blk_mailbox[0] = 1; // Уведомляем драйвер
+    
+    // Ждем ответа
+    while (blk_mailbox[0] != 0) { seL4_Yield(); }
+    
+    char* dir_data = (char*)(0x502000 + 4096);
+    sys_puts(console_ep, "Directory listing:\n");
+    sys_puts(console_ep, dir_data);
+    
+    // ВАЖНО: Закрываем трубу после завершения работы
+    global_pipe.writer_closed = true;
+    is_piping = false;
+    
+    // Поток завершается. 
+    // В реальной ОС тут нужно вызвать sys_exit, но пока оставим бесконечный слип
+    while(1) seL4_Yield(); 
+}
+
 
 // --- Точка входа ---
 extern "C" void __sel4_start_c(void) {
@@ -410,7 +467,7 @@ extern "C" void __sel4_start_c(void) {
                 }
                 
                 is_piping = true; // Открываем трубу!
-                pipe_buffer[0] = '\0'; // Очищаем буфер для новых данных
+                pipe_init(&global_pipe);
             } else {
                 is_piping = false;
             }
@@ -546,8 +603,14 @@ extern "C" void __sel4_start_c(void) {
                 if (arg) { build_absolute_path(shm, arg); } 
                 else { build_absolute_path(shm, ""); }
                 
-                vfs_syscall(110, console_ep, timer_ep, 2000); // Таймаут 2 сек
-                sys_puts(console_ep, shm);
+                if (is_piping) {
+                    // Если есть пайп (|), кидаем задачу в фоновый поток
+                    spawn_thread(ls_thread_func, timer_ep, 8);
+                } else {
+                    // Если пайпа нет, работаем как обычно
+                    vfs_syscall(110, console_ep, timer_ep, 2000); // Таймаут 2 сек
+                    sys_puts(console_ep, shm);
+                }
             }
 
             else if (my_strcmp(cmd, "pwd") == 0) {
@@ -833,51 +896,55 @@ extern "C" void __sel4_start_c(void) {
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 
             if (is_piping) {
-                is_piping = false; // Закрываем трубу (клапан переключается на консоль)
-                
-                char *arg2 = cmd2;
-                while (*arg2 && *arg2 != ' ') arg2++;
-                if (*arg2 == ' ') { *arg2 = '\0'; arg2++; } else { arg2 = nullptr; }
-                
-                if (my_strcmp(cmd2, "grep") == 0) {
-                    if (!arg2) { sys_puts_direct(console_ep, "Usage: <cmd> | grep <text>\n"); continue; }
-                    
-                    // Идем по нашему сохраненному буферу построчно
-                    char *line = pipe_buffer;
-                    while (*line) {
-                        char *next_line = line;
-                        while (*next_line && *next_line != '\n') next_line++;
-                        char saved = *next_line;
-                        if (*next_line == '\n') *next_line = '\0'; // Временно отрезаем строку
-                        
-                        // Поиск подстроки (arg2) внутри строки (line)
-                        char *search = line;
-                        bool found = false;
-                        while (*search) {
-                            char *p1 = search;
-                            char *p2 = arg2;
-                            while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
-                            if (!*p2) { found = true; break; } // Совпадение найдено!
-                            search++;
-                        }
-                        
-                        if (found) {
-                            sys_puts_direct(console_ep, line);
-                            sys_puts_direct(console_ep, "\n");
-                        }
-                        
-                        // Восстанавливаем строку и идем дальше
-                        if (saved == '\n') {
-                            *next_line = '\n';
-                            line = next_line + 1;
-                        } else {
-                            break;
-                        }
+                    // Если левая команда была НЕ 'ls', значит она отработала мгновенно (например, help)
+                    // и нам нужно вручную закрыть задвижку. (А вот ls_thread закрывает её сам изнутри потока)
+                    if (my_strcmp(cmd, "ls") != 0) {
+                        global_pipe.writer_closed = true;
                     }
-                } else {
-                    sys_puts_direct(console_ep, "Microkernel Pipe currently supports 'grep' on the right side.\n");
+
+                    char *arg2 = cmd2;
+                    while (*arg2 && *arg2 != ' ') arg2++;
+                    if (*arg2 == ' ') { *arg2 = '\0'; arg2++; } else { arg2 = nullptr; }
+
+                    if (my_strcmp(cmd2, "grep") == 0) {
+                        if (!arg2) { sys_puts_direct(console_ep, "Usage: <cmd> | grep <text>\n"); continue; }
+
+                        char line[256];
+                        int line_idx = 0;
+                        uint8_t c;
+
+                        // Главный поток (grep) будет вычитывать байты по мере того,
+                        // как фоновый поток (ls_thread) будет их туда писать параллельно!
+                        while (pipe_read(&global_pipe, 0, 0, &c, 1) > 0) {
+                            if (c == '\n' || line_idx >= 255) {
+                                line[line_idx] = '\0'; // Конец строки найден
+
+                                char *search = line;
+                                bool found = false;
+                                while (*search) {
+                                    char *p1 = search;
+                                    char *p2 = arg2;
+                                    while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
+                                    if (!*p2) { found = true; break; }
+                                    search++;
+                                }
+
+                                if (found) {
+                                    sys_puts_direct(console_ep, line);
+                                    sys_puts_direct(console_ep, "\n");
+                                }
+                                line_idx = 0; // Сбрасываем буфер
+                            } else {
+                                line[line_idx++] = c;
+                            }
+                        }
+                    } else {
+                        sys_puts_direct(console_ep, "Microkernel Pipe currently supports 'grep' on the right side.\n");
+                    }
+
+                    // Сбрасываем флаг только после того, как grep закончил работу
+                    is_piping = false; 
                 }
-            }
         }
     }
 }

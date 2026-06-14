@@ -613,7 +613,7 @@ static void net_poll(seL4_CPtr root_ep) {
                         net_schedule_next_ping(root_ep);
                     }
                 }
-            } // <--- ВОТ ЭТА СПАСИТЕЛЬНАЯ СКОБКА, ЗАКРЫВАЮЩАЯ ICMP!
+            }
             
             else if (ip->protocol == 17) { // UDP
                 volatile udp_header* udp = (volatile udp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);

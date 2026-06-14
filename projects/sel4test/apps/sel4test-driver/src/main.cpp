@@ -28,6 +28,7 @@ enum SyscallID {
     // --- УПРАВЛЕНИЕ ПРОЦЕССАМИ И ПАМЯТЬЮ ---
     SYS_DOCTOR = 99, 
     SYS_EXEC = 100, 
+    SYS_CLONE = 101,
     SYS_KILL = 102, 
     SYS_EXIT = 103, 
     SYS_PS = 104,
@@ -648,6 +649,68 @@ int main(int argc, char *argv[]) {
                 shm[i] = '\0';
 
                 seL4_SetMR(0, 0); 
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_CLONE: {
+                seL4_Word entry_point = seL4_GetMR(0);
+                seL4_Word thread_arg = seL4_GetMR(1);
+
+                int new_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (!pcbs[i].active) {
+                        new_pid = i;
+                        break;
+                    }
+                }
+
+                if (new_pid == -1) {
+                    seL4_SetMR(0, (seL4_Word)-1); 
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                // 1. Используем alloc_slot() вместо alloc_cnode_slot()
+                seL4_CPtr new_tcb = alloc.alloc_slot(); 
+                
+                seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, seL4_TCBBits, root_cnode, 0, 0, new_tcb, 1);
+
+                seL4_CNode_Copy(root_cnode, new_tcb, 8, root_cnode, 8, 8, seL4_AllRights); // Копируем консоль
+                
+                seL4_TCB_Configure(new_tcb, ep, root_cnode, root_vspace, root_vspace, 0, ep, 0);
+                
+                seL4_TCB_SetPriority(new_tcb, seL4_CapInitThreadTCB, 254);
+
+                seL4_Word stack_vaddr = 0x70000000ULL + (new_pid * 0x2000); 
+                
+                // 2. И здесь тоже: alloc_slot()
+                seL4_CPtr stack_frame1 = alloc.alloc_slot(); 
+                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 12, root_cnode, 0, 0, stack_frame1, 1);
+                seL4_ARM_Page_Map(stack_frame1, root_vspace, stack_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+                
+                // 3. И здесь: alloc_slot()
+                seL4_CPtr stack_frame2 = alloc.alloc_slot(); 
+                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 12, root_cnode, 0, 0, stack_frame2, 1);
+                seL4_ARM_Page_Map(stack_frame2, root_vspace, stack_vaddr + 0x1000, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+
+                seL4_Word stack_top = (stack_vaddr + 0x2000) & ~0xF; 
+
+                seL4_UserContext context = {0};
+                context.pc = entry_point;   
+                context.sp = stack_top;     
+                context.x0 = thread_arg;    
+                
+                seL4_TCB_WriteRegisters(new_tcb, false, 0, sizeof(context) / sizeof(seL4_Word), &context);
+
+                pcbs[new_pid].active = true;
+                pcbs[new_pid].tcb = new_tcb;
+                pcbs[new_pid].vspace = root_vspace; 
+                strncpy(pcbs[new_pid].name, "shell_thread", 31);
+
+                seL4_TCB_Resume(new_tcb);
+
+                seL4_SetMR(0, new_pid);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
