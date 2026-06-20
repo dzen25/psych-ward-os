@@ -12,7 +12,7 @@ musllibc_setup_build_environment_with_sel4runtime()
 sel4_import_libsel4()
 util_libs_import_libraries()
 sel4_libs_import_libraries()
-
+ 
 # ===================================================================
 # --- ИЗОЛИРОВАННЫЕ ПРОГРАММЫ (USER-SPACE BINARIES) ---
 # ===================================================================
@@ -20,28 +20,33 @@ sel4_libs_import_libraries()
 add_executable(uart_driver src/uart_driver.cpp)
 target_include_directories(uart_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(uart_driver PRIVATE "-nostdlib" "-static")
+target_link_options(uart_driver PRIVATE "-Wl,-e,_start")
 target_link_libraries(uart_driver sel4 sel4runtime muslc)
 
 add_executable(timer_driver src/timer_driver.cpp)
 target_include_directories(timer_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(timer_driver PRIVATE "-nostdlib" "-static")
+target_link_options(timer_driver PRIVATE "-Wl,-e,_start")
 target_link_libraries(timer_driver sel4 sel4runtime muslc)
 
 add_executable(shell src/shell.cpp src/pipe.cpp)
 target_include_directories(shell PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(shell PRIVATE "-nostdlib" "-static")
+target_link_options(shell PRIVATE "-Wl,-e,_start")
 target_link_libraries(shell sel4 sel4runtime muslc)
 
 # 4. НОВЫЙ БЛОЧНЫЙ ДРАЙВЕР (Файловая система)
 add_executable(blk_driver src/blk_driver.cpp)
 target_include_directories(blk_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(blk_driver PRIVATE "-nostdlib" "-static")
+target_link_options(blk_driver PRIVATE "-Wl,-e,_start")
 target_link_libraries(blk_driver sel4 sel4runtime muslc)
 
 # 4. НОВЫЙ СЕТЕВОЙ ДРАЙВЕР
 add_executable(net_driver src/net_driver.cpp)
 target_include_directories(net_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(net_driver PRIVATE "-nostdlib" "-static")
+target_link_options(net_driver PRIVATE "-Wl,-e,_start")
 target_link_libraries(net_driver sel4 sel4runtime muslc)
 
 # ===================================================================

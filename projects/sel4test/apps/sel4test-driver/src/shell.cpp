@@ -1,9 +1,41 @@
 #include <sel4/sel4.h>
+#include "common.h"
 #include <stdint.h>
 #include "pipe.h"
 
-__attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
+static volatile int* vfs_spinlock_ptr = (volatile int*)(0x502000 + 4084 - 16);
+
+void vfs_lock() {
+    while (__sync_lock_test_and_set(vfs_spinlock_ptr, 1)) {
+        seL4_Yield(); 
+    }
+}
+
+void vfs_unlock() {
+    __sync_lock_release(vfs_spinlock_ptr);
+}
+
+
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
+
+static inline seL4_IPCBuffer* get_local_ipc() {
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    return (seL4_IPCBuffer*)(tls_addr - 1024);
+}
+
+// Пример правильного sys_puts для драйвера:
+static void sys_puts(seL4_CPtr console_ep, const char *str) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    int len = 0;
+    while(str[len]) len++;
+    
+    ipc->msg[0] = 8; // SYS_PUTS
+    for (int i = 0; i < len; i++) {
+        ipc->msg[i + 1] = str[i];
+    }
+    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
+}
 
 static void my_strcpy(char *dest, const char *src) {
     while ((*dest++ = *src++));
@@ -26,7 +58,8 @@ static int simple_atoi(const char *str) {
 }
 
 static bool is_piping = false;
-static volatile ipc_pipe global_pipe;
+static __attribute__((aligned(8))) uint8_t global_pipe_memory[4096]; 
+#define global_pipe (*((volatile ipc_pipe*)global_pipe_memory))
 
 enum NetCommand {
     NET_CMD_PING = 1,
@@ -126,22 +159,20 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
 }
 
 static void sys_puts_direct(seL4_CPtr console_ep, const char *str) {
-    while (*str) {
-        seL4_SetMR(0, 8); // 8 = SYS_PUTS
-        seL4_SetMR(1, (seL4_Word)*str++);
-        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    // Пишем строку в MR регистры IPC буфера
+    seL4_Word len = my_strlen(str);
+    if (len > 40) len = 40; // Ограничение на размер одного сообщения в регистрах
+
+    // По спецификации твоей ОС, SYS_PUTS подготавливает данные в буфере
+    ipc->msg[0] = 8; // SYS_PUTS ID
+    for (seL4_Word i = 0; i < len; i++) {
+        ipc->msg[i + 1] = str[i];
     }
+    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
 }
 
-static void sys_puts(seL4_CPtr console_ep, const char *str) {
-    if (is_piping) {
-        int len = my_strlen(str);
-        // Пишем в трубу. Передаем 0 вместо Endpoints, т.к. пока работаем в одном потоке
-        pipe_write(&global_pipe, 0, 0, (const uint8_t*)str, len);
-    } else {
-        sys_puts_direct(console_ep, str);
-    }
-}
+
 
 struct ThreadArgs {
     void (*func)(void*);
@@ -149,27 +180,46 @@ struct ThreadArgs {
     seL4_CPtr console_ep;
 };
 
+static void sys_thread_exit() {
+    // 1. Получаем безопасный указатель на буфер текущего потока
+    seL4_IPCBuffer *ipc = get_local_ipc(); 
+    
+    // 2. Везде используем локальный 'ipc' вместо глобального макроса
+    seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
+    ipc->msg[0] = 105; // ID нашего нового сисколла
+    
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    while(1) seL4_Yield(); // Сюда выполнение никогда не дойдет
+}
+
 static void internal_thread_wrapper(void* raw_args) {
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
+
     ThreadArgs* args = (ThreadArgs*)raw_args;
-    // Вызываем реальную функцию ls_thread_func
-    args->func((void*)(uintptr_t)args->timer_ep);
-    // Поток должен остановиться, когда функция завершится
-    while(1) seL4_Yield();
+    args->func(raw_args); 
+    sys_thread_exit();
 }
 
 static int spawn_thread(void (*func)(void*), seL4_CPtr timer, seL4_CPtr console) {
-    // Используем выделенный участок в Shared Memory (0x502000) для передачи аргументов
-    ThreadArgs* args = (ThreadArgs*)0x502000; 
+    // 2. Сдвигаем ThreadArgs на 2 КБ вперед, чтобы не затереть путь VFS в начале SHM
+    ThreadArgs* args = (ThreadArgs*)(0x502000 + 2048); 
     args->func = func;
     args->timer_ep = timer;
     args->console_ep = console;
     
-    seL4_SetMR(0, (seL4_Word)internal_thread_wrapper); 
-    seL4_SetMR(1, (seL4_Word)args);
+    // Динамически берем Root Endpoint для сисколлов из нашего легитимного TLS
+    seL4_CPtr my_root_syscall_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
+
+    get_local_ipc()->msg[0] = 101; // SYS_CLONE
+    get_local_ipc()->msg[1] = (seL4_Word)internal_thread_wrapper;
+    get_local_ipc()->msg[2] = (seL4_Word)args;
     
-    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 2);
-    // Вызов в ядро по Endpoint 8
-    seL4_Call(8, info); 
+    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 3);
+    // Делаем сисколл к ядру через наш локальный root эндпоинт
+    seL4_Call(my_root_syscall_ep, info);
+    
     return seL4_GetMR(0);
 }
 
@@ -191,10 +241,11 @@ static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
 }
 
 static void sys_recover(const char* driver_name) {
-    seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
     char *shm = (char*)0x502000;
     my_strcpy(shm, driver_name);      // Передаем имя упавшего драйвера
-    __sel4_ipc_buffer->msg[0] = 117;  // SYS_RECOVER
+    ipc->msg[0] = 117;  // SYS_RECOVER
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
 }
 
@@ -221,32 +272,37 @@ static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int t
 }
 
 static void sys_wait(seL4_CPtr root_ep, int pid) {
-    __sel4_ipc_buffer->msg[0] = 106; // SYS_WAIT
-    __sel4_ipc_buffer->msg[1] = pid;
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    ipc->msg[0] = 106; // SYS_WAIT
+    ipc->msg[1] = pid;
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
 static void sys_exit(seL4_CPtr root_ep) {
-    __sel4_ipc_buffer->msg[0] = 103; // SYS_EXIT
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    ipc->msg[0] = 103; // SYS_EXIT
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     while(1) seL4_Yield();
 }
 
 static int sys_shm_get(seL4_CPtr root_ep, int shm_id, seL4_Word vaddr) {
-    __sel4_ipc_buffer->msg[0] = 107; // SYS_SHM_GET
-    __sel4_ipc_buffer->msg[1] = shm_id;
-    __sel4_ipc_buffer->msg[2] = vaddr;
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    ipc->msg[0] = 107; // SYS_SHM_GET
+    ipc->msg[1] = shm_id;
+    ipc->msg[2] = vaddr;
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 3));
     return (int)seL4_GetMR(0);
 }
 
 static int sys_getpid(seL4_CPtr root_ep) {
-    __sel4_ipc_buffer->msg[0] = 108; // SYS_GETPID
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    ipc->msg[0] = 108; // SYS_GETPID
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (int)seL4_GetMR(0);
 }
 
 static char current_working_dir[64] = "/";
+static char arg_buffer[512];
 
 static void build_absolute_path(char* target, const char* arg) {
     if (arg[0] == '/') {
@@ -260,15 +316,19 @@ static void build_absolute_path(char* target, const char* arg) {
 }
 
 static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
-    volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12);
+    vfs_lock();
+    volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12); // blk_driver mailbox
     mailbox[2] = 0; // Сбрасываем флаг готовности
     mailbox[0] = syscall_num; // Кладем команду в ящик
     
     int elapsed = 0;
     // Ждем пока драйвер диска ответит, но не дольше timeout_ms
     while (mailbox[2] == 0 && elapsed < timeout_ms) {
+        // Временно освобождаем лок, чтобы другие потоки могли работать, пока мы ждем
+        vfs_unlock();
         sys_sleep(timer_ep, 100);
         elapsed += 100;
+        vfs_lock(); // Снова захватываем лок перед проверкой условия
     }
     
     if (mailbox[2] == 0) {
@@ -287,53 +347,39 @@ static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep
         return -1; 
     }
     
-    return mailbox[1]; // Нормальный возврат статуса
+    int ret_val = mailbox[1]; // Нормальный возврат статуса
+    vfs_unlock();
+    return ret_val;
 }
 
-
-// Функция, которая будет крутиться в фоновом потоке
 static void ls_thread_func(void* arg) {
-    // Получаем Endpoint консоли (хардкод для простоты, или передать через arg)
-    seL4_CPtr console_ep = 8; 
+    ThreadArgs* args = (ThreadArgs*)arg;
+    seL4_CPtr console_ep = args->console_ep;
+    seL4_CPtr timer_ep = args->timer_ep;
     
-    // Включаем вывод в трубу
-    is_piping = true;
-    
-    // Твоя логика команды ls (просто дергаем блочный драйвер)
-    volatile int* blk_mailbox = (volatile int*)(0x502000 + 8188); // Пример адреса
-    blk_mailbox[1] = 0; // CMD_READ_DIR
-    blk_mailbox[0] = 1; // Уведомляем драйвер
-    
-    // Ждем ответа
-    while (blk_mailbox[0] != 0) { seL4_Yield(); }
-    
-    char* dir_data = (char*)(0x502000 + 4096);
-    sys_puts(console_ep, "Directory listing:\n");
-    sys_puts(console_ep, dir_data);
-    
-    // ВАЖНО: Закрываем трубу после завершения работы
+    char *shm = (char*)0x502000;
+    vfs_syscall(110, console_ep, timer_ep, 2000); 
+    sys_puts(console_ep, shm);
     global_pipe.writer_closed = true;
-    is_piping = false;
-    
-    // Поток завершается. 
-    // В реальной ОС тут нужно вызвать sys_exit, но пока оставим бесконечный слип
-    while(1) seL4_Yield(); 
+    return;
 }
-
 
 // --- Точка входа ---
-extern "C" void __sel4_start_c(void) {
-    seL4_Word fake_tls_base = 0x501800; 
-    asm volatile("msr tpidr_el0, %0" :: "r"(fake_tls_base));
-    __sel4_ipc_buffer = (seL4_IPCBuffer*)0x501000;
+int main(void) {
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    
+    // Инициализируем библиотеку корректным адресом
+    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
+    seL4_SetIPCBuffer(ipc);
 
-    seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
-    seL4_CPtr console_ep = __sel4_ipc_buffer->caps_or_badges[0];
-    seL4_CPtr timer_ep = __sel4_ipc_buffer->caps_or_badges[1];
-    seL4_CPtr net_ep = __sel4_ipc_buffer->caps_or_badges[2];
+    // 2. Теперь безопасно получаем root_ep
+    seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];  // Локальный эндпоинт ядра для сисколлов (SYS_CLONE, SYS_EXEC)
+    seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];  // Локальный дескриптор консоли (всегда равен 1)
+    seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];  // Локальный дескриптор таймера (всегда равен 2)
+    seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];  // Локальный дескриптор сети (всегда равен 3)
 
-    static char arg_buffer[512]; 
-    my_strcpy(arg_buffer, (char*)&__sel4_ipc_buffer->msg[0]);
+    my_strcpy(arg_buffer, (char*)&ipc->msg[0]);
 
     int argc = 1;
     char *argv[16];
@@ -603,9 +649,9 @@ extern "C" void __sel4_start_c(void) {
                 if (arg) { build_absolute_path(shm, arg); } 
                 else { build_absolute_path(shm, ""); }
                 
-                if (is_piping) {
+                if (is_piping) { 
                     // Если есть пайп (|), кидаем задачу в фоновый поток
-                    spawn_thread(ls_thread_func, timer_ep, 8);
+                    spawn_thread(ls_thread_func, timer_ep, console_ep);
                 } else {
                     // Если пайпа нет, работаем как обычно
                     vfs_syscall(110, console_ep, timer_ep, 2000); // Таймаут 2 сек
@@ -685,14 +731,17 @@ extern "C" void __sel4_start_c(void) {
             }
 
             else if (my_strcmp(cmd, "ps") == 0) {
-                __sel4_ipc_buffer->msg[0] = 104; seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_IPCBuffer *ipc = get_local_ipc();
+
+                ipc->msg[0] = 104; seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 sys_puts(console_ep, shm);
             }
 
             else if (my_strcmp(cmd, "kill") == 0) {
+                seL4_IPCBuffer *ipc = get_local_ipc();
                 if (!arg) { sys_puts(console_ep, "Usage: kill <pid>\n"); continue; }
-                __sel4_ipc_buffer->msg[0] = 102; // SYS_KILL
-                __sel4_ipc_buffer->msg[1] = simple_atoi(arg);
+                ipc->msg[0] = 102; // SYS_KILL
+                ipc->msg[1] = simple_atoi(arg);
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 sys_puts(console_ep, "Signal sent.\n");
             }
@@ -717,7 +766,7 @@ extern "C" void __sel4_start_c(void) {
                 }
 
                 my_strcpy(shm, arg);
-                __sel4_ipc_buffer->msg[0] = 100; // SYS_EXEC
+                ipc->msg[0] = 100; // SYS_EXEC
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 
                 int pid = (int)seL4_GetMR(0);
@@ -770,6 +819,7 @@ extern "C" void __sel4_start_c(void) {
                     sys_puts(console_ep, shm_ptr);
                     sys_puts(console_ep, "\n");
                 } 
+
                 else if (my_strcmp(op, "write") == 0) {
                     my_strcpy(shm_ptr, text);
                     sys_puts(console_ep, "Written to SHM.\n");
@@ -947,4 +997,6 @@ extern "C" void __sel4_start_c(void) {
                 }
         }
     }
+
+    return 0;
 }

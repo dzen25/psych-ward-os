@@ -1,17 +1,31 @@
 // net_driver.cpp
 #include <sel4/sel4.h>
+#include "common.h"
 #include <stdint.h>
 #include <kernel/gen_config.h>
 
-__attribute__((weak)) LIBSEL4_THREAD_LOCAL seL4_IPCBuffer *__sel4_ipc_buffer = nullptr;
 
 void __assert_fail(const char *expr, const char *file, int line, const char *func) { while (1) seL4_Yield(); }
 
-static void sys_puts(seL4_CPtr ep, const char *str) {
-    while (*str) {
-        seL4_SetMR(0, 8); seL4_SetMR(1, (seL4_Word)*str++);
-        seL4_Call(ep, seL4_MessageInfo_new(0, 0, 0, 2));
+static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return len; }
+
+static inline seL4_IPCBuffer* get_local_ipc() {
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    return (seL4_IPCBuffer*)(tls_addr - 1024);
+}
+
+// Пример правильного sys_puts для драйвера:
+static void sys_puts(seL4_CPtr console_ep, const char *str) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    int len = 0;
+    while(str[len]) len++;
+    
+    ipc->msg[0] = 8; // SYS_PUTS
+    for (int i = 0; i < len; i++) {
+        ipc->msg[i + 1] = str[i];
     }
+    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
 }
 
 static void put_hex_byte(seL4_CPtr ep, uint8_t val) {
@@ -25,13 +39,11 @@ static void my_memcpy(void *dest, const void *src, int n) {
     while (n--) *d++ = *s++;
 }
 
-static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return len; }
-
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
-static uint64_t sys_get_time_ms(seL4_CPtr root_ep) {
+static uint64_t sys_get_time_ms(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 3); // SYS_GET_TIME
-    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (uint64_t)seL4_GetMR(0);
 }
 
@@ -213,7 +225,7 @@ static void net_send_arp_request(seL4_CPtr root_ep) {
     net_send_packet(sizeof(virtio_net_hdr) + 14 + 28, 0x280);
 }
 
-static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
+static void net_send_ping(seL4_CPtr console_ep, const uint8_t dst_ip[4]) {
     uint16_t seq = ++g_ping_next_seq;
     if (seq == 0) seq = ++g_ping_next_seq;
 
@@ -237,11 +249,11 @@ static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     char* data = (char*)icmp + sizeof(icmp_header); data[0] = 'P'; data[1] = 'O'; data[2] = 'N'; data[3] = 'G';
     icmp->checksum = calculate_checksum((void*)icmp, sizeof(icmp_header) + 4);
 
-    sys_puts(root_ep, "[NET DRIVER] ICMP Echo Request to ");
-    put_ip(root_ep, dst_ip);
-    sys_puts(root_ep, ": icmp_seq=");
-    put_dec(root_ep, seq);
-    sys_puts(root_ep, "\n");
+    sys_puts(console_ep, "[NET DRIVER] ICMP Echo Request to ");
+    put_ip(console_ep, dst_ip);
+    sys_puts(console_ep, ": icmp_seq=");
+    put_dec(console_ep, seq);
+    sys_puts(console_ep, "\n");
 
     // ИЗМЕНЕНО: Фиксируем текущий цикл процессора!
     g_ping_sent_loop = g_cpu_loops;
@@ -252,34 +264,34 @@ static void net_send_ping(seL4_CPtr root_ep, const uint8_t dst_ip[4]) {
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(icmp_header) + 4, 0x280);
 }
 
-static void net_schedule_next_ping(seL4_CPtr root_ep) {
+static void net_schedule_next_ping(seL4_CPtr timer_ep) {
     if (g_ping_series_remaining > 0) {
-        g_ping_next_send_ms = sys_get_time_ms(root_ep) + 1000; // Пауза ровно 1 секунда через RTC!
+        g_ping_next_send_ms = sys_get_time_ms(timer_ep) + 1000; // Пауза ровно 1 секунда через RTC!
     } else {
         volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
         net_mailbox[0] = 0; // Готово, разблокируем Shell
     }
 }
 
-static void net_send_next_ping(seL4_CPtr root_ep) {
+static void net_send_next_ping(seL4_CPtr console_ep) {
     if (g_ping_outstanding || g_ping_series_remaining == 0) return;
     g_ping_series_remaining--;
-    net_send_ping(root_ep, g_ping_target_ip);
+    net_send_ping(console_ep, g_ping_target_ip);
 }
 
-static void net_check_ping_send(seL4_CPtr root_ep) {
+static void net_check_ping_send(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     if (g_ping_outstanding || g_ping_series_remaining == 0) return;
-    if (g_ping_next_send_ms == 0 || sys_get_time_ms(root_ep) >= g_ping_next_send_ms) {
+    if (g_ping_next_send_ms == 0 || sys_get_time_ms(timer_ep) >= g_ping_next_send_ms) {
         g_ping_next_send_ms = 0;
-        net_send_next_ping(root_ep);
+        net_send_next_ping(console_ep);
     }
 }
 
-static void net_start_ping_series(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint32_t count) {
+static void net_start_ping_series(seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_t dst_ip[4], uint32_t count) {
     if (count == 0) count = 1; if (count > 16) count = 16;
     for (int i = 0; i < 4; i++) g_ping_target_ip[i] = dst_ip[i];
     g_ping_series_remaining = count; g_ping_outstanding = false; g_ping_next_send_ms = 0;
-    net_check_ping_send(root_ep); // Шлем первый пакет сразу
+    net_check_ping_send(console_ep, timer_ep); // Шлем первый пакет сразу
 }
 
 static void net_record_ping_rtt(uint64_t rtt_us) {
@@ -288,19 +300,19 @@ static void net_record_ping_rtt(uint64_t rtt_us) {
     if (rtt_us > g_ping_max_rtt_us) g_ping_max_rtt_us = rtt_us;
 }
 
-static void net_check_ping_timeout(seL4_CPtr root_ep) {
+static void net_check_ping_timeout(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     if (!g_ping_outstanding) return;
     
     // ИЗМЕНЕНО: Считаем таймаут по количеству циклов драйвера! (~2 секунды = 100 000 циклов)
     uint64_t loops_passed = g_cpu_loops - g_ping_sent_loop;
     if (loops_passed < 100000) return; 
 
-    sys_puts(root_ep, "[NET PING] Request timeout for icmp_seq="); put_dec(root_ep, g_ping_outstanding_seq); sys_puts(root_ep, "\n");
+    sys_puts(console_ep, "[NET PING] Request timeout for icmp_seq="); put_dec(console_ep, g_ping_outstanding_seq); sys_puts(console_ep, "\n");
     g_ping_outstanding = false; g_ping_timeout_count++;
-    net_schedule_next_ping(root_ep);
+    net_schedule_next_ping(timer_ep);
 }
 
-static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
+static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
     volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
     
@@ -333,11 +345,11 @@ static void net_send_udp(seL4_CPtr root_ep, const uint8_t dst_ip[4], uint16_t ds
     char* data = (char*)udp + sizeof(udp_header);
     my_memcpy(data, message, msg_len);
 
-    sys_puts(root_ep, "[NET DRIVER] Firing UDP Datagram to ");
-    put_ip(root_ep, dst_ip);
-    sys_puts(root_ep, ":");
-    put_dec(root_ep, dst_port);
-    sys_puts(root_ep, "...\n");
+    sys_puts(console_ep, "[NET DRIVER] Firing UDP Datagram to ");
+    put_ip(console_ep, dst_ip);
+    sys_puts(console_ep, ":");
+    put_dec(console_ep, dst_port);
+    sys_puts(console_ep, "...\n");
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + my_strlen(message), 0x280);
     volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
     net_mailbox[0] = 0;
@@ -382,7 +394,7 @@ static int dns_format_name(char* dst, const char* src) {
     return pos + 2;
 }
 
-static void net_send_dns_query(seL4_CPtr root_ep, const char* domain) {
+static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
     uint32_t tx_offset = 0x280;  // Возвращаем проверенное смещение
     uintptr_t base_vaddr = 0x502000;
 
@@ -431,16 +443,16 @@ static void net_send_dns_query(seL4_CPtr root_ep, const char* domain) {
 
     uint32_t virtio_packet_len = sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + total_udp_len;
 
-    sys_puts(root_ep, "[NET] Sending DNS Query (");
-    put_dec(root_ep, virtio_packet_len);
-    sys_puts(root_ep, " bytes) directly to 8.8.8.8...\n");
+    sys_puts(console_ep, "[NET] Sending DNS Query (");
+    put_dec(console_ep, virtio_packet_len);
+    sys_puts(console_ep, " bytes) directly to 8.8.8.8...\n");
 
     net_send_packet(virtio_packet_len, tx_offset);
 
     g_dns_outstanding = true;
 }
 
-static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
+static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr net_cmd_ep) {
     if (net_cmd_ep == 0) return;
 
     seL4_Word sender_badge = 0;
@@ -459,16 +471,16 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
         if (count == 0) count = 1;
         if (count > 16) count = 16;
 
-        sys_puts(root_ep, "[NET DRIVER] Shell requested ICMP Ping x");
-        put_dec(root_ep, count);
-        sys_puts(root_ep, ".\n");
+        sys_puts(console_ep, "[NET DRIVER] Shell requested ICMP Ping x");
+        put_dec(console_ep, count);
+        sys_puts(console_ep, ".\n");
         if (have_router_mac) {
-            net_start_ping_series(root_ep, dst_ip, count);
+            net_start_ping_series(console_ep, timer_ep, dst_ip, count);
         } else {
             for (int i = 0; i < 4; i++) pending_ip[i] = dst_ip[i];
             pending_ping_count = count;
             pending_cmd = NET_CMD_PING;
-            net_send_arp_request(root_ep);
+            net_send_arp_request(console_ep);
         }
     } else if (cmd == NET_CMD_SEND && len >= 4) {
         uint8_t dst_ip[4];
@@ -483,52 +495,52 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
             for (int i = 0; i < 4; i++) dst_ip[i] = default_udp_ip[i];
         }
 
-        sys_puts(root_ep, "[NET DRIVER] Shell requested UDP send.\n");
+        sys_puts(console_ep, "[NET DRIVER] Shell requested UDP send.\n");
         if (have_router_mac) {
-            net_send_udp(root_ep, dst_ip, dst_port, msg);
+            net_send_udp(console_ep, dst_ip, dst_port, msg);
         } else {
             for (int i = 0; i < 4; i++) pending_udp_ip[i] = dst_ip[i];
             pending_udp_port = dst_port;
             my_memcpy(pending_udp, msg, my_strlen(msg) + 1);
             pending_cmd = NET_CMD_SEND;
-            net_send_arp_request(root_ep);
+            net_send_arp_request(console_ep);
         }
     } else if (cmd == NET_CMD_STATUS) {
-        sys_puts(root_ep, "[NET DRIVER] Status: virtio=up router_mac=");
+        sys_puts(console_ep, "[NET DRIVER] Status: virtio=up router_mac=");
         if (have_router_mac) {
-            sys_puts(root_ep, "known ");
+            sys_puts(console_ep, "known ");
             for (int i = 0; i < 6; i++) {
-                if (i > 0) sys_puts(root_ep, ":");
-                put_hex_byte(root_ep, router_mac[i]);
+                if (i > 0) sys_puts(console_ep, ":");
+                put_hex_byte(console_ep, router_mac[i]);
             }
         } else {
-            sys_puts(root_ep, "unknown");
+            sys_puts(console_ep, "unknown");
         }
-        sys_puts(root_ep, " tx_idx=");
-        put_dec(root_ep, g_tx_avail_idx);
-        sys_puts(root_ep, " rx_used_idx=");
-        put_dec(root_ep, g_last_rx_used_idx);
-        sys_puts(root_ep, " default_udp=");
-        put_ip(root_ep, default_udp_ip);
-        sys_puts(root_ep, ":");
-        put_dec(root_ep, default_udp_port);
-        sys_puts(root_ep, " ping_sent=");
-        put_dec(root_ep, g_ping_sent_count);
-        sys_puts(root_ep, " ping_reply=");
-        put_dec(root_ep, g_ping_reply_count);
-        sys_puts(root_ep, " ping_timeout=");
-        put_dec(root_ep, g_ping_timeout_count);
+        sys_puts(console_ep, " tx_idx=");
+        put_dec(console_ep, g_tx_avail_idx);
+        sys_puts(console_ep, " rx_used_idx=");
+        put_dec(console_ep, g_last_rx_used_idx);
+        sys_puts(console_ep, " default_udp=");
+        put_ip(console_ep, default_udp_ip);
+        sys_puts(console_ep, ":");
+        put_dec(console_ep, default_udp_port);
+        sys_puts(console_ep, " ping_sent=");
+        put_dec(console_ep, g_ping_sent_count);
+        sys_puts(console_ep, " ping_reply=");
+        put_dec(console_ep, g_ping_reply_count);
+        sys_puts(console_ep, " ping_timeout=");
+        put_dec(console_ep, g_ping_timeout_count);
         if (g_ping_reply_count > 0) {
-            sys_puts(root_ep, " rtt_last=");
-            put_duration_us(root_ep, g_ping_last_rtt_us);
-            sys_puts(root_ep, " rtt_avg=");
-            put_duration_us(root_ep, g_ping_total_rtt_us / g_ping_reply_count);
-            sys_puts(root_ep, " rtt_min=");
-            put_duration_us(root_ep, g_ping_min_rtt_us);
-            sys_puts(root_ep, " rtt_max=");
-            put_duration_us(root_ep, g_ping_max_rtt_us);
+            sys_puts(console_ep, " rtt_last=");
+            put_duration_us(console_ep, g_ping_last_rtt_us);
+            sys_puts(console_ep, " rtt_avg=");
+            put_duration_us(console_ep, g_ping_total_rtt_us / g_ping_reply_count);
+            sys_puts(console_ep, " rtt_min=");
+            put_duration_us(console_ep, g_ping_min_rtt_us);
+            sys_puts(console_ep, " rtt_max=");
+            put_duration_us(console_ep, g_ping_max_rtt_us);
         }
-        sys_puts(root_ep, "\n");
+        sys_puts(console_ep, "\n");
         volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
         net_mailbox[0] = 0;
 
@@ -537,18 +549,18 @@ static void net_handle_command(seL4_CPtr root_ep, seL4_CPtr net_cmd_ep) {
         copy_text_from_mrs(g_dns_pending_domain, sizeof(g_dns_pending_domain), text_len, len);
         
         if (have_router_mac) {
-            net_send_dns_query(root_ep, g_dns_pending_domain);
+            net_send_dns_query(console_ep, g_dns_pending_domain);
         } else {
             pending_cmd = NET_CMD_RESOLVE;
-            net_send_arp_request(root_ep);
+            net_send_arp_request(console_ep);
         }
 
     } else {
-        sys_puts(root_ep, "[NET DRIVER] Unknown Shell command.\n");
+        sys_puts(console_ep, "[NET DRIVER] Unknown Shell command.\n");
     }
 }
 
-static void net_poll(seL4_CPtr root_ep) {
+static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(0x502000 + 0x2040);
     volatile virtq_used_rx* rx_used = (volatile virtq_used_rx*)(0x502000 + 0x2080);
 
@@ -562,21 +574,21 @@ static void net_poll(seL4_CPtr root_ep) {
         if (type == 0x0806) { // ARP
             volatile arp_ipv4* arp_reply = (volatile arp_ipv4*)eth->payload;
             if (htons(arp_reply->oper) == 2 && !have_router_mac) { 
-                sys_puts(root_ep, ">>> [NET RX] ARP Reply Received! Saving Router MAC.\n");
+                sys_puts(console_ep, ">>> [NET RX] ARP Reply Received! Saving Router MAC.\n");
                 for(int i=0; i<6; i++) router_mac[i] = arp_reply->sha[i];
                 have_router_mac = true;
 
                 if (pending_cmd == NET_CMD_RESOLVE) {
-                    sys_puts(root_ep, "[NET] ARP ready. Launching DNS Query...\n");
+                    sys_puts(console_ep, "[NET] ARP ready. Launching DNS Query...\n");
                     pending_cmd = NET_CMD_NONE;
-                    net_send_dns_query(root_ep, g_dns_pending_domain); 
+                    net_send_dns_query(console_ep, g_dns_pending_domain); 
                 } 
                 else if (pending_cmd == NET_CMD_PING) {
                     uint32_t count = pending_ping_count;
                     pending_cmd = NET_CMD_NONE;
-                    net_start_ping_series(root_ep, pending_ip, count);
+                    net_start_ping_series(console_ep, timer_ep, pending_ip, count);
                 } else if (pending_cmd == NET_CMD_SEND) {
-                    net_send_udp(root_ep, pending_udp_ip, pending_udp_port, pending_udp);
+                    net_send_udp(console_ep, pending_udp_ip, pending_udp_port, pending_udp);
                     pending_cmd = NET_CMD_NONE;
                 }
             }
@@ -598,19 +610,19 @@ static void net_poll(seL4_CPtr root_ep) {
                     uint8_t src_ip[4];
                     for (int i = 0; i < 4; i++) src_ip[i] = ip->saddr[i];
 
-                    sys_puts(root_ep, "[NET PING] "); put_dec(root_ep, icmp_bytes);
-                    sys_puts(root_ep, " bytes from "); put_ip(root_ep, src_ip);
-                    sys_puts(root_ep, ": icmp_seq="); put_dec(root_ep, seq);
-                    sys_puts(root_ep, " ttl="); put_dec(root_ep, ip->ttl);
-                    sys_puts(root_ep, " time=");
-                    if (matched) put_duration_us(root_ep, rtt_us); else sys_puts(root_ep, "unknown");
-                    if (!matched) sys_puts(root_ep, " late/unmatched");
-                    sys_puts(root_ep, "\n");
+                    sys_puts(console_ep, "[NET PING] "); put_dec(console_ep, icmp_bytes);
+                    sys_puts(console_ep, " bytes from "); put_ip(console_ep, src_ip);
+                    sys_puts(console_ep, ": icmp_seq="); put_dec(console_ep, seq);
+                    sys_puts(console_ep, " ttl="); put_dec(console_ep, ip->ttl);
+                    sys_puts(console_ep, " time=");
+                    if (matched) put_duration_us(console_ep, rtt_us); else sys_puts(console_ep, "unknown");
+                    if (!matched) sys_puts(console_ep, " late/unmatched");
+                    sys_puts(console_ep, "\n");
 
                     if (matched) {
                         g_ping_outstanding = false;
                         net_record_ping_rtt(rtt_us);
-                        net_schedule_next_ping(root_ep);
+                        net_schedule_next_ping(timer_ep);
                     }
                 }
             }
@@ -619,7 +631,7 @@ static void net_poll(seL4_CPtr root_ep) {
                 volatile udp_header* udp = (volatile udp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);
 
                 if (htons(udp->src_port) == 53) {
-                    sys_puts(root_ep, ">>> [NET RX] UDP Response from Port 53 captured!\n");
+                    sys_puts(console_ep, ">>> [NET RX] UDP Response from Port 53 captured!\n");
                     
                     volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
                     
@@ -635,8 +647,8 @@ static void net_poll(seL4_CPtr root_ep) {
                         if (data_len == 4) { // Это точно IPv4 адрес!
                             uint8_t resolved_ip[4] = {reader[0], reader[1], reader[2], reader[3]};
                             
-                            sys_puts(root_ep, ">>> [NET RX] DNS SUCCESS: ");
-                            put_ip(root_ep, resolved_ip); sys_puts(root_ep, "\n");
+                            sys_puts(console_ep, ">>> [NET RX] DNS SUCCESS: ");
+                            put_ip(console_ep, resolved_ip); sys_puts(console_ep, "\n");
 
                             seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) | 
                                                 (resolved_ip[2] << 8) | resolved_ip[3];
@@ -646,11 +658,11 @@ static void net_poll(seL4_CPtr root_ep) {
                             net_mailbox[0] = 0;
                             g_dns_outstanding = false;
                         } else {
-                            sys_puts(root_ep, ">>> [NET RX] DNS Error: Unexpected data_len (CNAME?). Length=");
-                            put_dec(root_ep, data_len); sys_puts(root_ep, "\n");
+                            sys_puts(console_ep, ">>> [NET RX] DNS Error: Unexpected data_len (CNAME?). Length=");
+                            put_dec(console_ep, data_len); sys_puts(console_ep, "\n");
                         }
                     } else {
-                        sys_puts(root_ep, ">>> [NET RX] DNS Ignored: ID mismatch or 0 answers.\n");
+                        sys_puts(console_ep, ">>> [NET RX] DNS Ignored: ID mismatch or 0 answers.\n");
                     }
                 }
             } // Конец проверки UDP
@@ -664,12 +676,21 @@ static void net_poll(seL4_CPtr root_ep) {
     }
 }
 
-extern "C" void __sel4_start_c(void) {
-    seL4_Word fake_tls_base = 0x501800; asm volatile("msr tpidr_el0, %0" :: "r"(fake_tls_base));
-    __sel4_ipc_buffer = (seL4_IPCBuffer*)0x501000; seL4_CPtr root_ep = __sel4_ipc_buffer->userData;
-    seL4_CPtr net_cmd_ep = __sel4_ipc_buffer->caps_or_badges[2];
+int main(void) {
+    seL4_Word tls_addr;
+    // 1. Безопасно читаем аппаратный регистр TLS (он указывает на +3072)
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    
+    // 2. Вычитаем 1024 байта, чтобы попасть на реальный seL4_IPCBuffer (+2048)
+    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
+    seL4_SetIPCBuffer(ipc);
 
-    sys_puts(root_ep, "\n[NET DRIVER] Network Server Online!\n");
+    seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
+    seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];
+    seL4_CPtr net_cmd_ep = ipc->msg[BOOT_NET_EP];
+    seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
+
+    sys_puts(console_ep, "\n[NET DRIVER] Network Server Online!\n");
     uintptr_t base_addr = 0;
     for (int i = 0; i < 32; i++) {
         uintptr_t slot_addr = 0x200004000ULL + (i * 0x200);
@@ -694,7 +715,7 @@ extern "C" void __sel4_start_c(void) {
 
         g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (0x60000000 + 0x200) / 64; 
         g_net_regs->status |= 8; g_net_regs->status |= 4; 
-        sys_puts(root_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized. Waiting for Shell commands.\n");
+        sys_puts(console_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized. Waiting for Shell commands.\n");
         g_net_regs->queue_notify = 0; 
         for(volatile int i=0; i<10000000; i++); 
     }
@@ -702,11 +723,13 @@ extern "C" void __sel4_start_c(void) {
     while(1) {
         g_cpu_loops++;
         if (g_net_regs) {
-            net_poll(root_ep);
-            net_handle_command(root_ep, net_cmd_ep);
-            net_check_ping_timeout(root_ep);
-            net_check_ping_send(root_ep);
+            net_poll(console_ep, timer_ep);
+            net_handle_command(console_ep, timer_ep, net_cmd_ep);
+            net_check_ping_timeout(console_ep, timer_ep);
+            net_check_ping_send(console_ep, timer_ep);
         }
         seL4_Yield();
-    } 
+    }
+
+    return 0;
 }
