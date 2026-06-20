@@ -140,10 +140,9 @@ static int next_pid = 1;
 static seL4_CPtr alloc_and_track_cap(PsychAllocator &alloc, ProcessControlBlock &pcb) {
     seL4_CPtr cap = alloc.alloc_slot();
     
-    // ДОБАВЛЕНО: Жесткая защита от попытки использовать Null Cap (Слот 0)
     if (cap == 0) {
         uart_puts("KERNEL PANIC: Out of CSlots during process allocation!\n");
-        while(1); // Останавливаем систему до попытки вызвать seL4_Untyped_Retype
+        while(1);
     }
 
     if (pcb.cap_tracker.count < 64) {
@@ -211,7 +210,6 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_Word local_net_recv_ep = 5;
     seL4_Word local_syscall_ep  = 10; // <-- Локальный индекс для Faults и Syscalls
 
-    // КРИТИЧНО: Копируем глобальный badged_ep внутрь песочницы!
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
     // ИСПРАВЛЕНО: Упрощена и исправлена логика копирования. Теперь она зависит от аргументов, а не от PCB.
@@ -360,7 +358,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
         child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
         child_ipc_ptr->msg[BOOT_NET_EP] = local_net_send_ep;
     }
-    // ===================================================================
+
     seL4_ARM_Page_Clean_Data(ipc_frame, 0, 4096);
     
     check_err(seL4_ARM_Page_Unmap(ipc_frame), "Unmap IPC from Root");
@@ -383,15 +381,23 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_CPtr tcb = alloc_and_track_cap(alloc, pcb);
     pcb.tcb = tcb;
     pcb.vspace = child_vspace;
-
     seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1);
-    // Создаем Guard для 8-битного CNode
-    // --- Конфигурация TCB ---
+
     seL4_Word cspace_guard = seL4_CNode_CapData_new(0, seL4_WordBits - 8).words[0];
     
-    // ВАЖНО: Передаем local_syscall_ep (10), а не глобальный badged_ep!
-    // ИСПРАВЛЕНИЕ: Заменил ipc_vaddr на child_ipc
-    seL4_TCB_Configure(tcb, local_syscall_ep, child_cnode, cspace_guard, child_vspace, seL4_NilData, child_ipc + 2048, ipc_frame);
+    seL4_TCB_Configure(
+        tcb, 
+        local_syscall_ep, // <-- Вернули как было
+        child_cnode, 
+        cspace_guard, 
+        child_vspace, 
+        seL4_NilData, 
+        child_ipc + 2048, 
+        ipc_frame
+    );
+    
+    seL4_TCB_Configure(tcb, 100, child_cnode, cspace_guard, child_vspace, seL4_NilData, child_ipc + 2048, ipc_frame);
+
     seL4_UserContext regs = {0};
     regs.pc = entry_point;
     regs.sp = child_stack + 4096;
@@ -427,7 +433,6 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     uart_puts("\n[WATCHDOG] Emergency recovery initiated for PID: "); uart_putdec(pid);
     uart_puts(" ("); uart_puts(meta.name); uart_puts(")\n");
 
-    // 2. Освобождаем потоки, заблокированные на sys_wait для этого PID (например, Shell)
     for (int i = 1; i < 256; i++) {
         if (pcbs[i].active && pcbs[i].waiting_for == pid) { 
             pcbs[i].waiting_for = 0;
@@ -439,7 +444,6 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         }
     }
     
-    // 3. Полная изоляция и уничтожение старых Capabilities в архитектуре seL4
     if (pcbs[pid].tcb) {
         seL4_TCB_Suspend(pcbs[pid].tcb);
         if (pcbs[pid].irq_ntfn != 0) {
@@ -447,7 +451,6 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         }
     }
 
-    // ИСПРАВЛЕНО: Уничтожаем ВСЕ capabilities, связанные с процессом, чтобы избежать утечки CSlot.
     for (int i = 0; i < pcbs[pid].cap_tracker.count; i++) {
         bool is_thread = (strncmp(pcbs[pid].name, "shell_thread", 12) == 0);
         if (is_thread && pcbs[pid].cap_tracker.caps[i] == pcbs[pid].vspace) continue;
@@ -461,10 +464,8 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         alloc.free(cap_to_free);
     }
     
-    // ДОБАВЛЕНО: Сбрасываем счетчик трекера после очистки
     pcbs[pid].cap_tracker.count = 0;
 
-    // 4. Критерий системного компонента: перезапускаем только системные драйверы и Shell.
     if (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
         
@@ -547,7 +548,7 @@ int main(int argc, char *argv[]) {
     alloc_device_frame(info, alloc, 0x60002000, root_cnode);
     alloc_device_frame(info, alloc, 0x60003000, root_cnode);
     
-    uintptr_t root_shm  = 0x200006000ULL;
+    uintptr_t root_shm  = 0x502000;
     for (int i = 0; i < 4; i++) {
         seL4_ARM_Page_Map(shm_frame_root + i, root_vspace, root_shm + (i * 4096), seL4_AllRights, seL4_ARM_Default_VMAttributes);
     }
@@ -595,7 +596,6 @@ int main(int argc, char *argv[]) {
                       2, console_ep, timer_ep, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
-
 
     // Запускаем Драйвер Диска и ФС (is_driver = 3)
     if (spawn_process("blk_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
@@ -779,7 +779,7 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_DOCTOR: {
-                char *shm = (char*)0x200006000ULL; 
+                char *shm = (char*)0x502000; 
                 uart_puts("\n[DOCTOR] Patient wrote in SHM: \"");
                 uart_puts(shm);
                 uart_puts("\"\n");
@@ -834,10 +834,7 @@ int main(int argc, char *argv[]) {
                 if (clone_temp_vaddr >= 0x2001F0000ULL) clone_temp_vaddr = 0x2001C0000ULL; // Сброс
                 
                 seL4_ARM_Page_Map(ipc_frame, root_vspace, temp_window, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-                
                 memset((void*)temp_window, 0, 4096);
-                
-                // Тот самый критический сдвиг на 2048 байт!
                 seL4_IPCBuffer *child_ipc_ptr = (seL4_IPCBuffer *)(temp_window + 2048);
                 
                 child_ipc_ptr->msg[BOOT_ROOT_EP] = local_thread_fault_ep;
@@ -938,7 +935,7 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_EXEC: {
-                char* shm_args = (char*)0x200006000ULL; 
+                char* shm_args = (char*)0x502000; 
                 
                 char safe_args[256];
                 strncpy(safe_args, shm_args, sizeof(safe_args) - 1);
@@ -957,7 +954,7 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_PS: {
-                char *shm = (char*)0x200006000ULL;
+                char *shm = (char*)0x502000;
                 int offset = 0;
                 
                 strcpy(shm, "  PID STATUS    NAME\n");
@@ -1081,7 +1078,7 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_RECOVER: {
-                char *shm = (char*)0x200006000ULL;
+                char *shm = (char*)0x502000;
                 char driver_name[32];
                 strncpy(driver_name, shm, 31); driver_name[31] = '\0';
 

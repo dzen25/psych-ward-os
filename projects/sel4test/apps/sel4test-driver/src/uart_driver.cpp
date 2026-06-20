@@ -1,21 +1,20 @@
 #include <sel4/sel4.h>
 #include "common.h"
+
 static inline seL4_IPCBuffer* get_local_ipc() {
-    seL4_Word ipc_addr;
-    // Безопасное чтение аппаратного регистра потока в AArch64
-    asm volatile("mrs %0, tpidr_el0" : "=r"(ipc_addr));
-    return (seL4_IPCBuffer*)ipc_addr;
+    seL4_Word tls_addr;
+    // Добавлена буква 'ro'. crt0 не мог его стереть!
+    asm volatile("mrs %0, tpidrro_el0" : "=r"(tls_addr)); 
+    return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
 
-int main(void) {
-    seL4_Word tls_addr;
-    // 1. Безопасно читаем аппаратный регистр TLS (он указывает на +3072)
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+int main(int argc, char *argv[]) {
+    // 2. Достаем настоящий адрес буфера
+    seL4_IPCBuffer *ipc = get_local_ipc();
     
-    // 2. Вычитаем 1024 байта, чтобы попасть на реальный seL4_IPCBuffer (+2048)
-    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
+    // 3. Отдаем его libsel4 (теперь её TLS инициализирован, и она сохранит его куда надо)
     seL4_SetIPCBuffer(ipc);
 
     // 2. Теперь безопасно получаем root_ep

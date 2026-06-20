@@ -11,7 +11,8 @@ static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return 
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    // Добавлена буква 'ro'. crt0 не мог его стереть!
+    asm volatile("mrs %0, tpidrro_el0" : "=r"(tls_addr)); 
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
@@ -676,19 +677,22 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     }
 }
 
-int main(void) {
-    seL4_Word tls_addr;
-    // 1. Безопасно читаем аппаратный регистр TLS (он указывает на +3072)
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+int main(int argc, char *argv[]) {
+    // 2. Достаем настоящий адрес буфера
+    seL4_IPCBuffer *ipc = get_local_ipc();
     
-    // 2. Вычитаем 1024 байта, чтобы попасть на реальный seL4_IPCBuffer (+2048)
-    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
+    // 3. Отдаем его libsel4 (теперь её TLS инициализирован, и она сохранит его куда надо)
     seL4_SetIPCBuffer(ipc);
 
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];
     seL4_CPtr net_cmd_ep = ipc->msg[BOOT_NET_EP];
     seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
+    seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];
+
+    if (my_ep == 0) {
+        __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
+    }
 
     sys_puts(console_ep, "\n[NET DRIVER] Network Server Online!\n");
     uintptr_t base_addr = 0;

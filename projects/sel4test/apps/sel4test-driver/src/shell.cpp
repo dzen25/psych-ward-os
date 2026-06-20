@@ -15,12 +15,11 @@ void vfs_unlock() {
     __sync_lock_release(vfs_spinlock_ptr);
 }
 
-
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    asm volatile("mrs %0, tpidrro_el0" : "=r"(tls_addr)); 
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
@@ -171,8 +170,6 @@ static void sys_puts_direct(seL4_CPtr console_ep, const char *str) {
     }
     seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
 }
-
-
 
 struct ThreadArgs {
     void (*func)(void*);
@@ -365,30 +362,32 @@ static void ls_thread_func(void* arg) {
 }
 
 // --- Точка входа ---
-int main(void) {
-    seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+int main(int argc, char *argv[]) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
     
-    // Инициализируем библиотеку корректным адресом
-    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
     seL4_SetIPCBuffer(ipc);
 
     // 2. Теперь безопасно получаем root_ep
-    seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];  // Локальный эндпоинт ядра для сисколлов (SYS_CLONE, SYS_EXEC)
-    seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];  // Локальный дескриптор консоли (всегда равен 1)
-    seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];  // Локальный дескриптор таймера (всегда равен 2)
-    seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];  // Локальный дескриптор сети (всегда равен 3)
+    seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];  
+    seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP]; 
+    seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];  
+    seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];        
+    seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];
+
+    if (my_ep == 0) {
+        __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
+    }
 
     my_strcpy(arg_buffer, (char*)&ipc->msg[0]);
 
-    int argc = 1;
-    char *argv[16];
-    argv[0] = (char*)"shell";
+    int cmd_argc = 1;
+    char *cmd_argv[16];
+    cmd_argv[0] = (char*)"shell";
     
     char *cmd_args = arg_buffer; 
     
     if (cmd_args[0] != '\0') {
-        argv[argc++] = cmd_args;
+        cmd_argv[cmd_argc++] = cmd_args;
         
         while (*cmd_args) {
             if (*cmd_args == ' ') {
@@ -397,34 +396,35 @@ int main(void) {
                 while (*(cmd_args + 1) == ' ') cmd_args++;
                 
                 if (*(cmd_args + 1) != '\0') {
-                    argv[argc++] = cmd_args + 1;
+                    cmd_argv[cmd_argc++] = cmd_args + 1;
                 }
             }
             cmd_args++;
-            if (argc >= 15) break;
+            if (cmd_argc >= 15) break;
         }
     }
-    argv[argc] = nullptr;
+    cmd_argv[cmd_argc] = nullptr;
     
     sys_puts(console_ep, "\n======================================================\n");
     sys_puts(console_ep, "  TRUE MICROKERNEL: ALL MODULES ONLINE & FUNCTIONAL!  \n");
     sys_puts(console_ep, "======================================================\n\n");
 
-    // Демонстрация: выводим полученные аргументы
-    if (argc > 1) {
+    // 4. Демонстрация (заменено на cmd_argc/cmd_argv)
+    if (cmd_argc > 1) {
         sys_puts(console_ep, "[Shell Init] Started with arguments:\n");
-        for (int j = 0; j < argc; j++) {
+        for (int j = 0; j < cmd_argc; j++) {
             sys_puts(console_ep, "  argv[");
             char buf[2] = {(char)(j + '0'), 0}; sys_puts(console_ep, buf);
             sys_puts(console_ep, "] = ");
-            sys_puts(console_ep, argv[j]);
+            sys_puts(console_ep, cmd_argv[j]);
             sys_puts(console_ep, "\n");
         }
     }
 
+    // 5. Парсинг флагов (заменено на cmd_argc/cmd_argv)
     bool is_daemon = false;
-    for (int j = 1; j < argc; j++) {
-        if (my_strcmp(argv[j], "--daemon") == 0) {
+    for (int j = 1; j < cmd_argc; j++) {
+        if (my_strcmp(cmd_argv[j], "--daemon") == 0) {
             is_daemon = true;
             break;
         }
@@ -433,8 +433,7 @@ int main(void) {
     if (is_daemon) {
         sys_puts(console_ep, "[Daemon] Mode engaged. TTY input disabled.\n");
         int ticks = 0;
-        // Фоновый цикл: делаем "полезную работу" (например, стучим в лог каждые 10 сек)
-        // ВАЖНО: Мы НЕ вызываем sys_read(), поэтому TTY остается свободен!
+
         while (1) {
             sys_sleep(timer_ep, 10000);
             sys_puts(console_ep, "\n[Daemon] Heartbeat tick: ");
@@ -449,9 +448,7 @@ int main(void) {
     // Запрашиваем свой PID у Rootserver'а
     int my_pid = sys_getpid(root_ep);
     
-    // --- Оригинальный интерактивный цикл (для Foreground) ---
     while (1) {
-        // 1. Формируем динамический промпт локально в буфере
         char prompt[128];
         my_strcpy(prompt, "sandbox[");
         

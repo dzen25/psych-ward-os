@@ -4,7 +4,7 @@
 
 #define VIRTIO_MMIO_BASE 0x200004000ULL
 
-// ИСПРАВЛЕНО: Абстракция хардкода памяти.
+
 // В будущем эти адреса должны получаться через BootInfo
 #define VFS_SHM_VIRT_BASE 0x502000ULL
 #define VFS_SHM_PHYS_BASE 0x60000000ULL // Только для DMA дескрипторов Virtio
@@ -43,7 +43,8 @@ static void my_memset(void *s, int c, int n) {
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    // Добавлена буква 'ro'. crt0 не мог его стереть!
+    asm volatile("mrs %0, tpidrro_el0" : "=r"(tls_addr)); 
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
@@ -282,18 +283,21 @@ static void put_hex(seL4_CPtr console_ep, uint32_t val) {
 // ==========================================
 // ГЛАВНАЯ ФУНКЦИЯ БЛОЧНОГО ДРАЙВЕРА
 // ==========================================
-int main(void) {
-    seL4_Word tls_addr;
-    // 1. Безопасно читаем аппаратный регистр TLS (он указывает на +3072)
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+int main(int argc, char *argv[]) {
+    // 2. Достаем настоящий адрес буфера
+    seL4_IPCBuffer *ipc = get_local_ipc();
     
-    // 2. Вычитаем 1024 байта, чтобы попасть на реальный seL4_IPCBuffer (+2048)
-    seL4_IPCBuffer *ipc = (seL4_IPCBuffer*)(tls_addr - 1024);
+    // 3. Отдаем его libsel4 (теперь её TLS инициализирован, и она сохранит его куда надо)
     seL4_SetIPCBuffer(ipc);
 
     // 2. Теперь безопасно получаем root_ep
-    seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
-    seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
+    seL4_CPtr root_ep       = ipc->msg[BOOT_ROOT_EP];
+    seL4_CPtr console_ep    = ipc->msg[BOOT_CONSOLE_EP];
+    seL4_CPtr my_ep         = ipc->msg[BOOT_TIMER_EP];
+
+    if (my_ep == 0) {
+        __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
+    }
 
     sys_puts(console_ep, "\n[BLK DRIVER] VFS & FAT32 Server Online!\n");
 
@@ -339,11 +343,11 @@ int main(void) {
     g_disk_regs->status |= 8; 
 
     // Настраиваем очередь команд (Virtqueue 0)
-    g_disk_regs->guest_page_size = 64; 
+    g_disk_regs->guest_page_size = 4096;
     g_disk_regs->queue_sel = 0;
     g_disk_regs->queue_num = 16;       
     g_disk_regs->queue_align = 64;
-    g_disk_regs->queue_pfn = (VFS_SHM_PHYS_BASE + 0x400) / 64;
+    g_disk_regs->queue_pfn = (VFS_SHM_PHYS_BASE + 0x400) / 4096;
     g_disk_regs->status |= 4; // DRIVER_OK
 
     // ==========================================
@@ -434,9 +438,14 @@ int main(void) {
                 }
 
                 case 110: { // SYS_LS
+                    sys_puts(console_ep, "[BLK] LS command received\n");
                     char *shm = (char*)VFS_SHM_VIRT_BASE;
                     char target_dir[64];
                     strcpy(target_dir, shm);
+
+                    char dbg[128];
+                    sprintf(dbg, "[BLK] path='%s'\n", shm);
+                    sys_puts(console_ep, dbg);
                     
                     // Добавляем слэш на конец пути (если это не корень), чтобы корректно фильтровать подпапки
                     int t_len = strlen(target_dir);
