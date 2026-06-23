@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include "pipe.h"
 
+#define BOOT_BLK_EP 7
+
 static volatile int* vfs_spinlock_ptr = (volatile int*)(0x502000 + 4084 - 16);
 
 void vfs_lock() {
@@ -23,17 +25,25 @@ static inline seL4_IPCBuffer* get_local_ipc() {
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
-// Пример правильного sys_puts для драйвера:
+// Единая защищенная функция вывода
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
-    int len = 0;
-    while(str[len]) len++;
+    int total_len = 0;
+    while(str[total_len]) total_len++;
     
-    ipc->msg[0] = 8; // SYS_PUTS
-    for (int i = 0; i < len; i++) {
-        ipc->msg[i + 1] = str[i];
+    int offset = 0;
+    while (offset < total_len) {
+        int chunk = total_len - offset;
+        // Строгий лимит IPC Message Registers для ARM64 (оставляем запас безопасности)
+        if (chunk > 100) chunk = 100; 
+        
+        ipc->msg[0] = 8; // SYS_PUTS ID
+        for (int i = 0; i < chunk; i++) {
+            ipc->msg[i + 1] = str[offset + i];
+        }
+        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        offset += chunk;
     }
-    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
 }
 
 static void my_strcpy(char *dest, const char *src) {
@@ -44,6 +54,12 @@ static void my_strcpy(char *dest, const char *src) {
 
 static int my_strcmp(const char *s1, const char *s2) { 
     while (*s1 && (*s1 == *s2)) { s1++; s2++; } return *(const unsigned char*)s1 - *(const unsigned char*)s2; 
+}
+
+static int my_strncmp(const char *s1, const char *s2, int n) {
+    while (n && *s1 && (*s1 == *s2)) { s1++; s2++; n--; }
+    if (n == 0) return 0;
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
 static seL4_Word my_strlen(const char *s) {
@@ -157,25 +173,8 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
     seL4_Yield();
 }
 
-static void sys_puts_direct(seL4_CPtr console_ep, const char *str) {
-    seL4_IPCBuffer *ipc = get_local_ipc();
-    // Пишем строку в MR регистры IPC буфера
-    seL4_Word len = my_strlen(str);
-    if (len > 40) len = 40; // Ограничение на размер одного сообщения в регистрах
-
-    // По спецификации твоей ОС, SYS_PUTS подготавливает данные в буфере
-    ipc->msg[0] = 8; // SYS_PUTS ID
-    for (seL4_Word i = 0; i < len; i++) {
-        ipc->msg[i + 1] = str[i];
-    }
-    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
-}
-
-struct ThreadArgs {
-    void (*func)(void*);
-    seL4_CPtr timer_ep;
-    seL4_CPtr console_ep;
-};
+// Алиас для обратной совместимости (чтобы не переписывать логику grep)
+#define sys_puts_direct sys_puts
 
 static void sys_thread_exit() {
     // 1. Получаем безопасный указатель на буфер текущего потока
@@ -189,31 +188,18 @@ static void sys_thread_exit() {
     while(1) seL4_Yield(); // Сюда выполнение никогда не дойдет
 }
 
-static void internal_thread_wrapper(void* raw_args) {
-    seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
-    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
-
-    ThreadArgs* args = (ThreadArgs*)raw_args;
-    args->func(raw_args); 
-    sys_thread_exit();
-}
-
-static int spawn_thread(void (*func)(void*), seL4_CPtr timer, seL4_CPtr console) {
-    // 2. Сдвигаем ThreadArgs на 2 КБ вперед, чтобы не затереть путь VFS в начале SHM
-    ThreadArgs* args = (ThreadArgs*)(0x502000 + 2048); 
-    args->func = func;
-    args->timer_ep = timer;
-    args->console_ep = console;
-    
+static int spawn_thread(void (*func)(seL4_CPtr, seL4_CPtr, seL4_CPtr), seL4_CPtr timer, seL4_CPtr console, seL4_CPtr blk_ep) {
     // Динамически берем Root Endpoint для сисколлов из нашего легитимного TLS
     seL4_CPtr my_root_syscall_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
 
     get_local_ipc()->msg[0] = 101; // SYS_CLONE
-    get_local_ipc()->msg[1] = (seL4_Word)internal_thread_wrapper;
-    get_local_ipc()->msg[2] = (seL4_Word)args;
+    // ИСПРАВЛЕНО: Передаем аргументы через регистры, а не через уязвимую SHM
+    get_local_ipc()->msg[1] = (seL4_Word)func;
+    get_local_ipc()->msg[2] = timer;
+    get_local_ipc()->msg[3] = console;
+    get_local_ipc()->msg[4] = blk_ep;
     
-    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 3);
+    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 5);
     // Делаем сисколл к ядру через наш локальный root эндпоинт
     seL4_Call(my_root_syscall_ep, info);
     
@@ -312,53 +298,37 @@ static void build_absolute_path(char* target, const char* arg) {
     my_strcpy(target + my_strlen(target), arg);
 }
 
-static int vfs_syscall(int syscall_num, seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
+static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
     vfs_lock();
-    volatile int* mailbox = (volatile int*)(0x502000 + 4084 - 12); // blk_driver mailbox
-    mailbox[2] = 0; // Сбрасываем флаг готовности
-    mailbox[0] = syscall_num; // Кладем команду в ящик
     
-    int elapsed = 0;
-    // Ждем пока драйвер диска ответит, но не дольше timeout_ms
-    while (mailbox[2] == 0 && elapsed < timeout_ms) {
-        // Временно освобождаем лок, чтобы другие потоки могли работать, пока мы ждем
-        vfs_unlock();
-        sys_sleep(timer_ep, 100);
-        elapsed += 100;
-        vfs_lock(); // Снова захватываем лок перед проверкой условия
-    }
+    seL4_SetMR(0, syscall_num);
+    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 1);
+    seL4_Call(blk_ep, info);
     
-    if (mailbox[2] == 0) {
-        sys_puts_direct(console_ep, "\n[SHELL] Error: Disk/VFS operation timed out (");
-        char buf[10]; int s = timeout_ms / 1000, j = 0;
-        if (s == 0) buf[j++] = '0';
-        while(s > 0) { buf[j++] = (s % 10) + '0'; s /= 10; }
-        while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts_direct(console_ep, c); }
-        sys_puts_direct(console_ep, "s). Unblocking shell.\n");
-        mailbox[2] = 1; // Насильно снимаем блокировку
-        
-        // НОВОЕ: Перезапуск зависшего дискового драйвера!
-        sys_puts_direct(console_ep, "[SHELL] Initiating emergency recovery for blk_driver...\n");
-        sys_recover("blk_driver");
-        
-        return -1; 
-    }
-    
-    int ret_val = mailbox[1]; // Нормальный возврат статуса
+    int ret_val = seL4_GetMR(0);
     vfs_unlock();
     return ret_val;
 }
 
-static void ls_thread_func(void* arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    seL4_CPtr console_ep = args->console_ep;
-    seL4_CPtr timer_ep = args->timer_ep;
+static void ls_thread_func(seL4_CPtr timer_ep, seL4_CPtr console_ep, seL4_CPtr blk_ep) {
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
+    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
     
     char *shm = (char*)0x502000;
-    vfs_syscall(110, console_ep, timer_ep, 2000); 
-    sys_puts(console_ep, shm);
+    
+    // 1. Делаем системный вызов к драйверу диска. Результат ляжет в shm.
+    vfs_syscall(110, blk_ep); 
+    
+    // 2. ВМЕСТО прямой печати на экран, перенаправляем вывод в трубу (Pipe)
+    int len = my_strlen(shm);
+    pipe_write(&global_pipe, 0, 0, (uint8_t*)shm, len);
+    
+    // 3. Сообщаем grep'у, что передача окончена
     global_pipe.writer_closed = true;
-    return;
+
+    // 4. Корректно убиваем поток
+    sys_thread_exit();
 }
 
 // --- Точка входа ---
@@ -373,6 +343,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];  
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];        
     seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];
+    seL4_CPtr blk_ep     = ipc->msg[BOOT_BLK_EP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -648,10 +619,10 @@ int main(int argc, char *argv[]) {
                 
                 if (is_piping) { 
                     // Если есть пайп (|), кидаем задачу в фоновый поток
-                    spawn_thread(ls_thread_func, timer_ep, console_ep);
+                    spawn_thread(ls_thread_func, timer_ep, console_ep, blk_ep);
                 } else {
                     // Если пайпа нет, работаем как обычно
-                    vfs_syscall(110, console_ep, timer_ep, 2000); // Таймаут 2 сек
+                    vfs_syscall(110, blk_ep);
                     sys_puts(console_ep, shm);
                 }
             }
@@ -670,12 +641,12 @@ int main(int argc, char *argv[]) {
                 for (int i = 1; shm[i] != '\0'; i++) {
                     if (shm[i] == '/') {
                         shm[i] = '\0'; 
-                        if (vfs_syscall(109, console_ep, timer_ep, 5000) != 0) fail = 1; // Таймаут 5 сек
+                        if (vfs_syscall(109, blk_ep) != 0) fail = 1;
                         shm[i] = '/';  
                     }
                 }
                 
-                if (vfs_syscall(109, console_ep, timer_ep, 5000) != 0) fail = 1; // Таймаут 5 сек
+                if (vfs_syscall(109, blk_ep) != 0) fail = 1;
                 
                 if (!fail) sys_puts(console_ep, "Directory tree created.\n");
                 else sys_puts(console_ep, "Failed to create directory tree.\n");
@@ -720,7 +691,7 @@ int main(int argc, char *argv[]) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(111, console_ep, timer_ep, 5000) == 0) {
+                if (vfs_syscall(111, blk_ep) == 0) {
                     my_strcpy(current_working_dir, shm);
                 } else {
                     sys_puts(console_ep, "No such directory.\n");
@@ -839,7 +810,7 @@ int main(int argc, char *argv[]) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(112, console_ep, timer_ep, 5000) == 0) sys_puts(console_ep, "File created.\n"); // 5 сек
+                if (vfs_syscall(112, blk_ep) == 0) sys_puts(console_ep, "File created.\n");
                 else sys_puts(console_ep, "Failed to create file.\n");
             }
 
@@ -848,7 +819,7 @@ int main(int argc, char *argv[]) {
                 char *shm = (char*)0x502000;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(114, console_ep, timer_ep, 5000) == 0) { // Чтение: 5 сек
+                if (vfs_syscall(114, blk_ep) == 0) {
                     sys_puts(console_ep, shm);
                     sys_puts(console_ep, "\n");
                 } else {
@@ -891,7 +862,7 @@ int main(int argc, char *argv[]) {
                     build_absolute_path(path_ptr, redir);
                     my_strcpy(text_ptr, arg);
                     
-                    if (vfs_syscall(113, console_ep, timer_ep, 5000) != 0) { // Запись текста: 5 сек
+                    if (vfs_syscall(113, blk_ep) != 0) {
                         sys_puts(console_ep, "Failed to write to file.\n");
                     }
                     // Если все ок - молчим, как настоящий bash!
@@ -903,7 +874,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd, "help") == 0) {
-                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat\n");
+                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, create_file, rm\n");
             }
 
             else if (my_strcmp(cmd, "exit") == 0) {
@@ -922,24 +893,30 @@ int main(int argc, char *argv[]) {
 
             else if (my_strcmp(cmd, "crash_disk") == 0) {
                 sys_puts(console_ep, "[SHELL] Sending poison pill to blk_driver...\n");
-                vfs_syscall(118, console_ep, timer_ep, 5000); // Оправляем команду умереть
+                vfs_syscall(118, blk_ep); // Оправляем команду умереть
             }
             // ==========================================
-
-            else if (my_strcmp(cmd, "hack_disk") == 0) {
-                vfs_syscall(115, console_ep, timer_ep, 7000); // Жесткая операция: 7 сек
-                char *shm = (char*)0x502000;
-                sys_puts(console_ep, shm);
-            }
-
+            // === УМНОЕ СОЗДАНИЕ ФАЙЛОВ ===
             else if (my_strcmp(cmd, "create_file") == 0) {
-                char *shm = (char*)0x502000;
-                strcpy(shm, "NEWFILE TXT|This file was built from SCRATCH by Psych Ward OS using raw DMA cluster allocation!");
+                if (arg) {
+                    my_strcpy(shm, arg); // Копируем аргумент (название) в SHM
+                } else {
+                    shm[0] = '\0'; // No argument
+                }
                 
-                vfs_syscall(116, console_ep, timer_ep, 7000); // Поиск кластеров FAT32: 7 сек
-                sys_puts(console_ep, shm);
+                vfs_syscall(115, blk_ep); 
+                sys_puts_direct(console_ep, shm); // Выводим ответ драйвера
+            
+            // === УДАЛЕНИЕ ФАЙЛОВ ===
+            } else if (my_strcmp(cmd, "rm") == 0) {
+                if (!arg || *arg == '\0') {
+                    sys_puts_direct(console_ep, "Usage: rm <filename>\n");
+                } else {
+                    my_strcpy(shm, arg); // Копируем имя файла для удаления
+                    vfs_syscall(119, blk_ep); // Вызов 119 - это будет RM
+                    sys_puts_direct(console_ep, shm);
+                }
             }
-
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 
             if (is_piping) {
@@ -958,31 +935,43 @@ int main(int argc, char *argv[]) {
 
                         char line[256];
                         int line_idx = 0;
-                        uint8_t c;
+                        char c;
 
-                        // Главный поток (grep) будет вычитывать байты по мере того,
-                        // как фоновый поток (ls_thread) будет их туда писать параллельно!
-                        while (pipe_read(&global_pipe, 0, 0, &c, 1) > 0) {
-                            if (c == '\n' || line_idx >= 255) {
-                                line[line_idx] = '\0'; // Конец строки найден
+                        // ИСПРАВЛЕНО: Бесконечный цикл чтения, который ждет писателя
+                        while (true) {
+                            int bytes_read = pipe_read(&global_pipe, 0, 0, (uint8_t*)&c, 1);
+                            
+                            if (bytes_read > 0) {
+                                // Мы прочитали символ! Собираем строку.
+                                if (c == '\n' || line_idx >= 255) {
+                                    line[line_idx] = '\0'; // Конец строки найден
 
-                                char *search = line;
-                                bool found = false;
-                                while (*search) {
-                                    char *p1 = search;
-                                    char *p2 = arg2;
-                                    while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
-                                    if (!*p2) { found = true; break; }
-                                    search++;
+                                    char *search = line;
+                                    bool match = false;
+                                    while (*search) {
+                                        char *p1 = search;
+                                        char *p2 = arg2; // Это наше слово "mnt"
+                                        while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
+                                        if (!*p2) { match = true; break; }
+                                        search++;
+                                    }
+
+                                    if (match) {
+                                        sys_puts_direct(console_ep, line);
+                                        sys_puts_direct(console_ep, "\n");
+                                    }
+                                    line_idx = 0; // Сбрасываем буфер для следующей строки
+                                } else {
+                                    line[line_idx++] = c;
                                 }
-
-                                if (found) {
-                                    sys_puts_direct(console_ep, line);
-                                    sys_puts_direct(console_ep, "\n");
-                                }
-                                line_idx = 0; // Сбрасываем буфер
                             } else {
-                                line[line_idx++] = c;
+                                // Пайп пуст! Писатель закончил работу?
+                                if (global_pipe.writer_closed) {
+                                    break; // Да, конец файла (EOF). Выходим из цикла.
+                                } else {
+                                    // Писатель еще работает, просто данные еще не дошли. Ждем!
+                                    seL4_Yield();
+                                }
                             }
                         }
                     } else {

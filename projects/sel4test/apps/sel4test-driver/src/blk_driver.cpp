@@ -7,8 +7,11 @@
 
 // В будущем эти адреса должны получаться через BootInfo
 #define VFS_SHM_VIRT_BASE 0x502000ULL
-#define VFS_SHM_PHYS_BASE 0x60000000ULL // Только для DMA дескрипторов Virtio
+#define VIRTIO_Q_SHM_VIRT_BASE (VFS_SHM_VIRT_BASE + 0x1000)
 
+// ИСПРАВЛЕНО: Физический адрес для DMA теперь получается динамически от ядра,
+// а не хардкодится.
+static uint64_t g_vfs_shm_phys_base = 0;
 
 void __assert_fail(const char *expr, const char *file, int line, const char *func) {
     // Если внутри макросов seL4 произойдет ошибка, просто тихо висим
@@ -32,6 +35,51 @@ static int my_strncmp(const char *s1, const char *s2, int n) {
     if (n == 0) return 0;
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
+
+// Умный конвертер строк в FAT32 формат (8.3) с поддержкой дубликатов (1), (2)...
+static void to_fat32_name(const char* input, int counter, char* output) {
+    for (int i = 0; i < 11; i++) output[i] = ' '; // Заполняем пробелами
+    output[11] = '\0';
+    
+    int in_idx = 0;
+    int out_idx = 0;
+    
+    // Копируем базовое имя
+    while (input[in_idx] && input[in_idx] != '.' && out_idx < 8) {
+        char c = input[in_idx++];
+        if (c >= 'a' && c <= 'z') c -= 32; // Перевод в UPPERCASE
+        output[out_idx++] = c;
+    }
+    
+    // Приклеиваем счетчик (1), (2), (3)...
+    if (counter > 0) {
+        char num[4];
+        int n = counter, len = 0;
+        while (n > 0) { num[len++] = (n % 10) + '0'; n /= 10; }
+        
+        int needed = len + 2; // Место под скобки и цифру
+        if (out_idx + needed > 8) {
+            out_idx = 8 - needed; // Обрезаем имя, чтобы влез суффикс!
+        }
+        
+        output[out_idx++] = '(';
+        for (int i = len - 1; i >= 0; i--) output[out_idx++] = num[i];
+        output[out_idx++] = ')';
+    }
+    
+    // Ищем расширение после точки
+    while (input[in_idx] && input[in_idx] != '.') in_idx++;
+    if (input[in_idx] == '.') {
+        in_idx++; // Пропускаем саму точку
+        out_idx = 8;
+        while (input[in_idx] && out_idx < 11) {
+            char c = input[in_idx++];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            output[out_idx++] = c;
+        }
+    }
+}
+
 static char* my_strchr(const char *s, int c) {
     while (*s) { if (*s == (char)c) return (char*)s; s++; }
     return nullptr;
@@ -48,16 +96,30 @@ static inline seL4_IPCBuffer* get_local_ipc() {
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
-// ИСПРАВЛЕНО: Унифицированная функция вывода через IPC к uart_driver
+// --- СТРОГИЕ СМЕЩЕНИЯ VIRTIO (Legacy Spec) ---
+#define VQ_DESC_OFFSET      0x000   // 16 * 16 = 256 байт
+#define VQ_AVAIL_OFFSET     0x100   // 38 байт
+#define VQ_USED_OFFSET      0x140   // Выровнено по 64 байтам (queue_align)
+#define BLK_REQ_OFFSET      0x200   // Произвольное безопасное место
+#define BLK_STATUS_OFFSET   0x220   // Произвольное безопасное место
+
+// ИСПРАВЛЕНО: Безопасная отправка строк любой длины (Chunking)
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
-    int len = my_strlen(str);
-    if (len > 40) len = 40;
-    ipc->msg[0] = 8; // SYS_PUTS ID
-    for (int i = 0; i < len; i++) {
-        ipc->msg[i + 1] = str[i];
+    int total_len = my_strlen(str);
+    int offset = 0;
+    
+    while (offset < total_len) {
+        int chunk = total_len - offset;
+        if (chunk > 100) chunk = 100; // Безопасный лимит Message Registers
+        
+        ipc->msg[0] = 8; // SYS_PUTS ID
+        for (int i = 0; i < chunk; i++) {
+            ipc->msg[i + 1] = str[offset + i];
+        }
+        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        offset += chunk;
     }
-    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, len + 1));
 }
 
 static void my_strncpy(char *dest, const char *src, int n) {
@@ -185,18 +247,17 @@ struct virtio_blk_req { uint32_t type; uint32_t reserved; uint64_t sector; };
 
 // Функция-помощник: скачивает любой сектор с диска в нашу память
 static void virtio_read_sector(uint64_t sector, uint32_t dest_offset, uint32_t len) {
-    // Структуры лежат по смещению 0x400 (1024 байта от начала)
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VFS_SHM_VIRT_BASE + 0x400);
-    volatile virtq_avail* vq_avail = (volatile virtq_avail*)(VFS_SHM_VIRT_BASE + 0x500);
-    volatile virtq_used* vq_used = (volatile virtq_used*)(VFS_SHM_VIRT_BASE + 0x540);
-    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VFS_SHM_VIRT_BASE + 0x5E0);
-    volatile uint8_t* blk_status = (volatile uint8_t*)(VFS_SHM_VIRT_BASE + 0x5F0);
+    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_DESC_OFFSET);
+    volatile virtq_avail* vq_avail = (volatile virtq_avail*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_AVAIL_OFFSET);
+    volatile virtq_used* vq_used = (volatile virtq_used*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_USED_OFFSET);
+    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_REQ_OFFSET);
+    volatile uint8_t* blk_status = (volatile uint8_t*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_STATUS_OFFSET);
 
     // Подготовка запроса
     blk_req->sector = sector;
     *blk_status = 0xFF; 
     
-    vq_desc[1].addr = VFS_SHM_PHYS_BASE + dest_offset;
+    vq_desc[1].addr = g_vfs_shm_phys_base + dest_offset; // Данные по-прежнему пишутся в общую память
     vq_desc[1].len = len;
 
     vq_avail->ring[g_vq_avail_idx % 16] = 0; 
@@ -206,9 +267,8 @@ static void virtio_read_sector(uint64_t sector, uint32_t dest_offset, uint32_t l
     // Это гарантирует, что QEMU не увидит новый индекс, пока не запишутся дескрипторы
     __atomic_store_n(&vq_avail->idx, g_vq_avail_idx, __ATOMIC_RELEASE);
 
-    // 2. Уведомляем QEMU о том, что появился новый запрос
-    volatile uint32_t* queue_notify_ptr = (volatile uint32_t*)(VIRTIO_MMIO_BASE + 0x050);
-    __atomic_store_n(queue_notify_ptr, 0, __ATOMIC_SEQ_CST);
+    // ИСПРАВЛЕНО: Используем динамический указатель на регистры найденного устройства, а не хардкод.
+    g_disk_regs->queue_notify = 0;
 
     // 3. Ожидание ответа от хоста с барьером ACQUIRE
     // Это гарантирует, что мы не прочитаем данные в буфере до того, как обновится индекс used
@@ -219,11 +279,11 @@ static void virtio_read_sector(uint64_t sector, uint32_t dest_offset, uint32_t l
 
 // Функция-помощник: записывает данные из нашей памяти на физический диск!
 static void virtio_write_sector(uint64_t sector, uint32_t src_offset, uint32_t len) {
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VFS_SHM_VIRT_BASE + 0x400);
-    volatile virtq_avail* vq_avail = (volatile virtq_avail*)(VFS_SHM_VIRT_BASE + 0x500);
-    volatile virtq_used* vq_used = (volatile virtq_used*)(VFS_SHM_VIRT_BASE + 0x540);
-    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VFS_SHM_VIRT_BASE + 0x5E0);
-    volatile uint8_t* blk_status = (volatile uint8_t*)(VFS_SHM_VIRT_BASE + 0x5F0);
+    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_DESC_OFFSET);
+    volatile virtq_avail* vq_avail = (volatile virtq_avail*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_AVAIL_OFFSET);
+    volatile virtq_used* vq_used = (volatile virtq_used*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_USED_OFFSET);
+    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_REQ_OFFSET);
+    volatile uint8_t* blk_status = (volatile uint8_t*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_STATUS_OFFSET);
 
     // ВАЖНО: 1 = VIRTIO_BLK_T_OUT (Запись на диск)
     blk_req->type = 1; 
@@ -232,19 +292,19 @@ static void virtio_write_sector(uint64_t sector, uint32_t src_offset, uint32_t l
     *blk_status = 0xFF; 
     
     // Дескриптор 0 (Заголовок: Железо ЧИТАЕТ тип запроса)
-    vq_desc[0].addr = VFS_SHM_PHYS_BASE + 0x5E0;
+    vq_desc[0].addr = (g_vfs_shm_phys_base + 0x1000) + BLK_REQ_OFFSET;
     vq_desc[0].len = sizeof(virtio_blk_req);
     vq_desc[0].flags = 1; // NEXT
     vq_desc[0].next = 1;
 
     // Дескриптор 1 (Данные: Железо ЧИТАЕТ из нашей RAM, чтобы записать на диск)
-    vq_desc[1].addr = VFS_SHM_PHYS_BASE + src_offset;
+    vq_desc[1].addr = g_vfs_shm_phys_base + src_offset; // Данные берутся из общей памяти
     vq_desc[1].len = len;
     vq_desc[1].flags = 1; // ТОЛЬКО NEXT! (Флага WRITE больше нет)
     vq_desc[1].next = 2;
 
     // Дескриптор 2 (Статус: Железо ПИШЕТ статус операции 0 в нашу RAM)
-    vq_desc[2].addr = VFS_SHM_PHYS_BASE + 0x5F0;
+    vq_desc[2].addr = (g_vfs_shm_phys_base + 0x1000) + BLK_STATUS_OFFSET;
     vq_desc[2].len = 1;
     vq_desc[2].flags = 2; // WRITE
     vq_desc[2].next = 0;
@@ -293,13 +353,32 @@ int main(int argc, char *argv[]) {
     // 2. Теперь безопасно получаем root_ep
     seL4_CPtr root_ep       = ipc->msg[BOOT_ROOT_EP];
     seL4_CPtr console_ep    = ipc->msg[BOOT_CONSOLE_EP];
-    seL4_CPtr my_ep         = ipc->msg[BOOT_TIMER_EP];
+    seL4_CPtr my_ep         = ipc->msg[7]; // BOOT_BLK_EP
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
     sys_puts(console_ep, "\n[BLK DRIVER] VFS & FAT32 Server Online!\n");
+
+    // ИСПРАВЛЕНО: Запрашиваем у ядра истинный физический адрес SHM для DMA
+    sys_puts(console_ep, "[BLK DRIVER] Requesting physical SHM address from kernel...\n");
+    seL4_MessageInfo_t shm_info = seL4_MessageInfo_new(0, 0, 0, 1);
+    seL4_SetMR(0, 107); // SYS_SHM_GET
+    seL4_Call(root_ep, shm_info);
+    g_vfs_shm_phys_base = seL4_GetMR(1);
+    if (g_vfs_shm_phys_base == 0) {
+        sys_puts(console_ep, "[BLK DRIVER] FATAL: Failed to get physical SHM address!\n");
+        while(1);
+    }
+
+    // ИСПРАВЛЕНИЕ: Жестко обнуляем 1 страницу памяти Virtio Queues (Control Plane),
+    // чтобы стереть остатки от предыдущего упавшего драйвера и избежать
+    // рассинхронизации с QEMU при перезапуске.
+    my_memset((void*)VIRTIO_Q_SHM_VIRT_BASE, 0, 4096);
+
+    // Сбрасываем программный счетчик индекса
+    g_vq_avail_idx = 0;
 
     // ==========================================
     // ГЛОБАЛЬНЫЙ ПОИСК ДИСКА (32 СЛОТА)
@@ -316,10 +395,15 @@ int main(int argc, char *argv[]) {
         if (regs->magic_value == 0x74726976) {
             uint32_t id = regs->device_id;
             if (id == 2) {
-                sys_puts(console_ep, "[VIRTIO] Found Block Device at Slot ");
-                char buf[3] = {(char)((i/10)+'0'), (char)((i%10)+'0'), 0};
-                sys_puts(console_ep, buf);
-                sys_puts(console_ep, " SUCCESS!\n");
+                // ИСПРАВЛЕНО: Объединяем вывод в один буфер, чтобы избежать "склеивания" логов
+                char msg_buf[128];
+                strcpy(msg_buf, "[VIRTIO] Found Block Device at Slot ");
+                char* cursor = msg_buf + strlen(msg_buf);
+                char num_buf[4] = {(char)((i/10)+'0'), (char)((i%10)+'0'), '\0', '\0'};
+                strcpy(cursor, num_buf);
+                cursor += strlen(num_buf);
+                strcpy(cursor, " SUCCESS!\n");
+                sys_puts(console_ep, msg_buf);
                 
                 // ЗАПИСЫВАЕМ В ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ!
                 g_disk_regs = regs;
@@ -337,34 +421,35 @@ int main(int argc, char *argv[]) {
     // VIRTIO HANDSHAKE & VIRTQUEUE SETUP
     // ==========================================
     g_disk_regs->status = 0; 
-    g_disk_regs->status |= 1; 
-    g_disk_regs->status |= 2; 
+    g_disk_regs->status |= 1;
+    g_disk_regs->status |= 2;
     g_disk_regs->guest_features = 0;
-    g_disk_regs->status |= 8; 
+    g_disk_regs->status |= 8;
 
     // Настраиваем очередь команд (Virtqueue 0)
     g_disk_regs->guest_page_size = 4096;
     g_disk_regs->queue_sel = 0;
-    g_disk_regs->queue_num = 16;       
+    g_disk_regs->queue_num = 16;
     g_disk_regs->queue_align = 64;
-    g_disk_regs->queue_pfn = (VFS_SHM_PHYS_BASE + 0x400) / 4096;
+    // ИСПРАВЛЕНО: Убран ошибочный сдвиг +0x400. Теперь PFN строго указывает на начало страницы!
+    g_disk_regs->queue_pfn = (g_vfs_shm_phys_base + 0x1000) / 4096;
     g_disk_regs->status |= 4; // DRIVER_OK
 
     // ==========================================
     // СТАТИЧЕСКАЯ НАСТРОЙКА ДЕСКРИПТОРОВ
     // ==========================================
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VFS_SHM_VIRT_BASE + 0x400);
-    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VFS_SHM_VIRT_BASE + 0x5E0);
+    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(VIRTIO_Q_SHM_VIRT_BASE + VQ_DESC_OFFSET);
+    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_REQ_OFFSET);
     
     blk_req->type = 0; 
     blk_req->reserved = 0;
-    vq_desc[0].addr = VFS_SHM_PHYS_BASE + 0x5E0;
+    vq_desc[0].addr = (g_vfs_shm_phys_base + 0x1000) + BLK_REQ_OFFSET;
     vq_desc[0].len = sizeof(virtio_blk_req);
     vq_desc[0].flags = 1; vq_desc[0].next = 1;
     
     vq_desc[1].flags = 1 | 2; vq_desc[1].next = 2; 
     
-    vq_desc[2].addr = VFS_SHM_PHYS_BASE + 0x5F0;
+    vq_desc[2].addr = (g_vfs_shm_phys_base + 0x1000) + BLK_STATUS_OFFSET;
     vq_desc[2].len = 1;
     vq_desc[2].flags = 2; vq_desc[2].next = 0;
 
@@ -374,7 +459,7 @@ int main(int argc, char *argv[]) {
     // Boot Sector читаем в 0x600
     virtio_read_sector(0, 0x600, 512);
 
-    volatile uint8_t* blk_status = (volatile uint8_t*)(VFS_SHM_VIRT_BASE + 0x5F0);
+    volatile uint8_t* blk_status = (volatile uint8_t*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_STATUS_OFFSET);
     if (*blk_status == 0) {
         fat32_image_ptr = (char*)(VFS_SHM_VIRT_BASE + 0x600);
         fat32_bpb = (FAT32_BPB*)fat32_image_ptr;
@@ -408,11 +493,21 @@ int main(int argc, char *argv[]) {
     volatile int* mailbox = (volatile int*)(VFS_SHM_VIRT_BASE + 4084 - 12);
     mailbox[0] = 0; mailbox[1] = 0; mailbox[2] = 0;
 
-    while (1) {
-        if (mailbox[0] != 0) { 
-            int syscall_num = mailbox[0];
-            int ret_val = 0;
+    seL4_Word sender_badge;
 
+    while (1) {
+        // Block and wait for an IPC message from the Shell/Client. 
+        // This eliminates CPU busy-waiting and standardizes seL4 synchronization.
+        seL4_MessageInfo_t info = seL4_Recv(my_ep, &sender_badge);
+        
+        // Extract System Call Number from Message Register (Control Plane)
+        // Fallback to legacy mailbox if the shell hasn't been updated to pass MRs yet.
+        int syscall_num = seL4_GetMR(0); 
+        if (syscall_num == 0 && mailbox[0] != 0) {
+            syscall_num = mailbox[0]; 
+        }
+
+        int ret_val = -1;
             switch (syscall_num) {
                 case 109: { // SYS_MKDIR
                     char *shm = (char*)VFS_SHM_VIRT_BASE;
@@ -441,13 +536,17 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "[BLK] LS command received\n");
                     char *shm = (char*)VFS_SHM_VIRT_BASE;
                     char target_dir[64];
-                    strcpy(target_dir, shm);
-
-                    char dbg[128];
-                    sprintf(dbg, "[BLK] path='%s'\n", shm);
-                    sys_puts(console_ep, dbg);
                     
-                    // Добавляем слэш на конец пути (если это не корень), чтобы корректно фильтровать подпапки
+                    // FIX 2: Stack overflow protection
+                    strncpy(target_dir, shm, sizeof(target_dir) - 1);
+                    target_dir[sizeof(target_dir) - 1] = '\0';
+
+                    // FIX 1: Removed sprintf, using custom sys_puts concatenation
+                    sys_puts(console_ep, "[BLK] path='");
+                    sys_puts(console_ep, target_dir);
+                    sys_puts(console_ep, "'\n");
+                    
+                    // Append trailing slash (if not root) to filter subdirectories correctly
                     int t_len = strlen(target_dir);
                     if (t_len > 1 && target_dir[t_len - 1] != '/') {
                         target_dir[t_len] = '/';
@@ -458,10 +557,17 @@ int main(int argc, char *argv[]) {
                     strcpy(shm, "Directory listing:\n");
                     char *curr = shm + strlen(shm);
                     
+                    // Limit: 4096 (Page) - 16 (Mailbox footprint) - 128 (Buffer for one line)
+                    char *shm_limit = shm + 3950; 
+                    
+                    // RAM/ROM VFS Search
                     for (int k = 0; k < 128; k++) {
                         if (vfs[k].active && strncmp(vfs[k].path, target_dir, t_len) == 0) {
                             char *rest = vfs[k].path + t_len;
                             if (strlen(rest) > 0 && strchr(rest, '/') == nullptr) {
+                                // FIX 3: Shared Memory and Mailbox overflow protection
+                                if (curr >= shm_limit) break; 
+
                                 strcpy(curr, vfs[k].is_dir ? " [DIR] " : (vfs[k].is_rom ? " [ROM] " : " [RAM] "));
                                 curr += 7;
                                 strcpy(curr, rest); curr += strlen(rest);
@@ -470,15 +576,18 @@ int main(int argc, char *argv[]) {
                         }
                     }
 
-                    // Чтение FAT32: проверяем, начинается ли путь с /mnt/
+                    // FAT32 Read: Check if path targets /mnt/
                     if (strncmp(target_dir, "/mnt/", 5) == 0 && fat32_image_ptr) {
                         FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
                         for (int i = 0; i < 16; i++) {
+                            // FIX 3 (Applied): Overflow protection for FAT32 loop
+                            if (curr >= shm_limit) break; 
+
                             if (entry[i].name[0] == 0x00) break;
                             if (entry[i].name[0] == 0xE5 || entry[i].attr == 0x0F) continue;
                             
                             strcpy(curr, " [FAT] "); curr += 7;
-                            for(int j=0; j<11; j++) {
+                            for(int j=0; j < 11; j++) {
                                 if (entry[i].name[j] != ' ') *curr++ = entry[i].name[j];
                                 if (j == 7 && entry[i].name[8] != ' ') *curr++ = '.';
                             }
@@ -578,32 +687,50 @@ int main(int argc, char *argv[]) {
                         }
 
                         uint32_t file_cluster = 0;
+                        int target_idx = -1;
 
                         if (existing_idx >= 0) {
-                            // 1. ФАЙЛ СУЩЕСТВУЕТ (Перезаписываем поверх)
+                            // 1. ФАЙЛ СУЩЕСТВУЕТ
                             file_cluster = (entry[existing_idx].fst_clus_hi << 16) | entry[existing_idx].fst_clus_lo;
                             entry[existing_idx].file_size = strlen(text);
+                            target_idx = existing_idx;
                         } else if (free_idx >= 0) {
-                            // 2. НОВЫЙ ФАЙЛ (Выделяем кластер)
+                            // 2. НОВЫЙ ФАЙЛ (Будет записан в свободный слот)
+                            target_idx = free_idx;
+                        }
+
+                        // МАГИЯ ЗДЕСЬ: Если кластер еще не выделен (это совершенно новый файл, 
+                        // ИЛИ существующий пустой файл от create_file)
+                        if (file_cluster == 0 && target_idx >= 0) {
                             virtio_read_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
                             uint32_t* fat_table = (uint32_t*)(VFS_SHM_VIRT_BASE + 0xE00);
+                            
+                            // Ищем свободный кластер в таблице FAT
                             for (int c = 3; c < 128; c++) {
                                 if ((fat_table[c] & 0x0FFFFFFF) == 0x00000000) {
                                     file_cluster = c;
-                                    fat_table[c] = 0x0FFFFFFF; // Помечаем как занятый
+                                    fat_table[c] = 0x0FFFFFFF; // Помечаем как занятый (End of File)
                                     break;
                                 }
                             }
+                            
                             if (file_cluster > 0) {
+                                // Сохраняем обновленную таблицу FAT обратно на диск
                                 virtio_write_sector(fat32_bpb->reserved_sectors, 0xE00, 512);
-                                memcpy(entry[free_idx].name, fat_name, 11);
-                                entry[free_idx].attr = 0x20; 
-                                entry[free_idx].fst_clus_hi = (file_cluster >> 16) & 0xFFFF;
-                                entry[free_idx].fst_clus_lo = file_cluster & 0xFFFF;
-                                entry[free_idx].file_size = strlen(text);
+                                
+                                // Если это совершенно новый файл (free_idx) - прописываем ему имя и атрибуты
+                                if (target_idx == free_idx) {
+                                    memcpy(entry[target_idx].name, fat_name, 11);
+                                    entry[target_idx].attr = 0x20; 
+                                }
+                                
+                                // Привязываем выделенный кластер к файлу (и для новых, и для существующих пустых)
+                                entry[target_idx].fst_clus_hi = (file_cluster >> 16) & 0xFFFF;
+                                entry[target_idx].fst_clus_lo = file_cluster & 0xFFFF;
                             }
                         }
 
+                        // Теперь, когда у нас 100% есть валидный кластер, пишем данные!
                         if (file_cluster > 0) {
                             // Сбрасываем Текст на диск (Сектор Данных)
                             uint32_t data_sector = fat32_first_data_sector + ((file_cluster - 2) * fat32_bpb->sectors_per_cluster);
@@ -617,7 +744,7 @@ int main(int argc, char *argv[]) {
                             virtio_write_sector(root_sector, 0x800, 1024); 
                             ret_val = 0;
                         } else {
-                            ret_val = -1; // Диск или Директория заполнены
+                            ret_val = -1; // Диск заполнен! Нет свободных кластеров
                         }
                         break;
                     }
@@ -696,7 +823,7 @@ int main(int argc, char *argv[]) {
                                 // Читаем данные в безопасный буфер (Смещение 0xC00)
                                 virtio_read_sector(file_sector, 0xC00, read_len);
                                 
-                                volatile uint8_t* blk_status = (volatile uint8_t*)(VFS_SHM_VIRT_BASE + 0x5F0);
+                                volatile uint8_t* blk_status = (volatile uint8_t*)(VIRTIO_Q_SHM_VIRT_BASE + BLK_STATUS_OFFSET);
                                 if (*blk_status == 0) {
                                     // Теперь безопасно копируем текст файла в начало SHM (0x502000), 
                                     // откуда Оболочка заберет его для вывода на экран!
@@ -729,55 +856,106 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                case 115: { // SYS_WRITE_IN_PLACE & METADATA UPDATE
-                    char *shm = (char*)VFS_SHM_VIRT_BASE;
-                    char target_file[12] = "HELLO   TXT"; 
+                case 115: { // CREATE_FILE (Умное создание)
+                    char* shm = (char*)VFS_SHM_VIRT_BASE;
+                    char req_name[32];
+                    my_strcpy(req_name, shm);
                     
-                    if (fat32_image_ptr) {
-                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
-                        bool hacked = false;
-                        for (int i = 0; i < 16; i++) {
-                            if (strncmp((const char*)entry[i].name, target_file, 11) == 0) {
-                                uint32_t file_cluster = (entry[i].fst_clus_hi << 16) | entry[i].fst_clus_lo;
-                                uint32_t file_sector = fat32_first_data_sector + ((file_cluster - 2) * fat32_bpb->sectors_per_cluster);
-                                
-                                // Шаг 1: Читаем сектор файла
-                                virtio_read_sector(file_sector, 0xC00, 512);
-                                
-                                // Шаг 2: Изменяем данные в памяти
-                                char* file_data = (char*)(VFS_SHM_VIRT_BASE + 0xC00);
-                                for(int k=0; k<512; k++) file_data[k] = 0; 
-                                
-                                const char* new_text = "Psych Ward OS has HACKED this physical disk!\n";
-                                strcpy(file_data, new_text);
-                                
-                                // Шаг 3: Записываем сектор ДАННЫХ на диск
-                                virtio_write_sector(file_sector, 0xC00, 512);
-                                
-                                // ==========================================
-                                // ШАГ 4: ОБНОВЛЯЕМ МЕТАДАННЫЕ И ROOT DIRECTORY
-                                // ==========================================
-                                // Увеличиваем размер файла в структуре FAT32
-                                entry[i].file_size = strlen(new_text);
-                                
-                                // Вычисляем сектор Root Directory
-                                uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
-                                
-                                // Записываем обновленный Root Directory (буфер 0x800) обратно на жесткий диск!
-                                virtio_write_sector(root_sector, 0x800, 1024); 
-                                // ==========================================
-
-                                strcpy(shm, "SUCCESS: HELLO.TXT rewritten AND size updated!\n");
-                                ret_val = 0;
-                                hacked = true;
+                    // Если вызвали create_file без аргументов
+                    if (req_name[0] == '\0') {
+                        my_strcpy(req_name, "FILE.TXT");
+                    }
+                    
+                    uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                    virtio_read_sector(root_sector, 0x800, 1024);
+                    FAT32_DirEntry* entry = (FAT32_DirEntry*)(VFS_SHM_VIRT_BASE + 0x800);
+                    
+                    char fat_name[12];
+                    int counter = 0;
+                    bool unique_found = false;
+                    
+                    // ИЩЕМ УНИКАЛЬНОЕ ИМЯ
+                    while (!unique_found) {
+                        to_fat32_name(req_name, counter, fat_name);
+                        bool conflict = false;
+                        for (int i = 0; i < 32; i++) {
+                            // 0x00 = пусто, 0xE5 = удаленный файл (можно переиспользовать)
+                            if (entry[i].name[0] == 0x00 || entry[i].name[0] == 0xE5) continue;
+                            if (my_strncmp((char*)entry[i].name, fat_name, 11) == 0) {
+                                conflict = true;
                                 break;
                             }
                         }
-                        if (!hacked) strcpy(shm, "ERROR: HELLO.TXT not found!\n");
+                        if (!conflict) unique_found = true;
+                        else counter++; // Имя занято, увеличиваем цифру в скобках!
                     }
+                    
+                    // ЗАПИСЫВАЕМ ФАЙЛ В ПЕРВЫЙ СВОБОДНЫЙ СЛОТ
+                    bool created = false;
+                    for (int i = 0; i < 32; i++) {
+                        if (entry[i].name[0] == 0x00 || entry[i].name[0] == 0xE5) {
+                            my_memcpy(entry[i].name, fat_name, 11);
+                            entry[i].attr = 0x20; // Archive (Обычный файл)
+                            entry[i].file_size = 0;     // Пустой файл
+                            entry[i].fst_clus_hi = 0;
+                            entry[i].fst_clus_lo = 0;
+                            created = true;
+                            break;
+                        }
+                    }
+                    
+                    if (created) {
+                        virtio_write_sector(root_sector, 0x800, 1024);
+                        
+                        // Красиво форматируем вывод для консоли
+                        my_strcpy(shm, "SUCCESS: Created ");
+                        char* p = shm + 17;
+                        for(int i=0; i<8 && fat_name[i]!=' '; i++) *p++ = fat_name[i];
+                        if (fat_name[8] != ' ') {
+                            *p++ = '.';
+                            for(int i=8; i<11 && fat_name[i]!=' '; i++) *p++ = fat_name[i];
+                        }
+                        *p++ = '\n';
+                        *p = '\0';
+                    } else {
+                        my_strcpy(shm, "ERROR: Root Directory is full!\n");
+                    }
+                    ret_val = 0;
                     break;
                 }
 
+                case 119: { // RM (Удаление файла)
+                    char* shm = (char*)VFS_SHM_VIRT_BASE;
+                    char fat_name[12];
+                    to_fat32_name(shm, 0, fat_name); // Конвертируем аргумент в формат FAT32
+                    
+                    uint32_t root_sector = fat32_first_data_sector + ((fat32_bpb->root_cluster - 2) * fat32_bpb->sectors_per_cluster);
+                    virtio_read_sector(root_sector, 0x800, 1024);
+                    FAT32_DirEntry* entry = (FAT32_DirEntry*)(VFS_SHM_VIRT_BASE + 0x800);
+                    
+                    bool found = false;
+                    for (int i = 0; i < 32; i++) {
+                        if (entry[i].name[0] == 0x00) break; // Конец списка
+                        if (entry[i].name[0] == 0xE5) continue; // Уже удален
+                        
+                        if (my_strncmp((char*)entry[i].name, fat_name, 11) == 0) {
+                            // Магия FAT32: чтобы удалить файл, достаточно заменить первый 
+                            // символ его имени на байт 0xE5. Система посчитает слот свободным!
+                            entry[i].name[0] = 0xE5; 
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if (found) {
+                        virtio_write_sector(root_sector, 0x800, 1024);
+                        my_strcpy(shm, "SUCCESS: File deleted.\n");
+                    } else {
+                        my_strcpy(shm, "ERROR: File not found.\n");
+                    }
+                    ret_val = 0;
+                    break;
+                }
                 case 116: { // SYS_CREATE_FAT_FILE
                     char *shm = (char*)VFS_SHM_VIRT_BASE;
                     
@@ -788,6 +966,25 @@ int main(int argc, char *argv[]) {
                     char* file_content = shm + 12; // Текст начинается после 11 символов имени и 1 разделителя
                     
                     if (fat32_image_ptr) {
+                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+
+                        // ИСПРАВЛЕНИЕ: Сначала проверяем, существует ли уже файл с таким именем,
+                        // чтобы избежать создания дубликатов.
+                        bool file_exists = false;
+                        for (int i = 0; i < 16; i++) {
+                            if (entry[i].name[0] == 0x00) break; // Конец директории
+                            if (entry[i].name[0] == 0xE5) continue; // Удаленный файл
+                            if (strncmp((const char*)entry[i].name, filename, 11) == 0) {
+                                file_exists = true;
+                                break;
+                            }
+                        }
+
+                        if (file_exists) {
+                            strcpy(shm, "ERROR: File already exists!\n");
+                            break; // Выходим, ret_val останется -1
+                        }
+
                         // ==========================================
                         // ШАГ 1: АЛЛОКАЦИЯ КЛАСТЕРА В ТАБЛИЦЕ FAT
                         // ==========================================
@@ -825,7 +1022,7 @@ int main(int argc, char *argv[]) {
                         // ==========================================
                         // ШАГ 3: ОБНОВЛЕНИЕ ROOT DIRECTORY
                         // ==========================================
-                        FAT32_DirEntry* entry = (FAT32_DirEntry*)(fat32_image_ptr + fat32_root_offset);
+                        // FAT32_DirEntry* entry уже объявлен выше
                         bool created = false;
                         for (int i = 0; i < 16; i++) {
                             // 0x00 = никогда не использовался, 0xE5 = файл был удален (свободное место)
@@ -852,6 +1049,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
+
                 case 118: { // Краш-тест - удалить 
                     volatile int* boom = (volatile int*)0x0;
                     *boom = 0xBAD; // Попытка записи в нулевой указатель. ПРОЦЕССОР УБЬЕТ НАС ЗДЕСЬ!
@@ -859,12 +1057,14 @@ int main(int argc, char *argv[]) {
                 }
             }
             
-            // Завершаем транзакцию: кладем ответ и поднимаем флаг готовности
+            // Legacy Data Plane flag reset
             mailbox[1] = ret_val;
             mailbox[0] = 0; 
             mailbox[2] = 1;
-        }
-        seL4_Yield();
+
+            // Unblock the client and pass the return code safely via Control Plane
+            seL4_SetMR(0, ret_val);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
     }
 
     return 0;
