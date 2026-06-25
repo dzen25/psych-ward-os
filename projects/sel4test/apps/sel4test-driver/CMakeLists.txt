@@ -113,3 +113,8 @@ set_target_properties(sel4test-driver PROPERTIES LINKER_LANGUAGE CXX)
 
 include(rootserver)
 DeclareRootserver(sel4test-driver)
+
+add_executable(test_app src/test.cpp)
+target_include_directories(test_app PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+target_link_options(test_app PRIVATE "-static")
+target_link_libraries(test_app sel4 sel4runtime muslc)

@@ -72,6 +72,11 @@ static int kbd_buffer_tail = 0;
 static seL4_CPtr reader_reply_slot = 0; static bool reader_waiting = false; 
 static seL4_CPtr sleeper_reply_slot = 0; static bool sleeper_waiting = false;
 
+// --- В начале файла или внутри spawn_process ---
+// Базовые адреса для временного маппинга (сдвигаются атомарно)
+static uintptr_t global_elf_temp_vaddr = 0x200100000ULL;
+static uintptr_t global_ipc_temp_vaddr = 0x200800000ULL;
+
 static uintptr_t untyped_watermarks[256] = {0};
 
 static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, uintptr_t target_paddr, seL4_CPtr root_cnode) {
@@ -159,7 +164,41 @@ struct SharedMemoryRegion {
 };
 static SharedMemoryRegion shm_regions[16];
 
-static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
+static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {
+    char* shm = (char*)0x502000;
+    uint32_t total_read = 0;
+
+    uart_puts("[ROOT] Fetching ELF from disk: ");
+    uart_puts(filename);
+    uart_puts("...\n");
+
+    while (1) {
+        // Драйвер перезаписывает SHM, поэтому имя файла восстанавливаем перед каждым запросом
+        strncpy(shm, filename, 63);
+        shm[63] = '\0';
+        
+        seL4_SetMR(0, 119); // SYS_READ_FILE
+        seL4_SetMR(1, total_read); // Передаем СМЕЩЕНИЕ (offset)
+        
+        seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2);
+        seL4_Call(blk_ep, msg);
+        
+        int status = seL4_GetMR(0);
+        int bytes_read = seL4_GetMR(1);
+        
+        if (status != 0) return -1; // Ошибка чтения или файл не найден
+        if (bytes_read == 0) break;    // Конец файла (EOF)
+        
+        // Копируем полученный безопасный кусок в большой буфер Rootserver'а
+        memcpy(load_buffer + total_read, shm, bytes_read);
+        total_read += bytes_read;
+    }
+    
+    uart_puts("[ROOT] ELF loaded successfully! Spawning...\n");
+    return total_read;
+}
+
+static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace,
                          seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
                          int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
@@ -168,9 +207,11 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
                          seL4_CPtr net_cmd_recv_ep = 0,
                          seL4_CPtr net_cmd_send_ep = 0) {
     
-    unsigned long elf_size = 0;
-    unsigned long archive_len = _cpio_archive_end - _cpio_archive;
-    char *elf_file = (char*)cpio_get_file(_cpio_archive, archive_len, elf_name, &elf_size);
+    char *elf_file = elf_data;
+    if (!elf_file) {
+        unsigned long archive_len = _cpio_archive_end - _cpio_archive;
+        elf_file = (char*)cpio_get_file(_cpio_archive, archive_len, name, &elf_size);
+    }
     if (!elf_file) return -1;
 
     int pid = -1;
@@ -191,7 +232,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     pcb.pid = pid;
     pcb.active = true;
 
-    strncpy(pcb.name, elf_name, 31); 
+    strncpy(pcb.name, name, 31); 
     pcb.name[31] = '\0';
 
     // 1. Создаем локальный CSpace (8 бит = 256 слотов)
@@ -214,10 +255,19 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
     // ИСПРАВЛЕНО: Упрощена и исправлена логика копирования. Теперь она зависит от аргументов, а не от PCB.
-    if (console_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_console_ep, 8, root_cnode, console_ep, seL4_WordBits, seL4_AllRights), "Copy console ep");
-    if (timer_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_timer_ep, 8, root_cnode, timer_ep, seL4_WordBits, seL4_AllRights), "Copy timer ep");
-    if (blk_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_blk_ep, 8, root_cnode, blk_ep, seL4_WordBits, seL4_AllRights), "Copy blk ep");
-    if (net_cmd_send_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_net_send_ep, 8, root_cnode, net_cmd_send_ep, seL4_WordBits, seL4_AllRights), "Copy net send ep");
+    if (console_ep != 0) {
+        if (is_driver == 1) check_err(seL4_CNode_Copy(child_cnode, local_console_ep, 8, root_cnode, console_ep, seL4_WordBits, seL4_AllRights), "Copy console ep");
+        else check_err(seL4_CNode_Mint(child_cnode, local_console_ep, 8, root_cnode, console_ep, seL4_WordBits, seL4_AllRights, pid), "Mint console ep");
+    }
+    if (timer_ep != 0) {
+        if (is_driver == 2) check_err(seL4_CNode_Copy(child_cnode, local_timer_ep, 8, root_cnode, timer_ep, seL4_WordBits, seL4_AllRights), "Copy timer ep");
+        else check_err(seL4_CNode_Mint(child_cnode, local_timer_ep, 8, root_cnode, timer_ep, seL4_WordBits, seL4_AllRights, pid), "Mint timer ep");
+    }
+    if (blk_ep != 0) {
+        if (is_driver == 3) check_err(seL4_CNode_Copy(child_cnode, local_blk_ep, 8, root_cnode, blk_ep, seL4_WordBits, seL4_AllRights), "Copy blk ep");
+        else check_err(seL4_CNode_Mint(child_cnode, local_blk_ep, 8, root_cnode, blk_ep, seL4_WordBits, seL4_AllRights, pid), "Mint blk ep");
+    }
+    if (net_cmd_send_ep != 0) check_err(seL4_CNode_Mint(child_cnode, local_net_send_ep, 8, root_cnode, net_cmd_send_ep, seL4_WordBits, seL4_AllRights, pid), "Mint net send ep");
     if (irq_handler != 0) check_err(seL4_CNode_Copy(child_cnode, local_irq_handler, 8, root_cnode, irq_handler, seL4_WordBits, seL4_AllRights), "Copy IRQ handler");
     if (net_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_net_recv_ep, 8, root_cnode, net_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy net recv ep");
 
@@ -255,8 +305,13 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_ARM_PageTable_Map(child_pt, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes);     // Покрывает 0x400000 - 0x5FFFFF
     seL4_ARM_PageTable_Map(child_pt2, child_vspace, 0x600000, seL4_ARM_Default_VMAttributes);    // Покрывает 0x600000 - 0x7FFFFF (Тут живут наши потоки)
 
-    // ИСПРАВЛЕНИЕ 1: Скользящее окно для ELF загрузчика
-    static uintptr_t elf_temp_vaddr = 0x200100000ULL; 
+    // Внутри функции spawn_process:
+    // Атомарно выделяем окно 16MB под ELF и 4KB под IPC для каждого нового процесса
+    // ИСПРАВЛЕНИЕ: Инкремент в 16MB (0x1000000) на каждый процесс не масштабируется, так как требует
+    // маппинга огромного количества таблиц страниц. Для временного окна достаточно 4KB,
+    // поэтому используем инкремент 0x1000, чтобы каждый параллельный вызов получил
+    // уникальную 4KB-страницу в пределах заранее смапленного 2MB-региона.
+    uintptr_t elf_temp_vaddr = __atomic_fetch_add(&global_elf_temp_vaddr, 0x1000, __ATOMIC_SEQ_CST);
 
     for (int i = 0; i < elf_getNumProgramHeaders(&elf); i++) {
         if (elf_getProgramHeaderType(&elf, i) == PT_LOAD) {
@@ -282,11 +337,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
                 }
                 seL4_ARM_Page_Clean_Data(frame, 0, 4096);
                 seL4_ARM_Page_Unmap(frame);
-                
-                // СДВИГАЕМ ОКНО ДЛЯ СЛЕДУЮЩЕЙ СТРАНИЦЫ
-                elf_temp_vaddr += 0x1000; 
-                if (elf_temp_vaddr >= 0x200170000ULL) elf_temp_vaddr = 0x200100000ULL; // Сброс
-                
+
                 seL4_ARM_Page_Map(frame, child_vspace, page, seL4_AllRights, seL4_ARM_Default_VMAttributes);
             }
         }
@@ -299,9 +350,7 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frame, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
 
-    // ИСПРАВЛЕНИЕ 2: Скользящее окно для IPC буферов процессов
-    // Берем адрес повыше, чтобы точно не пересечься с ELF загрузчиком
-    static uintptr_t ipc_temp_vaddr = 0x200180000ULL;
+    uintptr_t ipc_temp_vaddr = __atomic_fetch_add(&global_ipc_temp_vaddr, 0x1000, __ATOMIC_SEQ_CST);
 
 
     check_err(seL4_ARM_Page_Map(ipc_frame, root_vspace, ipc_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Root");
@@ -370,10 +419,6 @@ static int spawn_process(const char* elf_name, seL4_CPtr ep, seL4_CPtr med_ep,
     seL4_ARM_Page_Clean_Data(ipc_frame, 0, 4096);
     
     check_err(seL4_ARM_Page_Unmap(ipc_frame), "Unmap IPC from Root");
-    
-    // СДВИГАЕМ ОКНО ДЛЯ СЛЕДУЮЩЕГО ПРОЦЕССА (Например, для таймера или shell)
-    ipc_temp_vaddr += 0x1000;
-    if (ipc_temp_vaddr >= 0x2001B0000ULL) ipc_temp_vaddr = 0x200180000ULL; // Сброс 
 
     check_err(seL4_ARM_Page_Map(stack_frame, child_vspace, child_stack, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map Stack to Child");
     check_err(seL4_ARM_Page_Map(ipc_frame, child_vspace, child_ipc, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Child");
@@ -463,10 +508,13 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     for (int i = 0; i < pcbs[pid].cap_tracker.count; i++) {
         bool is_thread = (strncmp(pcbs[pid].name, "shell_thread", 12) == 0);
         if (is_thread && pcbs[pid].cap_tracker.caps[i] == pcbs[pid].vspace) continue;
-
+        
         seL4_CPtr cap_to_free = pcbs[pid].cap_tracker.caps[i];
 
+        // 1. Сначала ОТЗЫВАЕМ (Revoke) все дочерние объекты в ядре, чтобы освободить RAM
         seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+        
+        // 2. Затем УДАЛЯЕМ (Delete) сам слот в CNode
         seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
         
         // ДОБАВЛЕНО: Возвращаем слот обратно в пул свободных слотов!
@@ -478,7 +526,7 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     if (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
         
-        int new_pid = spawn_process(meta.name, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+        int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
                                     meta.is_driver, console_ep, timer_ep, blk_ep, meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep);
         
@@ -526,6 +574,11 @@ int main(int argc, char *argv[]) {
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pmd, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1);
 
+    // ИСПРАВЛЕНИЕ: Создаем и мапим дополнительную таблицу страниц (Page Table)
+    // для временного окна IPC, которое было перемещено на новый адрес.
+    seL4_CPtr pt_ipc_temp = alloc.alloc_slot();
+    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt_ipc_temp, 1);
+
     // Фреймы устройств
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, 0x09000000, root_cnode);
     seL4_CPtr rtc_frame  = alloc_device_frame(info, alloc, 0x09010000, root_cnode);
@@ -538,6 +591,10 @@ int main(int argc, char *argv[]) {
     seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+
+    // Мапим таблицу для временного окна IPC. Адрес должен совпадать с global_ipc_temp_vaddr.
+    // Одна таблица покрывает 2MB, чего достаточно для 512 процессов.
+    seL4_ARM_PageTable_Map(pt_ipc_temp, root_vspace, 0x200800000ULL, seL4_ARM_Default_VMAttributes);
 
     uintptr_t rtc_vaddr = 0x200002000ULL;
     seL4_ARM_Page_Map(rtc_frame, root_vspace, rtc_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
@@ -574,8 +631,8 @@ int main(int argc, char *argv[]) {
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, net_cmd_ep, 1);
     seL4_CNode_Copy(root_cnode, net_cmd_recv_ep, seL4_WordBits,
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanRead);
-    seL4_CNode_Mint(root_cnode, net_cmd_send_ep, seL4_WordBits,
-                    root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanWrite, 5);
+    seL4_CNode_Copy(root_cnode, net_cmd_send_ep, seL4_WordBits,
+                    root_cnode, net_cmd_ep, seL4_WordBits, seL4_CapRights_new(0, 1, 0, 1)); // Write + Grant
 
     seL4_CPtr timer_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
@@ -597,31 +654,31 @@ int main(int argc, char *argv[]) {
     seL4_IRQHandler_Ack(uart_irq_handler);
 
     // Запускаем Драйвер UART (is_driver = 1)
-    if (spawn_process("uart_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+    if (spawn_process("uart_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       1, console_ep, timer_ep, 0, uart_ntfn, uart_irq_handler, uart_frame) < 0) {
         uart_puts("PANIC: UART Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Таймера (is_driver = 2)
-    if (spawn_process("timer_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+    if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       2, console_ep, timer_ep, 0, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Диска и ФС (is_driver = 3)
-    if (spawn_process("blk_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+    if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       3, console_ep, timer_ep, blk_ep, 0, 0, virtio_frames[0]) < 0) {
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
 
-    if (spawn_process("net_driver", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+    if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       4, console_ep, timer_ep, 0, 0, 0, virtio_frames[0], nullptr,
                       net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Оболочку (is_driver = 0)
-    if (spawn_process("shell", ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
+    if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, 
                       0, console_ep, timer_ep, blk_ep, 0, 0, 0, nullptr,
                       0, net_cmd_send_ep) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
@@ -958,17 +1015,25 @@ int main(int argc, char *argv[]) {
 
             case SYS_EXEC: {
                 char* shm_args = (char*)0x502000; 
+                char app_name[64];
+                strncpy(app_name, shm_args, 63);
+                app_name[63] = '\0';
                 
-                char safe_args[256];
-                strncpy(safe_args, shm_args, sizeof(safe_args) - 1);
-                safe_args[sizeof(safe_args) - 1] = '\0'; 
+                static char elf_staging_buffer[1024 * 1024]; 
                 
-                memset(shm_args, 0, 256);
-                
-                int new_pid = spawn_process(safe_args, ep, med_ep, alloc, root_cnode, root_vspace, 
-                                            normal_untyped, shm_frame_root, 
-                                            254, console_ep, timer_ep, blk_ep,
-                                            0, 0, 0, "", 0, net_cmd_send_ep);
+                int elf_size = load_elf_from_disk(blk_ep, app_name, elf_staging_buffer);
+                int new_pid = -1;
+
+                if (elf_size > 0) {
+                    elf_t elf;
+                    if (elf_newFile(elf_staging_buffer, elf_size, &elf) == 0) {
+                        new_pid = spawn_process(app_name, elf_staging_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, 
+                                                normal_untyped, shm_frame_root, 254, console_ep, timer_ep, blk_ep,
+                                                0, 0, 0, "", 0, net_cmd_send_ep);
+                    } else {
+                        new_pid = -2; // Invalid ELF
+                    }
+                }
                 
                 seL4_SetMR(0, new_pid);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -1017,8 +1082,8 @@ int main(int argc, char *argv[]) {
                         generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root, console_ep, timer_ep, blk_ep);
                     } else {
                     seL4_TCB_Suspend(pcbs[target_pid].tcb);
-                    // Проверяем, был ли это поток, чтобы не отвязывать то, чего нет
-                    if (strncmp(pcbs[target_pid].name, "shell_thread", 12) != 0) {
+                    // Отвязываем прерывание, только если оно было привязано (у драйверов)
+                    if (pcbs[target_pid].irq_ntfn != 0) {
                         seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
                     }
                         pcbs[target_pid].active = false;
@@ -1047,7 +1112,9 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     seL4_TCB_Suspend(pcbs[sender_pid].tcb);
-                    seL4_TCB_UnbindNotification(pcbs[sender_pid].tcb);
+                    if (pcbs[sender_pid].irq_ntfn != 0) {
+                        seL4_TCB_UnbindNotification(pcbs[sender_pid].tcb);
+                    }
                     pcbs[sender_pid].active = false;
                     seL4_CNode_Delete(root_cnode, pcbs[sender_pid].badged_ep, seL4_WordBits);
                     seL4_CNode_Delete(root_cnode, pcbs[sender_pid].tcb, seL4_WordBits);
@@ -1065,9 +1132,6 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_SHM_GET: {
-                // ИСПРАВЛЕНО: Возвращаем истинный физический адрес VFS SHM для DMA.
-                // Эта реализация предназначена для драйверов и заменяет старую логику
-                // пользовательского SHM, которая была привязана к команде 'shm' в оболочке.
                 seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(shm_frame_root);
                 seL4_SetMR(0, 0x502000); // Virtual address mapping
                 seL4_SetMR(1, res.paddr); // True physical address for DMA

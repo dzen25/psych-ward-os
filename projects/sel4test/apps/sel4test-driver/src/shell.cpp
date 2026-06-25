@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "pipe.h"
 
+// Адреса для синхронизации доступа к VFS и TTY
 #define BOOT_BLK_EP 7
 
 static volatile int* vfs_spinlock_ptr = (volatile int*)(0x502000 + 4084 - 16);
@@ -46,6 +47,13 @@ static void sys_puts(seL4_CPtr console_ep, const char *str) {
     }
 }
 
+// Принудительно выталкивает застрявший текст на экран (нужно для prompt и эхо символов)
+static void sys_flush(seL4_CPtr console_ep) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    ipc->msg[0] = 9; // SYS_FLUSH ID
+    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
 static void my_strcpy(char *dest, const char *src) {
     while ((*dest++ = *src++));
 }
@@ -60,6 +68,16 @@ static int my_strncmp(const char *s1, const char *s2, int n) {
     while (n && *s1 && (*s1 == *s2)) { s1++; s2++; n--; }
     if (n == 0) return 0;
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+static void my_strncpy(char *dest, const char *src, int n) {
+    int i;
+    for (i = 0; i < n && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    for ( ; i < n; i++) {
+        dest[i] = '\0';
+    }
 }
 
 static seL4_Word my_strlen(const char *s) {
@@ -438,6 +456,7 @@ int main(int argc, char *argv[]) {
         prompt[len++] = '>'; prompt[len++] = ' '; prompt[len] = '\0';
         
         sys_puts(console_ep, prompt);
+        sys_flush(console_ep); // <--- СБРОС: чтобы prompt появился мгновенно!
         
         char cmd[64]; int i = 0;
         
@@ -446,14 +465,19 @@ int main(int argc, char *argv[]) {
             char c = sys_read(console_ep); 
             
             if (c == (char)-1 || c == (char)255) { seL4_Yield(); continue; }
-            if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; }
+            if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; } // Здесь \n сбросит буфер автоматически
             else if (c == 127 || c == '\b') { 
-                if (i > 0) { i--; sys_puts(console_ep, "\b \b"); } 
+                if (i > 0) { 
+                    i--; 
+                    sys_puts(console_ep, "\b \b"); 
+                    sys_flush(console_ep); // <--- СБРОС: чтобы буква стерлась мгновенно!
+                } 
             } 
             // ИСПРАВЛЕНИЕ: Берем только печатные символы (игнорируем стрелочки и спецкоды)
             else if (c >= 32 && c <= 126) { 
                 char tmp[2] = {c, 0}; 
                 sys_puts(console_ep, tmp); 
+                sys_flush(console_ep); // <--- СБРОС: чтобы набираемая буква появилась мгновенно!
                 cmd[i++] = c; 
             }
         }
@@ -862,10 +886,17 @@ int main(int argc, char *argv[]) {
                     build_absolute_path(path_ptr, redir);
                     my_strcpy(text_ptr, arg);
                     
-                    if (vfs_syscall(113, blk_ep) != 0) {
+                    vfs_lock();
+                    seL4_SetMR(0, 113); 
+                    seL4_SetMR(1, my_strlen(arg)); 
+                    
+                    seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2); // 2 регистра передано
+                    seL4_Call(blk_ep, msg);
+                    int ret_val = seL4_GetMR(0);
+                    vfs_unlock();
+                    if (ret_val != 0) {
                         sys_puts(console_ep, "Failed to write to file.\n");
                     }
-                    // Если все ок - молчим, как настоящий bash!
                 } else {
                     // Обычный echo без перенаправления
                     sys_puts(console_ep, arg);
@@ -913,10 +944,45 @@ int main(int argc, char *argv[]) {
                     sys_puts_direct(console_ep, "Usage: rm <filename>\n");
                 } else {
                     my_strcpy(shm, arg); // Копируем имя файла для удаления
-                    vfs_syscall(119, blk_ep); // Вызов 119 - это будет RM
+                    vfs_syscall(120, blk_ep); // Вызов 119 - это будет RM
                     sys_puts_direct(console_ep, shm);
                 }
-            }
+            } else if (my_strncmp(cmd, "./", 2) == 0) {
+                // Пользователь ввел команду типа ./test.elf
+                char* filename = cmd + 2; // Пропускаем символы "./"
+                
+                // 1. Копируем имя файла в разделяемую память для Rootserver-а
+                char* shm = (char*)0x502000;
+                my_strncpy(shm, filename, 63);
+                shm[63] = '\0';
+                
+                // 2. Отправляем IPC запрос в Rootserver (SYS_EXEC = 100)
+                seL4_SetMR(0, 100); 
+                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
+                seL4_Call(root_ep, msg);
+                
+                // 3. Проверяем ответ от ядра
+                int pid = (int)seL4_GetMR(0);
+                if (pid > 0) {
+                    // С новым мультиплексором в uart_driver, гонки больше нет.
+                    // Можно выводить частями.
+                    sys_puts(console_ep, "Spawned process with PID: ");
+                    char buf[16]; int temp = pid, j = 0;
+                    if (temp == 0) buf[j++] = '0';
+                    while(temp > 0) { buf[j++] = (temp % 10) + '0'; temp /= 10; }
+                    while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
+                    sys_puts(console_ep, "\nParent sleeping, handing over TTY...\n");
+
+                    sys_wait(root_ep, pid);
+                    sys_puts(console_ep, "\nChild exited. Parent taking back TTY.\n");
+                } else if (pid == -1) {
+                    sys_puts(console_ep, "[SHELL] Error: File not found on disk.\n");
+                } else if (pid == -2) {
+                    sys_puts(console_ep, "[SHELL] Error: Invalid ELF format.\n");
+                } else {
+                    sys_puts(console_ep, "[SHELL] Error: Spawn failed.\n");
+                }
+            } 
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 
             if (is_piping) {

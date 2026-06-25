@@ -24,7 +24,7 @@ void uart_clear_interrupts() {
 }
 
 void uart_putchar(char c) {
-    while ((*uart_fr) & (1 << 5)) seL4_Yield();
+    while ((*uart_fr) & (1 << 5));
     *uart_dr = c;
 }
 
