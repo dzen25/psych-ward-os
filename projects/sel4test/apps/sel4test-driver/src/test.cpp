@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
     // 3. Печатаем баннер. С новым мультиплексором в uart_driver, гонки больше нет.
     const char* banner = 
         "\n======================================\n"
-        "  SUCCESS: HELLO FROM FAT32 DISK!!!\n"
+        "  SUCCESS: HELLO FROM FAT32 64 DISK!!!\n"
         "  (Standard main() execution)\n"
         "======================================\n\n";
     sys_puts(console_ep, banner);

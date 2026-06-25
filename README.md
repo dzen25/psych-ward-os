@@ -16,7 +16,7 @@
 
 ---
 
-<details open>
+<details closed>
 <summary><b>🚀 Ключевые возможности</b></summary>
 
 
@@ -70,7 +70,7 @@ sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 ```bash
 # 1. Клонирование репозитория
 cd ~
-git clone [https://github.com/dzen25/psych-ward-os.git](https://github.com/dzen25/psych-ward-os.git)
+git clone https://github.com/dzen25/psych-ward-os.git
 cd psych-ward-os
 
 # 2. Создание и активация изолированного виртуального окружения Python
@@ -98,7 +98,6 @@ sudo bash -c 'echo "Welcome to FAT32" > /tmp/fat32_mount/HELLO.TXT'
 sudo umount /tmp/fat32_mount
 rm -rf /tmp/fat32_mount
 
-
 ```
 
 ### Компиляция образа:
@@ -107,18 +106,24 @@ rm -rf /tmp/fat32_mount
 mkdir -p build && cd build
 ../init-build.sh -DPLATFORM=qemu-arm-virt -DAARCH64=1
 ninja
-
 ```
-Добавлен тестовый файл test.cpp - как реализация сторонеей исполняемой программы.
-Для быстрого редактирования и повторной проверки исполняемых файлов был добавлен скрипт up.sh в папку build (для быстрого внесения изменений в fat32.img) - пути в нем захаркожены - при необходимости изменить.
+После компиляции образа вы можете убрать предупреждения об ошибках в main:
+В папке `psych-ward-os/projects/sel4test/apps/sel4test-driver/src/rt` есть файл `c_cpp_properties.json` который надо переместить в папку `.vscode` - это нужно указать анализатору `IntelliSense`, что он работает с кодом для `AArch64`.
 
-Для выполнения требуется:
+---
+### Обновление исполняемых файлов на диске
 
+Добавлен тестовый файл `test.cpp` - как реализация внешней исполняемой программы.
+Для быстрой проверки исполняемых файлов был добавлен скрипт `up.sh` (для быстрого внесения изменений в `fat32.img`). 
+
+Скрипт `up.sh` так же находится в папке `psych-ward-os/projects/sel4test/apps/sel4test-driver/src/rt`.
+После компиляции для удобства переместите файл `up.sh` в папку `build` и сделайте исполняемым:
+
+```bash
+chmod +x up.sh # Запускается однократно после создания/пересоздания папки build
+
+sudo ./up.sh 
 ```
-chmod +x up.sh - однократно
-sudo ./up.sh
-```
-
 ---
 
 ### Запуск в QEMU (с FAT32-диском и Virtio-Net):
@@ -138,7 +143,6 @@ qemu-system-aarch64 \
     -device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 \
     | tee ../projects/sel4test/apps/sel4test-driver/src/qemu_output.log
 
-
 ```
 
 ### Проверка сети
@@ -148,18 +152,15 @@ qemu-system-aarch64 \
 ```bash
 nc -ul 8080
 
-
 ```
 
 Внутри Shell в QEMU:
 
-```text
+```bash
 netstat
 ping google.com
 send Hello Linux
 sendto 10.0.2.2 8080 Hello again
-
-
 ```
 
 ---

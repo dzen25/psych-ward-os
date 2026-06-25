@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "seL4 AArch64",
+            "compilerPath": "/usr/bin/aarch64-linux-gnu-g++",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-arm64",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": [
+                "AARCH64=1",
+                "CONFIG_AARCH64=1"
+            ]
+        }
+    ],
+    "version": 4
+}
