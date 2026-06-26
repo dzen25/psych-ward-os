@@ -6,15 +6,18 @@
 // Адреса для синхронизации доступа к VFS и TTY
 #define BOOT_BLK_EP 7
 
-static volatile int* vfs_spinlock_ptr = (volatile int*)(0x502000 + 4084 - 16);
+static char* shm_base = nullptr;
+static volatile int* vfs_spinlock_ptr = nullptr;
 
 void vfs_lock() {
+    if (!vfs_spinlock_ptr) return; // Guard against early calls
     while (__sync_lock_test_and_set(vfs_spinlock_ptr, 1)) {
         seL4_Yield(); 
     }
 }
 
 void vfs_unlock() {
+    if (!vfs_spinlock_ptr) return;
     __sync_lock_release(vfs_spinlock_ptr);
 }
 
@@ -242,16 +245,23 @@ static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
 }
 
 static void sys_recover(const char* driver_name) {
-    seL4_IPCBuffer *ipc = get_local_ipc();
-    seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
-    char *shm = (char*)0x502000;
-    my_strcpy(shm, driver_name);      // Передаем имя упавшего драйвера
-    ipc->msg[0] = 117;  // SYS_RECOVER
-    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_CPtr root_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
+
+    char safe_name[32] = {0};
+    my_strncpy(safe_name, driver_name, 31);
+
+    seL4_SetMR(0, 117); // SYS_RECOVER
+    uint64_t* name_ptr = (uint64_t*)safe_name;
+    for (int i = 0; i < 4; i++) {
+        seL4_SetMR(i + 1, name_ptr[i]);
+    }
+
+    // Передаем 5 регистров (1 для номера сисколла + 4 для имени)
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 5));
 }
 
 static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
-    volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+    volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
     int elapsed = 0;
     while (net_mailbox[0] == 1 && elapsed < timeout_ms) {
         sys_sleep(timer_ep, 100);
@@ -333,7 +343,7 @@ static void ls_thread_func(seL4_CPtr timer_ep, seL4_CPtr console_ep, seL4_CPtr b
     asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
     seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
     
-    char *shm = (char*)0x502000;
+    char *shm = shm_base;
     
     // 1. Делаем системный вызов к драйверу диска. Результат ляжет в shm.
     vfs_syscall(110, blk_ep); 
@@ -365,6 +375,19 @@ int main(int argc, char *argv[]) {
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
+    }
+
+    // --- ДИНАМИЧЕСКИЙ ЗАПРОС SHM ---
+    seL4_SetMR(0, 107); // SYS_SHM_GET
+    seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
+    seL4_Call(root_ep, msg);
+
+    shm_base = (char*)seL4_GetMR(0);
+    // Physical address is not needed by the shell, only by DMA-capable drivers.
+
+    if (shm_base == nullptr) {
+        sys_puts(console_ep, "[SHELL] FATAL: Failed to get dynamic SHM!\n");
+        volatile int* boom = (volatile int*)0x0; *boom = 0; 
     }
 
     my_strcpy(arg_buffer, (char*)&ipc->msg[0]);
@@ -513,7 +536,7 @@ int main(int argc, char *argv[]) {
             char *arg = cmd; while (*arg && *arg != ' ') arg++;
             if (*arg == ' ') { *arg = '\0'; arg++; while (*arg == ' ') arg++; } else { arg = nullptr; }
 
-            char *shm = (char*)0x502000; // Адрес разделяемой памяти (Shared Memory)
+            char *shm = shm_base; // Адрес разделяемой памяти (Shared Memory)
 
             if (my_strcmp(cmd, "time") == 0) {
                 seL4_Word current = sys_get_time(timer_ep);
@@ -542,7 +565,7 @@ int main(int argc, char *argv[]) {
 
                 if (count_str && parse_port(count_str, &count) != 0) count = 1;
 
-                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
                 
                 // Пытаемся распарсить как IP. Если не вышло — это домен!
                 if (parse_ipv4(target_str, ip) != 0) {
@@ -553,7 +576,7 @@ int main(int argc, char *argv[]) {
                     wait_for_net_mailbox(console_ep, timer_ep, 10000);
                     
                     if (net_mailbox[0] == 0) {
-                        seL4_Word packed_ip = *((seL4_Word*)(0x502000 + 4064));
+                        seL4_Word packed_ip = *((seL4_Word*)(shm_base + 4064));
                         if (packed_ip == 0) {
                             sys_puts(console_ep, "[SHELL] DNS Error: Domain not found.\n");
                             continue;
@@ -581,7 +604,7 @@ int main(int argc, char *argv[]) {
 
                 uint8_t ip[4] = {10, 0, 2, 2};
                 
-                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
                 net_mailbox[0] = 1; // Запираем Mailbox!
 
                 sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
@@ -615,7 +638,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
                 net_mailbox[0] = 1; // Запираем Mailbox!
 
                 sys_puts(console_ep, "UDP datagram queued.\n");
@@ -627,7 +650,7 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd, "netstat") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
                 
-                volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
                 net_mailbox[0] = 1; // Запираем Mailbox!
                 
                 sys_puts(console_ep, "Net status requested.\n");
@@ -637,7 +660,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd, "ls") == 0) {
-                char *shm = (char*)0x502000; 
+                char *shm = shm_base; 
                 if (arg) { build_absolute_path(shm, arg); } 
                 else { build_absolute_path(shm, ""); }
                 
@@ -658,7 +681,7 @@ int main(int argc, char *argv[]) {
 
             else if (my_strcmp(cmd, "mkdir") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: mkdir <path>\n"); continue; }
-                char *shm = (char*)0x502000;
+                char *shm = shm_base;
                 build_absolute_path(shm, arg);
                 
                 int fail = 0;
@@ -712,7 +735,7 @@ int main(int argc, char *argv[]) {
                 }
                 
                 // 4. Обычный переход в папку
-                char *shm = (char*)0x502000;
+                char *shm = shm_base;
                 build_absolute_path(shm, arg);
                 
                 if (vfs_syscall(111, blk_ep) == 0) {
@@ -757,9 +780,17 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                my_strcpy(shm, arg);
-                ipc->msg[0] = 100; // SYS_EXEC
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                char safe_name[64] = {0};
+                my_strncpy(safe_name, arg, 63);
+
+                seL4_SetMR(0, 100); // SYS_EXEC
+                uint64_t* name_ptr = (uint64_t*)safe_name;
+                for (int i = 0; i < 8; i++) {
+                    seL4_SetMR(i + 1, name_ptr[i]);
+                }
+                
+                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 9);
+                seL4_Call(root_ep, msg);
                 
                 int pid = (int)seL4_GetMR(0);
                 if (pid > 0) {
@@ -831,7 +862,7 @@ int main(int argc, char *argv[]) {
 
             else if (my_strcmp(cmd, "touch") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: touch <file>\n"); continue; }
-                char *shm = (char*)0x502000;
+                char *shm = shm_base;
                 build_absolute_path(shm, arg);
                 
                 if (vfs_syscall(112, blk_ep) == 0) sys_puts(console_ep, "File created.\n");
@@ -840,7 +871,7 @@ int main(int argc, char *argv[]) {
 
             else if (my_strcmp(cmd, "cat") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: cat <file>\n"); continue; }
-                char *shm = (char*)0x502000;
+                char *shm = shm_base;
                 build_absolute_path(shm, arg);
                 
                 if (vfs_syscall(114, blk_ep) == 0) {
@@ -879,7 +910,7 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     
-                    char *shm = (char*)0x502000;
+                    char *shm = shm_base;
                     char *path_ptr = shm;
                     char *text_ptr = shm + 128; // Текст кладем со смещением!
                     
@@ -950,18 +981,20 @@ int main(int argc, char *argv[]) {
             } else if (my_strncmp(cmd, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf
                 char* filename = cmd + 2; // Пропускаем символы "./"
+                char safe_name[64] = {0};
+                my_strncpy(safe_name, filename, 63);
                 
-                // 1. Копируем имя файла в разделяемую память для Rootserver-а
-                char* shm = (char*)0x502000;
-                my_strncpy(shm, filename, 63);
-                shm[63] = '\0';
+                // Упаковываем строку прямо в регистры процессора!
+                seL4_SetMR(0, 100); // 100 = SYS_EXEC
+                uint64_t* name_ptr = (uint64_t*)safe_name;
+                for (int i = 0; i < 8; i++) {
+                    seL4_SetMR(i + 1, name_ptr[i]);
+                }
                 
-                // 2. Отправляем IPC запрос в Rootserver (SYS_EXEC = 100)
-                seL4_SetMR(0, 100); 
-                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
+                // Мы передали 9 регистров (1 под номер сисколла + 8 под строку)
+                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 9);
                 seL4_Call(root_ep, msg);
-                
-                // 3. Проверяем ответ от ядра
+
                 int pid = (int)seL4_GetMR(0);
                 if (pid > 0) {
                     // С новым мультиплексором в uart_driver, гонки больше нет.

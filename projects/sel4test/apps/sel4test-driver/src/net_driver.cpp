@@ -16,6 +16,10 @@ static inline seL4_IPCBuffer* get_local_ipc() {
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
+// --- Динамические адреса разделяемой памяти ---
+static char* g_shm_vaddr = nullptr;
+static uint32_t g_shm_paddr = 0;
+
 // Пример правильного sys_puts для драйвера:
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -182,15 +186,12 @@ static uint64_t g_cpu_loops = 0;
 static uint64_t g_ping_sent_loop = 0;
 
 static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
-    uintptr_t base_vaddr = 0x502000;
-    uintptr_t base_paddr = 0x60000000;
+    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(g_shm_vaddr + 0x200);
+    uint16_t* avail_ring = (uint16_t*)(g_shm_vaddr + 0x224);
+    volatile uint16_t* avail_idx = (volatile uint16_t*)(g_shm_vaddr + 0x222);
+    volatile uint16_t* used_idx = (volatile uint16_t*)(g_shm_vaddr + 0x242);
 
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)(base_vaddr + 0x200);
-    uint16_t* avail_ring = (uint16_t*)(base_vaddr + 0x224);
-    volatile uint16_t* avail_idx = (volatile uint16_t*)(base_vaddr + 0x222);
-    volatile uint16_t* used_idx = (volatile uint16_t*)(base_vaddr + 0x242);
-
-    vq_desc[0].addr = base_paddr + tx_offset;
+    vq_desc[0].addr = g_shm_paddr + tx_offset;
     vq_desc[0].len = total_len;
     vq_desc[0].flags = 0;
     vq_desc[0].next = 0;
@@ -207,9 +208,9 @@ static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
 }
 
 static void net_send_arp_request(seL4_CPtr root_ep) {
-    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(g_shm_vaddr + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
-    volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + 0x280 + sizeof(virtio_net_hdr));
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280 + sizeof(virtio_net_hdr));
     
     for(int i=0; i<6; i++) eth->dest_mac[i] = 0xFF;
     for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
@@ -229,10 +230,9 @@ static void net_send_arp_request(seL4_CPtr root_ep) {
 static void net_send_ping(seL4_CPtr console_ep, const uint8_t dst_ip[4]) {
     uint16_t seq = ++g_ping_next_seq;
     if (seq == 0) seq = ++g_ping_next_seq;
-
-    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(g_shm_vaddr + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
-    volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + 0x280 + sizeof(virtio_net_hdr));
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280 + sizeof(virtio_net_hdr));
     
     for(int i=0; i<6; i++) eth->dest_mac[i] = router_mac[i];
     for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
@@ -269,7 +269,7 @@ static void net_schedule_next_ping(seL4_CPtr timer_ep) {
     if (g_ping_series_remaining > 0) {
         g_ping_next_send_ms = sys_get_time_ms(timer_ep) + 1000; // Пауза ровно 1 секунда через RTC!
     } else {
-        volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
         net_mailbox[0] = 0; // Готово, разблокируем Shell
     }
 }
@@ -314,10 +314,10 @@ static void net_check_ping_timeout(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
 }
 
 static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
-    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(0x502000 + 0x280);
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(g_shm_vaddr + 0x280);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
     
-    volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + 0x280 + sizeof(virtio_net_hdr));
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280 + sizeof(virtio_net_hdr));
     for(int i=0; i<6; i++) eth->dest_mac[i] = router_mac[i];
     for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
     eth->ethertype = htons(0x0800); 
@@ -352,7 +352,7 @@ static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t
     put_dec(console_ep, dst_port);
     sys_puts(console_ep, "...\n");
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + my_strlen(message), 0x280);
-    volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
     net_mailbox[0] = 0;
 }
 
@@ -397,13 +397,12 @@ static int dns_format_name(char* dst, const char* src) {
 
 static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
     uint32_t tx_offset = 0x280;  // Возвращаем проверенное смещение
-    uintptr_t base_vaddr = 0x502000;
 
-    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(base_vaddr + tx_offset);
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(g_shm_vaddr + tx_offset);
     net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0;
     net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
 
-    volatile ethernet_frame* eth = (volatile ethernet_frame*)(base_vaddr + tx_offset + sizeof(virtio_net_hdr));
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + tx_offset + sizeof(virtio_net_hdr));
     
     for(int i = 0; i < 6; i++) eth->dest_mac[i] = router_mac[i];
     for(int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
@@ -538,11 +537,11 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
             put_duration_us(console_ep, g_ping_total_rtt_us / g_ping_reply_count);
             sys_puts(console_ep, " rtt_min=");
             put_duration_us(console_ep, g_ping_min_rtt_us);
-            sys_puts(console_ep, " rtt_max=");
+            sys_puts(console_ep, " rtt_max="); 
             put_duration_us(console_ep, g_ping_max_rtt_us);
         }
         sys_puts(console_ep, "\n");
-        volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
         net_mailbox[0] = 0;
 
     } else if (cmd == NET_CMD_RESOLVE) {
@@ -562,13 +561,13 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
 }
 
 static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(0x502000 + 0x2040);
-    volatile virtq_used_rx* rx_used = (volatile virtq_used_rx*)(0x502000 + 0x2080);
+    volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(g_shm_vaddr + 0x2040);
+    volatile virtq_used_rx* rx_used = (volatile virtq_used_rx*)(g_shm_vaddr + 0x2080);
 
     while (g_last_rx_used_idx != rx_used->idx) {
         uint16_t used_ring_idx = g_last_rx_used_idx % 4;
         uint32_t desc_id = rx_used->ring[used_ring_idx].id;
-        volatile ethernet_frame* eth = (volatile ethernet_frame*)(0x502000 + rx_buffer_offsets[desc_id] + sizeof(virtio_net_hdr));
+        volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + rx_buffer_offsets[desc_id] + sizeof(virtio_net_hdr));
 
         uint16_t type = htons(eth->ethertype);
 
@@ -653,9 +652,9 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
 
                             seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) | 
                                                 (resolved_ip[2] << 8) | resolved_ip[3];
-                            *((seL4_Word*)(0x502000 + 4064)) = packed_ip;
+                            *((seL4_Word*)(g_shm_vaddr + 4064)) = packed_ip;
                             
-                            volatile int* net_mailbox = (volatile int*)(0x502000 + 4060);
+                            volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
                             net_mailbox[0] = 0;
                             g_dns_outstanding = false;
                         } else {
@@ -696,6 +695,22 @@ int main(int argc, char *argv[]) {
 
     sys_puts(console_ep, "\n[NET DRIVER] Network Server Online!\n");
     uintptr_t base_addr = 0;
+
+    // =========================================================
+    // 1. ДИНАМИЧЕСКИЙ ЗАПРОС SHM (Убираем хардкод)
+    // =========================================================
+    seL4_SetMR(0, 107); // 107 = SYS_SHM_GET
+    seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
+    seL4_Call(root_ep, msg);
+    
+    g_shm_vaddr = (char*)seL4_GetMR(0);
+    g_shm_paddr = (uint32_t)seL4_GetMR(1);
+
+    if (g_shm_vaddr == nullptr || g_shm_paddr == 0) {
+        sys_puts(console_ep, "[NET] FATAL: Failed to get dynamic SHM!\n");
+        while(1) seL4_Yield();
+    }
+    // =========================================================
     for (int i = 0; i < 32; i++) {
         uintptr_t slot_addr = 0x200004000ULL + (i * 0x200);
         volatile VirtioMmioRegs* regs = (volatile VirtioMmioRegs*)slot_addr;
@@ -708,16 +723,16 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 6; i++) my_mac[i] = config_space[i];
 
         g_net_regs->guest_page_size = 64; 
-        g_net_regs->queue_sel = 0; g_net_regs->queue_num = 4; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (0x60000000 + 0x2000) / 64; 
-        volatile virtq_desc* rx_desc = (volatile virtq_desc*)(0x502000 + 0x2000);
-        volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(0x502000 + 0x2040);
+        g_net_regs->queue_sel = 0; g_net_regs->queue_num = 4; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (g_shm_paddr + 0x2000) / 64; 
+        volatile virtq_desc* rx_desc = (volatile virtq_desc*)(g_shm_vaddr + 0x2000);
+        volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(g_shm_vaddr + 0x2040);
         for (int i = 0; i < 4; i++) {
-            rx_desc[i].addr = 0x60000000 + rx_buffer_offsets[i]; rx_desc[i].len = 1536; rx_desc[i].flags = 2; rx_desc[i].next = 0;
+            rx_desc[i].addr = g_shm_paddr + rx_buffer_offsets[i]; rx_desc[i].len = 1536; rx_desc[i].flags = 2; rx_desc[i].next = 0;
             rx_avail->ring[g_rx_avail_idx % 4] = i; g_rx_avail_idx++;
         }
         rx_avail->idx = g_rx_avail_idx;
 
-        g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (0x60000000 + 0x200) / 64; 
+        g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (g_shm_paddr + 0x200) / 64; 
         g_net_regs->status |= 8; g_net_regs->status |= 4; 
         sys_puts(console_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized. Waiting for Shell commands.\n");
         g_net_regs->queue_notify = 0; 
