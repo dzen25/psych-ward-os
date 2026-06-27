@@ -1,6 +1,6 @@
 #include <sel4/sel4.h>
-#include "common.h"
-#include "fat32.h"
+#include "h/common.h"
+#include "h/fat32.h"
 #include <stdint.h>
 
 struct VirtioMmioRegs {
@@ -33,6 +33,7 @@ struct VirtioMmioRegs {
 static char* g_shm_vaddr = nullptr;
 static uint32_t g_shm_paddr = 0;
 static FAT32_Instance g_file_system;
+static seL4_CPtr g_console_ep = 0;
 
 // Глобальные переменные VirtIO
 static volatile VirtioMmioRegs* g_disk_regs = nullptr;
@@ -88,6 +89,19 @@ static void sys_puts(seL4_CPtr console_ep, const char *str) {
     }
 }
 
+static void put_dec(uint32_t val) {
+    char buf[12];
+    int i = 11;
+    buf[i] = '\0';
+    if (val == 0) { sys_puts(g_console_ep, "0"); return; }
+    while (val > 0 && i > 0) {
+        buf[--i] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+    sys_puts(g_console_ep, &buf[i]);
+}
+
+
 
 
 // ==========================================
@@ -103,15 +117,13 @@ struct virtio_blk_req { uint32_t type; uint32_t reserved; uint64_t sector; };
 // АППАРАТНЫЙ УРОВЕНЬ: Функция, которую будет дергать FAT32
 // ========================================================
 bool hardware_virtio_read(uint32_t sector, uint32_t count, void* buffer) {
+    if (count == 0) return true; // <--- БРОНЯ ОТ ПАДЕНИЯ QEMU
+    
     // Эта функция читает в временный DMA-буфер в разделяемой памяти,
     // а затем копирует в конечный буфер 'buffer'.
     uint32_t len = count * 512;
 
-    // Проверка, не слишком ли велик запрос для нашего одностраничного DMA-буфера
-    if (len > 4096) {
-        // Этот простой драйвер пока поддерживает чтение только в пределах одной страницы.
-        return false;
-    }
+    if (len > 4096) return false;
 
     volatile virtq_desc* vq_desc = (volatile virtq_desc*)((uintptr_t)virtio_q_shm_base + VQ_DESC_OFFSET);
     volatile virtq_avail* vq_avail = (volatile virtq_avail*)((uintptr_t)virtio_q_shm_base + VQ_AVAIL_OFFSET);
@@ -119,27 +131,38 @@ bool hardware_virtio_read(uint32_t sector, uint32_t count, void* buffer) {
     volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)((uintptr_t)virtio_q_shm_base + BLK_REQ_OFFSET);
     volatile uint8_t* blk_status = (volatile uint8_t*)((uintptr_t)virtio_q_shm_base + BLK_STATUS_OFFSET);
 
-    // Подготовка запроса
+    // 1. Подготовка структуры запроса
     blk_req->type = 0; // VIRTIO_BLK_T_IN (чтение)
     blk_req->sector = sector;
-    *blk_status = 0xFF; // Невалидный статус
+    *blk_status = 0xFF; 
     
-    // Дескриптор данных должен быть обновлен для этого чтения.
-    // DMA будет производиться в начало разделяемой области памяти.
+    // === БРОНЕЖИЛЕТ 2.0: ВОССТАНАВЛИВАЕМ ВСЕ ДЕСКРИПТОРЫ ===
+    vq_desc[0].addr = (g_shm_paddr + 0x1000) + BLK_REQ_OFFSET;
+    vq_desc[0].len = sizeof(virtio_blk_req);
+    vq_desc[0].flags = 1; // VIRTQ_DESC_F_NEXT
+    vq_desc[0].next = 1;
+    
     vq_desc[1].addr = g_shm_paddr;
     vq_desc[1].len = len;
+    vq_desc[1].flags = 1 | 2; // VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+    vq_desc[1].next = 2;
+    
+    vq_desc[2].addr = (g_shm_paddr + 0x1000) + BLK_STATUS_OFFSET;
+    vq_desc[2].len = 1;
+    vq_desc[2].flags = 2; // VIRTQ_DESC_F_WRITE
+    vq_desc[2].next = 0;
+    // =======================================================
 
-    // Добавляем цепочку дескрипторов в кольцо доступных
+    // 3. Добавляем цепочку дескрипторов в кольцо
     vq_avail->ring[g_vq_avail_idx % 16] = 0;
     g_vq_avail_idx++;
 
     // Барьер памяти, чтобы гарантировать, что записи дескриптора видны до обновления индекса
     __atomic_store_n(&vq_avail->idx, g_vq_avail_idx, __ATOMIC_RELEASE);
 
-    // Уведомляем устройство
+    // 4. Уведомляем QEMU
     g_disk_regs->queue_notify = 0;
 
-    // Ждем, пока устройство обработает запрос
     uint32_t timeout_counter = 5000000;
     while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) < g_vq_avail_idx) {
         if (--timeout_counter == 0) {
@@ -160,6 +183,8 @@ bool hardware_virtio_read(uint32_t sector, uint32_t count, void* buffer) {
 }
 
 bool hardware_virtio_write(uint32_t sector, uint32_t count, const void* buffer) {
+    if (count == 0) return true; // <--- БРОНЯ ОТ ПАДЕНИЯ QEMU
+    
     uint32_t len = count * 512;
     if (len > 4096) return false;
 
@@ -172,15 +197,27 @@ bool hardware_virtio_write(uint32_t sector, uint32_t count, const void* buffer) 
     volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)((uintptr_t)virtio_q_shm_base + BLK_REQ_OFFSET);
     volatile uint8_t* blk_status = (volatile uint8_t*)((uintptr_t)virtio_q_shm_base + BLK_STATUS_OFFSET);
 
-    blk_req->type = 1; // VIRTIO_BLK_T_OUT (ЗАПИСЬ)
+    blk_req->type = 1; // VIRTIO_BLK_T_OUT (WRITE)
     blk_req->sector = sector;
-    *blk_status = 0xFF; // Сброс статуса
+    *blk_status = 0xFF;
+    
+    // === БРОНЕЖИЛЕТ 2.0: ВОССТАНАВЛИВАЕМ ВСЕ ДЕСКРИПТОРЫ ===
+    vq_desc[0].addr = (g_shm_paddr + 0x1000) + BLK_REQ_OFFSET;
+    vq_desc[0].len = sizeof(virtio_blk_req);
+    vq_desc[0].flags = 1; // VIRTQ_DESC_F_NEXT
+    vq_desc[0].next = 1;
     
     vq_desc[1].addr = g_shm_paddr;
     vq_desc[1].len = len;
-    // ВАЖНО: Убираем флаг WRITE, потому что для записи на диск, диск должен ЧИТАТЬ из RAM
-    vq_desc[1].flags = 1; // Только VIRTQ_DESC_F_NEXT
+    // For WRITE, device READS from this buffer, so no VIRTQ_DESC_F_WRITE flag
+    vq_desc[1].flags = 1; // VIRTQ_DESC_F_NEXT
     vq_desc[1].next = 2;
+    
+    vq_desc[2].addr = (g_shm_paddr + 0x1000) + BLK_STATUS_OFFSET;
+    vq_desc[2].len = 1;
+    vq_desc[2].flags = 2; // VIRTQ_DESC_F_WRITE
+    vq_desc[2].next = 0;
+    // =======================================================
 
     vq_avail->ring[g_vq_avail_idx % 16] = 0;
     g_vq_avail_idx++;
@@ -193,9 +230,6 @@ bool hardware_virtio_write(uint32_t sector, uint32_t count, const void* buffer) 
         if (--timeout_counter == 0) return false;
         seL4_Yield(); 
     } 
-
-    // ВОЗВРАЩАЕМ дескриптор в режим ЧТЕНИЯ для будущих операций
-    vq_desc[1].flags = 1 | 2; // NEXT | WRITE
 
     return (*blk_status == 0);
 }
@@ -221,6 +255,7 @@ int main(int argc, char *argv[]) {
     // 2. Теперь безопасно получаем root_ep
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
+    g_console_ep = console_ep;
     seL4_CPtr my_ep   = ipc->msg[7]; // BOOT_BLK_EP
 
     if (my_ep == 0) {
@@ -313,12 +348,35 @@ int main(int argc, char *argv[]) {
         seL4_Word cmd = seL4_GetMR(0);
         
         if (cmd == 110) { // SYS_LS
+            char path[64];
+            my_strcpy(path, g_shm_vaddr);
+
+            // Сохраняем текущую рабочую директорию, чтобы восстановить ее позже
+            uint32_t original_cwd_cluster = g_file_system.current_dir_cluster;
+            bool changed_dir = false;
+
+            // Если был передан аргумент (путь), пытаемся временно перейти в эту директорию
+            if (path[0] != '\0' && !(path[0] == '/' && path[1] == '\0')) {
+                if (fat32_cd(&g_file_system, path)) {
+                    changed_dir = true;
+                } else {
+                    // Если `cd` не удался, значит это либо не директория, либо путь не существует.
+                    sys_puts(console_ep, "ls: cannot access '");
+                    sys_puts(console_ep, path);
+                    sys_puts(console_ep, "': No such file or directory\n");
+                    ((char*)g_shm_vaddr)[0] = '\0';
+                    seL4_SetMR(0, -1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    continue;
+                }
+            }
+
+            // Теперь CWD файловой системы указывает на нужную директорию.
             uint32_t target_sector = get_cwd_sector(&g_file_system);
             char sector_buf[512];
             
             // ВНИМАНИЕ: Это чтение аппаратно затирает g_shm_vaddr сырым FAT-сектором!
             hardware_virtio_read(target_sector, 1, sector_buf);
-
             char lfn_buf[256];
             for(int i = 0; i < 256; i++) lfn_buf[i] = 0;
 
@@ -405,6 +463,11 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "\n");
             }
             
+            // Если мы временно меняли директорию, возвращаем все как было
+            if (changed_dir) {
+                g_file_system.current_dir_cluster = original_cwd_cluster;
+            }
+
             ((char*)g_shm_vaddr)[0] = '\0'; // Блокируем утечку SHM
             
             seL4_SetMR(0, 0);
@@ -413,15 +476,19 @@ int main(int argc, char *argv[]) {
         else if (cmd == 119) { // SYS_READ_FILE
             uint32_t offset = seL4_GetMR(1);
             uint32_t bytes_read = 0;
-            
-            // ОЧЕНЬ ВАЖНО: Сейчас в SHM (g_shm_vaddr) лежит строковое имя файла, 
-            // которое передал Rootserver. Мы обязаны скопировать его себе на стек,
-            // потому что функция fat32_read_file перезапишет SHM бинарными данными ELF-файла!
             char filename[64];
-            my_strcpy(filename, g_shm_vaddr);
             
-            bool success = fat32_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
+            // Безопасное копирование (Safe Copy), чтобы не взорвать стек драйвера!
+            int i = 0;
+            char* shm = (char*)g_shm_vaddr;
+            while (shm[i] != '\0' && i < 63) {
+                filename[i] = shm[i];
+                i++;
+            }
+            filename[i] = '\0';
             
+            bool success = fat32_read_file(&g_file_system, filename, (char*)g_shm_vaddr, offset, &bytes_read);
+
             if (success) {
                 seL4_SetMR(0, 0); // Статус: OK
                 seL4_SetMR(1, bytes_read);

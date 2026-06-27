@@ -1,7 +1,7 @@
-#include "common.h"
-#include "allocator.h"
-#include "uart.h"
-#include "hw_timer.h" 
+#include "h/common.h"
+#include "h/allocator.h"
+#include "h/uart.h"
+#include "h/hw_timer.h" 
 
 #include <sel4/sel4.h>
 
@@ -13,6 +13,9 @@ extern "C" {
 
 extern char _cpio_archive[];
 extern char _cpio_archive_end[];
+
+// Выделяем гарантированно безопасный 1 МБ в секции BSS Rootserver'а
+static char global_lib_staging_buffer[1024 * 1024]; 
 
 enum SyscallID {
     // --- БАЗОВЫЕ КЕРНЕЛ-ВЫЗОВЫ ---
@@ -172,8 +175,14 @@ struct SharedMemoryRegion {
 };
 static SharedMemoryRegion shm_regions[16];
 
-static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
+static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {
+    char* shm = rootserver_shm_base;
     uint32_t total_read = 0;
+
+    // ВРЕМЕННЫЙ ПРИНТ ДЛЯ ОТЛАДКИ
+    uart_puts("[ROOT] Calling load_elf_from_disk for: '");
+    uart_puts(filename);
+    uart_puts("'\n");
 
     while (1) {
         // Драйвер перезаписывает SHM, поэтому имя файла восстанавливаем перед каждым запросом
@@ -186,15 +195,16 @@ static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load
         seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2);
         seL4_Call(blk_ep, msg);
         
-        int status = seL4_GetMR(0);
-        int bytes_read = seL4_GetMR(1);
+        int32_t status = seL4_GetMR(0);
+        uint32_t chunk_size = seL4_GetMR(1);
         
-        if (status != 0) return -1; // Ошибка чтения или файл не найден
-        if (bytes_read == 0) break;    // Конец файла (EOF)
+        if (status == -1 || chunk_size == 0) {
+            break;
+        }
         
         // Копируем полученный безопасный кусок в большой буфер Rootserver'а
-        memcpy(load_buffer + total_read, shm, bytes_read);
-        total_read += bytes_read;
+        memcpy(load_buffer + total_read, shm, chunk_size);
+        total_read += chunk_size;
     }
     
     return total_read;
@@ -237,7 +247,7 @@ static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, se
 
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace,
-                         seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
+                         seL4_CPtr normal_untyped, seL4_CPtr shm_frame,
                          int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
                          seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame,
                          const char *args_payload = nullptr,
@@ -358,25 +368,298 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         global_elf_temp_vaddr = 0x200100000ULL;
     }
 
+    // Внутри цикла перебора Program Headers в spawn_process:
+    
+    bool is_dynamic = false;
+    uint64_t dyn_vaddr = 0;
+    uint64_t dyn_size = 0;
+    uint64_t base_address = 0x400000; // Базовый адрес для PIE (обычно ELF загружаются сюда)
+
+    // 1. Сначала определяем, является ли бинарник динамическим (PIE)
+    // ВАЖНО: Код маппинга основного ELF файла перенесен ПОСЛЕ кода динамического линкера,
+    // чтобы линкер мог сначала пропатчить GOT/PLT в staging-буфере, и только потом
+    // эти уже измененные страницы будут скопированы в память процесса.
+
+    for (int i = 0; i < elf_getNumProgramHeaders(&elf); i++) {
+        if (elf_getProgramHeaderType(&elf, i) == 2) { // PT_DYNAMIC
+            is_dynamic = true;
+            // В PIE-файлах vaddr - это смещение. Прибавляем базовый адрес.
+            dyn_vaddr = base_address + elf_getProgramHeaderVaddr(&elf, i);
+            dyn_size = elf_getProgramHeaderMemorySize(&elf, i);
+            break;
+        }
+    }
+
+    // 3. Анализ динамической секции после загрузки в память
+    if (is_dynamic) {
+        uart_puts("[LINKER] Auto-resolving dependencies...\n");
+
+        // Виртуальный адрес для первой библиотеки. Последующие будут размещаться выше.
+        uint64_t current_lib_vaddr = 0x800000;
+
+        uint64_t dyn_offset = 0;
+        // Ищем смещение секции .dynamic в самом файле (elf_file)
+        for (int i = 0; i < elf_getNumProgramHeaders(&elf); i++) {
+            if (elf_getProgramHeaderType(&elf, i) == PT_DYNAMIC) { // PT_DYNAMIC = 2
+                dyn_offset = elf_getProgramHeaderOffset(&elf, i);
+                break;
+            }
+        }
+
+        if (dyn_offset != 0) {
+            Elf64_Dyn* dyn_table = (Elf64_Dyn*)((uintptr_t)elf_file + dyn_offset);
+            uint64_t strtab_offset = 0;
+
+            // 1. Ищем таблицу строк (DT_STRTAB)
+            for (int i = 0; dyn_table[i].d_tag != 0; i++) {
+                if (dyn_table[i].d_tag == 5 /* DT_STRTAB */) {
+                    uint64_t strtab_vaddr = dyn_table[i].d_un.d_ptr;
+                    for (int j = 0; j < elf_getNumProgramHeaders(&elf); j++) {
+                        if (elf_getProgramHeaderType(&elf, j) == PT_LOAD /* PT_LOAD = 1 */) {
+                            uint64_t p_vaddr = elf_getProgramHeaderVaddr(&elf, j);
+                            uint64_t p_memsz = elf_getProgramHeaderMemorySize(&elf, j);
+                            if (strtab_vaddr >= p_vaddr && strtab_vaddr < p_vaddr + p_memsz) {
+                                strtab_offset = elf_getProgramHeaderOffset(&elf, j) + (strtab_vaddr - p_vaddr);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // 2. Ищем все теги DT_NEEDED и автоматически грузим их!
+            if (strtab_offset != 0) {
+                for (int i = 0; dyn_table[i].d_tag != 0; i++) {
+                    if (dyn_table[i].d_tag == 1 /* DT_NEEDED */) {
+                        uint64_t name_idx = dyn_table[i].d_un.d_val;
+                        char* lib_name = (char*)((uintptr_t)elf_file + strtab_offset + name_idx);
+                        
+                        uart_puts("[LINKER] Need library: ");
+                        uart_puts(lib_name);
+                        uart_puts("\n");
+
+                        // Используем глобальный буфер для загрузки библиотеки
+                        char* lib_buf = global_lib_staging_buffer;
+                        memset(lib_buf, 0, 1024 * 1024); // Очищаем 1 МБ под либу
+                        
+                        // АВТОМАТИЧЕСКАЯ ЗАГРУЗКА БЕЗ ХАРДКОДА!
+                        int lib_size = load_elf_from_disk(blk_ep, lib_name, lib_buf);
+
+                        if (lib_size > 0) {
+                            elf_t lib_elf;
+                            if (elf_newFile(lib_buf, lib_size, &lib_elf) == 0) {
+                                
+                                for (int j = 0; j < elf_getNumProgramHeaders(&lib_elf); j++) {
+                                    if (elf_getProgramHeaderType(&lib_elf, j) == PT_LOAD /* 1 */) {
+                                        uint64_t l_offset = elf_getProgramHeaderOffset(&lib_elf, j);
+                                        uint64_t l_vaddr  = elf_getProgramHeaderVaddr(&lib_elf, j) + current_lib_vaddr;
+                                        uint64_t l_filesz = elf_getProgramHeaderFileSize(&lib_elf, j);
+                                        uint64_t l_memsz  = elf_getProgramHeaderMemorySize(&lib_elf, j);
+
+                                        uint64_t p_start = l_vaddr & ~0xFFFULL;
+                                        uint64_t p_end = (l_vaddr + l_memsz + 0xFFF) & ~0xFFFULL;
+
+                                        for (uint64_t page = p_start; page < p_end; page += 4096) {
+                                            seL4_CPtr frame = alloc_and_track_cap(alloc, pcb);
+                                            seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1);
+                                            
+                                            seL4_ARM_Page_Map(frame, root_vspace, elf_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+                                            memset((void*)elf_temp_vaddr, 0, 4096);
+
+                                            uint64_t copy_start = (page > l_vaddr) ? page : l_vaddr;
+                                            uint64_t copy_end = (page + 4096 < l_vaddr + l_filesz) ? page + 4096 : l_vaddr + l_filesz;
+                                            if (copy_start < copy_end) {
+                                                memcpy((void*)(elf_temp_vaddr + (copy_start - page)), 
+                                                       lib_buf + l_offset + (copy_start - l_vaddr), 
+                                                       copy_end - copy_start);
+                                            }
+                                            seL4_ARM_Page_Clean_Data(frame, 0, 4096);
+                                            seL4_ARM_Page_Unmap(frame);
+
+                                            if (!map_frame_robust(alloc, pcb, frame, child_vspace, page, normal_untyped, root_cnode)) {
+                                                uart_puts("[LINKER] FATAL: Failed to map library page!\n");
+                                            }
+                                        }
+                                    }
+                                }
+                                uart_puts("[LINKER] Mapped successfully!\n");
+                                
+                                // ==========================================
+                                // 4. THE RELOCATION ENGINE (Патчим GOT/PLT)
+                                // ==========================================
+                                uart_puts("[LINKER] Starting Relocation Phase...\n");
+                                
+                                uint64_t lib_base_address = 0x800000; 
+
+                                uint64_t rela_offset = 0;
+                                uint64_t relasz = 0;
+                                uint64_t symtab_offset = 0;
+                                // strtab_offset is already found above
+
+                                // 1. Ищем нужные таблицы в основном файле (dyn_test.elf)
+                                // dyn_offset is already found above
+
+                                if (dyn_offset != 0) {
+                                    Elf64_Dyn* dyn_table = (Elf64_Dyn*)((uintptr_t)elf_file + dyn_offset);
+                                    
+                                    // Функция-хелпер для конвертации VAddr -> Offset
+                                    auto vaddr_to_offset = [&](uint64_t vaddr) -> uint64_t {
+                                        for (int j = 0; j < elf_getNumProgramHeaders(&elf); j++) {
+                                            if (elf_getProgramHeaderType(&elf, j) == 1 /* PT_LOAD */) {
+                                                uint64_t p_vaddr = elf_getProgramHeaderVaddr(&elf, j);
+                                                uint64_t p_memsz = elf_getProgramHeaderMemorySize(&elf, j);
+                                                if (vaddr >= p_vaddr && vaddr < p_vaddr + p_memsz) {
+                                                    return elf_getProgramHeaderOffset(&elf, j) + (vaddr - p_vaddr);
+                                                }
+                                            }
+                                        }
+                                        return 0;
+                                    };
+
+                                    for (int i = 0; dyn_table[i].d_tag != 0; i++) {
+                                        if (dyn_table[i].d_tag == 7 /* DT_RELA */ || dyn_table[i].d_tag == 23 /* DT_JMPREL */) {
+                                            rela_offset = vaddr_to_offset(dyn_table[i].d_un.d_ptr);
+                                        } else if (dyn_table[i].d_tag == 8 /* DT_RELASZ */ || dyn_table[i].d_tag == 2 /* DT_PLTRELSZ */) {
+                                            relasz = dyn_table[i].d_un.d_val;
+                                        } else if (dyn_table[i].d_tag == 6 /* DT_SYMTAB */) {
+                                            symtab_offset = vaddr_to_offset(dyn_table[i].d_un.d_ptr);
+                                        }
+                                        // strtab_offset is handled outside this loop
+                                    }
+
+                                    // 2. Ищем таблицу символов и строк в Библиотеке (libpsych.so)
+                                    uint64_t lib_symtab_offset = 0;
+                                    uint64_t lib_strtab_offset = 0;
+                                    
+                                    uint64_t lib_dyn_offset = 0;
+                                    for (int i = 0; i < elf_getNumProgramHeaders(&lib_elf); i++) {
+                                        if (elf_getProgramHeaderType(&lib_elf, i) == 2 /* PT_DYNAMIC */) {
+                                            lib_dyn_offset = elf_getProgramHeaderOffset(&lib_elf, i);
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if (lib_dyn_offset != 0) {
+                                        Elf64_Dyn* lib_dyn_table = (Elf64_Dyn*)((uintptr_t)lib_buf + lib_dyn_offset);
+                                        for (int i = 0; lib_dyn_table[i].d_tag != 0; i++) {
+                                            // Аналогичный хелпер для библиотеки
+                                            auto lib_vaddr_to_offset = [&](uint64_t vaddr) -> uint64_t {
+                                                for (int j = 0; j < elf_getNumProgramHeaders(&lib_elf); j++) {
+                                                    if (elf_getProgramHeaderType(&lib_elf, j) == 1) {
+                                                        uint64_t p_vaddr = elf_getProgramHeaderVaddr(&lib_elf, j);
+                                                        uint64_t p_memsz = elf_getProgramHeaderMemorySize(&lib_elf, j);
+                                                        if (vaddr >= p_vaddr && vaddr < p_vaddr + p_memsz) {
+                                                            return elf_getProgramHeaderOffset(&lib_elf, j) + (vaddr - p_vaddr);
+                                                        }
+                                                    }
+                                                }
+                                                return 0;
+                                            };
+
+                                            if (lib_dyn_table[i].d_tag == 6 /* DT_SYMTAB */) {
+                                                lib_symtab_offset = lib_vaddr_to_offset(lib_dyn_table[i].d_un.d_ptr);
+                                            } else if (lib_dyn_table[i].d_tag == 5 /* DT_STRTAB */) {
+                                                lib_strtab_offset = lib_vaddr_to_offset(lib_dyn_table[i].d_un.d_ptr);
+                                            }
+                                        }
+                                    }
+
+                                    // 3. Выполняем ПАТЧИНГ!
+                                    if (rela_offset != 0 && symtab_offset != 0 && strtab_offset != 0 && 
+                                        lib_symtab_offset != 0 && lib_strtab_offset != 0) {
+                                        
+                                        Elf64_Rela* relocs = (Elf64_Rela*)((uintptr_t)elf_file + rela_offset);
+                                        Elf64_Sym* syms = (Elf64_Sym*)((uintptr_t)elf_file + symtab_offset);
+                                        Elf64_Sym* lib_syms = (Elf64_Sym*)((uintptr_t)lib_buf + lib_symtab_offset);
+                                        
+                                        int num_relocs = relasz / sizeof(Elf64_Rela);
+                                        
+                                        uart_puts("[LINKER] Patching ");
+                                        uart_putdec(num_relocs);
+                                        uart_puts(" relocations...\n");
+
+                                        for (int r = 0; r < num_relocs; r++) {
+                                            uint32_t type = ELF64_R_TYPE(relocs[r].r_info);
+                                            uint32_t sym_idx = ELF64_R_SYM(relocs[r].r_info);
+                                            
+                                            if (type == 1026 /* R_AARCH64_JUMP_SLOT */ || type == 1025 /* R_AARCH64_GLOB_DAT */) {
+                                                uint32_t name_offset = syms[sym_idx].st_name;
+                                                char* target_name = (char*)((uintptr_t)elf_file + strtab_offset + name_offset);
+                                                
+                                                uint64_t target_vaddr = 0;
+                                                for (int k = 1; k < 1000; k++) {
+                                                    if (lib_syms[k].st_name == 0) continue;
+                                                    if (lib_strtab_offset + lib_syms[k].st_name > (uint64_t)lib_size) break; 
+                                                    
+                                                    char* lib_sym_name = (char*)((uintptr_t)lib_buf + lib_strtab_offset + lib_syms[k].st_name);
+                                                    
+                                                    if (my_strcmp(target_name, lib_sym_name) == 0) {
+                                                        target_vaddr = lib_syms[k].st_value + lib_base_address;
+                                                        break;
+                                                    }
+                                                }
+
+                                                if (target_vaddr != 0) {
+                                                    uint64_t patch_offset = vaddr_to_offset(relocs[r].r_offset);
+                                                    if (patch_offset != 0) {
+                                                        uint64_t* got_entry = (uint64_t*)((uintptr_t)elf_file + patch_offset);
+                                                        *got_entry = target_vaddr;
+                                                        
+                                                        uart_puts("[LINKER] Patched ");
+                                                        uart_puts(target_name);
+                                                        uart_puts(" at GOT\n");
+                                                    }
+                                                } else {
+                                                    uart_puts("[LINKER] WARNING: Symbol not found: ");
+                                                    uart_puts(target_name);
+                                                    uart_puts("\n");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Сдвигаем адреса для следующей библиотеки (шаг 2 МБ)
+                                current_lib_vaddr += 0x200000;
+                            } else {
+                                uart_puts("[LINKER] ERROR: Could not parse library ELF!\n");
+                            }
+                        } else {
+                            uart_puts("[LINKER] ERROR: Could not load library from disk!\n");
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    // 2. Модифицированная загрузка PT_LOAD (учитываем базовый адрес)
+    // Этот код выполняется ПОСЛЕ динамического линкера, чтобы он мог пропатчить ELF в буфере.
     for (int i = 0; i < elf_getNumProgramHeaders(&elf); i++) {
         if (elf_getProgramHeaderType(&elf, i) == PT_LOAD) {
-            uint64_t vaddr = elf_getProgramHeaderVaddr(&elf, i);
-            uint64_t filesz = elf_getProgramHeaderFileSize(&elf, i);
-            uint64_t memsz = elf_getProgramHeaderMemorySize(&elf, i);
             uint64_t offset = elf_getProgramHeaderOffset(&elf, i);
+            uint64_t vaddr = elf_getProgramHeaderVaddr(&elf, i);
+            uint64_t file_size = elf_getProgramHeaderFileSize(&elf, i);
+            uint64_t mem_size = elf_getProgramHeaderMemorySize(&elf, i);
+
+            if (is_dynamic) {
+                vaddr += base_address;
+            }
+
             uint64_t page_start = vaddr & ~0xFFFULL;
-            uint64_t page_end = (vaddr + memsz + 0xFFF) & ~0xFFFULL;
-            
+            uint64_t page_end = (vaddr + mem_size + 0xFFF) & ~0xFFFULL;
+
             for (uint64_t page = page_start; page < page_end; page += 4096) {
                 seL4_CPtr frame = alloc_and_track_cap(alloc, pcb);
                 seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1);
-                
-                // Используем скользящее окно!
+
                 seL4_ARM_Page_Map(frame, root_vspace, elf_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
                 memset((void*)elf_temp_vaddr, 0, 4096);
-                
+
                 uint64_t copy_start = (page > vaddr) ? page : vaddr;
-                uint64_t copy_end = (page + 4096 < vaddr + filesz) ? page + 4096 : vaddr + filesz;
+                uint64_t copy_end = (page + 4096 < vaddr + file_size) ? page + 4096 : vaddr + file_size;
                 if (copy_start < copy_end) {
                     memcpy((void*)(elf_temp_vaddr + (copy_start - page)), elf_file + offset + (copy_start - vaddr), copy_end - copy_start);
                 }
@@ -386,6 +669,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 seL4_ARM_Page_Map(frame, child_vspace, page, seL4_AllRights, seL4_ARM_Default_VMAttributes);
             }
         }
+    }
+
+    if (is_dynamic) {
+        entry_point += base_address; 
     }
 
     uintptr_t child_stack = 0x500000;
@@ -492,13 +779,16 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     
     // ИСПРАВЛЕНО: Удален дублирующийся вызов seL4_TCB_Configure, который перезаписывал Fault Endpoint и скрывал падения.
     seL4_UserContext regs = {0};
-    regs.pc = entry_point;
     regs.sp = child_stack + 4096;
     regs.x0 = (seL4_Word)badged_ep;
     regs.x1 = (seL4_Word)child_ipc;
     regs.x2 = (seL4_Word)med_ep; 
     regs.tpidr_el0 = (seL4_Word)child_ipc + 3072;
     regs.tpidrro_el0 = (seL4_Word)child_ipc + 3072;
+
+    // ИСПРАВЛЕНО: Устанавливаем PC после того, как он был скорректирован для PIE
+    regs.pc = entry_point;
+
     size_t reg_count = sizeof(seL4_UserContext) / sizeof(seL4_Word);
     seL4_TCB_WriteRegisters(tcb, 0, 0, reg_count, &regs);
 
@@ -516,8 +806,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 }
 
 static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc, 
-                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped, 
-                                    seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep) {
+                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                                    seL4_CPtr shm_frame, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep) {
     if (pid <= 0 || pid >= 256 || !pcbs[pid].active) return;
 
     // 1. Копируем метаданные упавшего процесса во временный буфер
@@ -576,7 +866,7 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     if (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
         
-        int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+        int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame,
                                     meta.is_driver, console_ep, timer_ep, blk_ep, meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep);
         
@@ -1085,7 +1375,7 @@ int main(int argc, char *argv[]) {
                     *args = '\0';
                     args++;
                 } else {
-                    args = ""; // No args
+                    args = (char*)""; // No args
                 }
                 
                 static char elf_staging_buffer[1024 * 1024];

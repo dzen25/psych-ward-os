@@ -1,4 +1,4 @@
-#include "fat32.h"
+#include "h/fat32.h"
 
 // Forward declarations for static helpers
 static void my_memcpy(void *dest, const void *src, int n);
@@ -191,6 +191,13 @@ bool fat32_read_file(FAT32_Instance* fs, const char* filename, char* out_buffer,
     // Ограничиваем чтение размером страницы разделяемой памяти (SHM = 4096)
     uint32_t chunk_size = (remaining > 4096) ? 4096 : remaining; 
     
+    // === АБСОЛЮТНАЯ ЗАЩИТА QEMU ===
+    if (chunk_size == 0 || remaining == 0) {
+        *bytes_read = 0;
+        return true; // Файл закончился, возвращаем успех, но 0 байт прочитано.
+    }
+
+    
     // Внимание: для простоты предполагаем, что кластеры идут подряд (Contiguous).
     // Для запуска небольших test.elf этого хватит с головой.
     uint32_t base_sector = fs->data_start_sector + (start_cluster - 2) * fs->sectors_per_cluster;
@@ -241,11 +248,14 @@ static void format_fat32_name(const char* input, char* output) {
 }
 
 // Ищет запись внутри конкретной папки (dir_cluster) и возвращает её кластер (или 0xFFFFFFFF, если не найдена)
-static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name) {
+static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name, uint8_t* out_attr) {
     // === ФИКС ДЛЯ "cd .." ИЗ КОРНЯ ===
     if (my_strcmp(target_name, "..") == 0 && (dir_cluster == fs->root_cluster || dir_cluster == 0)) {
+        if (out_attr) *out_attr = 0x10; // ATTR_DIRECTORY
         return fs->root_cluster; // Безопасно возвращаем корень, предотвращая ошибку
     }
+
+    if (out_attr) *out_attr = 0; // По умолчанию атрибутов нет
 
     char sector_buf[512];
     uint32_t clus = (dir_cluster == 0) ? fs->root_cluster : dir_cluster;
@@ -292,6 +302,7 @@ static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, cons
                 // Если имя совпало, берем номер кластера из 8.3 записи!
                 uint16_t clus_hi = *(uint16_t*)&entry[20];
                 uint16_t clus_lo = *(uint16_t*)&entry[26];
+                if (out_attr) *out_attr = entry[11];
                 return ((uint32_t)clus_hi << 16) | clus_lo;
             }
             for(int k=0; k<256; k++) lfn_buf[k] = 0; // Не совпало - очищаем буфер
@@ -303,6 +314,7 @@ static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, cons
             if (my_strcmp(entry_name, formatted_name) == 0) {
                 uint16_t clus_hi = *(uint16_t*)&entry[20];
                 uint16_t clus_lo = *(uint16_t*)&entry[26];
+                if (out_attr) *out_attr = entry[11];
                 return ((uint32_t)clus_hi << 16) | clus_lo;
             }
         }
@@ -341,8 +353,10 @@ uint32_t fat32_resolve_parent(FAT32_Instance* fs, const char* full_path, char* o
         }
 
         // Иначе это промежуточная директория, пытаемся в неё "провалиться"
-        uint32_t next_clus = fat32_find_in_dir(fs, current_clus, token);
+        uint8_t attr = 0;
+        uint32_t next_clus = fat32_find_in_dir(fs, current_clus, token, &attr);
         if (next_clus == 0xFFFFFFFF) return 0xFFFFFFFF; // Промежуточная папка не существует!
+        if (!(attr & 0x10)) return 0xFFFFFFFF; // Компонент пути не является директорией
         
         // Если `find_in_dir` вернул 0, это значит, что мы перешли в корневой каталог (например, `cd ..` из `/mydir`)
         if (next_clus == 0) next_clus = fs->root_cluster;
@@ -791,8 +805,10 @@ bool fat32_cd(FAT32_Instance* fs, const char* path) {
     if (parent_clus == 0xFFFFFFFF) return false; 
 
     // Ищем целевую папку внутри найденного родителя
-    uint32_t target_clus = fat32_find_in_dir(fs, parent_clus, basename);
+    uint8_t attr = 0;
+    uint32_t target_clus = fat32_find_in_dir(fs, parent_clus, basename, &attr);
     if (target_clus == 0xFFFFFFFF) return false;
+    if (!(attr & 0x10)) return false; // Можно переходить только в директории
 
     // В FAT32 ".." из папки первого уровня ведет в 0. Конвертируем обратно в root
     if (target_clus == 0) target_clus = fs->root_cluster; 

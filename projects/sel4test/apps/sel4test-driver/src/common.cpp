@@ -1,4 +1,4 @@
-#include "common.h"
+#include "h/common.h"
 
 extern "C" void __assert_fail(const char *assertion, const char *file, int line, const char *function) {
     printf("PANIC: %s at %s:%d\n", assertion, file, line);

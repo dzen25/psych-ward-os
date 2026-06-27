@@ -1,5 +1,5 @@
 #include <sel4/sel4.h>
-#include "common.h"
+#include "h/common.h"
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;

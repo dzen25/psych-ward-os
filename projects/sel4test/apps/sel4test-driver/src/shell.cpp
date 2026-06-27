@@ -1,7 +1,7 @@
 #include <sel4/sel4.h>
-#include "common.h"
+#include "h/common.h"
 #include <stdint.h>
-#include "pipe.h"
+#include "h/pipe.h"
 
 // Адреса для синхронизации доступа к VFS и TTY
 #define BOOT_BLK_EP 7
@@ -506,8 +506,17 @@ int main(int argc, char *argv[]) {
         cmd[i] = '\0';
         
         if (i > 0) {
+            // Убираем ведущие пробелы из команды
+            char *command_start = cmd;
+            while (*command_start == ' ') {
+                command_start++;
+            }
+            // Если после пробелов ничего не осталось, выходим
+            if (*command_start == '\0') {
+                continue;
+            }
 
-            char *pipe_sym = cmd;
+            char *pipe_sym = command_start;
             while (*pipe_sym && *pipe_sym != '|') pipe_sym++;
             
             char cmd2[64];
@@ -518,10 +527,9 @@ int main(int argc, char *argv[]) {
                 char *right_cmd = pipe_sym + 1;
                 while (*right_cmd == ' ') right_cmd++; // Убираем пробелы
                 my_strcpy(cmd2, right_cmd);
-                
                 // Убираем пробел в конце левой команды
                 char *left_end = pipe_sym - 1;
-                while (left_end >= cmd && *left_end == ' ') {
+                while (left_end >= command_start && *left_end == ' ') {
                     *left_end = '\0';
                     left_end--;
                 }
@@ -532,12 +540,12 @@ int main(int argc, char *argv[]) {
                 is_piping = false;
             }
 
-            char *arg = cmd; while (*arg && *arg != ' ') arg++;
+            char *arg = command_start; while (*arg && *arg != ' ') arg++;
             if (*arg == ' ') { *arg = '\0'; arg++; while (*arg == ' ') arg++; } else { arg = nullptr; }
 
             char *shm = shm_base; // Адрес разделяемой памяти (Shared Memory)
 
-            if (my_strcmp(cmd, "time") == 0) {
+            if (my_strcmp(command_start, "time") == 0) {
                 seL4_Word current = sys_get_time(timer_ep);
                 sys_puts(console_ep, "Uptime: ");
                 char buf[16]; int temp = current, j = 0;
@@ -547,13 +555,13 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, " ms\n");
             } 
              
-            else if (my_strcmp(cmd, "sleep") == 0) {
+            else if (my_strcmp(command_start, "sleep") == 0) {
                 sys_puts(console_ep, "Sleeping 3 seconds...\n");
                 sys_sleep(timer_ep, 3000);
                 sys_puts(console_ep, "Woke up!\n");
             }
 
-            else if (my_strcmp(cmd, "ping") == 0) {
+            else if (my_strcmp(command_start, "ping") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: ping <domain_or_ip> [count]\n"); continue; }
                 
                 char *cursor = arg;
@@ -597,7 +605,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, timeout);
             }
 
-            else if (my_strcmp(cmd, "send") == 0) {
+            else if (my_strcmp(command_start, "send") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: send <text>\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
@@ -612,7 +620,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
-            else if (my_strcmp(cmd, "sendto") == 0) {
+            else if (my_strcmp(command_start, "sendto") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
@@ -646,7 +654,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
-            else if (my_strcmp(cmd, "netstat") == 0) {
+            else if (my_strcmp(command_start, "netstat") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
                 
                 volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
@@ -658,7 +666,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 2000); // Для статуса достаточно 2-х секунд
             }
 
-            else if (my_strcmp(cmd, "ls") == 0) {
+            else if (my_strcmp(command_start, "ls") == 0) {
                 char *shm = shm_base; 
                 if (arg) { build_absolute_path(shm, arg); } 
                 else { build_absolute_path(shm, ""); }
@@ -673,12 +681,12 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "pwd") == 0) {
+            else if (my_strcmp(command_start, "pwd") == 0) {
                 sys_puts(console_ep, current_working_dir);
                 sys_puts(console_ep, "\n");
             }
 
-            else if (my_strcmp(cmd, "mkdir") == 0) {
+            else if (my_strcmp(command_start, "mkdir") == 0) {
                 if (!arg) {
                     sys_puts(console_ep, "mkdir: missing operand\n");
                     continue;
@@ -711,7 +719,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "cd") == 0) {
+            else if (my_strcmp(command_start, "cd") == 0) {
                 char* path = arg;
                 if (!path || path[0] == '\0') {
                     path = (char*)"/";
@@ -746,14 +754,14 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "ps") == 0) {
+            else if (my_strcmp(command_start, "ps") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
 
                 ipc->msg[0] = 104; seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 sys_puts(console_ep, shm);
             }
 
-            else if (my_strcmp(cmd, "kill") == 0) {
+            else if (my_strcmp(command_start, "kill") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
                 if (!arg) { sys_puts(console_ep, "Usage: kill <pid>\n"); continue; }
                 ipc->msg[0] = 102; // SYS_KILL
@@ -762,7 +770,7 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "Signal sent.\n");
             }
 
-            else if (my_strcmp(cmd, "exec") == 0) {
+            else if (my_strcmp(command_start, "exec") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: exec <filename> [args] [&]\n"); continue; }
                 
                 bool run_in_background = false;
@@ -814,7 +822,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "shm") == 0) {
+            else if (my_strcmp(command_start, "shm") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: shm <id> <read|write> [text]\n"); continue; }
                 
                 char *id_str = arg;
@@ -852,7 +860,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "pid") == 0) {
+            else if (my_strcmp(command_start, "pid") == 0) {
                 sys_puts(console_ep, "Current Shell PID: ");
                 char buf[16]; int temp = my_pid, j = 0;
                 if (temp == 0) buf[j++] = '0';
@@ -862,7 +870,7 @@ int main(int argc, char *argv[]) {
             }
 
             // === КОМАНДА TOUCH (Поддержка бесконечного числа аргументов) ===
-            else if (my_strcmp(cmd, "touch") == 0) {
+            else if (my_strcmp(command_start, "touch") == 0) {
                 char* p = arg;
 
                 // 1. Ошибка: если после пробелов сразу конец строки (нет аргументов)
@@ -896,7 +904,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "cat") == 0) {
+            else if (my_strcmp(command_start, "cat") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: cat <file>\n"); continue; }
                 char *shm = shm_base;
                 build_absolute_path(shm, arg);
@@ -909,7 +917,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "echo") == 0) {
+            else if (my_strcmp(command_start, "echo") == 0) {
                 if (!arg) { sys_puts(console_ep, "\n"); continue; }
                 
                 // Парсер перенаправления потока (ищем символ '>')
@@ -962,11 +970,11 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "help") == 0) {
+            else if (my_strcmp(command_start, "help") == 0) {
                 sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, touch, rm, mv\n");
             }
 
-            else if (my_strcmp(cmd, "exit") == 0) {
+            else if (my_strcmp(command_start, "exit") == 0) {
                 sys_puts(console_ep, "Exiting sandbox...\n");
                 sys_exit(root_ep);
             }
@@ -974,19 +982,19 @@ int main(int argc, char *argv[]) {
             // ==========================================
             // НОВОЕ: ТРИГГЕРЫ АППАРАТНЫХ КРАШЕЙ // Краш-тест - удалить
             // ==========================================
-            else if (my_strcmp(cmd, "crash_shell") == 0) {
+            else if (my_strcmp(command_start, "crash_shell") == 0) {
                 sys_puts(console_ep, "[SHELL] Initiating intentional Segfault (Null Pointer Dereference)...\n");
                 volatile int* boom = (volatile int*)0x0;
                 *boom = 0xDEAD; // Оболочка умрет на этой строке
             }
 
-            else if (my_strcmp(cmd, "crash_disk") == 0) {
+            else if (my_strcmp(command_start, "crash_disk") == 0) {
                 sys_puts(console_ep, "[SHELL] Sending poison pill to blk_driver...\n");
                 vfs_syscall(121, blk_ep); // Оправляем команду умереть
             }
             // ==========================================
 
-            else if (my_strcmp(cmd, "rm") == 0) {
+            else if (my_strcmp(command_start, "rm") == 0) {
                 char* p = arg;
 
                 if (!p || *p == '\0') {
@@ -1015,7 +1023,7 @@ int main(int argc, char *argv[]) {
                 }
             } 
             // === КОМАНДА MV (Переименование) ===
-            else if (my_strcmp(cmd, "mv") == 0) {
+            else if (my_strcmp(command_start, "mv") == 0) {
                 if (!arg) {
                     sys_puts(console_ep, "mv: missing file operand\n");
                     continue;
@@ -1066,9 +1074,9 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "': No such file or directory\n");
                 }
             }
-            else if (my_strncmp(cmd, "./", 2) == 0) {
+            else if (my_strncmp(command_start, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf
-                char* filename = cmd + 2; // Пропускаем "./"
+                char* filename = command_start + 2; // Пропускаем "./"
                 
                 // --- НОВЫЙ БЛОК ПАРСИНГА ПУТЕЙ ---
                 // Если в имени файла есть слеш (например, mnt/test.elf),
@@ -1121,7 +1129,7 @@ int main(int argc, char *argv[]) {
             if (is_piping) {
                     // Если левая команда была НЕ 'ls', значит она отработала мгновенно (например, help)
                     // и нам нужно вручную закрыть задвижку. (А вот ls_thread закрывает её сам изнутри потока)
-                    if (my_strcmp(cmd, "ls") != 0) {
+                    if (my_strcmp(command_start, "ls") != 0) {
                         global_pipe.writer_closed = true;
                     }
 
