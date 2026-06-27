@@ -194,7 +194,6 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
     seL4_Yield();
 }
 
-// Алиас для обратной совместимости (чтобы не переписывать логику grep)
 #define sys_puts_direct sys_puts
 
 static void sys_thread_exit() {
@@ -680,68 +679,70 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd, "mkdir") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: mkdir <path>\n"); continue; }
-                char *shm = shm_base;
-                build_absolute_path(shm, arg);
-                
-                int fail = 0;
-                for (int i = 1; shm[i] != '\0'; i++) {
-                    if (shm[i] == '/') {
-                        shm[i] = '\0'; 
-                        if (vfs_syscall(109, blk_ep) != 0) fail = 1;
-                        shm[i] = '/';  
-                    }
+                if (!arg) {
+                    sys_puts(console_ep, "mkdir: missing operand\n");
+                    continue;
                 }
-                
-                if (vfs_syscall(109, blk_ep) != 0) fail = 1;
-                
-                if (!fail) sys_puts(console_ep, "Directory tree created.\n");
-                else sys_puts(console_ep, "Failed to create directory tree.\n");
+
+                char* p = arg;
+                while (*p != '\0') {
+                    while (*p == ' ') p++;
+                    if (*p == '\0') break;
+
+                    char* start_of_arg = p;
+                    while (*p != ' ' && *p != '\0') p++;
+                    
+                    char temp_char = *p;
+                    *p = '\0';
+
+                    my_strcpy(shm_base, start_of_arg);
+                    vfs_lock();
+                    seL4_SetMR(0, 117); // SYS_MKDIR
+                    seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                    int ret = seL4_GetMR(0);
+                    vfs_unlock();
+                    
+                    if (ret != 0) {
+                        sys_puts(console_ep, "mkdir: cannot create directory '");
+                        sys_puts(console_ep, start_of_arg);
+                        sys_puts(console_ep, "'\n");
+                    }
+                    *p = temp_char;
+                }
             }
 
             else if (my_strcmp(cmd, "cd") == 0) {
-                // 1. Если просто "cd" без аргументов — прыгаем в корень
-                if (!arg || arg[0] == '\0') { 
-                    my_strcpy(current_working_dir, "/"); 
-                    continue; 
+                char* path = arg;
+                if (!path || path[0] == '\0') {
+                    path = (char*)"/";
                 }
-                
-                // 2. Если "cd /" — тоже прыгаем в корень
-                if (my_strcmp(arg, "/") == 0) {
-                    my_strcpy(current_working_dir, "/");
-                    continue;
-                }
-                
-                // 3. Обработка перехода на уровень вверх "cd .."
-                if (my_strcmp(arg, "..") == 0) {
-                    int len = my_strlen(current_working_dir);
-                    if (len > 1) { // Если мы не в корне
-                        len--; // Сдвигаемся с нулевого байта
-                        if (current_working_dir[len] == '/') len--; // Пропускаем возможный слеш на конце
-                        
-                        // Идем назад, пока не встретим предыдущий слеш
-                        while (len > 0 && current_working_dir[len] != '/') {
+
+                my_strcpy(shm_base, path);
+                vfs_lock();
+                seL4_SetMR(0, 118); // SYS_CD
+                seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                int ret = seL4_GetMR(0);
+                vfs_unlock();
+
+                if (ret == 0) {
+                    if (my_strcmp(path, "/") == 0) {
+                        my_strcpy(current_working_dir, "/");
+                    } else if (my_strcmp(path, "..") == 0) {
+                        int len = my_strlen(current_working_dir);
+                        if (len > 1) {
                             len--;
+                            if (current_working_dir[len] == '/') len--;
+                            while (len > 0 && current_working_dir[len] != '/') len--;
+                            if (len == 0) my_strcpy(current_working_dir, "/");
+                            else current_working_dir[len] = '\0';
                         }
-                        
-                        // Если дошли до начала пути, значит мы вернулись в корень
-                        if (len == 0) {
-                            my_strcpy(current_working_dir, "/");
-                        } else {
-                            current_working_dir[len] = '\0'; // Отрезаем последнюю папку
-                        }
+                    } else {
+                        build_absolute_path(current_working_dir, path);
                     }
-                    continue;
-                }
-                
-                // 4. Обычный переход в папку
-                char *shm = shm_base;
-                build_absolute_path(shm, arg);
-                
-                if (vfs_syscall(111, blk_ep) == 0) {
-                    my_strcpy(current_working_dir, shm);
                 } else {
-                    sys_puts(console_ep, "No such directory.\n");
+                    sys_puts(console_ep, "cd: ");
+                    sys_puts(console_ep, path);
+                    sys_puts(console_ep, ": No such file or directory\n");
                 }
             }
 
@@ -860,13 +861,39 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "\n");
             }
 
+            // === КОМАНДА TOUCH (Поддержка бесконечного числа аргументов) ===
             else if (my_strcmp(cmd, "touch") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: touch <file>\n"); continue; }
-                char *shm = shm_base;
-                build_absolute_path(shm, arg);
-                
-                if (vfs_syscall(112, blk_ep) == 0) sys_puts(console_ep, "File created.\n");
-                else sys_puts(console_ep, "Failed to create file.\n");
+                char* p = arg;
+
+                // 1. Ошибка: если после пробелов сразу конец строки (нет аргументов)
+                if (!p || *p == '\0') {
+                    sys_puts(console_ep, "touch: missing file operand\n");
+                    continue;
+                }
+
+                // 2. Парсим бесконечное количество аргументов
+                while (*p != '\0') {
+                    // Пропускаем лишние пробелы перед очередным файлом (на случай "touch  a     b")
+                    while (*p == ' ') p++;
+                    if (*p == '\0') break;
+
+                    char* start_of_arg = p;
+                    // Ищем конец имени файла
+                    while (*p != ' ' && *p != '\0') p++;
+                    
+                    char temp_char = *p;
+                    *p = '\0'; // Временно обрезаем строку, чтобы получить один аргумент
+
+                    // 3. Отправляем IPC-вызов драйверу диска для ЭТОГО конкретного файла
+                    char *shm = shm_base;
+                    build_absolute_path(shm, start_of_arg);
+                    if (vfs_syscall(112, blk_ep) != 0) {
+                        sys_puts(console_ep, "touch: failed to create '");
+                        sys_puts(console_ep, start_of_arg);
+                        sys_puts(console_ep, "'\n");
+                    }
+                    *p = temp_char; // Восстанавливаем строку для следующей итерации
+                }
             }
 
             else if (my_strcmp(cmd, "cat") == 0) {
@@ -936,7 +963,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd, "help") == 0) {
-                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, create_file, rm\n");
+                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, touch, rm, mv\n");
             }
 
             else if (my_strcmp(cmd, "exit") == 0) {
@@ -955,34 +982,108 @@ int main(int argc, char *argv[]) {
 
             else if (my_strcmp(cmd, "crash_disk") == 0) {
                 sys_puts(console_ep, "[SHELL] Sending poison pill to blk_driver...\n");
-                vfs_syscall(118, blk_ep); // Оправляем команду умереть
+                vfs_syscall(121, blk_ep); // Оправляем команду умереть
             }
             // ==========================================
-            // === УМНОЕ СОЗДАНИЕ ФАЙЛОВ ===
-            else if (my_strcmp(cmd, "create_file") == 0) {
-                if (arg) {
-                    my_strcpy(shm, arg); // Копируем аргумент (название) в SHM
-                } else {
-                    shm[0] = '\0'; // No argument
+
+            else if (my_strcmp(cmd, "rm") == 0) {
+                char* p = arg;
+
+                if (!p || *p == '\0') {
+                    sys_puts(console_ep, "rm: missing operand\n");
+                    continue;
+                }
+
+                while (*p != '\0') {
+                    while (*p == ' ') p++;
+                    if (*p == '\0') break;
+
+                    char* start_of_arg = p;
+                    while (*p != ' ' && *p != '\0') p++;
+                    
+                    char temp_char = *p;
+                    *p = '\0';
+
+                    char *shm = shm_base;
+                    build_absolute_path(shm, start_of_arg);
+                    if (vfs_syscall(120, blk_ep) != 0) {
+                        sys_puts(console_ep, "rm: cannot remove '");
+                        sys_puts(console_ep, start_of_arg);
+                        sys_puts(console_ep, "': No such file or directory\n");
+                    }
+                    *p = temp_char;
+                }
+            } 
+            // === КОМАНДА MV (Переименование) ===
+            else if (my_strcmp(cmd, "mv") == 0) {
+                if (!arg) {
+                    sys_puts(console_ep, "mv: missing file operand\n");
+                    continue;
+                }
+                char* p = arg;
+
+                // 1. Вытаскиваем ИМЯ СТАРОГО ФАЙЛА (old_name)
+                char old_name[32];
+                int i = 0;
+                while (*p != ' ' && *p != '\0' && i < 31) {
+                    old_name[i++] = *p++;
+                }
+                old_name[i] = '\0';
+
+                // 2. Пропускаем пробелы между аргументами
+                while (*p == ' ') p++; 
+
+                if (*p == '\0') {
+                    sys_puts(console_ep, "mv: missing destination file operand after '");
+                    sys_puts(console_ep, old_name);
+                    sys_puts(console_ep, "'\n");
+                    continue;
+                }
+
+                // 3. Вытаскиваем ИМЯ НОВОГО ФАЙЛА (new_name)
+                char new_name[32];
+                i = 0;
+                while (*p != ' ' && *p != '\0' && i < 31) {
+                    new_name[i++] = *p++;
+                }
+                new_name[i] = '\0';
+
+                // 4. Готовим IPC-сообщение
+                char *shm = shm_base;
+                build_absolute_path(shm, old_name);
+                build_absolute_path(shm + 128, new_name);
+                
+                vfs_lock();
+                seL4_SetMR(0, 116); // SYS_RENAME
+                seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 1);
+                seL4_Call(blk_ep, info);
+                int ret_val = seL4_GetMR(0);
+                vfs_unlock();
+                
+                if (ret_val != 0) {
+                    sys_puts(console_ep, "mv: cannot stat '");
+                    sys_puts(console_ep, old_name);
+                    sys_puts(console_ep, "': No such file or directory\n");
+                }
+            }
+            else if (my_strncmp(cmd, "./", 2) == 0) {
+                // Пользователь ввел команду типа ./test.elf
+                char* filename = cmd + 2; // Пропускаем "./"
+                
+                // --- НОВЫЙ БЛОК ПАРСИНГА ПУТЕЙ ---
+                // Если в имени файла есть слеш (например, mnt/test.elf),
+                // нам нужно извлечь только само имя (test.elf)
+                char* pure_filename = filename;
+                int len = my_strlen(filename);
+                for (int i = len - 1; i >= 0; i--) {
+                    if (filename[i] == '/') {
+                        pure_filename = &filename[i + 1];
+                        break;
+                    }
                 }
                 
-                vfs_syscall(115, blk_ep); 
-                sys_puts_direct(console_ep, shm); // Выводим ответ драйвера
-            
-            // === УДАЛЕНИЕ ФАЙЛОВ ===
-            } else if (my_strcmp(cmd, "rm") == 0) {
-                if (!arg || *arg == '\0') {
-                    sys_puts_direct(console_ep, "Usage: rm <filename>\n");
-                } else {
-                    my_strcpy(shm, arg); // Копируем имя файла для удаления
-                    vfs_syscall(120, blk_ep); // Вызов 119 - это будет RM
-                    sys_puts_direct(console_ep, shm);
-                }
-            } else if (my_strncmp(cmd, "./", 2) == 0) {
-                // Пользователь ввел команду типа ./test.elf
-                char* filename = cmd + 2; // Пропускаем символы "./"
                 char safe_name[64] = {0};
-                my_strncpy(safe_name, filename, 63);
+                my_strncpy(safe_name, pure_filename, 63);
                 
                 // Упаковываем строку прямо в регистры процессора!
                 seL4_SetMR(0, 100); // 100 = SYS_EXEC
@@ -991,7 +1092,6 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(i + 1, name_ptr[i]);
                 }
                 
-                // Мы передали 9 регистров (1 под номер сисколла + 8 под строку)
                 seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 9);
                 seL4_Call(root_ep, msg);
 

@@ -14,6 +14,10 @@ static volatile int tx_tail = 0;
 static char line_buffers[MAX_CLIENTS][LINE_BUFFER_SIZE];
 static int line_buffer_pos[MAX_CLIENTS] = {0};
 
+// Глобальные указатели на регистры для функции flush_buffer
+static volatile seL4_Uint32 *uart_dr = nullptr;
+static volatile seL4_Uint32 *uart_fr = nullptr;
+
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
     // Добавлена буква 'ro'. crt0 не мог его стереть!
@@ -22,6 +26,17 @@ static inline seL4_IPCBuffer* get_local_ipc() {
 }
 
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
+
+static void flush_buffer() {
+    // Записываем столько, сколько влезает в FIFO прямо сейчас.
+    // Эта операция неблокирующая: если FIFO полон, цикл немедленно
+    // завершится, и драйвер вернется к ожиданию новых событий.
+    // Остаток данных будет отправлен на следующей итерации.
+    while (tx_tail != tx_head && (((*uart_fr) & (1 << 5)) == 0)) {
+        *uart_dr = tx_buffer[tx_tail];
+        tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
+    }
+}
 
 int main(int argc, char *argv[]) {
     // 2. Достаем настоящий адрес буфера
@@ -39,8 +54,8 @@ int main(int argc, char *argv[]) {
         __assert_fail("Null Capability Detected in Driver Init!", __FILE__, __LINE__, __func__);
     }
 
-    volatile seL4_Uint32 *uart_dr = (volatile seL4_Uint32*)(0x200000000ULL);
-    volatile seL4_Uint32 *uart_fr = (volatile seL4_Uint32*)(0x200000000ULL + 0x18);
+    uart_dr = (volatile seL4_Uint32*)(0x200000000ULL);
+    uart_fr = (volatile seL4_Uint32*)(0x200000000ULL + 0x18);
     char kbd_buffer[128]; int head = 0, tail = 0;
 
     while(1) {
@@ -121,13 +136,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // ИСПРАВЛЕНО: Неблокирующий сброс буфера.
-        // Записываем столько, сколько влезает прямо сейчас. Остаток уйдет на следующей итерации,
-        // что позволяет драйверу немедленно вернуться в seL4_Recv и принимать новые IPC.
-        while (tx_tail != tx_head && (((*uart_fr) & (1 << 5)) == 0)) {
-            *uart_dr = tx_buffer[tx_tail];
-            tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
-        }
+        flush_buffer();
     }
 
     return 0;

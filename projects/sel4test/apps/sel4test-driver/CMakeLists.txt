@@ -36,7 +36,7 @@ target_link_options(shell PRIVATE "-Wl,-e,_start")
 target_link_libraries(shell sel4 sel4runtime muslc)
 
 # 4. НОВЫЙ БЛОЧНЫЙ ДРАЙВЕР (Файловая система)
-add_executable(blk_driver src/blk_driver.cpp)
+add_executable(blk_driver src/blk_driver.cpp src/fat32.cpp)
 target_include_directories(blk_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(blk_driver PRIVATE "-nostdlib" "-static")
 target_link_options(blk_driver PRIVATE "-Wl,-e,_start")
