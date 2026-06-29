@@ -169,6 +169,7 @@ static seL4_CPtr alloc_and_track_cap(PsychAllocator &alloc, ProcessControlBlock 
     }
     return cap;
 }
+
 struct SharedMemoryRegion {
     bool active;
     seL4_CPtr frame_cap; // Физический фрейм памяти
