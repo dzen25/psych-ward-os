@@ -1,6 +1,6 @@
 // net_driver.cpp
 #include <sel4/sel4.h>
-#include "common.h"
+#include "h/common.h"
 #include <stdint.h>
 #include <kernel/gen_config.h>
 

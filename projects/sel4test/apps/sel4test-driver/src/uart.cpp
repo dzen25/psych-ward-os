@@ -1,5 +1,5 @@
-#include "uart.h"
-#include "hw_timer.h"
+#include "h/uart.h"
+#include "h/hw_timer.h"
 
 volatile uint32_t *uart_dr;
 volatile uint32_t *uart_fr;

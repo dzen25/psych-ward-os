@@ -1,4 +1,4 @@
-#include "pipe.h"
+#include "h/pipe.h"
 
 // ИСПРАВЛЕНО: Non-Atomic Shared Memory Access
 // Использование встроенных атомарных операций GCC/Clang для lock-free структур

@@ -1,10 +1,13 @@
 #include <sel4/sel4.h>
-#include "common.h"
+#include "h/common.h"
 #include <stdint.h>
-#include "pipe.h"
 
 // Адреса для синхронизации доступа к VFS и TTY
 #define BOOT_BLK_EP 7
+
+// Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
+static char ls_thread_stack[16384] __attribute__((aligned(16)));
+static char grep_thread_stack[16384] __attribute__((aligned(16)));
 
 static char* shm_base = nullptr;
 static volatile int* vfs_spinlock_ptr = nullptr;
@@ -29,25 +32,65 @@ static inline seL4_IPCBuffer* get_local_ipc() {
     return (seL4_IPCBuffer*)(tls_addr - 1024);
 }
 
+static void my_strcpy(char *dest, const char *src);
+static seL4_Word my_strlen(const char *s);
+
+static void sys_write(int fd, const char* str);
+static char sys_read_fd(int fd);
+
 // Единая защищенная функция вывода
-static void sys_puts(seL4_CPtr console_ep, const char *str) {
+static void sys_puts(seL4_CPtr _ignored, const char *str) {
+    sys_write(1, str); // Write to STDOUT
+}
+
+// Helper to print a 64-bit value in hex via IPC.
+static void sys_puthex(seL4_Word val) {
+    char buf[17];
+    const char hex_chars[] = "0123456789ABCDEF";
+    buf[16] = '\0';
+    for (int i = 15; i >= 0; i--) {
+        buf[15 - i] = hex_chars[(val >> (i * 4)) & 0xF];
+    }
+    sys_puts(0, buf); // The first argument is ignored, writes to stdout
+}
+
+// Универсальная запись в файловый дескриптор
+void sys_write(int fd, const char* str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr target_ep = ipc->caps_or_badges[fd]; 
+    
     int total_len = 0;
     while(str[total_len]) total_len++;
     
     int offset = 0;
     while (offset < total_len) {
         int chunk = total_len - offset;
-        // Строгий лимит IPC Message Registers для ARM64 (оставляем запас безопасности)
         if (chunk > 100) chunk = 100; 
         
-        ipc->msg[0] = 8; // SYS_PUTS ID
+        ipc->msg[0] = 8; // ВСЕГДА ИСПОЛЬЗУЕМ 8 (SYS_PUTS)
         for (int i = 0; i < chunk; i++) {
             ipc->msg[i + 1] = str[offset + i];
         }
-        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
         offset += chunk;
     }
+}
+
+void sys_write_eof(int fd) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr target_ep = ipc->caps_or_badges[fd];
+    ipc->msg[0] = 8; // SYS_PUTS
+    ipc->msg[1] = '\0'; // Тот самый заветный EOF
+    seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+}
+
+// Универсальное чтение из файлового дескриптора
+char sys_read_fd(int fd) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr target_ep = ipc->caps_or_badges[fd];
+    ipc->msg[0] = 6; // ВСЕГДА ИСПОЛЬЗУЕМ 6 (SYS_READ)
+    seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (char)ipc->msg[0];
 }
 
 // Принудительно выталкивает застрявший текст на экран (нужно для prompt и эхо символов)
@@ -61,6 +104,11 @@ static void my_strcpy(char *dest, const char *src) {
     while ((*dest++ = *src++));
 }
 
+static void my_strcat(char *dest, const char *src) {
+    while (*dest) dest++;
+    while ((*dest++ = *src++));
+}
+
 #define strcpy my_strcpy
 
 static int my_strcmp(const char *s1, const char *s2) { 
@@ -71,6 +119,18 @@ static int my_strncmp(const char *s1, const char *s2, int n) {
     while (n && *s1 && (*s1 == *s2)) { s1++; s2++; n--; }
     if (n == 0) return 0;
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+static const char* my_strstr(const char* haystack, const char* needle) {
+    if (!*needle) return haystack;
+    const char* p1 = haystack;
+    while (*p1) {
+        const char* p1_begin = p1, *p2 = needle;
+        while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
+        if (!*p2) return p1_begin;
+        p1 = p1_begin + 1;
+    }
+    return nullptr;
 }
 
 static void my_strncpy(char *dest, const char *src, int n) {
@@ -94,8 +154,6 @@ static int simple_atoi(const char *str) {
 }
 
 static bool is_piping = false;
-static __attribute__((aligned(8))) uint8_t global_pipe_memory[4096]; 
-#define global_pipe (*((volatile ipc_pipe*)global_pipe_memory))
 
 enum NetCommand {
     NET_CMD_PING = 1,
@@ -203,33 +261,30 @@ static void sys_thread_exit() {
     // 2. Везде используем локальный 'ipc' вместо глобального макроса
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
     ipc->msg[0] = 105; // ID нашего нового сисколла
-    
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    while(1) seL4_Yield(); // Сюда выполнение никогда не дойдет
+    while(1) seL4_Yield(); // Сюда выполнение никогда не дойдет, ядро уничтожит поток
 }
 
-static int spawn_thread(void (*func)(seL4_CPtr, seL4_CPtr, seL4_CPtr), seL4_CPtr timer, seL4_CPtr console, seL4_CPtr blk_ep) {
-    // Динамически берем Root Endpoint для сисколлов из нашего легитимного TLS
+static int spawn_thread(seL4_Word func_ptr, seL4_Word stack_top, seL4_Word arg0, seL4_Word arg1, seL4_Word arg2, int pipe_id, seL4_CPtr stdin_cap, seL4_CPtr stdout_cap, seL4_CPtr stderr_cap) {
     seL4_CPtr my_root_syscall_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
 
     get_local_ipc()->msg[0] = 101; // SYS_CLONE
-    // ИСПРАВЛЕНО: Передаем аргументы через регистры, а не через уязвимую SHM
-    get_local_ipc()->msg[1] = (seL4_Word)func;
-    get_local_ipc()->msg[2] = timer;
-    get_local_ipc()->msg[3] = console;
-    get_local_ipc()->msg[4] = blk_ep;
-    
-    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 5);
-    // Делаем сисколл к ядру через наш локальный root эндпоинт
+    get_local_ipc()->msg[1] = func_ptr;
+    get_local_ipc()->msg[2] = arg0;
+    get_local_ipc()->msg[3] = arg1;
+    get_local_ipc()->msg[4] = arg2;
+    get_local_ipc()->msg[5] = stdin_cap;
+    get_local_ipc()->msg[6] = stdout_cap;
+    get_local_ipc()->msg[7] = stderr_cap;
+    get_local_ipc()->msg[8] = pipe_id;
+    get_local_ipc()->msg[9] = stack_top;
+    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 10);
     seL4_Call(my_root_syscall_ep, info);
-    
     return seL4_GetMR(0);
 }
 
-static char sys_read(seL4_CPtr console_ep) {
-    seL4_SetMR(0, 6); // 6 = SYS_READ
-    seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    return (char)seL4_GetMR(0);
+static char sys_read(seL4_CPtr _ignored) {
+    return sys_read_fd(0);
 }
 
 static seL4_Word sys_get_time(seL4_CPtr timer_ep) {
@@ -337,24 +392,73 @@ static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
     return ret_val;
 }
 
-static void ls_thread_func(seL4_CPtr timer_ep, seL4_CPtr console_ep, seL4_CPtr blk_ep) {
-    seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r"(tls_addr));
-    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
-    
-    char *shm = shm_base;
-    
-    // 1. Делаем системный вызов к драйверу диска. Результат ляжет в shm.
-    vfs_syscall(110, blk_ep); 
-    
-    // 2. ВМЕСТО прямой печати на экран, перенаправляем вывод в трубу (Pipe)
-    int len = my_strlen(shm);
-    pipe_write(&global_pipe, 0, 0, (uint8_t*)shm, len);
-    
-    // 3. Сообщаем grep'у, что передача окончена
-    global_pipe.writer_closed = true;
+static void sys_pipe_wr_close(int fd) {
+    seL4_SetMR(0, 24); // SYS_PIPE_WR_CLOSE
+    seL4_Call(get_local_ipc()->caps_or_badges[fd], seL4_MessageInfo_new(0,0,0,1));
+}
 
-    // 4. Корректно убиваем поток
+static void sys_pipe_close(int fd) {
+    seL4_SetMR(0, 25); // SYS_PIPE_CLOSE
+    seL4_Call(get_local_ipc()->caps_or_badges[fd], seL4_MessageInfo_new(0,0,0,1));
+    get_local_ipc()->caps_or_badges[fd] = 0; // Invalidate local FD
+}
+
+void ls_thread_func(seL4_Word _timer_ep, seL4_Word _console_ep, seL4_Word blk_ep) {
+    // CRITICAL: Initialize libsel4's IPC buffer for this thread.
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r" (tls_addr));
+    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
+
+    // The shell has already placed the target path into shm_base.
+    // We just need to call the VFS syscall.
+    vfs_syscall(110, blk_ep); // SYS_LS
+
+    // The result is now in shm_base. Write it to our stdout (the pipe).
+    sys_write(1, shm_base);
+
+    // Signal end of data to the reader.
+    sys_pipe_wr_close(1);
+
+    // Terminate the thread.
+    sys_thread_exit();
+}
+
+void grep_thread_func(const char* pattern) {
+    // CRITICAL: Initialize libsel4's IPC buffer for this thread.
+    seL4_Word tls_addr;
+    asm volatile("mrs %0, tpidr_el0" : "=r" (tls_addr));
+    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
+
+    if (!pattern) {
+        sys_write(2, "grep: missing pattern\n"); // Write to stderr
+        sys_thread_exit();
+        return;
+    }
+
+    char line_buf[256];
+    int line_pos = 0;
+
+    while (1) {
+        char c = sys_read_fd(0); // Read from pipe (stdin)
+
+        if (c == '\n' || c == '\0') {
+            if (line_pos > 0) {
+                line_buf[line_pos] = '\0';
+                if (my_strstr(line_buf, pattern)) {
+                    sys_write(1, line_buf);
+                    sys_write(1, "\n");
+                }
+                line_pos = 0;
+            }
+            if (c == '\0') {
+                break; // EOF
+            }
+        } else if (line_pos < sizeof(line_buf) - 1) {
+            line_buf[line_pos++] = c;
+        }
+    }
+    
+    // Корректно завершаем поток
     sys_thread_exit();
 }
 
@@ -507,7 +611,18 @@ int main(int argc, char *argv[]) {
         
         if (i > 0) {
 
-            char *pipe_sym = cmd;
+            // НОВОЕ: Пропускаем пробелы в начале команды
+            char *cmd_ptr = cmd;
+            while (*cmd_ptr == ' ') cmd_ptr++;
+
+            // --- НОВЫЙ ПАРСЕР КОНВЕЙЕРОВ ---
+            int left_pid = -1;
+            int right_pid = -1;
+
+            int pipe_fd = -1;
+            seL4_CPtr pipe_cap = 0;
+
+            char *pipe_sym = cmd_ptr;
             while (*pipe_sym && *pipe_sym != '|') pipe_sym++;
             
             char cmd2[64];
@@ -521,23 +636,39 @@ int main(int argc, char *argv[]) {
                 
                 // Убираем пробел в конце левой команды
                 char *left_end = pipe_sym - 1;
-                while (left_end >= cmd && *left_end == ' ') {
+                while (left_end >= cmd_ptr && *left_end == ' ') {
                     *left_end = '\0';
                     left_end--;
                 }
-                
-                is_piping = true; // Открываем трубу!
-                pipe_init(&global_pipe);
+
+                seL4_SetMR(0, 20); // SYS_PIPE
+                seL4_SetMR(1, 3);  // Просим ядро заминтить capability в наш FD 3
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                pipe_fd = seL4_GetMR(0);
+
+                // Защита от кривых ответов ядра и исчерпания IPC-буфера
+                if (pipe_fd < 0 || pipe_fd >= 32) {
+                    sys_puts(console_ep, "shell: failed to create pipe or invalid FD returned\n");
+                    is_piping = false;
+                } else {
+                    is_piping = true;
+                    // 🔥 ТОТ САМЫЙ ФИКС: ЗАПИСЫВАЕМ НОМЕР СЛОТА В НАШУ FD-ТАБЛИЦУ! 🔥
+                    // В seL4 Capability Pointer (CPtr) — это и есть номер слота (индекс).
+                    // Раз ядро положило cap в слот pipe_fd, значит CPtr равен pipe_fd!
+                    ipc->caps_or_badges[pipe_fd] = pipe_fd;
+
+                    // Теперь мы можем безопасно читать его для передачи потомкам
+                    pipe_cap = ipc->caps_or_badges[pipe_fd];
+                }
             } else {
                 is_piping = false;
             }
-
-            char *arg = cmd; while (*arg && *arg != ' ') arg++;
+            char *arg = cmd_ptr; while (*arg && *arg != ' ') arg++;
             if (*arg == ' ') { *arg = '\0'; arg++; while (*arg == ' ') arg++; } else { arg = nullptr; }
 
             char *shm = shm_base; // Адрес разделяемой памяти (Shared Memory)
 
-            if (my_strcmp(cmd, "time") == 0) {
+            if (my_strcmp(cmd_ptr, "time") == 0) {
                 seL4_Word current = sys_get_time(timer_ep);
                 sys_puts(console_ep, "Uptime: ");
                 char buf[16]; int temp = current, j = 0;
@@ -547,13 +678,13 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, " ms\n");
             } 
              
-            else if (my_strcmp(cmd, "sleep") == 0) {
+            else if (my_strcmp(cmd_ptr, "sleep") == 0) {
                 sys_puts(console_ep, "Sleeping 3 seconds...\n");
                 sys_sleep(timer_ep, 3000);
                 sys_puts(console_ep, "Woke up!\n");
             }
 
-            else if (my_strcmp(cmd, "ping") == 0) {
+            else if (my_strcmp(cmd_ptr, "ping") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: ping <domain_or_ip> [count]\n"); continue; }
                 
                 char *cursor = arg;
@@ -597,7 +728,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, timeout);
             }
 
-            else if (my_strcmp(cmd, "send") == 0) {
+            else if (my_strcmp(cmd_ptr, "send") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: send <text>\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
@@ -612,7 +743,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
-            else if (my_strcmp(cmd, "sendto") == 0) {
+            else if (my_strcmp(cmd_ptr, "sendto") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
@@ -646,7 +777,7 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
-            else if (my_strcmp(cmd, "netstat") == 0) {
+            else if (my_strcmp(cmd_ptr, "netstat") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
                 
                 volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
@@ -658,27 +789,27 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 2000); // Для статуса достаточно 2-х секунд
             }
 
-            else if (my_strcmp(cmd, "ls") == 0) {
+            else if (my_strcmp(cmd_ptr, "ls") == 0) {
                 char *shm = shm_base; 
                 if (arg) { build_absolute_path(shm, arg); } 
                 else { build_absolute_path(shm, ""); }
-                
+
                 if (is_piping) { 
-                    // Если есть пайп (|), кидаем задачу в фоновый поток
-                    spawn_thread(ls_thread_func, timer_ep, console_ep, blk_ep);
+                    // Запускаем ls в потоке, перенаправив его stdout в пайп
+                    left_pid = spawn_thread((seL4_Word)ls_thread_func, (seL4_Word)ls_thread_stack + sizeof(ls_thread_stack) - 16,
+                                 timer_ep, console_ep, blk_ep, pipe_fd, ipc->caps_or_badges[0], pipe_cap, ipc->caps_or_badges[2]);
                 } else {
-                    // Если пайпа нет, работаем как обычно
                     vfs_syscall(110, blk_ep);
                     sys_puts(console_ep, shm);
                 }
             }
 
-            else if (my_strcmp(cmd, "pwd") == 0) {
+            else if (my_strcmp(cmd_ptr, "pwd") == 0) {
                 sys_puts(console_ep, current_working_dir);
                 sys_puts(console_ep, "\n");
             }
 
-            else if (my_strcmp(cmd, "mkdir") == 0) {
+            else if (my_strcmp(cmd_ptr, "mkdir") == 0) {
                 if (!arg) {
                     sys_puts(console_ep, "mkdir: missing operand\n");
                     continue;
@@ -711,7 +842,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "cd") == 0) {
+            else if (my_strcmp(cmd_ptr, "cd") == 0) {
                 char* path = arg;
                 if (!path || path[0] == '\0') {
                     path = (char*)"/";
@@ -746,14 +877,20 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "ps") == 0) {
+            else if (my_strcmp(cmd_ptr, "ps") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
 
-                ipc->msg[0] = 104; seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-                sys_puts(console_ep, shm);
+                ipc->msg[0] = 104; 
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                if (is_piping) {
+                    sys_write(pipe_fd, shm);
+                    sys_pipe_wr_close(pipe_fd);
+                } else {
+                    sys_puts(console_ep, shm);
+                }
             }
 
-            else if (my_strcmp(cmd, "kill") == 0) {
+            else if (my_strcmp(cmd_ptr, "kill") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
                 if (!arg) { sys_puts(console_ep, "Usage: kill <pid>\n"); continue; }
                 ipc->msg[0] = 102; // SYS_KILL
@@ -762,7 +899,7 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "Signal sent.\n");
             }
 
-            else if (my_strcmp(cmd, "exec") == 0) {
+            else if (my_strcmp(cmd_ptr, "exec") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: exec <filename> [args] [&]\n"); continue; }
                 
                 bool run_in_background = false;
@@ -814,7 +951,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "shm") == 0) {
+            else if (my_strcmp(cmd_ptr, "shm") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: shm <id> <read|write> [text]\n"); continue; }
                 
                 char *id_str = arg;
@@ -852,7 +989,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "pid") == 0) {
+            else if (my_strcmp(cmd_ptr, "pid") == 0) {
                 sys_puts(console_ep, "Current Shell PID: ");
                 char buf[16]; int temp = my_pid, j = 0;
                 if (temp == 0) buf[j++] = '0';
@@ -862,7 +999,7 @@ int main(int argc, char *argv[]) {
             }
 
             // === КОМАНДА TOUCH (Поддержка бесконечного числа аргументов) ===
-            else if (my_strcmp(cmd, "touch") == 0) {
+            else if (my_strcmp(cmd_ptr, "touch") == 0) {
                 char* p = arg;
 
                 // 1. Ошибка: если после пробелов сразу конец строки (нет аргументов)
@@ -896,21 +1033,27 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "cat") == 0) {
+            else if (my_strcmp(cmd_ptr, "cat") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: cat <file>\n"); continue; }
                 char *shm = shm_base;
                 build_absolute_path(shm, arg);
                 
-                if (vfs_syscall(114, blk_ep) == 0) {
-                    sys_puts(console_ep, shm);
-                    sys_puts(console_ep, "\n");
+                if (vfs_syscall(114, blk_ep) == 0) { // Файл прочитан в shm
+                    if (is_piping) {
+                        sys_write(pipe_fd, shm);
+                        sys_write(pipe_fd, "\n");
+                        sys_pipe_wr_close(pipe_fd);
+                    } else {
+                        sys_puts(console_ep, shm);
+                        sys_puts(console_ep, "\n");
+                    }
                 } else {
                     sys_puts(console_ep, "File not found or is a directory.\n");
                 }
             }
 
-            else if (my_strcmp(cmd, "echo") == 0) {
-                if (!arg) { sys_puts(console_ep, "\n"); continue; }
+            else if (my_strcmp(cmd_ptr, "echo") == 0) {
+                if (!arg) { if (!is_piping) sys_puts(console_ep, "\n"); continue; }
                 
                 // Парсер перенаправления потока (ищем символ '>')
                 char *redir = arg;
@@ -955,6 +1098,10 @@ int main(int argc, char *argv[]) {
                     if (ret_val != 0) {
                         sys_puts(console_ep, "Failed to write to file.\n");
                     }
+                } else if (is_piping) {
+                    sys_write(pipe_fd, arg);
+                    sys_write(pipe_fd, "\n");
+                    sys_pipe_wr_close(pipe_fd);
                 } else {
                     // Обычный echo без перенаправления
                     sys_puts(console_ep, arg);
@@ -962,11 +1109,17 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd, "help") == 0) {
-                sys_puts(console_ep, "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, touch, rm, mv\n");
+            else if (my_strcmp(cmd_ptr, "help") == 0) {
+                const char* help_text = "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, touch, rm, mv\n";
+                if (is_piping) {
+                    sys_write(pipe_fd, help_text);
+                    sys_pipe_wr_close(pipe_fd);
+                } else {
+                    sys_puts(console_ep, help_text);
+                }
             }
 
-            else if (my_strcmp(cmd, "exit") == 0) {
+            else if (my_strcmp(cmd_ptr, "exit") == 0) {
                 sys_puts(console_ep, "Exiting sandbox...\n");
                 sys_exit(root_ep);
             }
@@ -974,19 +1127,19 @@ int main(int argc, char *argv[]) {
             // ==========================================
             // НОВОЕ: ТРИГГЕРЫ АППАРАТНЫХ КРАШЕЙ // Краш-тест - удалить
             // ==========================================
-            else if (my_strcmp(cmd, "crash_shell") == 0) {
+            else if (my_strcmp(cmd_ptr, "crash_shell") == 0) {
                 sys_puts(console_ep, "[SHELL] Initiating intentional Segfault (Null Pointer Dereference)...\n");
                 volatile int* boom = (volatile int*)0x0;
                 *boom = 0xDEAD; // Оболочка умрет на этой строке
             }
 
-            else if (my_strcmp(cmd, "crash_disk") == 0) {
+            else if (my_strcmp(cmd_ptr, "crash_disk") == 0) {
                 sys_puts(console_ep, "[SHELL] Sending poison pill to blk_driver...\n");
                 vfs_syscall(121, blk_ep); // Оправляем команду умереть
             }
             // ==========================================
 
-            else if (my_strcmp(cmd, "rm") == 0) {
+            else if (my_strcmp(cmd_ptr, "rm") == 0) {
                 char* p = arg;
 
                 if (!p || *p == '\0') {
@@ -1015,7 +1168,7 @@ int main(int argc, char *argv[]) {
                 }
             } 
             // === КОМАНДА MV (Переименование) ===
-            else if (my_strcmp(cmd, "mv") == 0) {
+            else if (my_strcmp(cmd_ptr, "mv") == 0) {
                 if (!arg) {
                     sys_puts(console_ep, "mv: missing file operand\n");
                     continue;
@@ -1066,9 +1219,9 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "': No such file or directory\n");
                 }
             }
-            else if (my_strncmp(cmd, "./", 2) == 0) {
+            else if (my_strncmp(cmd_ptr, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf
-                char* filename = cmd + 2; // Пропускаем "./"
+                char* filename = cmd_ptr + 2; // Пропускаем "./"
                 
                 // --- НОВЫЙ БЛОК ПАРСИНГА ПУТЕЙ ---
                 // Если в имени файла есть слеш (например, mnt/test.elf),
@@ -1118,68 +1271,32 @@ int main(int argc, char *argv[]) {
             } 
             else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
 
+            // --- ПРАВАЯ ЧАСТЬ КОНВЕЙЕРА ---
             if (is_piping) {
-                    // Если левая команда была НЕ 'ls', значит она отработала мгновенно (например, help)
-                    // и нам нужно вручную закрыть задвижку. (А вот ls_thread закрывает её сам изнутри потока)
-                    if (my_strcmp(cmd, "ls") != 0) {
-                        global_pipe.writer_closed = true;
-                    }
+                char *arg2 = cmd2;
+                while (*arg2 && *arg2 != ' ') arg2++;
+                if (*arg2 == ' ') { *arg2 = '\0'; arg2++; } else { arg2 = nullptr; }
 
-                    char *arg2 = cmd2;
-                    while (*arg2 && *arg2 != ' ') arg2++;
-                    if (*arg2 == ' ') { *arg2 = '\0'; arg2++; } else { arg2 = nullptr; }
-
-                    if (my_strcmp(cmd2, "grep") == 0) {
-                        if (!arg2) { sys_puts_direct(console_ep, "Usage: <cmd> | grep <text>\n"); continue; }
-
-                        char line[256];
-                        int line_idx = 0;
-                        char c;
-
-                        // ИСПРАВЛЕНО: Бесконечный цикл чтения, который ждет писателя
-                        while (true) {
-                            int bytes_read = pipe_read(&global_pipe, 0, 0, (uint8_t*)&c, 1);
-                            
-                            if (bytes_read > 0) {
-                                // Мы прочитали символ! Собираем строку.
-                                if (c == '\n' || line_idx >= 255) {
-                                    line[line_idx] = '\0'; // Конец строки найден
-
-                                    char *search = line;
-                                    bool match = false;
-                                    while (*search) {
-                                        char *p1 = search;
-                                        char *p2 = arg2; // Это наше слово "mnt"
-                                        while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
-                                        if (!*p2) { match = true; break; }
-                                        search++;
-                                    }
-
-                                    if (match) {
-                                        sys_puts_direct(console_ep, line);
-                                        sys_puts_direct(console_ep, "\n");
-                                    }
-                                    line_idx = 0; // Сбрасываем буфер для следующей строки
-                                } else {
-                                    line[line_idx++] = c;
-                                }
-                            } else {
-                                // Пайп пуст! Писатель закончил работу?
-                                if (global_pipe.writer_closed) {
-                                    break; // Да, конец файла (EOF). Выходим из цикла.
-                                } else {
-                                    // Писатель еще работает, просто данные еще не дошли. Ждем!
-                                    seL4_Yield();
-                                }
-                            }
-                        }
+                if (my_strcmp(cmd2, "grep") == 0) {
+                    if (arg2) {
+                        right_pid = spawn_thread((seL4_Word)grep_thread_func, (seL4_Word)grep_thread_stack + sizeof(grep_thread_stack) - 16, 
+                                                    (seL4_Word)arg2, 0, 0, -1,
+                                                    pipe_cap, ipc->caps_or_badges[1], ipc->caps_or_badges[2]);
                     } else {
-                        sys_puts_direct(console_ep, "Microkernel Pipe currently supports 'grep' on the right side.\n");
+                        sys_puts(console_ep, "grep: usage: grep <pattern>\n");
                     }
-
-                    // Сбрасываем флаг только после того, как grep закончил работу
-                    is_piping = false; 
+                } else {
+                    sys_puts(console_ep, "Microkernel Pipe currently supports 'grep' on the right side.\n");
                 }
+
+                // ИСПРАВЛЕНО: Ждем завершения дочерних процессов с помощью sys_wait
+                // Это надежнее, чем глобальный флаг.
+                // Порядок не важен, т.к. sys_wait немедленно вернется, если процесс уже завершился.
+                if (left_pid != -1) sys_wait(root_ep, left_pid);
+                if (right_pid != -1) sys_wait(root_ep, right_pid);
+
+                sys_pipe_close(pipe_fd);
+            }
         }
     }
 

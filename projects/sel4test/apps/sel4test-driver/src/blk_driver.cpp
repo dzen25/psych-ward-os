@@ -1,7 +1,9 @@
 #include <sel4/sel4.h>
-#include "common.h"
-#include "fat32.h"
+#include "h/common.h"
+#include "h/fat32.h"
 #include <stdint.h>
+
+uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name);
 
 struct VirtioMmioRegs {
     uint32_t magic_value;        // 0x000 (Должно быть 0x74726976)
@@ -141,7 +143,7 @@ bool hardware_virtio_read(uint32_t sector, uint32_t count, void* buffer) {
 
     // Ждем, пока устройство обработает запрос
     uint32_t timeout_counter = 5000000;
-    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) < g_vq_avail_idx) {
+    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) != g_vq_avail_idx) {
         if (--timeout_counter == 0) {
             return false; // Таймаут
         }
@@ -189,7 +191,7 @@ bool hardware_virtio_write(uint32_t sector, uint32_t count, const void* buffer) 
     g_disk_regs->queue_notify = 0;
 
     uint32_t timeout_counter = 5000000;
-    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) < g_vq_avail_idx) {
+    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) != g_vq_avail_idx) {
         if (--timeout_counter == 0) return false;
         seL4_Yield(); 
     } 
@@ -262,8 +264,18 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // Handshake
-    g_disk_regs->status = 0; 
+    // === WATCHDOG-SAFE RESET ===
+    // 1. Жесткий сброс устройства VirtIO. Запись 0 в status возвращает его в исходное состояние.
+    g_disk_regs->status = 0;
+
+    // 2. Очистка "грязной" SHM от старых дескрипторов, оставшихся от упавшего процесса.
+    // Это предотвращает ошибку "Virtqueue size exceeded" в QEMU при респавне.
+    for (int i = 0; i < 4096; i++) {
+        virtio_q_shm_base[i] = 0;
+    }
+    g_vq_avail_idx = 0; // Сбрасываем и наш внутренний счетчик
+
+    // 3. Теперь можно безопасно начать handshake
     g_disk_regs->status |= 1; // ACKNOWLEDGE
     g_disk_regs->status |= 2; // DRIVER
     g_disk_regs->guest_features = 0;
@@ -313,16 +325,47 @@ int main(int argc, char *argv[]) {
         seL4_Word cmd = seL4_GetMR(0);
         
         if (cmd == 110) { // SYS_LS
-            uint32_t target_sector = get_cwd_sector(&g_file_system);
+            char path[64];
+            my_strcpy(path, g_shm_vaddr);
+
+            uint32_t dir_cluster;
+            if (path[0] == '\0') {
+                dir_cluster = g_file_system.current_dir_cluster;
+                if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
+            } else {
+                char basename[64];
+                uint32_t parent_clus = fat32_resolve_parent(&g_file_system, path, basename);
+                if (parent_clus == 0xFFFFFFFF) {
+                    my_strcpy(g_shm_vaddr, "ls: path not found\n");
+                    seL4_SetMR(0, 0);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    continue;
+                }
+                if (basename[0] == '\0') {
+                    dir_cluster = parent_clus;
+                } else {
+                    dir_cluster = fat32_find_in_dir(&g_file_system, parent_clus, basename);
+                }
+            }
+
+            if (dir_cluster == 0xFFFFFFFF) {
+                my_strcpy(g_shm_vaddr, "ls: directory not found\n");
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                continue;
+            }
+            if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
+
+            uint32_t target_sector = g_file_system.data_start_sector + (dir_cluster - 2) * g_file_system.sectors_per_cluster;
             char sector_buf[512];
-            
-            // ВНИМАНИЕ: Это чтение аппаратно затирает g_shm_vaddr сырым FAT-сектором!
             hardware_virtio_read(target_sector, 1, sector_buf);
+
+            char* out_buf = (char*)g_shm_vaddr;
+            int offset = 0;
+            my_strcpy(out_buf, ""); // Clear SHM
 
             char lfn_buf[256];
             for(int i = 0; i < 256; i++) lfn_buf[i] = 0;
-
-            sys_puts(console_ep, "Directory listing:\n");
 
             for (int i = 0; i < 512; i += 32) {
                 uint8_t* entry = (uint8_t*)&sector_buf[i];
@@ -373,10 +416,14 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Печатаем тип и финальное имя
-                sys_puts(console_ep, is_dir ? " [DIR] " : " [FAT] ");
-                sys_puts(console_ep, final_name);
+                // Пишем тип и имя в SHM
+                const char* type_str = is_dir ? " [DIR] " : " [FAT] ";
+                my_strcpy(out_buf + offset, type_str);
+                offset += my_strlen(type_str);
 
+                my_strcpy(out_buf + offset, final_name);
+                offset += my_strlen(final_name);
+                
                 // === ВЫВОД РАЗМЕРА ФАЙЛА ===
                 if (!is_dir) { 
                     uint32_t file_size = *(uint32_t*)&entry[28]; 
@@ -397,16 +444,19 @@ int main(int argc, char *argv[]) {
                     }
                     size_str[idx] = '\0';
 
-                    sys_puts(console_ep, " \t(");
-                    sys_puts(console_ep, size_str);
-                    sys_puts(console_ep, " bytes)");
+                    my_strcpy(out_buf + offset, " \t(");
+                    offset += 3;
+                    my_strcpy(out_buf + offset, size_str);
+                    offset += my_strlen(size_str);
+                    my_strcpy(out_buf + offset, " bytes)");
+                    offset += 7;
                 }
 
-                sys_puts(console_ep, "\n");
+                my_strcpy(out_buf + offset, "\n");
+                offset++;
             }
             
-            ((char*)g_shm_vaddr)[0] = '\0'; // Блокируем утечку SHM
-            
+            out_buf[offset] = '\0';
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }

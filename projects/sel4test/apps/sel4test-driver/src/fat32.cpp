@@ -1,4 +1,4 @@
-#include "fat32.h"
+#include "h/fat32.h"
 
 // Forward declarations for static helpers
 static void my_memcpy(void *dest, const void *src, int n);
@@ -241,13 +241,13 @@ static void format_fat32_name(const char* input, char* output) {
 }
 
 // Ищет запись внутри конкретной папки (dir_cluster) и возвращает её кластер (или 0xFFFFFFFF, если не найдена)
-static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name) {
+uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name) {
     // === ФИКС ДЛЯ "cd .." ИЗ КОРНЯ ===
     if (my_strcmp(target_name, "..") == 0 && (dir_cluster == fs->root_cluster || dir_cluster == 0)) {
         return fs->root_cluster; // Безопасно возвращаем корень, предотвращая ошибку
     }
 
-    char sector_buf[512];
+    static char sector_buf[512]; // Сделано статическим для экономии стека
     uint32_t clus = (dir_cluster == 0) ? fs->root_cluster : dir_cluster;
     uint32_t sector = fs->data_start_sector + (clus - 2) * fs->sectors_per_cluster;
     
@@ -256,7 +256,7 @@ static uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, cons
     char formatted_name[12];
     format_fat32_name(target_name, formatted_name); // Готовим 8.3 на случай фоллбека
 
-    char lfn_buf[256];
+    static char lfn_buf[256]; // Сделано статическим для экономии стека
     for(int i = 0; i < 256; i++) lfn_buf[i] = 0;
 
     for (int i = 0; i < 512; i += 32) {
@@ -480,9 +480,9 @@ bool fat32_create_file(FAT32_Instance* fs, const char* path) {
 }
 
 // === ЗАПИСЬ В ФАЙЛ (echo > file) ===
+// REFACTORED: This function now includes logic from fat32_create_file
+// to reduce stack depth and avoid redundant path lookups, fixing a stack overflow.
 bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, uint32_t len) {
-    if (!fat32_create_file(fs, path)) return false; 
-
     char basename[64];
     uint32_t parent_clus = fat32_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -496,71 +496,85 @@ bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, ui
     char formatted_name[12];
     format_fat32_name(basename, formatted_name);
     char lfn_buf[256] = {0};
+    int entry_idx = -1;
+    int free_idx = -1;
 
+    // 1. Ищем существующую запись или свободный слот
     for (int i = 0; i < 512; i += 32) {
         uint8_t* entry = (uint8_t*)&sector_buf[i];
-        if (entry[0] == 0x00) break;
-        if (entry[0] == 0xE5) { for(int k=0; k<256; k++) lfn_buf[k] = 0; continue; }
+
+        if (entry[0] == 0x00 || entry[0] == 0xE5) {
+            if (free_idx == -1) free_idx = i;
+            if (entry[0] == 0x00) break;
+            for(int k=0; k<256; k++) lfn_buf[k] = 0;
+            continue;
+        }
 
         if (entry[11] == 0x0F) {
             int seq = (entry[0] & 0x1F) - 1;
-            if (seq >= 0 && seq < 20) {
-                char* p = lfn_buf + (seq * 13);
-                for(int k=1;  k<11; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-                for(int k=14; k<26; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-                for(int k=28; k<32; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-            }
+            if (seq >= 0 && seq < 20) { char* p = lfn_buf + (seq * 13); for(int k=1;  k<11; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; } for(int k=14; k<26; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; } for(int k=28; k<32; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; } }
             continue;
         }
 
         if (entry[11] & 0x08) { for(int k=0; k<256; k++) lfn_buf[k] = 0; continue; }
 
         bool match = false;
-        if (lfn_buf[0] != '\0') {
-            if (my_strcasecmp(lfn_buf, basename) == 0) match = true;
-            for(int k=0; k<256; k++) lfn_buf[k] = 0;
-        } else {
-            char entry_name[12];
-            my_memcpy(entry_name, entry, 11); entry_name[11] = '\0';
-            if (my_strcmp(entry_name, formatted_name) == 0) match = true;
-        }
+        if (lfn_buf[0] != '\0') { if (my_strcasecmp(lfn_buf, basename) == 0) match = true; } 
+        else { char entry_name[12]; my_memcpy(entry_name, entry, 11); entry_name[11] = '\0'; if (my_strcmp(entry_name, formatted_name) == 0) match = true; }
 
         if (match) {
-            uint16_t clus_hi = *(uint16_t*)&entry[20];
-            uint16_t clus_lo = *(uint16_t*)&entry[26];
-            uint32_t clus = (clus_hi << 16) | clus_lo;
-
-            // Если файл новый, выделяем ему кластер из таблицы FAT
-            if (clus == 0) {
-                char fat_buf[512];
-                if (!fs->read_blocks(fs->reserved_sectors, 1, fat_buf)) return false;
-                uint32_t* fat_table = (uint32_t*)fat_buf;
-
-                for (uint32_t c = 3; c < 128; c++) {
-                    if ((fat_table[c] & 0x0FFFFFFF) == 0) { // Нашли свободный кластер
-                        clus = c;
-                        fat_table[c] = 0x0FFFFFFF; // Маркер конца (EOF)
-                        fs->write_blocks(fs->reserved_sectors, 1, fat_buf);
-                        break;
-                    }
-                }
-                if (clus == 0) return false; // Диск заполнен
-                
-                *(uint16_t*)&entry[20] = (clus >> 16);
-                *(uint16_t*)&entry[26] = (clus & 0xFFFF);
-            }
-
-            *(uint32_t*)&entry[28] = len; // Обновляем размер файла
-            fs->write_blocks(parent_sector, 1, sector_buf); // Сохраняем Директорию
-
-            // Пишем сами данные
-            uint32_t file_sector = fs->data_start_sector + (clus - 2) * fs->sectors_per_cluster;
-            uint32_t sectors = (len + 511) / 512;
-            if (sectors == 0) sectors = 1;
-            return fs->write_blocks(file_sector, sectors, text);
+            entry_idx = i;
+            break;
         }
+        for(int k=0; k<256; k++) lfn_buf[k] = 0;
     }
-    return false;
+
+    // 2. Если файл не найден, создаем новую запись
+    if (entry_idx == -1) {
+        if (free_idx == -1) return false; // Directory is full
+        entry_idx = free_idx;
+        uint8_t* new_entry = (uint8_t*)&sector_buf[entry_idx];
+        for(int i = 0; i < 32; i++) new_entry[i] = 0;
+        my_memcpy(new_entry, formatted_name, 11);
+        new_entry[11] = 0x20; // ATTR_ARCHIVE
+    }
+
+    // 3. Получаем указатель на запись и ее текущий кластер
+    uint8_t* target_entry = (uint8_t*)&sector_buf[entry_idx];
+    uint16_t clus_hi = *(uint16_t*)&target_entry[20];
+    uint16_t clus_lo = *(uint16_t*)&target_entry[26];
+    uint32_t clus = (clus_hi << 16) | clus_lo;
+
+    // 4. Если кластер не выделен (новый файл), выделяем его
+    if (clus == 0 && len > 0) { // Only allocate if there's data to write
+        char fat_buf[512];
+        if (!fs->read_blocks(fs->reserved_sectors, 1, fat_buf)) return false;
+        uint32_t* fat_table = (uint32_t*)fat_buf;
+        for (uint32_t c = 3; c < 128; c++) {
+            if ((fat_table[c] & 0x0FFFFFFF) == 0) {
+                clus = c;
+                fat_table[c] = 0x0FFFFFFF;
+                if (!fs->write_blocks(fs->reserved_sectors, 1, fat_buf)) return false;
+                break;
+            }
+        }
+        if (clus == 0) return false; // Disk full
+        *(uint16_t*)&target_entry[20] = (clus >> 16);
+        *(uint16_t*)&target_entry[26] = (clus & 0xFFFF);
+    }
+
+    // 5. Обновляем размер и записываем изменения в директорию
+    *(uint32_t*)&target_entry[28] = len;
+    if (!fs->write_blocks(parent_sector, 1, sector_buf)) return false;
+
+    // 6. Записываем данные файла в выделенный кластер
+    if (len > 0 && clus != 0) {
+        uint32_t file_sector = fs->data_start_sector + (clus - 2) * fs->sectors_per_cluster;
+        uint32_t sectors_to_write = (len + 511) / 512;
+        return fs->write_blocks(file_sector, sectors_to_write, text);
+    }
+
+    return true; // Success (e.g., for a 0-byte file)
 }
 
 // === УДАЛЕНИЕ ФАЙЛА (rm) ===

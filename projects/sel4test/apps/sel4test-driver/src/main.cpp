@@ -1,7 +1,7 @@
-#include "common.h"
-#include "allocator.h"
-#include "uart.h"
-#include "hw_timer.h" 
+#include "h/common.h"
+#include "h/allocator.h"
+#include "h/uart.h"
+#include "h/hw_timer.h" 
 
 #include <sel4/sel4.h>
 
@@ -33,7 +33,7 @@ enum SyscallID {
     SYS_EXIT = 103, 
     SYS_PS = 104,
     SYS_THREAD_EXIT = 105,
-    SYS_WAIT = 106, 
+    SYS_WAIT = 106,
     SYS_SHM_GET = 107,
     SYS_GETPID = 108,
     SYS_RECOVER = 117,
@@ -65,11 +65,6 @@ static void pl011_putchar(char c) {
     while ((*uart_fr) & (1 << 5)); *uart_dr = c;
 }
 
-#define KBD_BUFFER_SIZE 128
-static char kbd_buffer[KBD_BUFFER_SIZE];
-static int kbd_buffer_head = 0;
-static int kbd_buffer_tail = 0;
-static seL4_CPtr reader_reply_slot = 0; static bool reader_waiting = false; 
 static seL4_CPtr sleeper_reply_slot = 0; static bool sleeper_waiting = false;
 
 // --- В начале файла или внутри spawn_process ---
@@ -147,6 +142,25 @@ struct ProcessControlBlock {
     bool has_shm;
     seL4_CPtr shm_copies[4];
 };
+
+// --- UNIX PIPES SUBSYSTEM ---
+#define MAX_PIPES 16
+#define PIPE_BASE_BADGE 1000 // Бейджи от 1000 до 1015 будут пайпами
+
+struct pipe_t {
+    bool active;
+    char buffer[4096];
+    int count; // Сколько байт сейчас в буфере
+    
+    // Блокировка! Если читатель пришел, а пайп пуст, мы сохраняем его Reply Cap,
+    // чтобы ответить (разбудить) его позже, когда писатель положит данные.
+    seL4_CPtr reader_reply_cap; 
+    int writer_pid;
+    int owner_pid; // PID процесса, который создал пайп
+    
+    bool eof; // Флаг конца файла (писатель умер или закрыл трубу)
+};
+
 static ProcessControlBlock pcbs[256];
 static int next_pid = 1;
 
@@ -170,6 +184,8 @@ struct SharedMemoryRegion {
     bool active;
     seL4_CPtr frame_cap; // Физический фрейм памяти
 };
+
+static pipe_t g_pipes[MAX_PIPES] = {0};
 static SharedMemoryRegion shm_regions[16];
 
 static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
@@ -236,9 +252,9 @@ static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, se
 }
 
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
-                         PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace,
-                         seL4_CPtr normal_untyped, seL4_CPtr shm_frame_root,
-                         int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
+                         PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                         seL4_CPtr shm_frame_root, int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep,
+                         seL4_CPtr blk_ep, seL4_CPtr stdin_ep, seL4_CPtr stdout_ep, seL4_CPtr stderr_ep,
                          seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame,
                          const char *args_payload = nullptr,
                          seL4_CPtr net_cmd_recv_ep = 0,
@@ -413,6 +429,13 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         strcpy((char*)&child_ipc_ptr->msg[0], args_payload);
     }
 
+    // ИСПРАВЛЕНИЕ: Мы не можем передавать Capability из CSpace ядра напрямую.
+    // Вместо этого мы используем локальные слоты, в которые мы уже сминтовали
+    // нужные capabilities (в данном случае, console_ep).
+    child_ipc_ptr->caps_or_badges[0] = local_console_ep; // FD 0 = STDIN
+    child_ipc_ptr->caps_or_badges[1] = local_console_ep; // FD 1 = STDOUT
+    child_ipc_ptr->caps_or_badges[2] = local_console_ep; // FD 2 = STDERR
+
     child_ipc_ptr->msg[BOOT_ROOT_EP] = local_syscall_ep;
 
     if (is_driver > 0 && is_driver <= 4) { // Any driver
@@ -518,7 +541,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc, 
                                     seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped, 
                                     seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep) {
-    if (pid <= 0 || pid >= 256 || !pcbs[pid].active) return;
+    if (pid <= 0 || pid >= 256 || !pcbs[pid].active)
+        return;
 
     // 1. Копируем метаданные упавшего процесса во временный буфер
     ProcessControlBlock meta = pcbs[pid];
@@ -577,7 +601,8 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
         
         int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                                    meta.is_driver, console_ep, timer_ep, blk_ep, meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
+                                    meta.is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
+                                    meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep);
         
         if (new_pid > 0) {
@@ -615,8 +640,6 @@ int main(int argc, char *argv[]) {
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
-
-    reader_reply_slot = alloc.alloc_slot();
     sleeper_reply_slot = alloc.alloc_slot();
 
     seL4_CPtr pmd = alloc.alloc_slot();
@@ -710,31 +733,31 @@ int main(int argc, char *argv[]) {
 
     // Запускаем Драйвер UART (is_driver = 1)
     if (spawn_process("uart_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
-                      1, console_ep, timer_ep, 0, uart_ntfn, uart_irq_handler, uart_frame) < 0) {
+                      1, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, uart_ntfn, uart_irq_handler, uart_frame) < 0) {
         uart_puts("PANIC: UART Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Таймера (is_driver = 2)
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
-                      2, console_ep, timer_ep, 0, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
+                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Диска и ФС (is_driver = 3)
     if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
-                      3, console_ep, timer_ep, blk_ep, 0, 0, virtio_frames[0]) < 0) {
+                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0]) < 0) {
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
 
     if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
-                      4, console_ep, timer_ep, 0, 0, 0, virtio_frames[0], nullptr,
+                      4, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0], nullptr,
                       net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Оболочку (is_driver = 0)
     if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
-                      0, console_ep, timer_ep, blk_ep, 0, 0, 0, nullptr,
+                      0, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, 0, nullptr,
                       0, net_cmd_send_ep) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
@@ -744,23 +767,29 @@ int main(int argc, char *argv[]) {
     // --- ЕДИНЫЙ ЦИКЛ ЯДРА ---
     while (1) {
         seL4_Word sender_badge = 0;
-    // Ожидаем прерывание, сообщение IPC или fault
-    seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
+        // Ожидаем прерывание, сообщение IPC или fault
+        seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
 
-    seL4_Word sender_pid = 0;
+        seL4_Word sender_pid = 0;
 
-    if (sender_badge != 0) {
-        // Извлекаем чистый PID процесса/потока из младших 16 бит
-        seL4_Word actual_pid = sender_badge & 0xFFFF;
-        
-        // Проверяем, что это не ядро (0) и процесс зарегистрирован
-        if (actual_pid > 0 && actual_pid < 256 && pcbs[actual_pid].active) {
-            sender_pid = actual_pid;
-        } else {
-            // Защита от взлома/коррупции: игнорируем неопознанный бейдж
-            continue; 
+        // --- НОВАЯ, УМНАЯ ЛОГИКА ОБРАБОТКИ БЕЙДЖЕЙ ---
+        bool is_pipe_call = (sender_badge >= PIPE_BASE_BADGE && sender_badge < PIPE_BASE_BADGE + MAX_PIPES);
+
+        if (sender_badge != 0 && !is_pipe_call) {
+            // Это обычный системный вызов или fault от процесса/потока.
+            // Извлекаем PID из младших 16 бит.
+            seL4_Word actual_pid = sender_badge & 0xFFFF;
+            
+            // Проверяем, что PID валиден и процесс активен
+            if (actual_pid > 0 && actual_pid < 256 && pcbs[actual_pid].active) {
+                sender_pid = actual_pid;
+            } else {
+                // Неопознанный бейдж, который не является пайпом. Игнорируем.
+                continue; 
+            }
         }
-    }
+        // Если это вызов к пайпу (is_pipe_call == true), sender_pid остается 0.
+        // Логика обработки пайпов в case 6 и 8 использует sender_badge, а не sender_pid.
 
         seL4_Word label = seL4_MessageInfo_get_label(recv_info);
         
@@ -853,31 +882,149 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(0, 0); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
 
-            case SYS_PUTS: {
-                int msg_len = seL4_MessageInfo_get_length(recv_info);
-                for (int i = 1; i < msg_len; i++) {
-                    pl011_putchar((char)seL4_GetMR(i));
+            case 20: { // SYS_PIPE (Создать конвейер)
+                // 1. СРАЗУ СПАСАЕМ ВХОДНЫЕ ДАННЫЕ!
+                seL4_Word requested_fd = seL4_GetMR(1);
+                seL4_CPtr child_cspace = pcbs[sender_pid].cspace;
+
+                int pipe_id = -1;
+                for (int i = 0; i < MAX_PIPES; i++) {
+                    if (!g_pipes[i].active) {
+                        g_pipes[i].active = true;
+                        g_pipes[i].count = 0;
+                        g_pipes[i].reader_reply_cap = 0;
+                        g_pipes[i].eof = false;
+                        g_pipes[i].writer_pid = sender_pid;
+                        g_pipes[i].owner_pid = sender_pid; // Запоминаем владельца
+                        pipe_id = i;
+                        break;
+                    }
                 }
-                seL4_SetMR(0, 0); 
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+
+                if (pipe_id != -1) {
+                    seL4_Word pipe_badge = PIPE_BASE_BADGE + pipe_id;
+
+                    // 2. Минтим Capability в правильный слот (requested_fd)
+                    seL4_CNode_Delete(child_cspace, requested_fd, 8); // Pre-emptively clear slot
+                    seL4_Error err = seL4_CNode_Mint(
+                        child_cspace,       // CNode оболочки
+                        requested_fd,       // Слот (например, 3)
+                        8,                  // Глубина слота
+                        root_cnode,         // Откуда берем
+                        ep,                 // Базовый Endpoint (на который ядро слушает)
+                        seL4_WordBits,
+                        seL4_AllRights,
+                        pipe_badge          // Устанавливаем бейдж 1000+
+                    );
+
+                    if (err == seL4_NoError) {
+                        // 3. Формируем ответ (только теперь трогаем MR)
+                        seL4_SetMR(0, requested_fd); // Возвращаем реальный FD
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    } else {
+                        g_pipes[pipe_id].active = false; // Rollback
+                        seL4_SetMR(0, -1);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    }
+                } else {
+                    seL4_SetMR(0, -1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                }
                 break;
             }
 
-            case SYS_READ:
-                if (kbd_buffer_head != kbd_buffer_tail) {
-                    char c = kbd_buffer[kbd_buffer_tail];
-                    kbd_buffer_tail = (kbd_buffer_tail + 1) % KBD_BUFFER_SIZE;
-                    seL4_SetMR(0, c); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                } else {
-                    if (reader_waiting) {
-                        seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                    } else {
-                        seL4_Error err = seL4_CNode_SaveCaller(root_cnode, reader_reply_slot, seL4_WordBits);
-                        if (err == seL4_NoError) { reader_waiting = true; } 
-                        else { seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1)); }
+            case 8: { // Универсальный WRITE (SYS_PUTS)
+                if (sender_badge >= PIPE_BASE_BADGE && sender_badge < PIPE_BASE_BADGE + MAX_PIPES) { // Это пайп
+                    int pipe_id = sender_badge - PIPE_BASE_BADGE;
+                    pipe_t* p = &g_pipes[pipe_id];
+                    
+                    int chunk = seL4_MessageInfo_get_length(recv_info) - 1;
+                    // Пишем данные в кольцевой буфер пайпа
+                    for (int i = 0; i < chunk; i++) {
+                        if (p->count < 4096) {
+                            p->buffer[p->count++] = (char)seL4_GetMR(i + 1);
+                        }
                     }
+
+                    // Если кто-то спал и ждал данных (grep) - БУДИМ ЕГО!
+                    if (p->reader_reply_cap != 0 && p->count > 0) {
+                        seL4_SetMR(0, p->buffer[0]); // Отдаем 1 байт
+                        for(int i = 1; i < p->count; i++) p->buffer[i-1] = p->buffer[i]; // Сдвигаем
+                        p->count--;
+
+                        seL4_Send(p->reader_reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+                        seL4_CNode_Delete(root_cnode, p->reader_reply_cap, seL4_WordBits);
+                        alloc.free(p->reader_reply_cap);
+                        p->reader_reply_cap = 0;
+                    }
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                } else {
+                    // Заглушка, если кто-то случайно прислал консольный вывод в ядро
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
                 }
                 break;
+            }
+
+            case 6: { // Универсальный READ (SYS_READ)
+                if (sender_badge >= PIPE_BASE_BADGE && sender_badge < PIPE_BASE_BADGE + MAX_PIPES) {
+                    int pipe_id = sender_badge - PIPE_BASE_BADGE;
+                    pipe_t* p = &g_pipes[pipe_id];
+
+                    if (p->count > 0) {
+                        // Данные есть, отдаем байт читателю!
+                        seL4_SetMR(0, p->buffer[0]);
+                        for(int i = 1; i < p->count; i++) p->buffer[i-1] = p->buffer[i];
+                        p->count--;
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    } else if (p->eof) {
+                        // Писатель (ls) завершился, закрываем трубу
+                        seL4_SetMR(0, 0); // 0 байт = конец файла
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    } else {
+                        // ДАННЫХ НЕТ! Писатель еще ничего не написал. Замораживаем читателя!
+                        p->reader_reply_cap = alloc.alloc_slot();
+                        seL4_CNode_SaveCaller(root_cnode, p->reader_reply_cap, seL4_WordBits);
+                        // БЕЗ seL4_Reply! Процесс засыпает до прихода данных в case 8.
+                    }
+                } else {
+                    seL4_SetMR(0, 0);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                }
+                break;
+            }
+
+            case 24: { // SYS_PIPE_WR_CLOSE
+                if (sender_badge >= PIPE_BASE_BADGE && sender_badge < PIPE_BASE_BADGE + MAX_PIPES) {
+                    int pipe_id = sender_badge - PIPE_BASE_BADGE;
+                    pipe_t* p = &g_pipes[pipe_id];
+                    p->eof = true;
+                    if (p->reader_reply_cap != 0) {
+                        seL4_SetMR(0, 0); // EOF
+                        seL4_Send(p->reader_reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+                        seL4_CNode_Delete(root_cnode, p->reader_reply_cap, seL4_WordBits);
+                        alloc.free(p->reader_reply_cap);
+                        p->reader_reply_cap = 0;
+                    }
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                break;
+            }
+
+            case 25: { // SYS_PIPE_CLOSE
+                if (sender_badge >= PIPE_BASE_BADGE && sender_badge < PIPE_BASE_BADGE + MAX_PIPES) {
+                    int pipe_id = sender_badge - PIPE_BASE_BADGE;
+                    g_pipes[pipe_id].active = false;
+                    
+                    // ИСПРАВЛЕНО: Используем PID владельца, а не sender_pid, который равен 0
+                    int owner_pid = g_pipes[pipe_id].owner_pid;
+                    if (owner_pid > 0 && owner_pid < 256 && pcbs[owner_pid].active) {
+                        // Удаляем capability из CSpace процесса-владельца
+                        seL4_CNode_Delete(pcbs[owner_pid].cspace, 3, 8);
+                    }
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                break;
+            }
 
             case SYS_ALLOC:
                 seL4_SetMR(0, 0); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -924,6 +1071,11 @@ int main(int argc, char *argv[]) {
                 seL4_Word arg0 = seL4_GetMR(2);
                 seL4_Word arg1 = seL4_GetMR(3);
                 seL4_Word arg2 = seL4_GetMR(4);
+                seL4_CPtr req_stdin_cap = seL4_GetMR(5);
+                seL4_CPtr req_stdout_cap = seL4_GetMR(6);
+                seL4_CPtr req_stderr_cap = seL4_GetMR(7);
+                int pipe_id = (int)seL4_GetMR(8);
+                seL4_Word stack_top = seL4_GetMR(9);
 
                 int new_pid = -1;
                 for (int i = 1; i < 256; i++) {
@@ -939,12 +1091,20 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                seL4_CPtr new_tcb = alloc.alloc_slot(); 
+                ProcessControlBlock& pcb = pcbs[new_pid];
+                memset(&pcb, 0, sizeof(ProcessControlBlock));
+                pcb.pid = new_pid;
+                strncpy(pcb.name, "shell_thread", 31);
+                pcb.active = true;
+                pcb.vspace = pcbs[sender_pid].vspace; // Потоки разделяют VSpace и CSpace родителя
+                pcb.cspace = pcbs[sender_pid].cspace;
+
+                seL4_CPtr new_tcb = alloc_and_track_cap(alloc, pcb);
                 seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, seL4_TCBBits, root_cnode, 0, 0, new_tcb, 1);
 
                 // --- ГЕНЕРАЦИЯ УНИКАЛЬНОГО БЕЙДЖА ПОТОКА ---
-                seL4_Word thread_badge = (sender_pid << 16) | new_pid; 
-                seL4_CPtr thread_badged_ep = alloc.alloc_slot();
+                seL4_Word thread_badge = (sender_pid << 16) | new_pid;
+                seL4_CPtr thread_badged_ep = alloc_and_track_cap(alloc, pcb);
                 seL4_CNode_Mint(root_cnode, thread_badged_ep, seL4_WordBits,
                                 root_cnode, ep, seL4_WordBits, seL4_AllRights, thread_badge);
 
@@ -955,7 +1115,7 @@ int main(int argc, char *argv[]) {
                 seL4_CNode_Copy(pcbs[sender_pid].cspace, local_thread_fault_ep, 8,
                                 root_cnode, thread_badged_ep, seL4_WordBits, seL4_AllRights);
 
-                seL4_CPtr ipc_frame = alloc.alloc_slot();
+                seL4_CPtr ipc_frame = alloc_and_track_cap(alloc, pcb);
                 seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
                 
                 static uintptr_t clone_temp_vaddr = 0x2001C0000ULL; 
@@ -972,6 +1132,11 @@ int main(int argc, char *argv[]) {
                 child_ipc_ptr->msg[BOOT_TIMER_EP] = 2; // local_timer_ep
                 child_ipc_ptr->msg[BOOT_NET_EP] = 3; // local_net_send_ep
                 
+                // НОВОЕ: Устанавливаем файловые дескрипторы для потока
+                child_ipc_ptr->caps_or_badges[0] = req_stdin_cap;
+                child_ipc_ptr->caps_or_badges[1] = req_stdout_cap;
+                child_ipc_ptr->caps_or_badges[2] = req_stderr_cap;
+
                 seL4_ARM_Page_Unmap(ipc_frame);
 
                 // ИСПРАВЛЕНО: База IPC-буферов потоков смещена на 0x700000 во избежание коллизии со стеками
@@ -987,25 +1152,12 @@ int main(int argc, char *argv[]) {
                                    pcbs[sender_pid].vspace, seL4_NilData, 
                                    thread_ipc_vaddr + 2048, ipc_frame);       
                 
-                seL4_TCB_SetPriority(new_tcb, seL4_CapInitThreadTCB, 254);
-
-                // --- Выделение стека ---
-                seL4_Word stack_vaddr = 0x540000 + (new_pid * 0x2000); 
-                
-                seL4_CPtr stack_frame1 = alloc.alloc_slot(); 
-                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frame1, 1);
-                check_err(seL4_ARM_Page_Map(stack_frame1, pcbs[sender_pid].vspace, stack_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Thread Stack Page 1");
-                
-                seL4_CPtr stack_frame2 = alloc.alloc_slot(); 
-                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frame2, 1);
-                check_err(seL4_ARM_Page_Map(stack_frame2, pcbs[sender_pid].vspace, stack_vaddr + 0x1000, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Thread Stack Page 2");
-
-                seL4_Word stack_top = (stack_vaddr + 0x2000) & ~0xF; 
+                seL4_TCB_SetPriority(new_tcb, seL4_CapInitThreadTCB, 254); 
 
                 // --- Запуск контекста ---
                 seL4_UserContext context = {0};
                 context.pc = entry_point;   
-                context.sp = stack_top;     
+                context.sp = stack_top; // Используем переданный указатель на стек
                 // Передаем аргументы в новый поток через регистры x0, x1, x2
                 context.x0 = arg0;
                 context.x1 = arg1;
@@ -1017,16 +1169,14 @@ int main(int argc, char *argv[]) {
                 seL4_TCB_WriteRegisters(new_tcb, false, 0, sizeof(context) / sizeof(seL4_Word), &context);
                 seL4_TCB_SetTLSBase(new_tcb, thread_ipc_vaddr + 3072);
 
-                pcbs[new_pid].active = true;
-                pcbs[new_pid].tcb = new_tcb;
-                pcbs[new_pid].vspace = pcbs[sender_pid].vspace;
-                pcbs[new_pid].cspace = pcbs[sender_pid].cspace;
-                pcbs[new_pid].badged_ep = thread_badged_ep;
-                strncpy(pcbs[new_pid].name, "shell_thread", 31);
+                pcb.tcb = new_tcb;
+                pcb.badged_ep = thread_badged_ep;
+                pcb.thread_ipc_frame = ipc_frame;
                 
-                pcbs[new_pid].thread_ipc_frame = ipc_frame;
-                pcbs[new_pid].thread_stack_frame1 = stack_frame1;
-                pcbs[new_pid].thread_stack_frame2 = stack_frame2;
+                // Если мы создаем поток для пайпа, регистрируем его как писателя
+                if (pipe_id != -1 && pipe_id < MAX_PIPES) {
+                    g_pipes[pipe_id].writer_pid = new_pid;
+                }
 
                 seL4_TCB_Resume(new_tcb);
 
@@ -1036,35 +1186,59 @@ int main(int argc, char *argv[]) {
             }
 
             case 105: { // SYS_THREAD_EXIT
-                int thread_pid = sender_badge & 0xFFFF; // Младшие 16 бит - это new_pid потока
-                
-                if (pcbs[thread_pid].active && strncmp(pcbs[thread_pid].name, "shell_thread", 12) == 0) {
-                    
-                    seL4_TCB_Suspend(pcbs[thread_pid].tcb);
-                    
-                    if (pcbs[thread_pid].thread_stack_frame1) {
-                        seL4_ARM_Page_Unmap(pcbs[thread_pid].thread_stack_frame1);
-                        seL4_CNode_Revoke(root_cnode, pcbs[thread_pid].thread_stack_frame1, seL4_WordBits);
-                        seL4_CNode_Delete(root_cnode, pcbs[thread_pid].thread_stack_frame1, seL4_WordBits);
-                    }
-                    if (pcbs[thread_pid].thread_stack_frame2) {
-                        seL4_ARM_Page_Unmap(pcbs[thread_pid].thread_stack_frame2);
-                        seL4_CNode_Revoke(root_cnode, pcbs[thread_pid].thread_stack_frame2, seL4_WordBits);
-                        seL4_CNode_Delete(root_cnode, pcbs[thread_pid].thread_stack_frame2, seL4_WordBits);
-                    }
-                    if (pcbs[thread_pid].thread_ipc_frame) {
-                        seL4_ARM_Page_Unmap(pcbs[thread_pid].thread_ipc_frame);
-                        seL4_CNode_Revoke(root_cnode, pcbs[thread_pid].thread_ipc_frame, seL4_WordBits);
-                        seL4_CNode_Delete(root_cnode, pcbs[thread_pid].thread_ipc_frame, seL4_WordBits);
-                    }
-                    
-                    seL4_CNode_Revoke(root_cnode, pcbs[thread_pid].tcb, seL4_WordBits);
-                    seL4_CNode_Delete(root_cnode, pcbs[thread_pid].tcb, seL4_WordBits);
-                    
-                    seL4_CNode_Delete(root_cnode, pcbs[thread_pid].badged_ep, seL4_WordBits); 
+                int thread_pid = sender_badge & 0xFFFF;
+                int parent_pid = (sender_badge >> 16) & 0xFFFF;
 
-                    pcbs[thread_pid].active = false;
+                if (thread_pid <= 0 || thread_pid >= 256 || !pcbs[thread_pid].active) {
+                    break; // Invalid thread PID, ignore.
                 }
+
+                // Если поток был писателем в пайп, сообщаем читателю, что данные закончились (EOF)
+                for (int i = 0; i < MAX_PIPES; i++) {
+                    if (g_pipes[i].active && g_pipes[i].writer_pid == thread_pid) {
+                        g_pipes[i].eof = true;
+                        if (g_pipes[i].reader_reply_cap != 0) {
+                            seL4_SetMR(0, 0); // EOF
+                            seL4_Send(g_pipes[i].reader_reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+                            seL4_CNode_Delete(root_cnode, g_pipes[i].reader_reply_cap, seL4_WordBits);
+                            alloc.free(g_pipes[i].reader_reply_cap);
+                            g_pipes[i].reader_reply_cap = 0;
+                        }
+                    }
+                }
+
+                // Будим родительский процесс, если он ждал этот поток
+                if (parent_pid > 0 && parent_pid < 256 && pcbs[parent_pid].active && pcbs[parent_pid].waiting_for == thread_pid) {
+                    pcbs[parent_pid].waiting_for = 0;
+                    seL4_SetMR(0, 0); // Success
+                    seL4_Send(pcbs[parent_pid].reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+                    seL4_CNode_Delete(root_cnode, pcbs[parent_pid].reply_cap, seL4_WordBits);
+                    alloc.free(pcbs[parent_pid].reply_cap);
+                    pcbs[parent_pid].reply_cap = 0;
+                }
+
+                // Финальная очистка ресурсов потока
+                ProcessControlBlock& pcb = pcbs[thread_pid];
+                if (strncmp(pcb.name, "shell_thread", 12) == 0) {
+                    seL4_TCB_Suspend(pcb.tcb);
+
+                    // Отмапим IPC буфер потока из VSpace родителя
+                    if (pcb.thread_ipc_frame) {
+                        seL4_ARM_Page_Unmap(pcb.thread_ipc_frame);
+                    }
+
+                    // Уничтожаем и освобождаем все capabilities, принадлежащие потоку
+                    for (int i = 0; i < pcb.cap_tracker.count; i++) {
+                        seL4_CPtr cap_to_free = pcb.cap_tracker.caps[i];
+                        seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+                        seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
+                        alloc.free(cap_to_free);
+                    }
+                    pcb.cap_tracker.count = 0;
+                    
+                    pcb.active = false;
+                }
+                // Не отвечаем на этот вызов, т.к. поток уничтожается
                 break;
             }
 
@@ -1085,7 +1259,7 @@ int main(int argc, char *argv[]) {
                     *args = '\0';
                     args++;
                 } else {
-                    args = ""; // No args
+                    args = (char*)""; // No args
                 }
                 
                 static char elf_staging_buffer[1024 * 1024];
@@ -1101,8 +1275,8 @@ int main(int argc, char *argv[]) {
                     uart_puts("[ROOT] ELF loaded successfully! Spawning...\n");
                     elf_t elf;
                     if (elf_newFile(elf_staging_buffer, elf_size, &elf) == 0) {
-                        new_pid = spawn_process(app_name_and_args, elf_staging_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, 
-                                                normal_untyped, shm_frames[0], 254, console_ep, timer_ep, blk_ep,
+                        new_pid = spawn_process(app_name_and_args, elf_staging_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                                shm_frames[0], 254, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                                 0, 0, 0, args, 0, net_cmd_send_ep);
                     } else {
                         new_pid = -2; // Invalid ELF
@@ -1177,12 +1351,29 @@ int main(int argc, char *argv[]) {
 
             case SYS_EXIT: {
                 if (sender_pid > 0) {
+                    // Проверяем, не был ли этот процесс писателем в пайп
+                    for (int i = 0; i < MAX_PIPES; i++) {
+                        if (g_pipes[i].active && g_pipes[i].writer_pid == sender_pid) {
+                            g_pipes[i].eof = true;
+                            if (g_pipes[i].reader_reply_cap != 0) {
+                                seL4_SetMR(0, 0); // EOF
+                                seL4_Send(g_pipes[i].reader_reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
+                                seL4_CNode_Delete(root_cnode, g_pipes[i].reader_reply_cap, seL4_WordBits);
+                                alloc.free(g_pipes[i].reader_reply_cap);
+                                g_pipes[i].reader_reply_cap = 0;
+                            }
+                        }
+                    }
+
+                    // Будим все процессы, которые ждали этот
                     for (int i = 1; i < 256; i++) {
                         if (pcbs[i].active && pcbs[i].waiting_for == sender_pid) {
                             pcbs[i].waiting_for = 0;
                             seL4_SetMR(0, 0);
                             seL4_Send(pcbs[i].reply_cap, seL4_MessageInfo_new(0, 0, 0, 1));
                             seL4_CNode_Delete(root_cnode, pcbs[i].reply_cap, seL4_WordBits);
+                            alloc.free(pcbs[i].reply_cap);
+                            pcbs[i].reply_cap = 0;
                         }
                     }
                     seL4_TCB_Suspend(pcbs[sender_pid].tcb);

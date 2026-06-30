@@ -1,5 +1,4 @@
-
-#include "hw_timer.h"
+#include "h/hw_timer.h"
 
 volatile uint32_t *rtc_dr;
 volatile uint32_t *rtc_mr;
