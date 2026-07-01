@@ -46,6 +46,12 @@ static void my_memcpy(void *dest, const void *src, int n) {
 
 static uint16_t htons(uint16_t hostshort) { return ((hostshort >> 8) & 0xFF) | ((hostshort & 0xFF) << 8); }
 
+// Симметричная операция (network <-> host), как и htons, но для 32-битных полей NTP-таймстампов.
+static uint32_t bswap32(uint32_t v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
 static uint64_t sys_get_time_ms(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 3); // SYS_GET_TIME
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
@@ -137,6 +143,25 @@ struct __attribute__((packed)) dns_header {
     uint16_t add_count;
 };
 
+// SNTPv4 (RFC 4330) заголовок, ровно 48 байт полезной нагрузки поверх UDP.
+struct __attribute__((packed)) ntp_packet {
+    uint8_t li_vn_mode;
+    uint8_t stratum;
+    uint8_t poll;
+    int8_t precision;
+    uint32_t root_delay;
+    uint32_t root_dispersion;
+    uint32_t ref_id;
+    uint32_t ref_ts_sec;
+    uint32_t ref_ts_frac;
+    uint32_t orig_ts_sec;
+    uint32_t orig_ts_frac;
+    uint32_t rx_ts_sec;
+    uint32_t rx_ts_frac;
+    uint32_t tx_ts_sec;
+    uint32_t tx_ts_frac;
+};
+
 // Глобальные переменные для DNS-сессии
 static char g_dns_pending_domain[64];
 static bool g_dns_outstanding = false;
@@ -159,7 +184,16 @@ enum NetCommand {
     NET_CMD_STATUS = 3,
     NET_CMD_RESOLVE = 4,
     NET_CMD_RECV = 5,
+    NET_CMD_NTP = 6,
 };
+
+// --- Настройки NTP-клиента (правьте здесь) ---
+// Google Public NTP (time.google.com), стабильный anycast-адрес, отвечает
+// в стандартном клиент-серверном режиме (mode=3) без leap smear проблем для нас.
+static uint8_t g_ntp_server_ip[4] = {216, 239, 35, 0};
+static const uint16_t NTP_SERVER_PORT = 123;
+// Разница эпох NTP (1900-01-01) и Unix (1970-01-01) в секундах.
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800u;
 
 // Последняя принятая произвольная UDP-датаграмма (не DNS-ответ), ждущая
 // команды `recv` из shell. Однослотовый почтовый ящик: новый пакет
@@ -194,6 +228,17 @@ static uint64_t g_ping_total_rtt_us = 0;
 static uint64_t g_ping_next_send_ms = 0;
 static uint64_t g_cpu_loops = 0;
 static uint64_t g_ping_sent_loop = 0;
+
+// --- Состояние NTP-клиента ---
+static bool g_ntp_outstanding = false;
+// T1: наши (возможно, неточные) часы в момент отправки запроса, сек. с эпохи Unix.
+static uint64_t g_ntp_t1_epoch_s = 0;
+static uint32_t g_ntp_last_offset_s = 0; // Для диагностики (netstat/логов), знак хранится отдельно.
+static bool g_ntp_last_offset_negative = false;
+static bool g_ntp_synced = false;
+// Отличает автосинхронизацию при старте net_driver от ручной команды `ntp`,
+// чтобы на успехе/неудаче загрузочного синка вывести отдельную строку в лог.
+static bool g_ntp_boot_sync_pending = false;
 
 static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
     volatile virtq_desc* vq_desc = (volatile virtq_desc*)(g_shm_vaddr + 0x200);
@@ -364,6 +409,54 @@ static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + my_strlen(message), 0x280);
     volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
     net_mailbox[0] = 0;
+}
+
+// Отправляет SNTP client-запрос (mode=3) напрямую на g_ntp_server_ip:123,
+// маршрутизируя через уже разрешенный router_mac (тот же прием, что и DNS-запрос
+// на 8.8.8.8 выше — адресат вне локальной подсети, но канальный уровень идет на гейтвей).
+static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    uint32_t tx_offset = 0x280;
+
+    volatile virtio_net_hdr* net_hdr = (volatile virtio_net_hdr*)(g_shm_vaddr + tx_offset);
+    net_hdr->flags = 0; net_hdr->gso_type = 0; net_hdr->hdr_len = 0; net_hdr->gso_size = 0; net_hdr->csum_start = 0; net_hdr->csum_offset = 0;
+
+    volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + tx_offset + sizeof(virtio_net_hdr));
+    for (int i = 0; i < 6; i++) eth->dest_mac[i] = router_mac[i];
+    for (int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
+    eth->ethertype = htons(0x0800);
+
+    volatile udp_header* udp = (volatile udp_header*)(eth->payload + sizeof(ipv4_header));
+    udp->src_port = htons(50123);
+    udp->dst_port = htons(NTP_SERVER_PORT);
+    udp->len = htons(sizeof(udp_header) + sizeof(ntp_packet));
+    udp->checksum = 0;
+
+    volatile ntp_packet* ntp = (volatile ntp_packet*)((char*)udp + sizeof(udp_header));
+    for (uint32_t i = 0; i < sizeof(ntp_packet); i++) ((volatile uint8_t*)ntp)[i] = 0;
+    ntp->li_vn_mode = 0x23; // LI=0, VN=4, Mode=3 (client)
+
+    // T1: наш "текущий" момент отправки — используется вместе с T2..T4 в формуле
+    // офсета ((T2-T1)+(T3-T4))/2 ниже, при получении ответа.
+    uint64_t our_epoch_s = sys_get_time_ms(timer_ep) / 1000ULL;
+    g_ntp_t1_epoch_s = our_epoch_s;
+    ntp->tx_ts_sec = bswap32((uint32_t)(our_epoch_s + NTP_UNIX_EPOCH_DELTA));
+    ntp->tx_ts_frac = 0;
+
+    volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
+    ip->ihl_version = 0x45; ip->tos = 0;
+    ip->tot_len = htons(sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet));
+    ip->id = htons(0x4E54); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 17;
+    ip->saddr[0] = 10; ip->saddr[1] = 0; ip->saddr[2] = 2; ip->saddr[3] = 15;
+    for (int i = 0; i < 4; i++) ip->daddr[i] = g_ntp_server_ip[i];
+    ip->check = 0;
+    ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
+
+    sys_puts(console_ep, "[NET] Sending NTP request to ");
+    put_ip(console_ep, g_ntp_server_ip);
+    sys_puts(console_ep, ":123...\n");
+
+    net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
+    g_ntp_outstanding = true;
 }
 
 static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
@@ -550,6 +643,14 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
             sys_puts(console_ep, " rtt_max="); 
             put_duration_us(console_ep, g_ping_max_rtt_us);
         }
+        sys_puts(console_ep, " ntp_synced=");
+        sys_puts(console_ep, g_ntp_synced ? "yes" : "no");
+        if (g_ntp_synced) {
+            sys_puts(console_ep, " ntp_offset=");
+            if (g_ntp_last_offset_negative) sys_puts(console_ep, "-");
+            put_dec(console_ep, g_ntp_last_offset_s);
+            sys_puts(console_ep, "s");
+        }
         sys_puts(console_ep, "\n");
         volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
         net_mailbox[0] = 0;
@@ -575,11 +676,23 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
     } else if (cmd == NET_CMD_RESOLVE) {
         int text_len = (int)seL4_GetMR(3);
         copy_text_from_mrs(g_dns_pending_domain, sizeof(g_dns_pending_domain), text_len, len);
-        
+
         if (have_router_mac) {
             net_send_dns_query(console_ep, g_dns_pending_domain);
         } else {
             pending_cmd = NET_CMD_RESOLVE;
+            net_send_arp_request(console_ep);
+        }
+
+    } else if (cmd == NET_CMD_NTP) {
+        if (g_ntp_outstanding) {
+            sys_puts(console_ep, "[NET] NTP request already in flight.\n");
+            volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+            net_mailbox[0] = 0;
+        } else if (have_router_mac) {
+            net_send_ntp_request(console_ep, timer_ep);
+        } else {
+            pending_cmd = NET_CMD_NTP;
             net_send_arp_request(console_ep);
         }
 
@@ -631,6 +744,9 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                 } else if (pending_cmd == NET_CMD_SEND) {
                     net_send_udp(console_ep, pending_udp_ip, pending_udp_port, pending_udp);
                     pending_cmd = NET_CMD_NONE;
+                } else if (pending_cmd == NET_CMD_NTP) {
+                    pending_cmd = NET_CMD_NONE;
+                    net_send_ntp_request(console_ep, timer_ep);
                 }
             }
         }
@@ -718,6 +834,61 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                         }
                     } else {
                         sys_puts(console_ep, ">>> [NET RX] DNS Ignored: ID mismatch or 0 answers.\n");
+                    }
+                } else if (htons(udp->src_port) == NTP_SERVER_PORT && g_ntp_outstanding) {
+                    // Ответ SNTP-сервера на наш запрос из net_send_ntp_request().
+                    uint8_t* buffer_end = (uint8_t*)((char*)eth - sizeof(virtio_net_hdr)) + 1536;
+                    uint8_t* data_ptr = (uint8_t*)udp + sizeof(udp_header);
+                    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+                    g_ntp_outstanding = false;
+
+                    if (data_ptr + sizeof(ntp_packet) > buffer_end) {
+                        sys_puts(console_ep, "[NET] NTP Error: truncated response, ignored.\n");
+                        net_mailbox[0] = 0;
+                        if (g_ntp_boot_sync_pending) {
+                            g_ntp_boot_sync_pending = false;
+                            sys_puts(console_ep, "[NET] Boot-time NTP sync: failed.\n");
+                        }
+                    } else {
+                        volatile ntp_packet* ntp = (volatile ntp_packet*)data_ptr;
+                        // Mode=4 (server) ожидается в ответ на наш Mode=3 (client) запрос;
+                        // stratum=0 значит Kiss-o'-Death (сервер отказывается отвечать).
+                        if (ntp->stratum == 0 || (ntp->li_vn_mode & 0x07) != 4) {
+                            sys_puts(console_ep, "[NET] NTP Error: Kiss-o'-Death or unexpected mode, ignored.\n");
+                            net_mailbox[0] = 0;
+                            if (g_ntp_boot_sync_pending) {
+                                g_ntp_boot_sync_pending = false;
+                                sys_puts(console_ep, "[NET] Boot-time NTP sync: failed.\n");
+                            }
+                        } else {
+                            uint64_t t1 = g_ntp_t1_epoch_s;
+                            uint64_t t2 = (uint64_t)bswap32(ntp->rx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
+                            uint64_t t3 = (uint64_t)bswap32(ntp->tx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
+                            uint64_t t4 = sys_get_time_ms(timer_ep) / 1000ULL;
+
+                            // Стандартная формула офсета NTP; секундной точности наших часов
+                            // достаточно, т.к. PL031 отдает целые секунды.
+                            int64_t offset_s = ((int64_t)(t2 - t1) + (int64_t)(t3 - t4)) / 2;
+
+                            seL4_SetMR(0, 5); // SYS_SET_TIME_OFFSET
+                            seL4_SetMR(1, (seL4_Word)offset_s);
+                            seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
+                            g_ntp_synced = true;
+                            g_ntp_last_offset_negative = offset_s < 0;
+                            g_ntp_last_offset_s = (uint32_t)(g_ntp_last_offset_negative ? -offset_s : offset_s);
+
+                            sys_puts(console_ep, "[NET] NTP sync OK, offset ");
+                            if (g_ntp_last_offset_negative) sys_puts(console_ep, "-");
+                            put_dec(console_ep, g_ntp_last_offset_s);
+                            sys_puts(console_ep, "s applied.\n");
+                            net_mailbox[0] = 0;
+
+                            if (g_ntp_boot_sync_pending) {
+                                g_ntp_boot_sync_pending = false;
+                                sys_puts(console_ep, "[NET] Boot-time NTP sync: good.\n");
+                            }
+                        }
                     }
                 } else {
                     // Произвольная входящая UDP-датаграмма (не DNS) — сохраняем для команды `recv`.
@@ -818,8 +989,16 @@ int main(int argc, char *argv[]) {
         g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (g_shm_paddr + 0x200) / 64; 
         g_net_regs->status |= 8; g_net_regs->status |= 4; 
         sys_puts(console_ep, "[NET] Virtio-net queues initialized.\n");
-        g_net_regs->queue_notify = 0; 
-        for(volatile int i=0; i<10000000; i++); 
+        g_net_regs->queue_notify = 0;
+        for(volatile int i=0; i<10000000; i++);
+
+        // Автоматическая синхронизация времени при старте (без ожидания команды `ntp`
+        // из shell). Асинхронно: ARP -> net_poll() отправит SNTP-запрос сам, когда
+        // MAC гейтвея разрешится (см. pending_cmd == NET_CMD_NTP в net_poll()).
+        sys_puts(console_ep, "[NET] Starting boot-time NTP sync...\n");
+        g_ntp_boot_sync_pending = true;
+        pending_cmd = NET_CMD_NTP;
+        net_send_arp_request(console_ep);
     }
 
     while(1) {

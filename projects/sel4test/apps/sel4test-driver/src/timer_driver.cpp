@@ -30,9 +30,14 @@ int main(int argc, char *argv[]) {
     volatile seL4_Uint32 *rtc_icr = (volatile seL4_Uint32*)(0x200002000ULL + 0x10);
 
     // Момент запуска драйвера (секунды эпохи PL031) — точка отсчета аптайма.
-    // В будущем при добавлении NTP-синхронизации сюда же ляжет коррекция смещения (offset)
-    // между локальным PL031 и временем, полученным от NTP-сервера.
+    // Не корректируется NTP-смещением: аптайм должен оставаться монотонным
+    // независимо от коррекции показаний часов.
     const seL4_Uint32 boot_epoch_seconds = *rtc_dr;
+
+    // Коррекция смещения (сек.) между локальным PL031 и NTP-сервером,
+    // применяется только к SYS_GET_TIME. Выставляется командой шелла `ntp`
+    // через net_driver (см. SYS_SET_TIME_OFFSET ниже).
+    seL4_Int64 ntp_offset_seconds = 0;
 
     // Главный цикл обработки прерываний и IPC
     while(1) {
@@ -48,11 +53,16 @@ int main(int argc, char *argv[]) {
 
         // Обработка запросов от процессов (SYS_GET_TIME / SYS_GET_UPTIME)
         seL4_Word sys = seL4_GetMR(0);
-        if (sys == 3) { // SYS_GET_TIME: мс с эпохи Unix (по локальным часам PL031)
-            seL4_SetMR(0, (*rtc_dr) * 1000);
+        if (sys == 3) { // SYS_GET_TIME: мс с эпохи Unix (PL031 + NTP-коррекция)
+            seL4_Int64 corrected = (seL4_Int64)(*rtc_dr) + ntp_offset_seconds;
+            seL4_SetMR(0, (seL4_Word)(corrected * 1000));
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else if (sys == 4) { // SYS_GET_UPTIME: мс с момента запуска timer_driver
             seL4_SetMR(0, (*rtc_dr - boot_epoch_seconds) * 1000);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 5) { // SYS_SET_TIME_OFFSET: применить офсет от NTP-клиента (net_driver)
+            ntp_offset_seconds = (seL4_Int64)seL4_GetMR(1);
+            seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));

@@ -5,6 +5,10 @@
 // Адреса для синхронизации доступа к VFS и TTY
 #define BOOT_BLK_EP 7
 
+// Смещение локального часового пояса от UTC (в часах) для команды `date`.
+// Системные часы (SYS_GET_TIME) всегда хранятся в UTC — здесь только отображение.
+static const int TZ_OFFSET_HOURS = 3;
+
 // Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
 static char ls_thread_stack[16384] __attribute__((aligned(16)));
 static char grep_thread_stack[16384] __attribute__((aligned(16)));
@@ -181,6 +185,7 @@ enum NetCommand {
     NET_CMD_STATUS = 3,
     NET_CMD_RESOLVE = 4,
     NET_CMD_RECV = 5,
+    NET_CMD_NTP = 6,
 };
 
 static char *next_token(char **cursor) {
@@ -319,6 +324,57 @@ static seL4_Word sys_get_uptime(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 4); // 4 = SYS_GET_UPTIME
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return seL4_GetMR(0);
+}
+
+// Разбивает число дней с 1970-01-01 на (год, месяц, день) в пролептическом
+// григорианском календаре. Алгоритм Хауарда Хиннанта (chrono-совместимый,
+// не требует libc/времени с плавающей точкой).
+static void civil_from_days(long z, int *y, int *m, int *d) {
+    z += 719468;
+    long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp + (mp < 10 ? 3 : -9));
+    *y = (int)((long)yoe + era * 400 + (*m <= 2 ? 1 : 0));
+}
+
+static void put_2digit(seL4_CPtr console_ep, int val) {
+    char buf[3];
+    if (val < 0) val = 0;
+    if (val > 99) val = 99;
+    buf[0] = (char)('0' + (val / 10));
+    buf[1] = (char)('0' + (val % 10));
+    buf[2] = '\0';
+    sys_puts(console_ep, buf);
+}
+
+// Печатает "YYYY-MM-DD HH:MM:SS UTC+N" по мс с эпохи Unix (UTC) и смещению в часах.
+static void print_localtime(seL4_CPtr console_ep, seL4_Word epoch_ms, int tz_offset_hours) {
+    long total_seconds = (long)(epoch_ms / 1000) + (long)tz_offset_hours * 3600;
+    long days = total_seconds / 86400;
+    long secs_of_day = total_seconds % 86400;
+    if (secs_of_day < 0) { secs_of_day += 86400; days -= 1; }
+
+    int year, month, day;
+    civil_from_days(days, &year, &month, &day);
+
+    int hour = (int)(secs_of_day / 3600);
+    int minute = (int)((secs_of_day % 3600) / 60);
+    int second = (int)(secs_of_day % 60);
+
+    sys_putdec((seL4_Word)year);
+    sys_puts(console_ep, "-"); put_2digit(console_ep, month);
+    sys_puts(console_ep, "-"); put_2digit(console_ep, day);
+    sys_puts(console_ep, " "); put_2digit(console_ep, hour);
+    sys_puts(console_ep, ":"); put_2digit(console_ep, minute);
+    sys_puts(console_ep, ":"); put_2digit(console_ep, second);
+    sys_puts(console_ep, " UTC");
+    sys_puts(console_ep, tz_offset_hours >= 0 ? "+" : "-");
+    sys_putdec((seL4_Word)(tz_offset_hours >= 0 ? tz_offset_hours : -tz_offset_hours));
+    sys_puts(console_ep, "\n");
 }
 
 static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
@@ -680,7 +736,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 seL4_SetMR(0, 20); // SYS_PIPE
-                seL4_SetMR(1, 3);  // Просим ядро заминтить capability в наш FD 3
+                seL4_SetMR(1, PIPE_FD_SLOT); // Просим ядро заминтить capability в наш слот пайпа
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 pipe_fd = seL4_GetMR(0);
 
@@ -723,6 +779,11 @@ int main(int argc, char *argv[]) {
                 sys_putdec(hours); sys_puts(console_ep, "h ");
                 sys_putdec(mins); sys_puts(console_ep, "m ");
                 sys_putdec(secs); sys_puts(console_ep, "s\n");
+            }
+
+            else if (my_strcmp(cmd_ptr, "date") == 0) {
+                seL4_Word epoch_ms = sys_get_time(timer_ep);
+                print_localtime(console_ep, epoch_ms, TZ_OFFSET_HOURS);
             }
 
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
@@ -845,6 +906,19 @@ int main(int argc, char *argv[]) {
                 net_send_text_command(net_ep, NET_CMD_RECV, 0, 0, nullptr);
 
                 wait_for_net_mailbox(console_ep, timer_ep, 2000);
+            }
+
+            else if (my_strcmp(cmd_ptr, "ntp") == 0) {
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+
+                sys_puts(console_ep, "Requesting NTP time sync...\n");
+                net_send_text_command(net_ep, NET_CMD_NTP, 0, 0, nullptr);
+
+                // ARP (если еще не разрешен) + запрос-ответ через интернет — щедрый запас.
+                wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
             else if (my_strcmp(cmd_ptr, "ls") == 0) {
@@ -1168,7 +1242,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

@@ -911,7 +911,7 @@ int main(int argc, char *argv[]) {
                     seL4_CNode_Delete(child_cspace, requested_fd, 8); // Pre-emptively clear slot
                     seL4_Error err = seL4_CNode_Mint(
                         child_cspace,       // CNode оболочки
-                        requested_fd,       // Слот (например, 3)
+                        requested_fd,       // Слот (см. PIPE_FD_SLOT в h/common.h)
                         8,                  // Глубина слота
                         root_cnode,         // Откуда берем
                         ep,                 // Базовый Endpoint (на который ядро слушает)
@@ -1021,8 +1021,11 @@ int main(int argc, char *argv[]) {
                     // ИСПРАВЛЕНО: Используем PID владельца, а не sender_pid, который равен 0
                     int owner_pid = g_pipes[pipe_id].owner_pid;
                     if (owner_pid > 0 && owner_pid < 256 && pcbs[owner_pid].active) {
-                        // Удаляем capability из CSpace процесса-владельца
-                        seL4_CNode_Delete(pcbs[owner_pid].cspace, 3, 8);
+                        // Удаляем capability из CSpace процесса-владельца.
+                        // ВАЖНО: раньше здесь был захардкожен слот 3, который совпадает
+                        // с local_net_send_ep — закрытие любого пайпа стирало сетевой
+                        // capability оболочки. Слот пайпа — общий PIPE_FD_SLOT.
+                        seL4_CNode_Delete(pcbs[owner_pid].cspace, PIPE_FD_SLOT, 8);
                     }
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
