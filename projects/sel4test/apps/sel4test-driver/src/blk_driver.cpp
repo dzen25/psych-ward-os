@@ -49,6 +49,13 @@ static void my_memcpy(void *dest, const void *src, int n) {
 }
 static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return len; }
 static void my_strcpy(char *dest, const char *src) { while ((*dest++ = *src++)); }
+// Копирует не более (cap-1) байт и всегда завершает '\0' в пределах [0, cap).
+static void my_strlcpy(char *dest, const char *src, int cap) {
+    if (cap <= 0) return;
+    int i = 0;
+    for (; i < cap - 1 && src[i] != '\0'; i++) dest[i] = src[i];
+    dest[i] = '\0';
+}
 static int my_strcmp(const char *s1, const char *s2) {
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
@@ -229,10 +236,10 @@ int main(int argc, char *argv[]) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
-    sys_puts(console_ep, "\n[BLK DRIVER] VFS & FAT32 Server Online (Refactored)!\n");
+    sys_puts(console_ep, "\n[BLK] Server online.\n");
 
     // --- ДИНАМИЧЕСКИЙ ЗАПРОС SHM ---
-    sys_puts(console_ep, "[BLK DRIVER] Requesting dynamic SHM from kernel...\n");
+    sys_puts(console_ep, "[BLK] Requesting SHM from kernel...\n");
     seL4_SetMR(0, 107); // SYS_SHM_GET
     seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
     seL4_Call(root_ep, msg);
@@ -241,7 +248,7 @@ int main(int argc, char *argv[]) {
     g_shm_paddr = (uint32_t)seL4_GetMR(1);
 
     if (!g_shm_vaddr) {
-        sys_puts(console_ep, "[BLK DRIVER] FATAL: Failed to get dynamic SHM!\n");
+        sys_puts(console_ep, "[BLK] FATAL: Failed to get dynamic SHM!\n");
         while(1) seL4_Yield();
     }
 
@@ -260,7 +267,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!g_disk_regs) {
-        sys_puts(console_ep, "[VIRTIO] ERROR: Block device not found.\n");
+        sys_puts(console_ep, "[BLK] ERROR: Block device not found.\n");
         return -1;
     }
 
@@ -312,9 +319,9 @@ int main(int argc, char *argv[]) {
     // 3. Монтируем Файловую Систему!
     // Передаем в нее указатель на функцию hardware_virtio_read
     if (fat32_init(&g_file_system, hardware_virtio_read, hardware_virtio_write)) {
-        sys_puts(console_ep, "[BLK] FAT32 Mounted Successfully!\n");
+        sys_puts(console_ep, "[BLK] FAT32 mounted.\n");
     } else {
-        sys_puts(console_ep, "[BLK] Failed to mount FAT32\n");
+        sys_puts(console_ep, "[BLK] FAT32 mount failed.\n");
     }
 
     // 4. Главный цикл диспетчеризации (Control Plane)
@@ -326,7 +333,7 @@ int main(int argc, char *argv[]) {
         
         if (cmd == 110) { // SYS_LS
             char path[64];
-            my_strcpy(path, g_shm_vaddr);
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
 
             uint32_t dir_cluster;
             if (path[0] == '\0') {
@@ -356,107 +363,11 @@ int main(int argc, char *argv[]) {
             }
             if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
 
-            uint32_t target_sector = g_file_system.data_start_sector + (dir_cluster - 2) * g_file_system.sectors_per_cluster;
-            char sector_buf[512];
-            hardware_virtio_read(target_sector, 1, sector_buf);
-
-            char* out_buf = (char*)g_shm_vaddr;
-            int offset = 0;
-            my_strcpy(out_buf, ""); // Clear SHM
-
-            char lfn_buf[256];
-            for(int i = 0; i < 256; i++) lfn_buf[i] = 0;
-
-            for (int i = 0; i < 512; i += 32) {
-                uint8_t* entry = (uint8_t*)&sector_buf[i];
-                if (entry[0] == 0x00) break; // Конец списка
-                
-                if (entry[0] == 0xE5) {
-                    for(int k=0; k<256; k++) lfn_buf[k] = 0; 
-                    continue; 
-                }
-
-                if (entry[11] == 0x0F) { // LFN
-                    int seq = (entry[0] & 0x1F) - 1; 
-                    if (seq >= 0 && seq < 20) {
-                        char* p = lfn_buf + (seq * 13); 
-                        for(int k=1;  k<11; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-                        for(int k=14; k<26; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-                        for(int k=28; k<32; k+=2) { if(entry[k] != 0xFF && entry[k] != 0) *p++ = entry[k]; }
-                    }
-                    continue; 
-                }
-
-                if (entry[11] & 0x08) {
-                    for(int k=0; k<256; k++) lfn_buf[k] = 0; 
-                    continue; 
-                }
-
-                bool is_dir = (entry[11] & 0x10);
-                
-                // === УМНАЯ СБОРКА ИМЕНИ ===
-                char final_name[256];
-                final_name[0] = '\0';
-
-                if (lfn_buf[0] != '\0') {
-                    my_strcpy(final_name, lfn_buf);           
-                    for(int k=0; k<256; k++) lfn_buf[k] = 0; 
-                } else {
-                    int pos = 0;
-                    for (int j = 0; j < 8 && entry[j] != ' '; j++) final_name[pos++] = entry[j];
-                    if (entry[8] != ' ') {
-                        final_name[pos++] = '.';
-                        for (int j = 8; j < 11 && entry[j] != ' '; j++) final_name[pos++] = entry[j];
-                    }
-                    final_name[pos] = '\0';
-                }
-
-                // КРИТИЧЕСКАЯ ЗАЩИТА: Если имя оказалось пустым (артефакт/мусор), просто игнорируем эту запись!
-                if (final_name[0] == '\0') {
-                    continue;
-                }
-
-                // Пишем тип и имя в SHM
-                const char* type_str = is_dir ? " [DIR] " : " [FAT] ";
-                my_strcpy(out_buf + offset, type_str);
-                offset += my_strlen(type_str);
-
-                my_strcpy(out_buf + offset, final_name);
-                offset += my_strlen(final_name);
-                
-                // === ВЫВОД РАЗМЕРА ФАЙЛА ===
-                if (!is_dir) { 
-                    uint32_t file_size = *(uint32_t*)&entry[28]; 
-                    char size_str[16];
-                    
-                    int idx = 0;
-                    if (file_size == 0) {
-                        size_str[idx++] = '0';
-                    } else {
-                        char rev[16];
-                        int r_idx = 0;
-                        uint32_t temp = file_size;
-                        while (temp > 0) {
-                            rev[r_idx++] = '0' + (temp % 10);
-                            temp /= 10;
-                        }
-                        while (r_idx > 0) size_str[idx++] = rev[--r_idx];
-                    }
-                    size_str[idx] = '\0';
-
-                    my_strcpy(out_buf + offset, " \t(");
-                    offset += 3;
-                    my_strcpy(out_buf + offset, size_str);
-                    offset += my_strlen(size_str);
-                    my_strcpy(out_buf + offset, " bytes)");
-                    offset += 7;
-                }
-
-                my_strcpy(out_buf + offset, "\n");
-                offset++;
-            }
-            
-            out_buf[offset] = '\0';
+            // fat32_format_dir_listing обходит ВСЮ цепочку кластеров каталога (а не
+            // только первый сектор), поэтому директории, не помещающиеся в 512 байт,
+            // теперь перечисляются полностью. out_buf делит SHM-страницу с
+            // virtio_q_shm_base (g_shm_vaddr + 0x1000) — оставляем запас в лимите.
+            fat32_format_dir_listing(&g_file_system, dir_cluster, g_shm_vaddr, 0x1000 - 8);
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -468,7 +379,7 @@ int main(int argc, char *argv[]) {
             // которое передал Rootserver. Мы обязаны скопировать его себе на стек,
             // потому что функция fat32_read_file перезапишет SHM бинарными данными ELF-файла!
             char filename[64];
-            my_strcpy(filename, g_shm_vaddr);
+            my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
             
             bool success = fat32_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
             
@@ -484,7 +395,7 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 112) { // SYS_TOUCH
             char path[64];
-            my_strcpy(path, g_shm_vaddr); // Спасаем имя файла со стека
+            my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем имя файла со стека
             if (fat32_create_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -492,9 +403,11 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 113) { // SYS_WRITE_FILE (echo > file)
             char path[64];
-            my_strcpy(path, g_shm_vaddr); // Спасаем путь
+            my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем путь
             uint32_t len = seL4_GetMR(1);
-            
+            // len приходит от клиента IPC и не должна превышать размер safe_text_buf
+            if (len > 4096) len = 4096;
+
             // Защита памяти: копируем текст в безопасную 3-ю страницу SHM,
             // чтобы DMA-контроллер VirtIO случайно не затер текст при чтении FAT
             char* safe_text_buf = g_shm_vaddr + 0x2000;
@@ -508,7 +421,7 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
             char path[64];
-            my_strcpy(path, g_shm_vaddr);
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
             
             // Читаем напрямую в SHM, чтобы shell мог сразу это распечатать
             if (fat32_read_text_file(&g_file_system, path, g_shm_vaddr)) seL4_SetMR(0, 0);
@@ -518,7 +431,7 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 120) { // SYS_RM
             char path[64];
-            my_strcpy(path, g_shm_vaddr);
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (fat32_delete_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -526,8 +439,8 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 116) { // SYS_RENAME (mv)
             char old_p[32], new_p[32];
-            my_strcpy(old_p, g_shm_vaddr);
-            my_strcpy(new_p, g_shm_vaddr + 128); // Ожидаем новое имя по смещению 128
+            my_strlcpy(old_p, g_shm_vaddr, sizeof(old_p));
+            my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p)); // Ожидаем новое имя по смещению 128
             if (fat32_rename_file(&g_file_system, old_p, new_p)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -535,7 +448,7 @@ int main(int argc, char *argv[]) {
 
         else if (cmd == 117) { // SYS_MKDIR
             char path[64];
-            my_strcpy(path, g_shm_vaddr);
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (fat32_mkdir(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -543,7 +456,7 @@ int main(int argc, char *argv[]) {
         
         else if (cmd == 118) { // SYS_CD
             char path[64];
-            my_strcpy(path, g_shm_vaddr);
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (fat32_cd(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));

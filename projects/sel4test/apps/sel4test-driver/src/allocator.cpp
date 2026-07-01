@@ -22,13 +22,20 @@ seL4_CPtr PsychAllocator::alloc_slot() {
 }
 
 void PsychAllocator::free(seL4_Word slot) {
-    // Возвращаем слот в пул
-    if (free_count < FREE_POOL_SIZE && slot != 0) {
-        free_slots[free_count++] = slot;
+    if (slot == 0 || free_count >= FREE_POOL_SIZE) return;
+
+    // Защита от двойного free: если вызывающий код по ошибке освободит один и
+    // тот же слот дважды, alloc_slot() иначе выдаст один CPtr двум разным
+    // владельцам (aliasing двух логических объектов на одном capability slot).
+    for (int i = 0; i < free_count; i++) {
+        if (free_slots[i] == slot) return;
     }
+
+    free_slots[free_count++] = slot;
 }
 
 seL4_CPtr PsychAllocator::get_untyped_cap(int idx) {
+    if (idx < 0) return 0;
     if (boot_info->untyped.start + idx < boot_info->untyped.end) {
         return boot_info->untyped.start + idx;
     }

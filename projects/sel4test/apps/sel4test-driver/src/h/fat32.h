@@ -31,6 +31,10 @@ bool fat32_init(FAT32_Instance* fs, block_read_fn read_func, block_write_fn writ
 // Вывод содержимого директории в строковый буфер (out_buffer)
 bool fat32_list_directory(FAT32_Instance* fs, const char* path, char* out_buffer);
 
+// Форматирует список произвольного каталога (по номеру кластера) в out_buffer,
+// обходя ВСЮ цепочку его кластеров. max_len — полный размер out_buffer.
+bool fat32_format_dir_listing(FAT32_Instance* fs, uint32_t dir_cluster, char* out_buffer, uint32_t max_len);
+
 // Чтение файла с диска с заданным смещением
 bool fat32_read_file(FAT32_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read);
 

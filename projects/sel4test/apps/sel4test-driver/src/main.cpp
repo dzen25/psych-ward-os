@@ -675,7 +675,10 @@ int main(int argc, char *argv[]) {
     uart_init((void*)uart_vaddr);
     timer_init((void*)rtc_vaddr);
 
-    uart_puts("\n=== Psych Ward OS: TRUE MICROKERNEL EDITION ===\n");
+    uart_puts("\n=================================================\n"
+              "  Psych Ward OS -- microkernel edition (seL4)\n"
+              "=================================================\n"
+              "[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
 
     seL4_CPtr ep = alloc.alloc_slot();
     seL4_CPtr med_ep = alloc.alloc_slot();
@@ -762,7 +765,7 @@ int main(int argc, char *argv[]) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
 
-    uart_puts("Quadruple Sandboxes Spawned! Kernel is purified and serving IPC...\n");
+    uart_puts("[ROOT] All sandboxes spawned. Serving IPC.\n");
 
     // --- ЕДИНЫЙ ЦИКЛ ЯДРА ---
     while (1) {
@@ -1173,8 +1176,11 @@ int main(int argc, char *argv[]) {
                 pcb.badged_ep = thread_badged_ep;
                 pcb.thread_ipc_frame = ipc_frame;
                 
-                // Если мы создаем поток для пайпа, регистрируем его как писателя
-                if (pipe_id != -1 && pipe_id < MAX_PIPES) {
+                // Если мы создаем поток для пайпа, регистрируем его как писателя.
+                // pipe_id приходит от вызывающего процесса через MR8 — обязательно
+                // проверяем обе границы, иначе отрицательный индекс (кроме -1) даёт
+                // запись за пределы статического массива g_pipes[MAX_PIPES].
+                if (pipe_id >= 0 && pipe_id < MAX_PIPES) {
                     g_pipes[pipe_id].writer_pid = new_pid;
                 }
 
@@ -1300,14 +1306,24 @@ int main(int argc, char *argv[]) {
                 
                 for (int i = 1; i < 256; i++) {
                     if (pcbs[i].active) {
+                        // rootserver_shm_base — это ровно 4 страницы (16KB, shm_frames[4]).
+                        // Резервируем запас на самую длинную возможную строку записи
+                        // ("    " + PID + " [RUNNING] " + name[32] + "\n"), чтобы не выйти
+                        // за пределы физических страниц при большом числе процессов.
+                        if (offset > 16384 - 64) {
+                            strcpy(shm + offset, "...\n");
+                            offset += 4;
+                            break;
+                        }
+
                         char pid_str[8];
                         int temp = i, j = 0;
                         while(temp > 0) { pid_str[j++] = (temp % 10) + '0'; temp /= 10; }
-                        
+
                         strcpy(shm + offset, "    "); offset += 4;
                         while(j > 0) { shm[offset++] = pid_str[--j]; }
                         strcpy(shm + offset, " [RUNNING] "); offset += 11;
-                        
+
                         strcpy(shm + offset, pcbs[i].name); offset = strlen(shm);
                         strcpy(shm + offset, "\n"); offset++;
                     }

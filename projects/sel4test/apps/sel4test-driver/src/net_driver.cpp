@@ -158,7 +158,17 @@ enum NetCommand {
     NET_CMD_SEND = 2,
     NET_CMD_STATUS = 3,
     NET_CMD_RESOLVE = 4,
+    NET_CMD_RECV = 5,
 };
+
+// Последняя принятая произвольная UDP-датаграмма (не DNS-ответ), ждущая
+// команды `recv` из shell. Однослотовый почтовый ящик: новый пакет
+// перезаписывает непрочитанный.
+static bool g_udp_rx_ready = false;
+static uint8_t g_udp_rx_src_ip[4] = {0, 0, 0, 0};
+static uint16_t g_udp_rx_src_port = 0;
+static char g_udp_rx_data[256];
+static int g_udp_rx_len = 0;
 
 static uint8_t default_udp_ip[4] = {10, 0, 2, 2};
 static uint16_t default_udp_port = 8080;
@@ -223,7 +233,7 @@ static void net_send_arp_request(seL4_CPtr root_ep) {
     for(int i=0; i<6; i++) arp->tha[i] = 0;
     arp->tpa[0] = 10; arp->tpa[1] = 0; arp->tpa[2] = 2; arp->tpa[3] = 2;  
 
-    sys_puts(root_ep, "\n[NET DRIVER] Broadcasting ARP Request for 10.0.2.2...\n");
+    sys_puts(root_ep, "\n[NET] Broadcasting ARP Request for 10.0.2.2...\n");
     net_send_packet(sizeof(virtio_net_hdr) + 14 + 28, 0x280);
 }
 
@@ -250,7 +260,7 @@ static void net_send_ping(seL4_CPtr console_ep, const uint8_t dst_ip[4]) {
     char* data = (char*)icmp + sizeof(icmp_header); data[0] = 'P'; data[1] = 'O'; data[2] = 'N'; data[3] = 'G';
     icmp->checksum = calculate_checksum((void*)icmp, sizeof(icmp_header) + 4);
 
-    sys_puts(console_ep, "[NET DRIVER] ICMP Echo Request to ");
+    sys_puts(console_ep, "[NET] ICMP Echo Request to ");
     put_ip(console_ep, dst_ip);
     sys_puts(console_ep, ": icmp_seq=");
     put_dec(console_ep, seq);
@@ -346,7 +356,7 @@ static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t
     char* data = (char*)udp + sizeof(udp_header);
     my_memcpy(data, message, msg_len);
 
-    sys_puts(console_ep, "[NET DRIVER] Firing UDP Datagram to ");
+    sys_puts(console_ep, "[NET] Firing UDP Datagram to ");
     put_ip(console_ep, dst_ip);
     sys_puts(console_ep, ":");
     put_dec(console_ep, dst_port);
@@ -471,7 +481,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
         if (count == 0) count = 1;
         if (count > 16) count = 16;
 
-        sys_puts(console_ep, "[NET DRIVER] Shell requested ICMP Ping x");
+        sys_puts(console_ep, "[NET] Shell requested ICMP Ping x");
         put_dec(console_ep, count);
         sys_puts(console_ep, ".\n");
         if (have_router_mac) {
@@ -495,7 +505,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
             for (int i = 0; i < 4; i++) dst_ip[i] = default_udp_ip[i];
         }
 
-        sys_puts(console_ep, "[NET DRIVER] Shell requested UDP send.\n");
+        sys_puts(console_ep, "[NET] Shell requested UDP send.\n");
         if (have_router_mac) {
             net_send_udp(console_ep, dst_ip, dst_port, msg);
         } else {
@@ -506,7 +516,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
             net_send_arp_request(console_ep);
         }
     } else if (cmd == NET_CMD_STATUS) {
-        sys_puts(console_ep, "[NET DRIVER] Status: virtio=up router_mac=");
+        sys_puts(console_ep, "[NET] Status: virtio=up router_mac=");
         if (have_router_mac) {
             sys_puts(console_ep, "known ");
             for (int i = 0; i < 6; i++) {
@@ -544,6 +554,24 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
         volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
         net_mailbox[0] = 0;
 
+    } else if (cmd == NET_CMD_RECV) {
+        if (g_udp_rx_ready) {
+            sys_puts(console_ep, "[NET] UDP datagram from ");
+            put_ip(console_ep, g_udp_rx_src_ip);
+            sys_puts(console_ep, ":");
+            put_dec(console_ep, g_udp_rx_src_port);
+            sys_puts(console_ep, " (");
+            put_dec(console_ep, g_udp_rx_len);
+            sys_puts(console_ep, " bytes): ");
+            sys_puts(console_ep, g_udp_rx_data);
+            sys_puts(console_ep, "\n");
+            g_udp_rx_ready = false;
+        } else {
+            sys_puts(console_ep, "[NET] No pending UDP datagrams.\n");
+        }
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+        net_mailbox[0] = 0;
+
     } else if (cmd == NET_CMD_RESOLVE) {
         int text_len = (int)seL4_GetMR(3);
         copy_text_from_mrs(g_dns_pending_domain, sizeof(g_dns_pending_domain), text_len, len);
@@ -556,7 +584,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
         }
 
     } else {
-        sys_puts(console_ep, "[NET DRIVER] Unknown Shell command.\n");
+        sys_puts(console_ep, "[NET] Unknown Shell command.\n");
     }
 }
 
@@ -567,6 +595,19 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     while (g_last_rx_used_idx != rx_used->idx) {
         uint16_t used_ring_idx = g_last_rx_used_idx % 4;
         uint32_t desc_id = rx_used->ring[used_ring_idx].id;
+
+        // desc_id приходит от virtio-устройства (backend может быть багнутым/враждебным)
+        // и используется как индекс в rx_buffer_offsets[4] — без проверки это OOB-чтение
+        // и разыменование произвольного смещения как Ethernet-кадра.
+        if (desc_id >= 4) {
+            rx_avail->ring[g_rx_avail_idx % 4] = 0;
+            g_rx_avail_idx++;
+            rx_avail->idx = g_rx_avail_idx;
+            g_net_regs->queue_notify = 0;
+            g_last_rx_used_idx++;
+            continue;
+        }
+
         volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + rx_buffer_offsets[desc_id] + sizeof(virtio_net_hdr));
 
         uint16_t type = htons(eth->ethertype);
@@ -636,34 +677,76 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                     volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
                     
                     if (htons(dns->id) == g_dns_id && htons(dns->ans_count) > 0) {
+                        // Буфер этого RX-дескриптора занимает ровно 1536 байт начиная с
+                        // rx_buffer_offsets[desc_id] (см. rx_desc[i].len выше); reader не
+                        // должен уходить за эту границу, иначе — неограниченный OOB read
+                        // при DNS-ответе без корректного нуль-терминатора имени.
+                        uint8_t* buffer_end = (uint8_t*)((char*)eth - sizeof(virtio_net_hdr)) + 1536;
                         uint8_t* reader = (uint8_t*)dns + sizeof(dns_header);
-                        while (*reader != 0) reader += (*reader) + 1;
-                        reader += 5; // Пропускаем нулевой байт конца имени и 4 байта Type/Class
+                        bool dns_ok = (reader < buffer_end);
 
-                        reader += 10;
-                        uint16_t data_len = (reader[0] << 8) | reader[1];
-                        reader += 2;
+                        while (dns_ok && *reader != 0) {
+                            reader += (*reader) + 1;
+                            if (reader >= buffer_end) { dns_ok = false; }
+                        }
+                        // Нужно ещё минимум 5 (терминатор+Type/Class) + 10 (фикс. поля RR) + 2 (RDLENGTH) байт
+                        if (dns_ok && (reader + 5 + 10 + 2) < buffer_end) {
+                            reader += 5; // Пропускаем нулевой байт конца имени и 4 байта Type/Class
+                            reader += 10;
+                            uint16_t data_len = (reader[0] << 8) | reader[1];
+                            reader += 2;
 
-                        if (data_len == 4) { // Это точно IPv4 адрес!
-                            uint8_t resolved_ip[4] = {reader[0], reader[1], reader[2], reader[3]};
-                            
-                            sys_puts(console_ep, ">>> [NET RX] DNS SUCCESS: ");
-                            put_ip(console_ep, resolved_ip); sys_puts(console_ep, "\n");
+                            if (data_len == 4 && (reader + 4) <= buffer_end) { // Это точно IPv4 адрес!
+                                uint8_t resolved_ip[4] = {reader[0], reader[1], reader[2], reader[3]};
 
-                            seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) | 
-                                                (resolved_ip[2] << 8) | resolved_ip[3];
-                            *((seL4_Word*)(g_shm_vaddr + 4064)) = packed_ip;
-                            
-                            volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
-                            net_mailbox[0] = 0;
-                            g_dns_outstanding = false;
+                                sys_puts(console_ep, ">>> [NET RX] DNS SUCCESS: ");
+                                put_ip(console_ep, resolved_ip); sys_puts(console_ep, "\n");
+
+                                seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) |
+                                                    (resolved_ip[2] << 8) | resolved_ip[3];
+                                *((seL4_Word*)(g_shm_vaddr + 4064)) = packed_ip;
+
+                                volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+                                net_mailbox[0] = 0;
+                                g_dns_outstanding = false;
+                            } else {
+                                sys_puts(console_ep, ">>> [NET RX] DNS Error: Unexpected data_len (CNAME?). Length=");
+                                put_dec(console_ep, data_len); sys_puts(console_ep, "\n");
+                            }
                         } else {
-                            sys_puts(console_ep, ">>> [NET RX] DNS Error: Unexpected data_len (CNAME?). Length=");
-                            put_dec(console_ep, data_len); sys_puts(console_ep, "\n");
+                            sys_puts(console_ep, ">>> [NET RX] DNS Error: malformed/truncated response, ignored.\n");
                         }
                     } else {
                         sys_puts(console_ep, ">>> [NET RX] DNS Ignored: ID mismatch or 0 answers.\n");
                     }
+                } else {
+                    // Произвольная входящая UDP-датаграмма (не DNS) — сохраняем для команды `recv`.
+                    // Границы буфера те же 1536 байт RX-дескриптора, что и в разборе DNS выше.
+                    uint8_t* buffer_end = (uint8_t*)((char*)eth - sizeof(virtio_net_hdr)) + 1536;
+                    uint8_t* data_ptr = (uint8_t*)udp + sizeof(udp_header);
+                    uint16_t udp_len = htons(udp->len);
+                    int payload_len = (udp_len > sizeof(udp_header)) ? (udp_len - sizeof(udp_header)) : 0;
+
+                    int avail = (data_ptr < buffer_end) ? (int)(buffer_end - data_ptr) : 0;
+                    if (payload_len > avail) payload_len = avail;
+                    if (payload_len > (int)sizeof(g_udp_rx_data) - 1) payload_len = (int)sizeof(g_udp_rx_data) - 1;
+                    if (payload_len < 0) payload_len = 0;
+
+                    for (int i = 0; i < payload_len; i++) g_udp_rx_data[i] = (char)data_ptr[i];
+                    g_udp_rx_data[payload_len] = '\0';
+                    g_udp_rx_len = payload_len;
+
+                    for (int i = 0; i < 4; i++) g_udp_rx_src_ip[i] = ip->saddr[i];
+                    g_udp_rx_src_port = htons(udp->src_port);
+                    g_udp_rx_ready = true;
+
+                    sys_puts(console_ep, "[NET RX] UDP datagram from ");
+                    put_ip(console_ep, g_udp_rx_src_ip);
+                    sys_puts(console_ep, ":");
+                    put_dec(console_ep, g_udp_rx_src_port);
+                    sys_puts(console_ep, " (");
+                    put_dec(console_ep, payload_len);
+                    sys_puts(console_ep, " bytes). Use 'recv' to view.\n");
                 }
             } // Конец проверки UDP
         } // Конец проверки IPv4
@@ -693,7 +776,7 @@ int main(int argc, char *argv[]) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
-    sys_puts(console_ep, "\n[NET DRIVER] Network Server Online!\n");
+    sys_puts(console_ep, "\n[NET] Server online.\n");
     uintptr_t base_addr = 0;
 
     // =========================================================
@@ -734,7 +817,7 @@ int main(int argc, char *argv[]) {
 
         g_net_regs->queue_sel = 1; g_net_regs->queue_num = 2; g_net_regs->queue_align = 64; g_net_regs->queue_pfn = (g_shm_paddr + 0x200) / 64; 
         g_net_regs->status |= 8; g_net_regs->status |= 4; 
-        sys_puts(console_ep, "[NET DRIVER] Virtio-Net TX & RX Queues Initialized. Waiting for Shell commands.\n");
+        sys_puts(console_ep, "[NET] Virtio-net queues initialized.\n");
         g_net_regs->queue_notify = 0; 
         for(volatile int i=0; i<10000000; i++); 
     }

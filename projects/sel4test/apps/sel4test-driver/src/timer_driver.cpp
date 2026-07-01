@@ -29,22 +29,30 @@ int main(int argc, char *argv[]) {
     volatile seL4_Uint32 *rtc_dr  = (volatile seL4_Uint32*)(0x200002000ULL + 0x00);
     volatile seL4_Uint32 *rtc_icr = (volatile seL4_Uint32*)(0x200002000ULL + 0x10);
 
+    // Момент запуска драйвера (секунды эпохи PL031) — точка отсчета аптайма.
+    // В будущем при добавлении NTP-синхронизации сюда же ляжет коррекция смещения (offset)
+    // между локальным PL031 и временем, полученным от NTP-сервера.
+    const seL4_Uint32 boot_epoch_seconds = *rtc_dr;
+
     // Главный цикл обработки прерываний и IPC
     while(1) {
         seL4_Word badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
 
         // Обработка прерывания таймера
-        if (badge == 2) { 
-            *rtc_icr = 1; 
+        if (badge == 2) {
+            *rtc_icr = 1;
             seL4_IRQHandler_Ack(irq_ep);
             continue;
         }
 
-        // Обработка запросов от процессов (SYS_GET_TIME)
+        // Обработка запросов от процессов (SYS_GET_TIME / SYS_GET_UPTIME)
         seL4_Word sys = seL4_GetMR(0);
-        if (sys == 3) { 
+        if (sys == 3) { // SYS_GET_TIME: мс с эпохи Unix (по локальным часам PL031)
             seL4_SetMR(0, (*rtc_dr) * 1000);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 4) { // SYS_GET_UPTIME: мс с момента запуска timer_driver
+            seL4_SetMR(0, (*rtc_dr - boot_epoch_seconds) * 1000);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));

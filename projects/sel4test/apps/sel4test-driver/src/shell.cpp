@@ -54,6 +54,14 @@ static void sys_puthex(seL4_Word val) {
     sys_puts(0, buf); // The first argument is ignored, writes to stdout
 }
 
+// Helper to print an unsigned value in decimal via IPC.
+static void sys_putdec(seL4_Word val) {
+    char buf[21]; int j = 0;
+    if (val == 0) buf[j++] = '0';
+    while (val > 0) { buf[j++] = (val % 10) + '0'; val /= 10; }
+    while (j > 0) { char c[2] = {buf[--j], 0}; sys_puts(0, c); }
+}
+
 // Универсальная запись в файловый дескриптор
 void sys_write(int fd, const char* str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -143,6 +151,18 @@ static void my_strncpy(char *dest, const char *src, int n) {
     }
 }
 
+// Копирует не более (cap-1) символов и всегда завершает '\0' в пределах [0, cap).
+// Возвращает итоговую длину скопированной строки (без учета '\0').
+static int my_strlcpy(char *dest, const char *src, int cap) {
+    if (cap <= 0) return 0;
+    int i = 0;
+    for (; i < cap - 1 && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+    return i;
+}
+
 static seL4_Word my_strlen(const char *s) {
     seL4_Word len = 0; while (*s++) len++; return len;
 }
@@ -160,6 +180,7 @@ enum NetCommand {
     NET_CMD_SEND = 2,
     NET_CMD_STATUS = 3,
     NET_CMD_RESOLVE = 4,
+    NET_CMD_RECV = 5,
 };
 
 static char *next_token(char **cursor) {
@@ -293,6 +314,13 @@ static seL4_Word sys_get_time(seL4_CPtr timer_ep) {
     return seL4_GetMR(0);
 }
 
+// Мс с момента запуска timer_driver (не привязано к эпохе Unix).
+static seL4_Word sys_get_uptime(seL4_CPtr timer_ep) {
+    seL4_SetMR(0, 4); // 4 = SYS_GET_UPTIME
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return seL4_GetMR(0);
+}
+
 static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
     seL4_Word start = sys_get_time(timer_ep);
     while (sys_get_time(timer_ep) - start < ms) { seL4_Yield(); }
@@ -366,18 +394,29 @@ static int sys_getpid(seL4_CPtr root_ep) {
     return (int)seL4_GetMR(0);
 }
 
-static char current_working_dir[64] = "/";
+#define CWD_SIZE 64
+#define SHM_TOTAL_SIZE 16384
+static char current_working_dir[CWD_SIZE] = "/";
 static char arg_buffer[512];
 
-static void build_absolute_path(char* target, const char* arg) {
+// max_len - полный размер буфера target (включая место под '\0').
+// Результат всегда '\0'-терминирован в пределах [0, max_len); при
+// переполнении путь молча обрезается, но выхода за границы буфера не происходит.
+static void build_absolute_path(char* target, const char* arg, int max_len) {
+    if (max_len <= 0) return;
     if (arg[0] == '/') {
-        my_strcpy(target, arg); // Уже абсолютный
+        my_strlcpy(target, arg, max_len); // Уже абсолютный
         return;
     }
-    my_strcpy(target, current_working_dir);
-    int len = my_strlen(target);
-    if (target[len-1] != '/') { target[len] = '/'; target[len+1] = '\0'; }
-    my_strcpy(target + my_strlen(target), arg);
+    int len = my_strlcpy(target, current_working_dir, max_len);
+    if (len > 0 && target[len - 1] != '/' && len + 1 < max_len) {
+        target[len] = '/';
+        target[len + 1] = '\0';
+        len++;
+    }
+    if (len < max_len - 1) {
+        my_strlcpy(target + len, arg, max_len - len);
+    }
 }
 
 static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
@@ -493,7 +532,7 @@ int main(int argc, char *argv[]) {
         volatile int* boom = (volatile int*)0x0; *boom = 0; 
     }
 
-    my_strcpy(arg_buffer, (char*)&ipc->msg[0]);
+    my_strlcpy(arg_buffer, (char*)&ipc->msg[0], (int)sizeof(arg_buffer));
 
     int cmd_argc = 1;
     char *cmd_argv[16];
@@ -520,13 +559,13 @@ int main(int argc, char *argv[]) {
     }
     cmd_argv[cmd_argc] = nullptr;
     
-    sys_puts(console_ep, "\n======================================================\n");
-    sys_puts(console_ep, "  TRUE MICROKERNEL: ALL MODULES ONLINE & FUNCTIONAL!  \n");
-    sys_puts(console_ep, "======================================================\n\n");
+    sys_puts(console_ep, "\n=================================================\n"
+                          "  All modules online.\n"
+                          "=================================================\n\n");
 
     // 4. Демонстрация (заменено на cmd_argc/cmd_argv)
     if (cmd_argc > 1) {
-        sys_puts(console_ep, "[Shell Init] Started with arguments:\n");
+        sys_puts(console_ep, "[SHELL] Started with arguments:\n");
         for (int j = 0; j < cmd_argc; j++) {
             sys_puts(console_ep, "  argv[");
             char buf[2] = {(char)(j + '0'), 0}; sys_puts(console_ep, buf);
@@ -576,9 +615,8 @@ int main(int argc, char *argv[]) {
         while (p_idx > 0) { prompt[len++] = pid_buf[--p_idx]; }
         
         prompt[len++] = ']'; prompt[len++] = ' ';
-        // Добавляем текущую директорию!
-        my_strcpy(prompt + len, current_working_dir);
-        len = my_strlen(prompt);
+        // Добавляем текущую директорию! (с запасом под "> \0" ниже)
+        len += my_strlcpy(prompt + len, current_working_dir, (int)sizeof(prompt) - len - 3);
         prompt[len++] = '>'; prompt[len++] = ' '; prompt[len] = '\0';
         
         sys_puts(console_ep, prompt);
@@ -670,14 +708,23 @@ int main(int argc, char *argv[]) {
 
             if (my_strcmp(cmd_ptr, "time") == 0) {
                 seL4_Word current = sys_get_time(timer_ep);
-                sys_puts(console_ep, "Uptime: ");
-                char buf[16]; int temp = current, j = 0;
-                if (temp == 0) buf[j++] = '0';
-                while(temp > 0) { buf[j++] = (temp % 10) + '0'; temp /= 10; }
-                while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
-                sys_puts(console_ep, " ms\n");
-            } 
-             
+                sys_puts(console_ep, "Time: "); sys_putdec(current); sys_puts(console_ep, " ms since epoch\n");
+            }
+
+            else if (my_strcmp(cmd_ptr, "uptime") == 0) {
+                seL4_Word ms = sys_get_uptime(timer_ep);
+                seL4_Word total_s = ms / 1000;
+                seL4_Word days = total_s / 86400;
+                seL4_Word hours = (total_s % 86400) / 3600;
+                seL4_Word mins = (total_s % 3600) / 60;
+                seL4_Word secs = total_s % 60;
+                sys_puts(console_ep, "up ");
+                if (days > 0) { sys_putdec(days); sys_puts(console_ep, "d "); }
+                sys_putdec(hours); sys_puts(console_ep, "h ");
+                sys_putdec(mins); sys_puts(console_ep, "m ");
+                sys_putdec(secs); sys_puts(console_ep, "s\n");
+            }
+
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
                 sys_puts(console_ep, "Sleeping 3 seconds...\n");
                 sys_sleep(timer_ep, 3000);
@@ -789,10 +836,21 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 2000); // Для статуса достаточно 2-х секунд
             }
 
+            else if (my_strcmp(cmd_ptr, "recv") == 0) {
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                net_mailbox[0] = 1; // Запираем Mailbox!
+
+                net_send_text_command(net_ep, NET_CMD_RECV, 0, 0, nullptr);
+
+                wait_for_net_mailbox(console_ep, timer_ep, 2000);
+            }
+
             else if (my_strcmp(cmd_ptr, "ls") == 0) {
                 char *shm = shm_base; 
-                if (arg) { build_absolute_path(shm, arg); } 
-                else { build_absolute_path(shm, ""); }
+                if (arg) { build_absolute_path(shm, arg, SHM_TOTAL_SIZE); }
+                else { build_absolute_path(shm, "", SHM_TOTAL_SIZE); }
 
                 if (is_piping) { 
                     // Запускаем ls в потоке, перенаправив его stdout в пайп
@@ -868,7 +926,7 @@ int main(int argc, char *argv[]) {
                             else current_working_dir[len] = '\0';
                         }
                     } else {
-                        build_absolute_path(current_working_dir, path);
+                        build_absolute_path(current_working_dir, path, CWD_SIZE);
                     }
                 } else {
                     sys_puts(console_ep, "cd: ");
@@ -1023,7 +1081,7 @@ int main(int argc, char *argv[]) {
 
                     // 3. Отправляем IPC-вызов драйверу диска для ЭТОГО конкретного файла
                     char *shm = shm_base;
-                    build_absolute_path(shm, start_of_arg);
+                    build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
                     if (vfs_syscall(112, blk_ep) != 0) {
                         sys_puts(console_ep, "touch: failed to create '");
                         sys_puts(console_ep, start_of_arg);
@@ -1036,7 +1094,7 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "cat") == 0) {
                 if (!arg) { sys_puts(console_ep, "Usage: cat <file>\n"); continue; }
                 char *shm = shm_base;
-                build_absolute_path(shm, arg);
+                build_absolute_path(shm, arg, SHM_TOTAL_SIZE);
                 
                 if (vfs_syscall(114, blk_ep) == 0) { // Файл прочитан в shm
                     if (is_piping) {
@@ -1083,9 +1141,9 @@ int main(int argc, char *argv[]) {
                     char *shm = shm_base;
                     char *path_ptr = shm;
                     char *text_ptr = shm + 128; // Текст кладем со смещением!
-                    
-                    build_absolute_path(path_ptr, redir);
-                    my_strcpy(text_ptr, arg);
+
+                    build_absolute_path(path_ptr, redir, 128);
+                    my_strlcpy(text_ptr, arg, SHM_TOTAL_SIZE - 128);
                     
                     vfs_lock();
                     seL4_SetMR(0, 113); 
@@ -1110,7 +1168,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, netstat, touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);
@@ -1158,7 +1216,7 @@ int main(int argc, char *argv[]) {
                     *p = '\0';
 
                     char *shm = shm_base;
-                    build_absolute_path(shm, start_of_arg);
+                    build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
                     if (vfs_syscall(120, blk_ep) != 0) {
                         sys_puts(console_ep, "rm: cannot remove '");
                         sys_puts(console_ep, start_of_arg);
@@ -1203,8 +1261,8 @@ int main(int argc, char *argv[]) {
 
                 // 4. Готовим IPC-сообщение
                 char *shm = shm_base;
-                build_absolute_path(shm, old_name);
-                build_absolute_path(shm + 128, new_name);
+                build_absolute_path(shm, old_name, 128);
+                build_absolute_path(shm + 128, new_name, SHM_TOTAL_SIZE - 128);
                 
                 vfs_lock();
                 seL4_SetMR(0, 116); // SYS_RENAME

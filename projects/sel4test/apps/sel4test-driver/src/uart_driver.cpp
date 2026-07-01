@@ -82,7 +82,15 @@ int main(int argc, char *argv[]) {
         if (badge == 1) {
             // Прерывание от клавиатуры
             while (((*uart_fr) & (1 << 4)) == 0) {
-                kbd_buffer[head] = *uart_dr; head = (head + 1) % 128;
+                char c = *uart_dr;
+                int next_head = (head + 1) % 128;
+                if (next_head == tail) {
+                    // Буфер полон — читатель не успевает вычитывать. Отбрасываем
+                    // символ вместо того, чтобы затирать непрочитанные данные и
+                    // рассинхронизировать head/tail.
+                    break;
+                }
+                kbd_buffer[head] = c; head = next_head;
             }
             seL4_IRQHandler_Ack(irq_ep);
             // Не делаем 'continue', чтобы после IRQ тоже можно было сбросить буфер на печать
