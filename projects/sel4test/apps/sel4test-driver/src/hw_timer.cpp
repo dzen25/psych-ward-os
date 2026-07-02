@@ -1,4 +1,5 @@
 #include "h/hw_timer.h"
+#include "h/platform.h"
 
 volatile uint32_t *rtc_dr;
 volatile uint32_t *rtc_mr;
@@ -6,12 +7,12 @@ volatile uint32_t *rtc_imsc;
 volatile uint32_t *rtc_icr;
 
 void timer_init(void *vaddr) {
-    rtc_dr = (volatile uint32_t*)((char*)vaddr + 0x00);
-    rtc_mr = (volatile uint32_t*)((char*)vaddr + 0x04);
-    rtc_imsc = (volatile uint32_t*)((char*)vaddr + 0x10);
-    
+    rtc_dr = (volatile uint32_t*)((char*)vaddr + PL031_DR_OFFSET);
+    rtc_mr = (volatile uint32_t*)((char*)vaddr + PL031_MR_OFFSET);
+    rtc_imsc = (volatile uint32_t*)((char*)vaddr + PL031_IMSC_OFFSET);
+
     // Правильный регистр очистки прерывания
-    rtc_icr = (volatile uint32_t*)((char*)vaddr + 0x1C);
+    rtc_icr = (volatile uint32_t*)((char*)vaddr + PL031_ICR_OFFSET);
 
     // Мы больше НЕ трогаем 0x0C (rtc_cr), чтобы QEMU не падал!
     

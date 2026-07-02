@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/platform.h"
 #include <stdint.h>
 
 // ИСПРАВЛЕНО: Переменные для очереди вывода вынесены в глобальную область видимости файла.
@@ -31,10 +32,10 @@ void __assert_fail(const char *assertion, const char *file, int line, const char
 
 static void uart_putc(char c) {
     if (c == '\n') {
-        while ((*uart_fr) & (1 << 5));
+        while ((*uart_fr) & PL011_FR_TXFF);
         *uart_dr = '\r';
     }
-    while ((*uart_fr) & (1 << 5));
+    while ((*uart_fr) & PL011_FR_TXFF);
     *uart_dr = c;
 }
 
@@ -43,7 +44,7 @@ static void flush_buffer() {
     // Эта операция неблокирующая: если FIFO полон, цикл немедленно
     // завершится, и драйвер вернется к ожиданию новых событий.
     // Остаток данных будет отправлен на следующей итерации.
-    while (tx_tail != tx_head && (((*uart_fr) & (1 << 5)) == 0)) {
+    while (tx_tail != tx_head && (((*uart_fr) & PL011_FR_TXFF) == 0)) {
         *uart_dr = tx_buffer[tx_tail];
         tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
     }
@@ -71,9 +72,12 @@ int main(int argc, char *argv[]) {
         __assert_fail("Null Capability Detected in Driver Init!", __FILE__, __LINE__, __func__);
     }
 
-    uart_dr = (volatile seL4_Uint32*)(0x200000000ULL);
-    uart_fr = (volatile seL4_Uint32*)(0x200000000ULL + 0x18);
+    uart_dr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + PL011_DR_OFFSET);
+    uart_fr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + PL011_FR_OFFSET);
     char kbd_buffer[128]; int head = 0, tail = 0;
+
+    seL4_SetMR(0, SYS_DRIVER_READY);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
 
     while(1) {
         seL4_Word badge = 0;
@@ -81,7 +85,7 @@ int main(int argc, char *argv[]) {
 
         if (badge == 1) {
             // Прерывание от клавиатуры
-            while (((*uart_fr) & (1 << 4)) == 0) {
+            while (((*uart_fr) & PL011_FR_RXFE) == 0) {
                 char c = *uart_dr;
                 int next_head = (head + 1) % 128;
                 if (next_head == tail) {

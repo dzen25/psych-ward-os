@@ -1,6 +1,7 @@
 // net_driver.cpp
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/platform.h"
 #include <stdint.h>
 #include <kernel/gen_config.h>
 
@@ -54,6 +55,14 @@ static uint32_t bswap32(uint32_t v) {
 
 static uint64_t sys_get_time_ms(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 3); // SYS_GET_TIME
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (uint64_t)seL4_GetMR(0);
+}
+
+// Мс с момента запуска timer_driver — в отличие от sys_get_time_ms(), не сбивается
+// NTP-коррекцией. Используется для планирования периодической ресинхронизации.
+static uint64_t sys_get_uptime_ms(seL4_CPtr timer_ep) {
+    seL4_SetMR(0, 4); // SYS_GET_UPTIME
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (uint64_t)seL4_GetMR(0);
 }
@@ -194,6 +203,13 @@ static uint8_t g_ntp_server_ip[4] = {216, 239, 35, 0};
 static const uint16_t NTP_SERVER_PORT = 123;
 // Разница эпох NTP (1900-01-01) и Unix (1970-01-01) в секундах.
 static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800u;
+// Интервал автоматической периодической ресинхронизации (мс). Отсчитывается
+// по аптайму (не по показаниям часов), поэтому не зависит от самой коррекции.
+static const uint64_t NTP_RESYNC_INTERVAL_MS = 30ull * 60 * 1000; // 30 минут
+// Сколько ждать при старте разрешения ARP + ответа NTP-сервера, прежде чем
+// сдаться и сообщить rootserver'у о готовности без синка. Не должно вешать
+// загрузку системы навечно, если сети/интернета вообще нет.
+static const uint64_t NTP_BOOT_TIMEOUT_MS = 5000;
 
 // Последняя принятая произвольная UDP-датаграмма (не DNS-ответ), ждущая
 // команды `recv` из shell. Однослотовый почтовый ящик: новый пакет
@@ -239,6 +255,11 @@ static bool g_ntp_synced = false;
 // Отличает автосинхронизацию при старте net_driver от ручной команды `ntp`,
 // чтобы на успехе/неудаче загрузочного синка вывести отдельную строку в лог.
 static bool g_ntp_boot_sync_pending = false;
+// Аптайм (мс), после которого попытка boot-time синка признается неудачной
+// по таймауту (см. NTP_BOOT_TIMEOUT_MS и net_check_boot_ntp_timeout()).
+static uint64_t g_ntp_boot_deadline_ms = 0;
+// Аптайм (мс) следующей плановой автоматической ресинхронизации.
+static uint64_t g_ntp_next_resync_uptime_ms = 0;
 
 static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
     volatile virtq_desc* vq_desc = (volatile virtq_desc*)(g_shm_vaddr + 0x200);
@@ -457,6 +478,54 @@ static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
 
     net_send_packet(sizeof(virtio_net_hdr) + 14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
     g_ntp_outstanding = true;
+}
+
+// Ставит в план следующую автоматическую ресинхронизацию через NTP_RESYNC_INTERVAL_MS
+// от текущего аптайма (не от показаний часов — не зависит от самой коррекции).
+static void net_schedule_next_ntp_resync(seL4_CPtr timer_ep) {
+    g_ntp_next_resync_uptime_ms = sys_get_uptime_ms(timer_ep) + NTP_RESYNC_INTERVAL_MS;
+}
+
+// Сигналит rootserver'у готовность net_driver. Вызывается один раз — либо
+// сразу при старте (если нет сетевого железа вообще), либо когда решится
+// судьба boot-time NTP синка (успех/ошибка/таймаут, см. main()/net_poll()/
+// net_check_boot_ntp_timeout()) — так приглашение shell в логе оказывается
+// строго после исхода этой попытки, а не до него.
+static void signal_net_driver_ready(seL4_CPtr root_ep) {
+    seL4_SetMR(0, SYS_DRIVER_READY);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
+// Если ARP/ответ NTP-сервера так и не пришли за NTP_BOOT_TIMEOUT_MS — сдаемся
+// и все равно сигналим готовность, иначе при недоступной сети вся загрузка
+// (в т.ч. shell) зависла бы навечно. Обычный периодический ресинк (см. выше)
+// продолжит попытки и после этого.
+static void net_check_boot_ntp_timeout(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep) {
+    if (!g_ntp_boot_sync_pending) return;
+    if (sys_get_uptime_ms(timer_ep) < g_ntp_boot_deadline_ms) return;
+
+    sys_puts(console_ep, "[NET] Boot-time NTP sync: timed out.\n");
+    g_ntp_boot_sync_pending = false;
+    g_ntp_outstanding = false;
+    if (pending_cmd == NET_CMD_NTP) pending_cmd = NET_CMD_NONE;
+
+    signal_net_driver_ready(root_ep);
+}
+
+// Периодически перезапускает NTP-синхронизацию, не дожидаясь команды `ntp` из shell.
+// Не мешает уже идущему запросу (ручному, загрузочному или предыдущему плановому).
+static void net_check_ntp_resync(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    if (g_ntp_outstanding || pending_cmd == NET_CMD_NTP) return;
+    if (sys_get_uptime_ms(timer_ep) < g_ntp_next_resync_uptime_ms) return;
+
+    sys_puts(console_ep, "[NET] Periodic NTP resync...\n");
+    if (have_router_mac) {
+        net_send_ntp_request(console_ep, timer_ep);
+    } else {
+        pending_cmd = NET_CMD_NTP;
+        net_send_arp_request(console_ep);
+    }
+    net_schedule_next_ntp_resync(timer_ep);
 }
 
 static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
@@ -701,7 +770,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
     }
 }
 
-static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep) {
     volatile virtq_avail_rx* rx_avail = (volatile virtq_avail_rx*)(g_shm_vaddr + 0x2040);
     volatile virtq_used_rx* rx_used = (volatile virtq_used_rx*)(g_shm_vaddr + 0x2080);
 
@@ -728,7 +797,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
         if (type == 0x0806) { // ARP
             volatile arp_ipv4* arp_reply = (volatile arp_ipv4*)eth->payload;
             if (htons(arp_reply->oper) == 2 && !have_router_mac) { 
-                sys_puts(console_ep, ">>> [NET RX] ARP Reply Received! Saving Router MAC.\n");
+                sys_puts(console_ep, "[NET RX] ARP Reply Received! Saving Router MAC.\n");
                 for(int i=0; i<6; i++) router_mac[i] = arp_reply->sha[i];
                 have_router_mac = true;
 
@@ -848,6 +917,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                         if (g_ntp_boot_sync_pending) {
                             g_ntp_boot_sync_pending = false;
                             sys_puts(console_ep, "[NET] Boot-time NTP sync: failed.\n");
+                            signal_net_driver_ready(root_ep);
                         }
                     } else {
                         volatile ntp_packet* ntp = (volatile ntp_packet*)data_ptr;
@@ -859,6 +929,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                             if (g_ntp_boot_sync_pending) {
                                 g_ntp_boot_sync_pending = false;
                                 sys_puts(console_ep, "[NET] Boot-time NTP sync: failed.\n");
+                                signal_net_driver_ready(root_ep);
                             }
                         } else {
                             uint64_t t1 = g_ntp_t1_epoch_s;
@@ -887,6 +958,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                             if (g_ntp_boot_sync_pending) {
                                 g_ntp_boot_sync_pending = false;
                                 sys_puts(console_ep, "[NET] Boot-time NTP sync: good.\n");
+                                signal_net_driver_ready(root_ep);
                             }
                         }
                     }
@@ -962,13 +1034,17 @@ int main(int argc, char *argv[]) {
 
     if (g_shm_vaddr == nullptr || g_shm_paddr == 0) {
         sys_puts(console_ep, "[NET] FATAL: Failed to get dynamic SHM!\n");
+        // Все равно сигналим готовность — иначе rootserver навечно зависнет
+        // на wait_for_driver_ready() и не запустит остальные модули/shell.
+        seL4_SetMR(0, SYS_DRIVER_READY);
+        seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
         while(1) seL4_Yield();
     }
     // =========================================================
     for (int i = 0; i < 32; i++) {
-        uintptr_t slot_addr = 0x200004000ULL + (i * 0x200);
+        uintptr_t slot_addr = PLAT_VIRTIO_MMIO_VADDR + (i * PLAT_VIRTIO_MMIO_STRIDE);
         volatile VirtioMmioRegs* regs = (volatile VirtioMmioRegs*)slot_addr;
-        if (regs->magic_value == 0x74726976 && regs->device_id == 1) { g_net_regs = regs; base_addr = slot_addr; break; }
+        if (regs->magic_value == VIRTIO_MMIO_MAGIC && regs->device_id == VIRTIO_DEVICE_ID_NET) { g_net_regs = regs; base_addr = slot_addr; break; }
     }
 
     if (g_net_regs) {
@@ -995,19 +1071,31 @@ int main(int argc, char *argv[]) {
         // Автоматическая синхронизация времени при старте (без ожидания команды `ntp`
         // из shell). Асинхронно: ARP -> net_poll() отправит SNTP-запрос сам, когда
         // MAC гейтвея разрешится (см. pending_cmd == NET_CMD_NTP в net_poll()).
+        // Готовность net_driver (SYS_DRIVER_READY) сигналится ПОСЛЕ исхода этой
+        // попытки (успех/ошибка/таймаут — см. net_poll()/net_check_boot_ntp_timeout()),
+        // а не сразу здесь: так лог загрузки shell'а оказывается строго после
+        // результата синка, а не до него. Таймаут не дает загрузке зависнуть
+        // навечно, если сети/интернета нет вовсе.
         sys_puts(console_ep, "[NET] Starting boot-time NTP sync...\n");
         g_ntp_boot_sync_pending = true;
+        g_ntp_boot_deadline_ms = sys_get_uptime_ms(timer_ep) + NTP_BOOT_TIMEOUT_MS;
         pending_cmd = NET_CMD_NTP;
         net_send_arp_request(console_ep);
+        net_schedule_next_ntp_resync(timer_ep); // Далее ресинк сам по себе каждые NTP_RESYNC_INTERVAL_MS
+    } else {
+        // Сетевого железа вообще нет — ждать boot-time синк не от чего, сигналим готовность сразу.
+        signal_net_driver_ready(root_ep);
     }
 
     while(1) {
         g_cpu_loops++;
         if (g_net_regs) {
-            net_poll(console_ep, timer_ep);
+            net_poll(console_ep, timer_ep, root_ep);
             net_handle_command(console_ep, timer_ep, net_cmd_ep);
             net_check_ping_timeout(console_ep, timer_ep);
             net_check_ping_send(console_ep, timer_ep);
+            net_check_ntp_resync(console_ep, timer_ep);
+            net_check_boot_ntp_timeout(console_ep, timer_ep, root_ep);
         }
         seL4_Yield();
     }

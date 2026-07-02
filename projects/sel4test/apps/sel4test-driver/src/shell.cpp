@@ -575,6 +575,12 @@ int main(int argc, char *argv[]) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
+    // Ждем, пока все остальные модули (uart/timer/blk/net) не отрапортуют о
+    // готовности рутсерверу (SYS_DRIVER_READY) — иначе собственный баннер и
+    // первое приглашение оболочки попадают в лог раньше их логов инициализации.
+    seL4_SetMR(0, SYS_WAIT_ALL_DRIVERS_READY);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+
     // --- ДИНАМИЧЕСКИЙ ЗАПРОС SHM ---
     seL4_SetMR(0, 107); // SYS_SHM_GET
     seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);

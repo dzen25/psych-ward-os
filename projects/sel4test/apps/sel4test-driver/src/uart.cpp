@@ -1,5 +1,6 @@
 #include "h/uart.h"
 #include "h/hw_timer.h"
+#include "h/platform.h"
 
 volatile uint32_t *uart_dr;
 volatile uint32_t *uart_fr;
@@ -7,29 +8,29 @@ volatile uint32_t *uart_imsc; // Interrupt Mask Set/Clear
 volatile uint32_t *uart_icr;  // Interrupt Clear Register
 
 void uart_init(void *vaddr) {
-    uart_dr = (volatile uint32_t*)vaddr;
-    uart_fr = (volatile uint32_t*)((char*)vaddr + 0x18);
-    uart_imsc = (volatile uint32_t*)((char*)vaddr + 0x38);
-    uart_icr = (volatile uint32_t*)((char*)vaddr + 0x44);
+    uart_dr = (volatile uint32_t*)((char*)vaddr + PL011_DR_OFFSET);
+    uart_fr = (volatile uint32_t*)((char*)vaddr + PL011_FR_OFFSET);
+    uart_imsc = (volatile uint32_t*)((char*)vaddr + PL011_IMSC_OFFSET);
+    uart_icr = (volatile uint32_t*)((char*)vaddr + PL011_ICR_OFFSET);
 }
 
 void uart_enable_interrupts() {
     // Включаем Receive Interrupt Mask (бит 4)
-    *uart_imsc |= (1 << 4);
+    *uart_imsc |= PL011_INT_RX_BIT;
 }
 
 void uart_clear_interrupts() {
     // Сбрасываем Receive Interrupt (бит 4)
-    *uart_icr = (1 << 4);
+    *uart_icr = PL011_INT_RX_BIT;
 }
 
 void uart_putchar(char c) {
-    while ((*uart_fr) & (1 << 5));
+    while ((*uart_fr) & PL011_FR_TXFF);
     *uart_dr = c;
 }
 
 int uart_havechar() {
-    return !((*uart_fr) & (1 << 4));
+    return !((*uart_fr) & PL011_FR_RXFE);
 }
 
 char uart_getchar() {

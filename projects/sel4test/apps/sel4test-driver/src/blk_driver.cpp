@@ -1,6 +1,7 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
 #include "h/fat32.h"
+#include "h/platform.h"
 #include <stdint.h>
 
 uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name);
@@ -249,6 +250,10 @@ int main(int argc, char *argv[]) {
 
     if (!g_shm_vaddr) {
         sys_puts(console_ep, "[BLK] FATAL: Failed to get dynamic SHM!\n");
+        // Все равно сигналим готовность — иначе rootserver навечно зависнет
+        // на wait_for_driver_ready() и не запустит остальные модули/shell.
+        seL4_SetMR(0, SYS_DRIVER_READY);
+        seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
         while(1) seL4_Yield();
     }
 
@@ -258,9 +263,9 @@ int main(int argc, char *argv[]) {
     // 2. Инициализация железа (MMIO VirtIO)
     // Поиск устройства
     for (int i = 0; i < 32; i++) {
-        uintptr_t slot_addr = 0x200004000ULL + (i * 0x200);
+        uintptr_t slot_addr = PLAT_VIRTIO_MMIO_VADDR + (i * PLAT_VIRTIO_MMIO_STRIDE);
         volatile VirtioMmioRegs* regs = (volatile VirtioMmioRegs*)slot_addr;
-        if (regs->magic_value == 0x74726976 && regs->device_id == 2) {
+        if (regs->magic_value == VIRTIO_MMIO_MAGIC && regs->device_id == VIRTIO_DEVICE_ID_BLOCK) {
             g_disk_regs = regs;
             break;
         }
@@ -268,6 +273,10 @@ int main(int argc, char *argv[]) {
 
     if (!g_disk_regs) {
         sys_puts(console_ep, "[BLK] ERROR: Block device not found.\n");
+        // Как и выше — сигналим готовность перед выходом, иначе rootserver
+        // навечно зависнет и не запустит остальные модули/shell.
+        seL4_SetMR(0, SYS_DRIVER_READY);
+        seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
         return -1;
     }
 
@@ -323,6 +332,9 @@ int main(int argc, char *argv[]) {
     } else {
         sys_puts(console_ep, "[BLK] FAT32 mount failed.\n");
     }
+
+    seL4_SetMR(0, SYS_DRIVER_READY);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
 
     // 4. Главный цикл диспетчеризации (Control Plane)
     while (1) {

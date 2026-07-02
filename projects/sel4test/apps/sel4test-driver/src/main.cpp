@@ -1,7 +1,8 @@
 #include "h/common.h"
 #include "h/allocator.h"
 #include "h/uart.h"
-#include "h/hw_timer.h" 
+#include "h/hw_timer.h"
+#include "h/platform.h"
 
 #include <sel4/sel4.h>
 
@@ -60,10 +61,11 @@ static void print_human_time(uint64_t total_ms) {
 }
 
 static void pl011_putchar(char c) {
-    volatile uint32_t *uart_dr = (volatile uint32_t*)(0x200000000ULL);
-    volatile uint32_t *uart_fr = (volatile uint32_t*)(0x200000000ULL + 0x18);
-    while ((*uart_fr) & (1 << 5)); *uart_dr = c;
+    volatile uint32_t *uart_dr = (volatile uint32_t*)(PLAT_UART_VADDR + PL011_DR_OFFSET);
+    volatile uint32_t *uart_fr = (volatile uint32_t*)(PLAT_UART_VADDR + PL011_FR_OFFSET);
+    while ((*uart_fr) & PL011_FR_TXFF); *uart_dr = c;
 }
+
 
 static seL4_CPtr sleeper_reply_slot = 0; static bool sleeper_waiting = false;
 
@@ -187,6 +189,17 @@ struct SharedMemoryRegion {
 
 static pipe_t g_pipes[MAX_PIPES] = {0};
 static SharedMemoryRegion shm_regions[16];
+
+// Готовность драйверов при загрузке (см. SYS_DRIVER_READY/SYS_WAIT_ALL_DRIVERS_READY
+// в common.h). Индекс — это is_driver (1=uart, 2=timer, 3=blk, 4=net); 0 (shell/apps)
+// не используется. driver_ready_wait_reply — сохраненный reply-cap шелла, если он
+// вызвал SYS_WAIT_ALL_DRIVERS_READY раньше, чем готовы все 4 модуля.
+static bool driver_ready[5] = {false, false, false, false, false};
+static seL4_CPtr driver_ready_wait_reply = 0;
+
+static bool all_drivers_ready() {
+    return driver_ready[1] && driver_ready[2] && driver_ready[3] && driver_ready[4];
+}
 
 static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
     uint32_t total_read = 0;
@@ -446,8 +459,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
         
-        uintptr_t hw_vaddr = (is_driver == 1) ? 0x200000000ULL : 
-                             ((is_driver == 2) ? 0x200002000ULL : 0x200004000ULL);
+        uintptr_t hw_vaddr = (is_driver == 1) ? PLAT_UART_VADDR :
+                             ((is_driver == 2) ? PLAT_RTC_VADDR : PLAT_VIRTIO_MMIO_VADDR);
         
         seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
         seL4_ARM_PageDirectory_Map(drv_pd, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
@@ -653,14 +666,14 @@ int main(int argc, char *argv[]) {
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt_ipc_temp, 1);
 
     // Фреймы устройств
-    seL4_CPtr uart_frame = alloc_device_frame(info, alloc, 0x09000000, root_cnode);
-    seL4_CPtr rtc_frame  = alloc_device_frame(info, alloc, 0x09010000, root_cnode);
-    seL4_CPtr virtio_frames[4];
-    for (int i = 0; i < 4; i++) {
-        virtio_frames[i] = alloc_device_frame(info, alloc, 0x0a000000 + (i * 4096), root_cnode);
+    seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
+    seL4_CPtr rtc_frame  = alloc_device_frame(info, alloc, PLAT_RTC_PADDR, root_cnode);
+    seL4_CPtr virtio_frames[PLAT_VIRTIO_MMIO_SLOTS];
+    for (int i = 0; i < PLAT_VIRTIO_MMIO_SLOTS; i++) {
+        virtio_frames[i] = alloc_device_frame(info, alloc, PLAT_VIRTIO_MMIO_PADDR + (i * 4096), root_cnode);
     }
 
-    uintptr_t uart_vaddr = 0x200000000ULL;
+    uintptr_t uart_vaddr = PLAT_UART_VADDR;
     seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
@@ -669,7 +682,7 @@ int main(int argc, char *argv[]) {
     // Одна таблица покрывает 2MB, чего достаточно для 512 процессов.
     seL4_ARM_PageTable_Map(pt_ipc_temp, root_vspace, 0x200800000ULL, seL4_ARM_Default_VMAttributes);
 
-    uintptr_t rtc_vaddr = 0x200002000ULL;
+    uintptr_t rtc_vaddr = PLAT_RTC_VADDR;
     seL4_ARM_Page_Map(rtc_frame, root_vspace, rtc_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
 
     uart_init((void*)uart_vaddr);
@@ -720,7 +733,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr timer_irq_handler = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
     seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, 2); 
-    seL4_IRQControl_Get(seL4_CapIRQControl, 34, root_cnode, timer_irq_handler, seL4_WordBits);
+    seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_TIMER_IRQ, root_cnode, timer_irq_handler, seL4_WordBits);
     seL4_IRQHandler_SetNotification(timer_irq_handler, badged_timer_ntfn);
     seL4_IRQHandler_Ack(timer_irq_handler);
 
@@ -729,37 +742,42 @@ int main(int argc, char *argv[]) {
     seL4_CPtr uart_irq_handler = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, uart_ntfn, 1);
     seL4_CNode_Mint(root_cnode, badged_uart_ntfn, seL4_WordBits, root_cnode, uart_ntfn, seL4_WordBits, seL4_AllRights, 1); 
-    seL4_IRQControl_Get(seL4_CapIRQControl, 33, root_cnode, uart_irq_handler, seL4_WordBits);
+    seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_UART_IRQ, root_cnode, uart_irq_handler, seL4_WordBits);
     seL4_IRQHandler_SetNotification(uart_irq_handler, badged_uart_ntfn); 
     uart_enable_interrupts();
     seL4_IRQHandler_Ack(uart_irq_handler);
 
     // Запускаем Драйвер UART (is_driver = 1)
-    if (spawn_process("uart_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
+    if (spawn_process("uart_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       1, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, uart_ntfn, uart_irq_handler, uart_frame) < 0) {
         uart_puts("PANIC: UART Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Таймера (is_driver = 2)
-    if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
+    if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
 
     // Запускаем Драйвер Диска и ФС (is_driver = 3)
-    if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
+    if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0]) < 0) {
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
 
-    if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
+    if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       4, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0], nullptr,
                       net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
 
-    // Запускаем Оболочку (is_driver = 0)
-    if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], 
+    // Запускаем Оболочку (is_driver = 0). Сама оболочка при старте блокируется
+    // на SYS_WAIT_ALL_DRIVERS_READY (см. главный цикл ниже и shell.cpp) —
+    // поэтому ее собственный баннер/приглашение печатаются только после того,
+    // как остальные 4 модуля отрапортуют о готовности через SYS_DRIVER_READY.
+    // Порядок этого ожидания просто следует порядку spawn_process() выше —
+    // никакого отдельного списка "кого ждать" не требуется.
+    if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       0, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, 0, nullptr,
                       0, net_cmd_send_ep) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
@@ -1410,8 +1428,40 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_GETPID: {
-                seL4_SetMR(0, sender_pid); 
+                seL4_SetMR(0, sender_pid);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_DRIVER_READY: {
+                int drv = (sender_pid > 0) ? pcbs[sender_pid].is_driver : 0;
+                if (drv >= 1 && drv <= 4) {
+                    driver_ready[drv] = true;
+                    uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
+
+                    // Отпускаем shell, ждавший на SYS_WAIT_ALL_DRIVERS_READY — ОТДЕЛЬНЫМ
+                    // Send на сохраненный reply-cap, а не seL4_Reply() (тот отвечал бы
+                    // текущему вызывающему, то есть этому самому драйверу, а не шеллу).
+                    if (all_drivers_ready() && driver_ready_wait_reply != 0) {
+                        seL4_Send(driver_ready_wait_reply, seL4_MessageInfo_new(0, 0, 0, 0));
+                        seL4_CNode_Delete(root_cnode, driver_ready_wait_reply, seL4_WordBits);
+                        alloc.free(driver_ready_wait_reply);
+                        driver_ready_wait_reply = 0;
+                    }
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0)); // Отпускаем сам драйвер, приславший READY
+                break;
+            }
+
+            case SYS_WAIT_ALL_DRIVERS_READY: {
+                if (all_drivers_ready()) {
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                } else {
+                    // Не отвечаем сразу — сохраняем reply-cap шелла и продолжаем цикл.
+                    // Ответим из case SYS_DRIVER_READY выше, когда готовы будут все 4.
+                    driver_ready_wait_reply = alloc.alloc_slot();
+                    seL4_CNode_SaveCaller(root_cnode, driver_ready_wait_reply, seL4_WordBits);
+                }
                 break;
             }
 

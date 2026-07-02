@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/platform.h"
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
@@ -26,8 +27,10 @@ int main(int argc, char *argv[]) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
-    volatile seL4_Uint32 *rtc_dr  = (volatile seL4_Uint32*)(0x200002000ULL + 0x00);
-    volatile seL4_Uint32 *rtc_icr = (volatile seL4_Uint32*)(0x200002000ULL + 0x10);
+    volatile seL4_Uint32 *rtc_dr  = (volatile seL4_Uint32*)(PLAT_RTC_VADDR + PL031_DR_OFFSET);
+    // Примечание: по датащиту PL031 0x10 — это IMSC, а не ICR (см. platform.h),
+    // но это существующее поведение, не меняем его в рамках этого рефакторинга.
+    volatile seL4_Uint32 *rtc_icr = (volatile seL4_Uint32*)(PLAT_RTC_VADDR + PL031_IMSC_OFFSET);
 
     // Момент запуска драйвера (секунды эпохи PL031) — точка отсчета аптайма.
     // Не корректируется NTP-смещением: аптайм должен оставаться монотонным
@@ -38,6 +41,9 @@ int main(int argc, char *argv[]) {
     // применяется только к SYS_GET_TIME. Выставляется командой шелла `ntp`
     // через net_driver (см. SYS_SET_TIME_OFFSET ниже).
     seL4_Int64 ntp_offset_seconds = 0;
+
+    seL4_SetMR(0, SYS_DRIVER_READY);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
 
     // Главный цикл обработки прерываний и IPC
     while(1) {
