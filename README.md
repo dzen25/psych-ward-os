@@ -95,11 +95,12 @@ pip install -r requirements.txt
 <summary><b>Текущий статус (следующий шаг) (клик, чтобы развернуть)</b></summary>
 
 - [x] Ветка `RPi4` создана, README переработан под порт
-- [x] Файлы цепочки загрузки собраны (`load_chain_test`) (1.1 из [ROADMAP.md](ROADMAP.md))
+- [x] Файлы цепочки тестовой загрузки собраны в (`load_chain_test`) (1.1 из [ROADMAP.md](ROADMAP.md))
 - [ ] SD-карта ещё не записана и не тестировалась на живом железе (1.4 из [ROADMAP.md](ROADMAP.md))
 
 Подробные шаги и прогресс по каждому пункту — в [ROADMAP.md](ROADMAP.md).
 </details>
+
 ---
 
 ## Работа с кодом
