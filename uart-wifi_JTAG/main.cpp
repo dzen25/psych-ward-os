@@ -1,12 +1,11 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
-const char* ssid = "";                  // ssid сети
-const char* password = "";              // пароль сети
+const char* ssid = "OpenWrt2.4";
+const char* password = "623636889";
 
-
-const int LED_TX = 2;                   // пин светодиода tx
-const int LED_RX = 1;                   // пин светодиода rx
+const int LED_TX = 2;                               // пин светодиода tx
+const int LED_RX = 1;                               // пин светодиода rx
 const unsigned long BLINK_MS = 30;
 
 HardwareSerial UartBridge(1);
@@ -16,6 +15,21 @@ WiFiClient client;
 unsigned long txOffTime = 0;
 unsigned long rxOffTime = 0;
 
+// --- Динамическое переключение power-save режима WiFi ---
+unsigned long lastActivityTime = 0;
+bool psActive = false;                              // если true то отключается режим экономии энергии
+const unsigned long IDLE_TIMEOUT_MS = 10000;        // через сколько простоя в мс уходим в энергосбережение
+
+void setPowerSaveMode(bool wantActive) {
+    if (wantActive == psActive) return;             // уже в нужном режиме, не дёргаем лишний раз
+    if (wantActive) {
+        esp_wifi_set_ps(WIFI_PS_NONE);              // полная мощность, без задержки первого пакета
+    } else {
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);         // энергосбережение, меньше нагрев в простое
+    }
+    psActive = wantActive;
+}
+
 void setup()
 {
     pinMode(LED_TX, OUTPUT);
@@ -24,7 +38,7 @@ void setup()
     digitalWrite(LED_RX, LOW);
 
     Serial.begin(115200);
-    delay(1500);                        // время открыть Serial Monitor до первых логов
+    delay(1500);                                    // время открыть Serial Monitor до первых логов
 
     // Тестовое моргание при старте - 5 раз обоими светодиодами
     for (int i = 0; i < 5; i++) {
@@ -39,11 +53,12 @@ void setup()
     // Увеличенные буферы UART - важно для потокового вывода (например логов sel4test)
     UartBridge.setRxBufferSize(1024);
     UartBridge.setTxBufferSize(1024);
-    UartBridge.begin(115200, SERIAL_8N1, 20, 21);  // RX=20, TX=21 -> к RPi4
+    UartBridge.begin(115200, SERIAL_8N1, 20, 21);   // RX=20, TX=21 -> к RPi4
 
     WiFi.mode(WIFI_STA);
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    WiFi.setTxPower(WIFI_POWER_11dBm);  // критично для стабильного коннекта на этой плате
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);             // стартуем в энергосбережении, включаем NONE только при активности
+    psActive = false;
+    WiFi.setTxPower(WIFI_POWER_11dBm);              // критично для стабильного коннекта на этой плате
 
     Serial.print("Connecting to WiFi: ");
     Serial.println(ssid);
@@ -97,11 +112,12 @@ void loop()
     if (!client || !client.connected()) {
         client = server.available();
         if (client) {
-            client.setNoDelay(true);   // явно отключаем Nagle для этого соединения
+            client.setNoDelay(true);                // явно отключаем Nagle для этого соединения
         }
     }
 
     static uint8_t buf[256];
+    bool hadActivity = false;
 
     // Из сети -> в UART, пачками, а не по байту
     while (client.available()) {
@@ -110,6 +126,7 @@ void loop()
             UartBridge.write(buf, n);
             digitalWrite(LED_TX, HIGH);
             txOffTime = millis() + BLINK_MS;
+            hadActivity = true;
         }
     }
 
@@ -120,7 +137,16 @@ void loop()
             client.write(buf, n);
             digitalWrite(LED_RX, HIGH);
             rxOffTime = millis() + BLINK_MS;
+            hadActivity = true;
         }
+    }
+
+    // Переключение power-save: активность -> полная мощность, простой 2с -> сон
+    if (hadActivity) {
+        setPowerSaveMode(true);
+        lastActivityTime = millis();
+    } else if (psActive && millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
+        setPowerSaveMode(false);
     }
 
     if (txOffTime && millis() > txOffTime) { digitalWrite(LED_TX, LOW); txOffTime = 0; }
