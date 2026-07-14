@@ -4,8 +4,8 @@
 const char* ssid = "OpenWrt2.4";
 const char* password = "623636889";
 
-const int LED_TX = 2;                               // пин светодиода tx
-const int LED_RX = 1;                               // пин светодиода rx
+const int LED_TX = 2;                   // пин светодиода tx
+const int LED_RX = 1;                   // пин светодиода rx
 const unsigned long BLINK_MS = 30;
 
 HardwareSerial UartBridge(1);
@@ -17,15 +17,15 @@ unsigned long rxOffTime = 0;
 
 // --- Динамическое переключение power-save режима WiFi ---
 unsigned long lastActivityTime = 0;
-bool psActive = false;                              // если true то отключается режим экономии энергии
-const unsigned long IDLE_TIMEOUT_MS = 10000;        // через сколько простоя в мс уходим в энергосбережение
+bool psActive = false;               // true -  в режиме NONE (без сна, без задержки)
+const unsigned long IDLE_TIMEOUT_MS = 10000;  // через сколько мс простоя уходим в энергосбережение
 
 void setPowerSaveMode(bool wantActive) {
-    if (wantActive == psActive) return;             // уже в нужном режиме, не дёргаем лишний раз
+    if (wantActive == psActive) return;   // уже в нужном режиме, не дёргаем лишний раз
     if (wantActive) {
-        esp_wifi_set_ps(WIFI_PS_NONE);              // полная мощность, без задержки первого пакета
+        esp_wifi_set_ps(WIFI_PS_NONE);       // полная мощность, без задержки первого пакета
     } else {
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);         // энергосбережение, меньше нагрев в простое
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // энергосбережение, меньше нагрев в простое
     }
     psActive = wantActive;
 }
@@ -38,7 +38,7 @@ void setup()
     digitalWrite(LED_RX, LOW);
 
     Serial.begin(115200);
-    delay(1500);                                    // время открыть Serial Monitor до первых логов
+    delay(1500);                        // время открыть Serial Monitor до первых логов
 
     // Тестовое моргание при старте - 5 раз обоими светодиодами
     for (int i = 0; i < 5; i++) {
@@ -53,12 +53,12 @@ void setup()
     // Увеличенные буферы UART - важно для потокового вывода (например логов sel4test)
     UartBridge.setRxBufferSize(1024);
     UartBridge.setTxBufferSize(1024);
-    UartBridge.begin(115200, SERIAL_8N1, 20, 21);   // RX=20, TX=21 -> к RPi4
+    UartBridge.begin(115200, SERIAL_8N1, 20, 21);  // RX=20, TX=21 -> к RPi4
 
     WiFi.mode(WIFI_STA);
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);             // стартуем в энергосбережении, включаем NONE только при активности
-    psActive = false;
-    WiFi.setTxPower(WIFI_POWER_11dBm);              // критично для стабильного коннекта на этой плате
+    esp_wifi_set_ps(WIFI_PS_NONE);        // стартуем в активном режиме - мгновенный отклик сразу после подключения
+    psActive = true;
+    WiFi.setTxPower(WIFI_POWER_11dBm);   // критично для стабильного коннекта на этой плате
 
     Serial.print("Connecting to WiFi: ");
     Serial.println(ssid);
@@ -91,6 +91,7 @@ void setup()
 
         server.begin();
         server.setNoDelay(true);
+        lastActivityTime = millis();   // чтобы не уйти в сон сразу же после подключения
     } else {
         Serial.println("WiFi FAILED to connect.");
     }
@@ -112,7 +113,7 @@ void loop()
     if (!client || !client.connected()) {
         client = server.available();
         if (client) {
-            client.setNoDelay(true);                // явно отключаем Nagle для этого соединения
+            client.setNoDelay(true);   // явно отключаем Nagle для этого соединения
         }
     }
 
