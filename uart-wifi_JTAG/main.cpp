@@ -36,6 +36,9 @@ void setup()
         delay(150);
     }
 
+    // Увеличенные буферы UART - важно для потокового вывода (например логов sel4test)
+    UartBridge.setRxBufferSize(1024);
+    UartBridge.setTxBufferSize(1024);
     UartBridge.begin(115200, SERIAL_8N1, 20, 21);  // RX=20, TX=21 -> к RPi4
 
     WiFi.mode(WIFI_STA);
@@ -80,22 +83,46 @@ void setup()
 
 void loop()
 {
-    if (WiFi.status() != WL_CONNECTED)
+    if (WiFi.status() != WL_CONNECTED) {
+        static unsigned long lastReconnectAttempt = 0;
+        if (millis() - lastReconnectAttempt > 2000) {
+            Serial.println("WiFi lost, reconnecting...");
+            WiFi.disconnect();
+            WiFi.begin(ssid, password);
+            lastReconnectAttempt = millis();
+        }
         return;
+    }
 
-    if (!client || !client.connected())
+    if (!client || !client.connected()) {
         client = server.available();
+        if (client) {
+            client.setNoDelay(true);   // явно отключаем Nagle для этого соединения
+        }
+    }
 
+    static uint8_t buf[256];
+
+    // Из сети -> в UART, пачками, а не по байту
     while (client.available()) {
-        UartBridge.write(client.read());
-        digitalWrite(LED_TX, HIGH);
-        txOffTime = millis() + BLINK_MS;
+        int n = client.read(buf, min((int)client.available(), (int)sizeof(buf)));
+        if (n > 0) {
+            UartBridge.write(buf, n);
+            digitalWrite(LED_TX, HIGH);
+            txOffTime = millis() + BLINK_MS;
+        }
     }
+
+    // Из UART -> в сеть, пачками
     while (UartBridge.available()) {
-        client.write(UartBridge.read());
-        digitalWrite(LED_RX, HIGH);
-        rxOffTime = millis() + BLINK_MS;
+        int n = UartBridge.read(buf, min((int)UartBridge.available(), (int)sizeof(buf)));
+        if (n > 0) {
+            client.write(buf, n);
+            digitalWrite(LED_RX, HIGH);
+            rxOffTime = millis() + BLINK_MS;
+        }
     }
+
     if (txOffTime && millis() > txOffTime) { digitalWrite(LED_TX, LOW); txOffTime = 0; }
     if (rxOffTime && millis() > rxOffTime) { digitalWrite(LED_RX, LOW); rxOffTime = 0; }
 }
