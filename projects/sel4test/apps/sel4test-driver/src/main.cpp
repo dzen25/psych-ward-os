@@ -706,22 +706,10 @@ int main(int argc, char *argv[]) {
     // ("Untyped Retype: Slot #0 in destination window non-empty" в логе
     // ядра). Пока RTC/virtio не переписаны под ARM generic timer/GENET/EMMC2,
     // timer_driver/blk_driver/net_driver не спавним — так проверяется путь
-    // UART/GPIO14/15 отдельно от них. Вернуть в false вместе с Фазой 3.1-3.3.
+    // UART отдельно от них. Вернуть в false вместе с Фазой 3.1-3.3.
     constexpr bool RPI4_BRINGUP_UART_ONLY = true;
 
-    // Фреймы устройств — все три (mailbox/GPIO/UART) лежат в одном 16MB
-    // device-untyped регионе [0xfe000000..0xff000000), поэтому запрашиваем
-    // их СТРОГО по возрастанию физического адреса: mailbox (0xfe00b000) ->
-    // GPIO (0xfe200000) -> UART (0xfe201000). alloc_device_frame() продвигает
-    // watermark только вперёд — вызов не по возрастанию молча вернёт чужую
-    // физическую страницу вместо запрошенной.
-    seL4_DebugPutString((char*)"[BRINGUP] mailbox_frame: begin\n");
-    seL4_CPtr mailbox_frame = alloc_device_frame(info, alloc, PLAT_MAILBOX_PADDR, root_cnode);
-    seL4_DebugPutString((char*)"[BRINGUP] mailbox_frame: done, begin gpio_frame\n");
-    seL4_CPtr gpio_frame = alloc_device_frame(info, alloc, PLAT_GPIO_PADDR, root_cnode);
-    seL4_DebugPutString((char*)"[BRINGUP] gpio_frame: done, begin uart_frame\n");
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
-    seL4_DebugPutString((char*)"[BRINGUP] uart_frame: done\n");
     seL4_CPtr rtc_frame = 0;
     seL4_CPtr virtio_frames[PLAT_VIRTIO_MMIO_SLOTS] = {0};
     if (!RPI4_BRINGUP_UART_ONLY) {
@@ -731,12 +719,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    seL4_DebugPutString((char*)"[BRINGUP] mapping uart_vaddr: begin\n");
     uintptr_t uart_vaddr = PLAT_UART_VADDR;
     seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
     seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-    seL4_DebugPutString((char*)"[BRINGUP] mapping uart_vaddr: done\n");
 
     // Мапим таблицу для временного окна IPC. Адрес должен совпадать с global_ipc_temp_vaddr.
     // Одна таблица покрывает 2MB, чего достаточно для 512 процессов.
@@ -747,77 +733,8 @@ int main(int argc, char *argv[]) {
         seL4_ARM_Page_Map(rtc_frame, root_vspace, rtc_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
     }
 
-    // GPIO нужен только здесь и только один раз: включить ALT0 на GPIO14/15
-    // (PL011 UART0 сядет на физические пины заголовка, а не на BT-модуль) —
-    // см. platform.h, RPI4_UART0_PL011_PADDR. Тот же 2MB-регион, что и uart_vaddr,
-    // отдельная PageDirectory/PageTable не нужна.
-    seL4_DebugPutString((char*)"[BRINGUP] mapping gpio_vaddr: begin\n");
-    uintptr_t gpio_vaddr = PLAT_GPIO_VADDR;
-    seL4_ARM_Page_Map(gpio_frame, root_vspace, gpio_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-    seL4_DebugPutString((char*)"[BRINGUP] mapping gpio_vaddr: done, calling gpio_init_uart0_pins\n");
-    debug_puthex32("[BRINGUP] GPFSEL1 BEFORE pinmux = ", *(volatile uint32_t*)(gpio_vaddr + RPI4_GPIO_GPFSEL1_OFFSET));
-    uint32_t gpfsel1_after = gpio_init_uart0_pins((void*)gpio_vaddr);
-    debug_puthex32("[BRINGUP] GPFSEL1 AFTER pinmux  = ", gpfsel1_after);
-    seL4_DebugPutString((char*)"[BRINGUP] gpio_init_uart0_pins: done\n");
-
-    // Просим прошивку включить тактирование PL011 UART0 (см. platform.h,
-    // PLAT_MBOX_* и комментарий у mailbox_set_uart_clock выше) — иначе
-    // FR никогда не отразит реальное состояние FIFO, даже после
-    // корректной настройки CR/IBRD/FBRD/LCR_H в uart_init() ниже.
-    seL4_DebugPutString((char*)"[BRINGUP] mapping mailbox_vaddr + msg buffer: begin\n");
-    uintptr_t mailbox_vaddr = PLAT_MAILBOX_VADDR;
-    seL4_ARM_Page_Map(mailbox_frame, root_vspace, mailbox_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-
-    // Буфер сообщения — обычная RAM (не device), и её физический адрес
-    // ДОЛЖЕН лежать ниже 0x40000000 (см. комментарий у low_ram_idx в начале
-    // main()) — иначе VideoCore физически не видит эту память, независимо
-    // от bus-адреса. Берём страницу из low_ram_idx, а не из normal_untyped
-    // (последний — самый большой untyped, почти наверняка выше границы 1GB).
-    // Мапим НЕКЭШИРУЕМЫМ (без seL4_ARM_PageCacheable) — VideoCore читает
-    // память напрямую по физическому адресу, а не через наш кэш ARM-ядра.
-    seL4_DebugPutString((char*)"[BRINGUP] mbox msg buffer: begin (low RAM)\n");
-    if (low_ram_idx == (size_t)-1) {
-        seL4_DebugPutString((char*)"[BRINGUP] FATAL: no untyped region entirely below 0x40000000!\n");
-        while(1);
-    }
-    debug_puthex32("[BRINGUP] low_ram_idx.paddr = ", (uint32_t)info->untypedList[low_ram_idx].paddr);
-    debug_puthex32("[BRINGUP] low_ram_idx.sizeBits = ", (uint32_t)info->untypedList[low_ram_idx].sizeBits);
-    seL4_CPtr mbox_msg_frame = alloc_device_frame(info, alloc, info->untypedList[low_ram_idx].paddr, root_cnode);
-    uintptr_t mbox_msg_vaddr = PLAT_MBOX_MSG_VADDR;
-    seL4_ARM_Page_Map(mbox_msg_frame, root_vspace, mbox_msg_vaddr, seL4_AllRights, seL4_ARM_ParityEnabled);
-    uint32_t mbox_msg_paddr = (uint32_t)info->untypedList[low_ram_idx].paddr; // = target_paddr, alloc_device_frame гарантирует точное совпадение
-    // Bus-адрес для VideoCore: некэшируемый alias, ARM_PHYS + 0xC0000000
-    // (см. /soc/dma-ranges = <0xc0000000 0x00 0x00 0x40000000> в rpi4.dts).
-    uint32_t mbox_msg_bus_addr = mbox_msg_paddr | 0xC0000000u;
-    debug_puthex32("[BRINGUP] mbox msg buffer paddr = ", mbox_msg_paddr);
-    debug_puthex32("[BRINGUP] mbox msg buffer bus addr = ", mbox_msg_bus_addr);
-    seL4_DebugPutString((char*)"[BRINGUP] mapping mailbox: done, calling mailbox_set_uart_clock\n");
-
-    mailbox_set_uart_clock((void*)mailbox_vaddr, (volatile uint32_t*)mbox_msg_vaddr,
-                            mbox_msg_bus_addr, RPI4_UART0_CLK_HZ);
-    seL4_DebugPutString((char*)"[BRINGUP] mailbox_set_uart_clock: done, calling uart_init\n");
-
     uart_init((void*)uart_vaddr);
-    seL4_DebugPutString((char*)"[BRINGUP] uart_init: done\n");
-
-    // ВРЕМЕННАЯ диагностика: читаем FR/CR напрямую и опрашиваем TXFF с
-    // ОГРАНИЧЕННЫМ числом итераций вместо бесконечного while(1) в
-    // uart_putc() — чтобы не потерять диагностику, если бит реально висит
-    // вечно (подозрение: PL011 UART0 на RPi4 требует явного включения
-    // тактовой частоты через VideoCore mailbox, иначе UARTEN ни на что не
-    // влияет — mini-UART тактуется от VPU-ядра и работает без этого шага,
-    // этим объясняется, почему отладочная консоль ядра всё время видна).
-    {
-        volatile uint32_t *diag_fr = (volatile uint32_t*)(uart_vaddr + PL011_FR_OFFSET);
-        volatile uint32_t *diag_cr = (volatile uint32_t*)(uart_vaddr + PL011_CR_OFFSET);
-        debug_puthex32("[BRINGUP] PL011 FR after init = ", *diag_fr);
-        debug_puthex32("[BRINGUP] PL011 CR after init = ", *diag_cr);
-        int spins = 0;
-        const int max_spins = 2000000;
-        while (((*diag_fr) & PL011_FR_TXFF) && spins < max_spins) spins++;
-        debug_puthex32("[BRINGUP] TXFF spin count = ", (uint32_t)spins);
-        debug_puthex32("[BRINGUP] PL011 FR after spin = ", *diag_fr);
-    }
+    seL4_DebugPutString((char*)"[BRINGUP] uart_init (mini-UART): done\n");
 
     if (!RPI4_BRINGUP_UART_ONLY) {
         timer_init((void*)rtc_vaddr);
@@ -837,7 +754,7 @@ int main(int argc, char *argv[]) {
               "  Psych Ward OS -- microkernel edition (seL4)\n"
               "=================================================\n");
     if (RPI4_BRINGUP_UART_ONLY) {
-        uart_puts("[ROOT] HW BRING-UP BUILD: UART/GPIO14/15 only, timer/blk/net DISABLED.\n"
+        uart_puts("[ROOT] HW BRING-UP BUILD: mini-UART only, timer/blk/net DISABLED.\n"
                    "[ROOT] time/date/sleep/ls/cat/exec/ping/... will hang -- do not use.\n");
     } else {
         uart_puts("[ROOT] Booting UART / Timer / Block / Net / Shell...\n");

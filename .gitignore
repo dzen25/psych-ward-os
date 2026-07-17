@@ -1,4 +1,5 @@
 build/
+build-rpi4/
 .vscode/
 *.log
 *.bin
