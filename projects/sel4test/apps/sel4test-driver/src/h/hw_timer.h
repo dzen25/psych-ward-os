@@ -1,7 +1,8 @@
 #pragma once
 #include "common.h"
 
-void timer_init(void *vaddr);
-uint64_t pl031_get_time();
-void pl031_set_match(uint32_t match_val);
-void pl031_clear_interrupt();
+// ARM generic timer (CNTVCT_EL0/CNTFRQ_EL0) — читается напрямую из EL0,
+// без MMIO/device-frame (см. hw_timer.cpp). Заменяет PL031 (Фаза 3.1,
+// ROADMAP.md) — на реальной RPi4 battery-backed RTC нет вообще.
+void timer_init();
+uint64_t hw_timer_get_uptime_ms();

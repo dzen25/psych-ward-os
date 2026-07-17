@@ -66,7 +66,7 @@ static void pl011_putchar(char c) {
     while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY)); *uart_io = c;
 }
 
-// ВРЕМЕННАЯ диагностика для hw bring-up (см. RPI4_BRINGUP_UART_ONLY в main()).
+// ВРЕМЕННАЯ диагностика для hw bring-up (см. RPI4_ENABLE_* в main()).
 // Печатает через отладочную консоль ядра (mini-UART, работает независимо от
 // состояния нашего PL011), так что видна даже если PL011 завис/не отвечает.
 static void debug_puthex32(const char *label, uint32_t val) {
@@ -79,7 +79,6 @@ static void debug_puthex32(const char *label, uint32_t val) {
 }
 
 
-static seL4_CPtr sleeper_reply_slot = 0; static bool sleeper_waiting = false;
 
 // --- В начале файла или внутри spawn_process ---
 // Базовые адреса для временного маппинга (сдвигаются атомарно)
@@ -103,8 +102,8 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
         }
     }
     if (idx == (size_t)-1) {
-        // ВРЕМЕННАЯ диагностика для hw bring-up на RPi4 — см. RPI4_BRINGUP_UART_ONLY
-        // в main(). seL4_DebugPutString идет через отладочную консоль ядра напрямую,
+        // ВРЕМЕННАЯ диагностика для hw bring-up на RPi4 — см. RPI4_ENABLE_* в main().
+        // seL4_DebugPutString идет через отладочную консоль ядра напрямую,
         // так что работает даже если наш собственный UART еще не замаплен.
         seL4_DebugPutString((char*)"[BRINGUP] alloc_device_frame: NOT FOUND in any untyped region, target_paddr=0x");
         for (int nib = 15; nib >= 0; nib--) {
@@ -115,14 +114,16 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
         while(1); // не нашли — фатально
     }
 
-    // ВРЕМЕННАЯ диагностика для hw bring-up на RPi4 — см. RPI4_BRINGUP_UART_ONLY.
-    // Печатаем, В КАКОЙ untyped-регион реально попал target_paddr: если
+    // Диагностика для hw bring-up на RPi4 (см. LOG_BRINGUP в platform.h) —
+    // печатает, В КАКОЙ untyped-регион реально попал target_paddr: если
     // isDevice=0, значит это обычная RAM, а не настоящий MMIO device-фрейм —
     // тогда чтение/запись регистров будут самосогласованы (что писали, то и
     // читаем), но к реальному железу отношения иметь не будут.
-    debug_puthex32("[BRINGUP]   matched region.paddr = ", (uint32_t)info->untypedList[idx].paddr);
-    debug_puthex32("[BRINGUP]   matched region.sizeBits = ", (uint32_t)info->untypedList[idx].sizeBits);
-    debug_puthex32("[BRINGUP]   matched region.isDevice = ", (uint32_t)info->untypedList[idx].isDevice);
+    if (LOG_BRINGUP) {
+        debug_puthex32("[BRINGUP]   matched region.paddr = ", (uint32_t)info->untypedList[idx].paddr);
+        debug_puthex32("[BRINGUP]   matched region.sizeBits = ", (uint32_t)info->untypedList[idx].sizeBits);
+        debug_puthex32("[BRINGUP]   matched region.isDevice = ", (uint32_t)info->untypedList[idx].isDevice);
+    }
 
     if (untyped_watermarks[idx] == 0)
         untyped_watermarks[idx] = info->untypedList[idx].paddr;
@@ -262,33 +263,46 @@ static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load
 }
 
 // Умная функция маппинга (Самовосстанавливающееся дерево VSpace)
+// Эта функция мапит ТОЛЬКО динамическое SHM (см. единственный вызов в
+// SYS_SHM_GET ниже) — а эта память используется как буфер и для GENET DMA
+// (net_driver.cpp: net_hw_send/net_hw_poll_rx), и GENET DMA-движок читает и
+// пишет физическую RAM напрямую, в обход кэша CPU. seL4_ARM_Default_VMAttributes
+// маппит страницу как обычную кэшируемую (WriteBack) память — тогда запись
+// пакета в SHM перед отправкой могла годами оставаться только в dirty-кэше
+// CPU и никогда не долетать до RAM до того, как DMA её оттуда читал (отсюда
+// "TX вроде завершается, а на проводе мусор" — GENET считает дескриптор
+// обработанным независимо от того, актуальны ли байты в физической памяти).
+// Явное cache maintenance (clean/invalidate) потребовало бы прокидывать
+// capability страницы через IPC в net_driver — вместо этого, как и для MMIO
+// device-страниц в этом же файле (см. комментарий про attridx=NORMAL/DEVICE
+// ниже), проще и надёжнее сразу мапить эту память некэшируемой: (seL4_ARM_VMAttributes)0.
 static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, seL4_CPtr frame, seL4_CPtr vspace, uintptr_t vaddr, seL4_CPtr normal_untyped, seL4_CPtr root_cnode) {
     // Сначала пробуем замапить фрейм напрямую
-    seL4_Error err = seL4_ARM_Page_Map(frame, vspace, vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-    
+    seL4_Error err = seL4_ARM_Page_Map(frame, vspace, vaddr, seL4_AllRights, (seL4_ARM_VMAttributes)0);
+
     if (err == seL4_FailedLookup) {
         // Не хватает промежуточных каталогов. Создаем их вслепую.
         // Если каталог уже существует (например, PGD[0]), seL4 вернет DeleteFirst (8). Мы ИГНОРИРУЕМ эту ошибку.
-        
+
         seL4_CPtr pud = alloc_and_track_cap(alloc, pcb);
         if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, pud, 1) == seL4_NoError) {
-            seL4_ARM_PageUpperDirectory_Map(pud, vspace, vaddr, seL4_ARM_Default_VMAttributes);
+            seL4_ARM_PageUpperDirectory_Map(pud, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
         seL4_CPtr pd = alloc_and_track_cap(alloc, pcb);
         if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pd, 1) == seL4_NoError) {
-            seL4_ARM_PageDirectory_Map(pd, vspace, vaddr, seL4_ARM_Default_VMAttributes);
+            seL4_ARM_PageDirectory_Map(pd, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
         seL4_CPtr pt = alloc_and_track_cap(alloc, pcb);
         if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1) == seL4_NoError) {
-            seL4_ARM_PageTable_Map(pt, vspace, vaddr, seL4_ARM_Default_VMAttributes);
+            seL4_ARM_PageTable_Map(pt, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
         // Дерево проложено. Мапим фрейм повторно.
-        err = seL4_ARM_Page_Map(frame, vspace, vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+        err = seL4_ARM_Page_Map(frame, vspace, vaddr, seL4_AllRights, (seL4_ARM_VMAttributes)0);
     }
-    
+
     if (err != seL4_NoError) {
         uart_puts("[ROOT] FATAL: Robust map failed!\n");
         return false;
@@ -483,22 +497,27 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     child_ipc_ptr->msg[BOOT_ROOT_EP] = local_syscall_ep;
 
-    if (is_driver > 0 && is_driver <= 4) { // Any driver
+    // is_driver == 2 (timer) намеренно исключён: ARM generic timer читается
+    // прямой mrs-инструкцией из EL0 и не мапится как MMIO (см. hw_timer.cpp,
+    // main() выше) — hw_frame для него всегда 0, мапить нечего.
+    if (hw_frame != 0 && (is_driver == 1 || is_driver == 3 || is_driver == 4)) { // Any driver with real MMIO
         seL4_CPtr drv_pud = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pd  = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pt  = alloc_and_track_cap(alloc, pcb);
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, drv_pud, 1), "Retype Drv PUD");
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
-        
+
         uintptr_t hw_vaddr = (is_driver == 1) ? PLAT_UART_VADDR :
-                             ((is_driver == 2) ? PLAT_RTC_VADDR : PLAT_VIRTIO_MMIO_VADDR);
-        
+                             ((is_driver == 3) ? PLAT_EMMC_VADDR : PLAT_GENET_VADDR);
+
         seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
         seL4_ARM_PageDirectory_Map(drv_pd, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
         seL4_ARM_PageTable_Map(drv_pt, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
 
-        int num_pages = (is_driver == 3 || is_driver == 4) ? 4 : 1;
+        // EMMC2 умещается в одну страницу (0x100 байт регистров). GENET
+        // занимает целых 64KB (0x10000) — 16 страниц.
+        int num_pages = (is_driver == 4) ? 16 : 1;
         for (int i = 0; i < num_pages; i++) {
             seL4_CPtr frame_child = alloc_and_track_cap(alloc, pcb);
             check_err(seL4_CNode_Copy(root_cnode, frame_child, seL4_WordBits, 
@@ -519,10 +538,11 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
-        } else if (is_driver == 4) { // Net driver - клиент консоли и таймера
+        } else if (is_driver == 4) { // Net driver - клиент консоли, таймера и blk (журнал net_udp.log)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
             child_ipc_ptr->msg[BOOT_NET_EP] = local_net_recv_ep;
+            child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
         }
 
     } else {
@@ -574,8 +594,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_TCB_SetTLSBase(tcb, child_ipc + 3072);
     seL4_TCB_SetPriority(tcb, seL4_CapInitThreadTCB, 254);
 
-    // Привязываем прерывание ТОЛЬКО драйверам (Оболочка работает без IRQ)
-    if (is_driver == 1 || is_driver == 2) {
+    // Привязываем прерывание только тем драйверам, у кого реально есть IRQ
+    // (раньше это было "is_driver == 1 || is_driver == 2", но таймер (2)
+    // больше не MMIO/IRQ-устройство — ARM generic timer читается из EL0
+    // напрямую, см. platform.h/hw_timer.cpp — irq_ntfn для него теперь 0,
+    // а bind нулевой notification-капы — IllegalOperation в ядре).
+    if (irq_ntfn != 0) {
         check_err(seL4_TCB_BindNotification(tcb, irq_ntfn), "Bind IRQ to Driver");
     }
 
@@ -685,7 +709,6 @@ int main(int argc, char *argv[]) {
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
-    sleeper_reply_slot = alloc.alloc_slot();
 
     seL4_CPtr pmd = alloc.alloc_slot();
     seL4_CPtr pt = alloc.alloc_slot();
@@ -697,65 +720,68 @@ int main(int argc, char *argv[]) {
     seL4_CPtr pt_ipc_temp = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt_ipc_temp, 1);
 
-    // --- ВРЕМЕННО (hw bring-up на живой плате): RTC/virtio-mmio ещё не
-    // портированы под RPi4 — PLAT_RTC_PADDR/PLAT_VIRTIO_MMIO_PADDR всё ещё
-    // QEMU-адреса (см. platform.h, ROADMAP.md Фаза 3.1-3.3). На реальном
-    // железе они не попадают ни в один device-untyped регион: alloc_device_frame()
-    // находит вместо этого обычную RAM и уходит в watermark-цикл на десятки
-    // тысяч итераций ещё до вызова uart_init(), исчерпывая слоты CNode
-    // ("Untyped Retype: Slot #0 in destination window non-empty" в логе
-    // ядра). Пока RTC/virtio не переписаны под ARM generic timer/GENET/EMMC2,
-    // timer_driver/blk_driver/net_driver не спавним — так проверяется путь
-    // UART отдельно от них. Вернуть в false вместе с Фазой 3.1-3.3.
-    constexpr bool RPI4_BRINGUP_UART_ONLY = true;
+    // --- ВРЕМЕННО (hw bring-up на живой плате): гранулярные флаги на каждый
+    // драйвер (см. platform.h, ROADMAP.md Фаза 3). Все три теперь портированы
+    // на реальные адреса/механизмы RPi4 — UART/EMMC2/GENET через
+    // alloc_device_frame(), таймер вообще без MMIO (ARM generic timer,
+    // CNTVCT_EL0/CNTFRQ_EL0 из EL0, см. hw_timer.cpp).
+    constexpr bool RPI4_ENABLE_TIMER = true;
+    constexpr bool RPI4_ENABLE_BLK   = true;
+    constexpr bool RPI4_ENABLE_NET   = true;
 
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
-    seL4_CPtr rtc_frame = 0;
-    seL4_CPtr virtio_frames[PLAT_VIRTIO_MMIO_SLOTS] = {0};
-    if (!RPI4_BRINGUP_UART_ONLY) {
-        rtc_frame = alloc_device_frame(info, alloc, PLAT_RTC_PADDR, root_cnode);
-        for (int i = 0; i < PLAT_VIRTIO_MMIO_SLOTS; i++) {
-            virtio_frames[i] = alloc_device_frame(info, alloc, PLAT_VIRTIO_MMIO_PADDR + (i * 4096), root_cnode);
+    seL4_CPtr emmc_frame = 0;
+    // GENET занимает 64KB (0x10000) — 16 страниц, а не один слот, как EMMC2.
+    seL4_CPtr genet_frames[16] = {0};
+    if (RPI4_ENABLE_BLK) {
+        emmc_frame = alloc_device_frame(info, alloc, PLAT_EMMC_PADDR, root_cnode);
+    }
+    if (RPI4_ENABLE_NET) {
+        for (int i = 0; i < 16; i++) {
+            genet_frames[i] = alloc_device_frame(info, alloc, PLAT_GENET_PADDR + (i * 4096), root_cnode);
         }
     }
 
+    // ВАЖНО: MMIO должен маппиться некэшируемым (Device memory), иначе CPU
+    // читает FR/LSR из кэша и никогда не видит обновления статусных битов
+    // железа — драйвер зависает в busy-wait навечно. seL4_ARM_Default_VMAttributes
+    // включает PageCacheable (см. kernel/src/arch/arm/64/kernel/vspace.c:
+    // makeUserPagePTE — cacheable=1 выбирает attridx=NORMAL вместо DEVICE_nGnRnE).
+    // Тот же (seL4_ARM_VMAttributes)0 уже правильно используется ниже для
+    // маппинга UART в дочерний uart_driver (см. hw_vaddr).
     uintptr_t uart_vaddr = PLAT_UART_VADDR;
-    seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
-    seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, seL4_ARM_Default_VMAttributes);
-    seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+    seL4_ARM_PageDirectory_Map(pmd, root_vspace, uart_vaddr, (seL4_ARM_VMAttributes)0);
+    seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, (seL4_ARM_VMAttributes)0);
+    seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, (seL4_ARM_VMAttributes)0);
 
     // Мапим таблицу для временного окна IPC. Адрес должен совпадать с global_ipc_temp_vaddr.
     // Одна таблица покрывает 2MB, чего достаточно для 512 процессов.
     seL4_ARM_PageTable_Map(pt_ipc_temp, root_vspace, 0x200800000ULL, seL4_ARM_Default_VMAttributes);
 
-    uintptr_t rtc_vaddr = PLAT_RTC_VADDR;
-    if (!RPI4_BRINGUP_UART_ONLY) {
-        seL4_ARM_Page_Map(rtc_frame, root_vspace, rtc_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
-    }
-
     uart_init((void*)uart_vaddr);
     seL4_DebugPutString((char*)"[BRINGUP] uart_init (mini-UART): done\n");
 
-    if (!RPI4_BRINGUP_UART_ONLY) {
-        timer_init((void*)rtc_vaddr);
+    if (RPI4_ENABLE_TIMER) {
+        timer_init(); // ARM generic timer — без device-frame, см. выше
     }
 
-    if (RPI4_BRINGUP_UART_ONLY) {
-        // timer/blk/net не спавнятся в этой сборке — см. RPI4_BRINGUP_UART_ONLY
-        // выше — поэтому они никогда не пришлют SYS_DRIVER_READY. Отмечаем их
-        // готовыми заранее, иначе shell навечно зависнет в SYS_WAIT_ALL_DRIVERS_READY
-        // (main.cpp, all_drivers_ready() ждёт все 4 индекса безусловно).
-        driver_ready[2] = true; // timer
-        driver_ready[3] = true; // blk
-        driver_ready[4] = true; // net
-    }
+    // Драйверы, которые в этой сборке не спавнятся (см. RPI4_ENABLE_* выше),
+    // никогда не пришлют SYS_DRIVER_READY — отмечаем их готовыми заранее,
+    // иначе shell навечно зависнет в SYS_WAIT_ALL_DRIVERS_READY (main.cpp,
+    // all_drivers_ready() ждёт все 4 индекса безусловно).
+    if (!RPI4_ENABLE_TIMER) driver_ready[2] = true;
+    if (!RPI4_ENABLE_BLK)   driver_ready[3] = true;
+    if (!RPI4_ENABLE_NET)   driver_ready[4] = true;
 
     uart_puts("\n=================================================\n"
               "  Psych Ward OS -- microkernel edition (seL4)\n"
               "=================================================\n");
-    if (RPI4_BRINGUP_UART_ONLY) {
-        uart_puts("[ROOT] HW BRING-UP BUILD: mini-UART only, timer/blk/net DISABLED.\n"
-                   "[ROOT] time/date/sleep/ls/cat/exec/ping/... will hang -- do not use.\n");
+    if (!RPI4_ENABLE_TIMER || !RPI4_ENABLE_BLK || !RPI4_ENABLE_NET) {
+        uart_puts("[ROOT] HW BRING-UP BUILD:");
+        if (!RPI4_ENABLE_TIMER) uart_puts(" timer DISABLED (time/date/sleep/ntp will hang);");
+        if (!RPI4_ENABLE_BLK)   uart_puts(" blk DISABLED (ls/cat/exec/touch/... will hang);");
+        if (!RPI4_ENABLE_NET)   uart_puts(" net DISABLED (ping/send/... will hang);");
+        uart_puts("\n");
     } else {
         uart_puts("[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
     }
@@ -795,14 +821,9 @@ int main(int argc, char *argv[]) {
     seL4_CNode_Copy(root_cnode, net_cmd_send_ep, seL4_WordBits,
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CapRights_new(0, 1, 0, 1)); // Write + Grant
 
-    seL4_CPtr timer_ntfn = alloc.alloc_slot();
-    seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
-    seL4_CPtr timer_irq_handler = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
-    seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, 2); 
-    seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_TIMER_IRQ, root_cnode, timer_irq_handler, seL4_WordBits);
-    seL4_IRQHandler_SetNotification(timer_irq_handler, badged_timer_ntfn);
-    seL4_IRQHandler_Ack(timer_irq_handler);
+    // Таймер (ARM generic timer) не MMIO-устройство и не генерирует IRQ,
+    // доступный из EL0 на этой сборке ядра (см. hw_timer.cpp) — никакой
+    // IRQ-обвязки timer_driver'у больше не нужно, в отличие от PL031.
 
     seL4_CPtr uart_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_uart_ntfn = alloc.alloc_slot(); 
@@ -820,21 +841,25 @@ int main(int argc, char *argv[]) {
         uart_puts("PANIC: UART Driver failed to load!\n"); while(1);
     }
 
-    if (!RPI4_BRINGUP_UART_ONLY) {
+    if (RPI4_ENABLE_TIMER) {
     // Запускаем Драйвер Таймера (is_driver = 2)
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, rtc_frame) < 0) {
+                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, 0) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
-
-    // Запускаем Драйвер Диска и ФС (is_driver = 3)
-    if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0]) < 0) {
-        uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
 
+    if (RPI4_ENABLE_BLK) {
+    // Запускаем Драйвер Диска и ФС (is_driver = 3)
+    if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, emmc_frame) < 0) {
+        uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
+    }
+    }
+
+    if (RPI4_ENABLE_NET) {
     if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      4, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, virtio_frames[0], nullptr,
+                      4, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, genet_frames[0], nullptr,
                       net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
@@ -946,25 +971,20 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SYS_GET_TIME: {
-                uint64_t ms = pl031_get_time() * 1000; 
+                uint64_t ms = hw_timer_get_uptime_ms();
                 seL4_SetMR(0, (seL4_Word)ms); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 
             case SYS_SLEEP:
-                if (sleeper_waiting) {
-                    seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                } else {
-                    seL4_Error err = seL4_CNode_SaveCaller(root_cnode, sleeper_reply_slot, seL4_WordBits);
-                    if (err == seL4_NoError) {
-                        sleeper_waiting = true;
-                        uint32_t seconds = arg1 / 1000;
-                        if (seconds == 0) seconds = 1; 
-                        pl031_set_match(pl031_get_time() + seconds); 
-                    } else {
-                        seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                    }
-                }
+                // ARM generic timer не даёт с EL0 аппаратного будильника (см.
+                // hw_timer.cpp — EXPORT_PTMR_USER/VTMR_USER=false в этой
+                // сборке ядра), а PL031-альтернативы на реальном железе нет.
+                // Этот путь и раньше никем не вызывался (шелл спит через
+                // клиентский поллинг SYS_GET_TIME, см. shell.cpp sys_sleep())
+                // — отвечаем честной ошибкой вместо того, чтобы бесконечно
+                // повесить вызывающего в SaveCaller без шанса на пробуждение.
+                seL4_SetMR(0, (seL4_Word)-1); seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
                 
             case SYS_PUTCHAR:

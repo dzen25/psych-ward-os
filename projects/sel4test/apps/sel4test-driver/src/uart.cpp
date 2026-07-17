@@ -106,7 +106,7 @@ void handle_command(char *cmd) {
         uart_puts("\n--- System Status ---\n");
         uart_puts("UART: mapped at 0x200000000\n");
         uart_puts("Timer freq: ");
-        uart_puthex(32768); // Частота таймера PL031 в QEMU
+        uart_puthex(32768); // Заглушка (этот built-in "status" не читает реальный CNTFRQ_EL0)
         uart_puts(" Hz\n");
         uart_puts("----------------------\n");
     } else if (my_strcmp(cmd, "sleep") == 0) {

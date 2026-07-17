@@ -6,41 +6,31 @@
 
 uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name);
 
-struct VirtioMmioRegs {
-    uint32_t magic_value;        // 0x000 (Должно быть 0x74726976)
-    uint32_t version;            // 0x004
-    uint32_t device_id;          // 0x008 (Должно быть 2)
-    uint32_t vendor_id;          // 0x00c
-    uint32_t host_features;      // 0x010
-    uint32_t host_features_sel;  // 0x014
-    uint32_t reserved_1[2];      // 0x018 - 0x01c (пропуск)
-    uint32_t guest_features;     // 0x020
-    uint32_t guest_features_sel; // 0x024
-    uint32_t guest_page_size;    // 0x028
-    uint32_t reserved_2;         // 0x02c
-    uint32_t queue_sel;          // 0x030
-    uint32_t queue_num_max;      // 0x034
-    uint32_t queue_num;          // 0x038
-    uint32_t queue_align;        // 0x03c
-    uint32_t queue_pfn;          // 0x040
-    uint32_t reserved_3[3];      // 0x044
-    uint32_t queue_notify;       // 0x050
-    uint32_t reserved_4[3];      // 0x054
-    uint32_t interrupt_status;   // 0x060
-    uint32_t interrupt_ack;      // 0x064
-    uint32_t reserved_5[2];      // 0x068
-    uint32_t status;             // 0x070 (Тот самый регистр!)
-};
-
 // --- Глобальные переменные ---
 static char* g_shm_vaddr = nullptr;
-static uint32_t g_shm_paddr = 0;
 static FAT32_Instance g_file_system;
 
-// Глобальные переменные VirtIO
-static volatile VirtioMmioRegs* g_disk_regs = nullptr;
-static uint16_t g_vq_avail_idx = 0;
-static char* virtio_q_shm_base = nullptr;
+// Глобальные переменные EMMC2 (см. h/platform.h — регистровая карта SDHCI)
+static volatile uint32_t* g_emmc_base = nullptr;
+static uint32_t g_emmc_rca = 0; // Relative Card Address, получаем в emmc_init()
+
+// Смещение (в секторах) начала FAT32-раздела на физической карте — см.
+// find_fat32_partition() ниже. На стандартно размеченной SD-карте (с MBR)
+// сектор 0 диска — это НЕ BPB, а таблица разделов; реальный BPB лежит по
+// LBA первого FAT-раздела. 0 — если раздела нет и сектор 0 сам является BPB.
+static uint32_t g_partition_start_sector = 0;
+
+// Чтение (ls/cat) подтверждено стабильным на 3 холодных перезагрузках —
+// включаем запись. ВНИМАНИЕ: FAT32-раздел на реальной SD-карте — тот же
+// раздел с config.txt/образом ОС, так что первые тесты (touch/echo/mkdir/rm/mv)
+// нужно делать на некритичных новых файлах, не трогая config.txt/u-boot.bin/
+// sel4test-driver-image-arm-bcm2711/bcm2711-rpi-4-b.dtb/START4.ELF/BOOT.SCR.
+constexpr bool RPI4_EMMC_ALLOW_WRITE = true;
+
+// Пользовательская рабочая директория (создаётся при первом запуске, если
+// нет — см. main()). Загрузочные файлы (config.txt/u-boot.bin/образ ОС)
+// остаются в корне раздела, шелл при старте всегда оказывается здесь.
+constexpr const char* USER_ROOT_DIR = "/root";
 
 // --- Вспомогательные функции ---
 static void my_memcpy(void *dest, const void *src, int n) {
@@ -73,12 +63,17 @@ void __assert_fail(const char *expr, const char *file, int line, const char *fun
     while (1) {}
 }
 
-// --- СТРОГИЕ СМЕЩЕНИЯ VIRTIO (Legacy Spec) ---
-#define VQ_DESC_OFFSET      0x000
-#define VQ_AVAIL_OFFSET     0x100
-#define VQ_USED_OFFSET      0x140
-#define BLK_REQ_OFFSET      0x200
-#define BLK_STATUS_OFFSET   0x220
+static void sys_puts(seL4_CPtr console_ep, const char *str);
+
+static void sys_puthex32(seL4_CPtr console_ep, const char* label, uint32_t val) {
+    sys_puts(console_ep, label);
+    char buf[11];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 8; i++) buf[2 + i] = "0123456789abcdef"[(val >> ((7 - i) * 4)) & 0xF];
+    buf[10] = 0;
+    sys_puts(console_ep, buf);
+    sys_puts(console_ep, "\n");
+}
 
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -103,111 +98,302 @@ static void sys_puts(seL4_CPtr console_ep, const char *str) {
 // ==========================================
 // Глобальное состояние FAT32
 // ==========================================
-struct virtq_desc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
-struct virtq_avail { uint16_t flags; uint16_t idx; uint16_t ring[16]; };
-struct virtq_used_elem { uint32_t id; uint32_t len; };
-struct virtq_used { uint16_t flags; uint16_t idx; virtq_used_elem ring[16]; };
-struct virtio_blk_req { uint32_t type; uint32_t reserved; uint64_t sector; };
 
 // ========================================================
-// АППАРАТНЫЙ УРОВЕНЬ: Функция, которую будет дергать FAT32
+// АППАРАТНЫЙ УРОВЕНЬ: EMMC2 (Arasan SDHCI), PIO/polling.
+// Регистровая карта и биты — см. h/platform.h (EMMC_*).
 // ========================================================
-bool hardware_virtio_read(uint32_t sector, uint32_t count, void* buffer) {
-    // Эта функция читает в временный DMA-буфер в разделяемой памяти,
-    // а затем копирует в конечный буфер 'buffer'.
-    uint32_t len = count * 512;
+static inline volatile uint32_t* emmc_reg(uintptr_t offset) {
+    return (volatile uint32_t*)((uintptr_t)g_emmc_base + offset);
+}
 
-    // Проверка, не слишком ли велик запрос для нашего одностраничного DMA-буфера
-    if (len > 4096) {
-        // Этот простой драйвер пока поддерживает чтение только в пределах одной страницы.
+static bool emmc_wait_cmd_ready() {
+    uint32_t timeout = 1000000;
+    while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_CMD_INHIBIT) {
+        if (--timeout == 0) return false;
+        seL4_Yield();
+    }
+    return true;
+}
+
+static bool emmc_wait_dat_ready() {
+    uint32_t timeout = 1000000;
+    while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_DAT_INHIBIT) {
+        if (--timeout == 0) return false;
+        seL4_Yield();
+    }
+    return true;
+}
+
+// Ждет конкретный бит в INTERRUPT (READ_RDY/WRITE_RDY/DATA_DONE/CMD_DONE),
+// сбрасывает его по получении. Любая ошибка (верхние 16 бит) — немедленный отказ.
+static bool emmc_wait_irpt_bit(uint32_t bit) {
+    uint32_t timeout = 1000000;
+    while (true) {
+        uint32_t irpt = *emmc_reg(EMMC_INTERRUPT_OFFSET);
+        if (irpt & EMMC_INT_ERROR_MASK) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = irpt; return false; }
+        if (irpt & bit) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = bit; return true; }
+        if (--timeout == 0) return false;
+        seL4_Yield();
+    }
+}
+
+static bool emmc_send_cmd(uint32_t cmd_flags, uint32_t index, uint32_t arg) {
+    if (!emmc_wait_cmd_ready()) return false;
+    *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF; // сброс старых статусов
+    *emmc_reg(EMMC_ARG1_OFFSET) = arg;
+    *emmc_reg(EMMC_CMDTM_OFFSET) = (index << EMMC_CMD_INDEX_SHIFT) | cmd_flags;
+    return emmc_wait_irpt_bit(EMMC_INT_CMD_DONE);
+}
+
+// Меняет делитель тактовой частоты (Divided Clock Mode). Клок обязательно
+// выключается перед сменой делителя и включается заново после стабилизации —
+// так требует SDHCI-спека.
+static void emmc_set_clock_divider(uint32_t divisor) {
+    uint32_t c1 = *emmc_reg(EMMC_CONTROL1_OFFSET) & ~EMMC_C1_CLK_EN;
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = c1;
+
+    c1 &= ~(0xFFu << EMMC_C1_CLK_FREQ_SHIFT);
+    c1 |= (divisor & 0xFFu) << EMMC_C1_CLK_FREQ_SHIFT;
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = c1;
+
+    uint32_t timeout = 1000000;
+    while (!(*emmc_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_CLK_STABLE)) {
+        if (--timeout == 0) break; // не фатально само по себе — увидим по дальнейшим таймаутам команд
+        seL4_Yield();
+    }
+
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = *emmc_reg(EMMC_CONTROL1_OFFSET) | EMMC_C1_CLK_EN;
+}
+
+// Стандартная последовательность инициализации SD-карты (см. план Фазы 3.3):
+// software reset -> идентификационный клок (~400kHz) -> CMD0 -> CMD8 ->
+// ACMD41 (ждём готовности OCR) -> CMD2 -> CMD3 (получаем RCA) -> CMD7
+// (выбираем карту) -> переключение на рабочий клок (~25MHz). 1-бит шина,
+// без high-speed — минимум подвижных частей для первого теста на живом железе.
+// console_ep — только для диагностики на живом железе (ВРЕМЕННО, см. ROADMAP.md
+// Фаза 3.3): печатаем, на каком именно шаге инициализация упала, плюс дамп
+// ключевых регистров в этот момент — без этого "EMMC2 init failed" ничего не
+// говорит о причине.
+bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
+    g_emmc_base = (volatile uint32_t*)vaddr;
+
+    // Диагностика состояния, оставленного U-Boot'ом (он же реально грузит наш
+    // образ с этой же карты через этот же контроллер, так что "до сброса" —
+    // заведомо рабочая конфигурация; сравнение с "после" покажет, что именно
+    // теряется после SRST_HC).
+    if (LOG_BLK) {
+        sys_puthex32(console_ep, "[BLK][EMMC] SLOTISR_VER (host version) = ", *emmc_reg(EMMC_SLOTISR_VER_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC] CAP0 (capabilities)        = ", *emmc_reg(EMMC_CAP0_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC] CONTROL0 before reset = ", *emmc_reg(EMMC_CONTROL0_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC] CONTROL1 before reset = ", *emmc_reg(EMMC_CONTROL1_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC] STATUS before reset    = ", *emmc_reg(EMMC_STATUS_OFFSET));
+    }
+
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = EMMC_C1_SRST_HC;
+    uint32_t timeout = 1000000;
+    while (*emmc_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_SRST_HC) {
+        if (--timeout == 0) {
+            sys_puts(console_ep, "[BLK][EMMC] FAIL: software reset (SRST_HC) never cleared\n");
+            sys_puthex32(console_ep, "[BLK][EMMC]   CONTROL1 = ", *emmc_reg(EMMC_CONTROL1_OFFSET));
+            return false;
+        }
+        seL4_Yield();
+    }
+    if (LOG_BLK) {
+        sys_puts(console_ep, "[BLK][EMMC] software reset OK\n");
+        sys_puthex32(console_ep, "[BLK][EMMC] CONTROL0 after reset = ", *emmc_reg(EMMC_CONTROL0_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC] CONTROL1 after reset = ", *emmc_reg(EMMC_CONTROL1_OFFSET));
+    }
+
+    // SRST_HC гасит питание шины (см. EMMC_C0_PWR_ON выше) — без этого ни одна
+    // команда никогда не завершится (CMD_INHIBIT висит вечно, INTERRUPT=0).
+    *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) | EMMC_C0_PWR_ON | EMMC_C0_PWR_3V3;
+    if (LOG_BLK) sys_puthex32(console_ep, "[BLK][EMMC] CONTROL0 after power-on = ", *emmc_reg(EMMC_CONTROL0_OFFSET));
+
+    *emmc_reg(EMMC_IRPT_MASK_OFFSET) = EMMC_INT_ALL_EN;
+    *emmc_reg(EMMC_IRPT_EN_OFFSET)   = 0; // сигнальные IRQ не используем, только статус-биты (polling)
+    *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF;
+
+    // Базовая частота EMMC2 на BCM2711 — фиксированные 100MHz (DT clocks =
+    // <0x06 0x33>). 0x80 -> 100MHz/(2*0x80) ≈ 390kHz (идентификационная стадия).
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = EMMC_C1_CLK_INTLEN | EMMC_C1_TOUNIT_MAX;
+    emmc_set_clock_divider(0x80);
+    if (LOG_BLK) sys_puthex32(console_ep, "[BLK][EMMC] CONTROL1 after clock setup = ", *emmc_reg(EMMC_CONTROL1_OFFSET));
+    if (!(*emmc_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_CLK_STABLE)) {
+        sys_puts(console_ep, "[BLK][EMMC] WARNING: clock not stable, continuing anyway\n");
+    }
+    // CLK_STABLE иногда выставляется раньше, чем клок реально устаканился на
+    // выходе (встречающийся на практике quirk некоторых SDHCI-реализаций) —
+    // добавляем небольшую "слепую" задержку сверх опроса бита, дешево и не
+    // мешает, если это не требуется.
+    for (int i = 0; i < 100000; i++) seL4_Yield();
+
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_NONE, EMMC_CMD_GO_IDLE, 0)) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD0 (GO_IDLE_STATE)\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   STATUS    = ", *emmc_reg(EMMC_STATUS_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC]   INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
         return false;
     }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] CMD0 OK\n");
 
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)((uintptr_t)virtio_q_shm_base + VQ_DESC_OFFSET);
-    volatile virtq_avail* vq_avail = (volatile virtq_avail*)((uintptr_t)virtio_q_shm_base + VQ_AVAIL_OFFSET);
-    volatile virtq_used* vq_used = (volatile virtq_used*)((uintptr_t)virtio_q_shm_base + VQ_USED_OFFSET);
-    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)((uintptr_t)virtio_q_shm_base + BLK_REQ_OFFSET);
-    volatile uint8_t* blk_status = (volatile uint8_t*)((uintptr_t)virtio_q_shm_base + BLK_STATUS_OFFSET);
-
-    // Подготовка запроса
-    blk_req->type = 0; // VIRTIO_BLK_T_IN (чтение)
-    blk_req->sector = sector;
-    *blk_status = 0xFF; // Невалидный статус
-    
-    // Дескриптор данных должен быть обновлен для этого чтения.
-    // DMA будет производиться в начало разделяемой области памяти.
-    vq_desc[1].addr = g_shm_paddr;
-    vq_desc[1].len = len;
-
-    // Добавляем цепочку дескрипторов в кольцо доступных
-    vq_avail->ring[g_vq_avail_idx % 16] = 0;
-    g_vq_avail_idx++;
-
-    // Барьер памяти, чтобы гарантировать, что записи дескриптора видны до обновления индекса
-    __atomic_store_n(&vq_avail->idx, g_vq_avail_idx, __ATOMIC_RELEASE);
-
-    // Уведомляем устройство
-    g_disk_regs->queue_notify = 0;
-
-    // Ждем, пока устройство обработает запрос
-    uint32_t timeout_counter = 5000000;
-    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) != g_vq_avail_idx) {
-        if (--timeout_counter == 0) {
-            return false; // Таймаут
-        }
-        seL4_Yield(); 
-    } 
-
-    // Проверяем статус
-    if (*blk_status != 0) {
-        return false; // VIRTIO_BLK_S_IOERR или VIRTIO_BLK_S_UNSUPP
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN,
+                        EMMC_CMD_SEND_IF_COND, 0x1AA)) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD8 (SEND_IF_COND) — command itself failed/timed out\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   STATUS    = ", *emmc_reg(EMMC_STATUS_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC]   INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
+        return false;
     }
+    uint32_t cmd8_resp = *emmc_reg(EMMC_RESP0_OFFSET);
+    if ((cmd8_resp & 0xFF) != 0xAA) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD8 echo mismatch (ответила, но не тем)\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   RESP0 = ", cmd8_resp);
+        return false;
+    }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] CMD8 OK\n");
 
-    // Копируем данные из DMA-буфера в конечное место назначения
-    my_memcpy(buffer, (void*)g_shm_vaddr, len);
+    bool ready = false;
+    uint32_t last_ocr = 0;
+    int acmd41_iters = 0;
+    for (int i = 0; i < 1000 && !ready; i++) {
+        acmd41_iters = i + 1;
+        if (!emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_CMD_APP_CMD, 0)) {
+            sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD55 (APP_CMD) во время ACMD41-цикла\n");
+            sys_puthex32(console_ep, "[BLK][EMMC]   iteration = ", (uint32_t)i);
+            return false;
+        }
+        if (!emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_ACMD_SD_SEND_OP_COND,
+                            EMMC_ACMD41_HCS | EMMC_ACMD41_VOLTAGE)) {
+            sys_puts(console_ep, "[BLK][EMMC] FAIL: ACMD41 — команда сама не прошла\n");
+            sys_puthex32(console_ep, "[BLK][EMMC]   iteration = ", (uint32_t)i);
+            return false;
+        }
+        last_ocr = *emmc_reg(EMMC_RESP0_OFFSET);
+        if (last_ocr & EMMC_OCR_READY) ready = true;
+        else seL4_Yield();
+    }
+    if (LOG_BLK) {
+        sys_puthex32(console_ep, "[BLK][EMMC] ACMD41 last OCR = ", last_ocr);
+        sys_puthex32(console_ep, "[BLK][EMMC] ACMD41 iterations = ", (uint32_t)acmd41_iters);
+    }
+    if (!ready) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: ACMD41 never set OCR ready bit (карта не готова за 1000 попыток)\n");
+        return false;
+    }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] ACMD41 OK, card ready\n");
+
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_136, EMMC_CMD_ALL_SEND_CID, 0)) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD2 (ALL_SEND_CID)\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
+        return false;
+    }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] CMD2 OK\n");
+
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_CMD_SEND_REL_ADDR, 0)) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD3 (SEND_RELATIVE_ADDR)\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
+        return false;
+    }
+    g_emmc_rca = *emmc_reg(EMMC_RESP0_OFFSET) & 0xFFFF0000u;
+    if (LOG_BLK) sys_puthex32(console_ep, "[BLK][EMMC] CMD3 OK, RCA = ", g_emmc_rca);
+
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_48B, EMMC_CMD_SELECT_CARD, g_emmc_rca)) {
+        sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD7 (SELECT_CARD)\n");
+        sys_puthex32(console_ep, "[BLK][EMMC]   STATUS    = ", *emmc_reg(EMMC_STATUS_OFFSET));
+        sys_puthex32(console_ep, "[BLK][EMMC]   INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
+        return false;
+    }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] CMD7 OK, card selected\n");
+
+    // 0x02 -> 100MHz/(2*2) = 25MHz (рабочая стадия, standard speed).
+    emmc_set_clock_divider(0x02);
 
     return true;
 }
 
-bool hardware_virtio_write(uint32_t sector, uint32_t count, const void* buffer) {
-    uint32_t len = count * 512;
-    if (len > 4096) return false;
+// Читает/пишет по одному сектору за раз (CMD17/CMD24) — без multi-block
+// (CMD18/CMD25), чтобы не связываться с auto-CMD12/CMD23 на первом проходе.
+// FAT32-слой запрашивает не больше 8 секторов (1 страница SHM) за вызов, так
+// что цикл по count здесь совсем короткий.
+bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
+    if (count == 0 || count > 8) return false;
+    uint32_t* out = (uint32_t*)buffer;
 
-    // Копируем данные из безопасного буфера в DMA-буфер разделяемой памяти (Page 0)
-    my_memcpy((void*)g_shm_vaddr, buffer, len);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!emmc_wait_dat_ready()) return false;
+        *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (1u << 16) | 512;
 
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)((uintptr_t)virtio_q_shm_base + VQ_DESC_OFFSET);
-    volatile virtq_avail* vq_avail = (volatile virtq_avail*)((uintptr_t)virtio_q_shm_base + VQ_AVAIL_OFFSET);
-    volatile virtq_used* vq_used = (volatile virtq_used*)((uintptr_t)virtio_q_shm_base + VQ_USED_OFFSET);
-    volatile virtio_blk_req* blk_req = (volatile virtio_blk_req*)((uintptr_t)virtio_q_shm_base + BLK_REQ_OFFSET);
-    volatile uint8_t* blk_status = (volatile uint8_t*)((uintptr_t)virtio_q_shm_base + BLK_STATUS_OFFSET);
+        uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
+                            | EMMC_CMD_ISDATA | EMMC_TM_DAT_DIR_READ;
+        if (!emmc_send_cmd(cmd_flags, EMMC_CMD_READ_SINGLE, g_partition_start_sector + sector + i)) return false;
 
-    blk_req->type = 1; // VIRTIO_BLK_T_OUT (ЗАПИСЬ)
-    blk_req->sector = sector;
-    *blk_status = 0xFF; // Сброс статуса
-    
-    vq_desc[1].addr = g_shm_paddr;
-    vq_desc[1].len = len;
-    // ВАЖНО: Убираем флаг WRITE, потому что для записи на диск, диск должен ЧИТАТЬ из RAM
-    vq_desc[1].flags = 1; // Только VIRTQ_DESC_F_NEXT
-    vq_desc[1].next = 2;
+        if (!emmc_wait_irpt_bit(EMMC_INT_READ_RDY)) return false;
+        for (int w = 0; w < 128; w++) out[i * 128 + w] = *emmc_reg(EMMC_DATA_OFFSET);
+        if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+    }
+    return true;
+}
 
-    vq_avail->ring[g_vq_avail_idx % 16] = 0;
-    g_vq_avail_idx++;
-    __atomic_store_n(&vq_avail->idx, g_vq_avail_idx, __ATOMIC_RELEASE);
+bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
+    if (!RPI4_EMMC_ALLOW_WRITE) return false;
+    if (count == 0 || count > 8) return false;
+    const uint32_t* in = (const uint32_t*)buffer;
 
-    g_disk_regs->queue_notify = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!emmc_wait_dat_ready()) return false;
+        *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (1u << 16) | 512;
 
-    uint32_t timeout_counter = 5000000;
-    while (__atomic_load_n(&vq_used->idx, __ATOMIC_ACQUIRE) != g_vq_avail_idx) {
-        if (--timeout_counter == 0) return false;
-        seL4_Yield(); 
-    } 
+        uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN | EMMC_CMD_ISDATA;
+        if (!emmc_send_cmd(cmd_flags, EMMC_CMD_WRITE_SINGLE, g_partition_start_sector + sector + i)) return false;
 
-    // ВОЗВРАЩАЕМ дескриптор в режим ЧТЕНИЯ для будущих операций
-    vq_desc[1].flags = 1 | 2; // NEXT | WRITE
+        if (!emmc_wait_irpt_bit(EMMC_INT_WRITE_RDY)) return false;
+        for (int w = 0; w < 128; w++) *emmc_reg(EMMC_DATA_OFFSET) = in[i * 128 + w];
+        if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+    }
+    return true;
+}
 
-    return (*blk_status == 0);
+// Стандартно размеченные SD-карты (в т.ч. подготовленные обычными
+// инструментами вроде Raspberry Pi Imager) несут MBR в секторе 0 — это НЕ
+// BPB, а таблица разделов, и реальный FAT32 начинается по LBA первого
+// FAT-раздела. fat32_init() слепо трактует сектор 0 как BPB и не проверяет
+// сигнатуры, поэтому на такой карте "монтирование" формально проходит (все
+// поля защищены дефолтами на случай нулевых значений), но реального
+// содержимого не видно — корневая директория читается из данных MBR/боот-кода,
+// что выглядит как пустой каталог. Проверяем сигнатуру 0x55AA и jump instruction
+// (0xEB/0xE9 — то, чем всегда начинается настоящий BPB), и если сектор 0 не
+// похож на BPB — ищем первый FAT32/FAT16-раздел (тип 0x0B/0x0C/0x0E) в
+// таблице MBR и сдвигаем все дальнейшие чтения/записи на его LBA.
+static void find_fat32_partition(seL4_CPtr console_ep) {
+    uint8_t sector0[512];
+    if (!hardware_emmc_read(0, 1, sector0)) {
+        sys_puts(console_ep, "[BLK] WARNING: couldn't read sector 0 to detect partition table.\n");
+        return;
+    }
+
+    uint16_t sig = (uint16_t)sector0[510] | ((uint16_t)sector0[511] << 8);
+    bool looks_like_bpb = (sector0[0] == 0xEB || sector0[0] == 0xE9);
+
+    if (looks_like_bpb) {
+        if (LOG_BLK) sys_puts(console_ep, "[BLK] sector 0 looks like a raw FAT32 BPB (no MBR).\n");
+        return;
+    }
+    if (sig != 0xAA55) {
+        sys_puts(console_ep, "[BLK] WARNING: sector 0 is neither a BPB nor has an MBR signature — mounting as-is.\n");
+        return;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        const uint8_t* entry = &sector0[0x1BE + i * 16];
+        uint8_t type = entry[4];
+        if (type == 0x0B || type == 0x0C || type == 0x0E) { // FAT32 (CHS/LBA) / FAT16 LBA
+            g_partition_start_sector = (uint32_t)entry[8] | ((uint32_t)entry[9] << 8)
+                                      | ((uint32_t)entry[10] << 16) | ((uint32_t)entry[11] << 24);
+            if (LOG_BLK) sys_puthex32(console_ep, "[BLK] MBR partition found, start LBA = ", g_partition_start_sector);
+            return;
+        }
+    }
+    sys_puts(console_ep, "[BLK] WARNING: MBR signature found but no FAT partition entry — mounting sector 0 as-is.\n");
 }
 
 // Helper to get the sector of the current working directory
@@ -237,16 +423,15 @@ int main(int argc, char *argv[]) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
 
-    sys_puts(console_ep, "\n[BLK] Server online.\n");
+    if (LOG_BLK) sys_puts(console_ep, "\n[BLK] Server online.\n");
 
     // --- ДИНАМИЧЕСКИЙ ЗАПРОС SHM ---
-    sys_puts(console_ep, "[BLK] Requesting SHM from kernel...\n");
+    if (LOG_BLK) sys_puts(console_ep, "[BLK] Requesting SHM from kernel...\n");
     seL4_SetMR(0, 107); // SYS_SHM_GET
     seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 1);
     seL4_Call(root_ep, msg);
 
     g_shm_vaddr = (char*)seL4_GetMR(0);
-    g_shm_paddr = (uint32_t)seL4_GetMR(1);
 
     if (!g_shm_vaddr) {
         sys_puts(console_ep, "[BLK] FATAL: Failed to get dynamic SHM!\n");
@@ -257,78 +442,55 @@ int main(int argc, char *argv[]) {
         while(1) seL4_Yield();
     }
 
-    // Структуры virtio-очереди будут находиться на второй странице нашей SHM-области.
-    virtio_q_shm_base = g_shm_vaddr + 0x1000;
-
-    // 2. Инициализация железа (MMIO VirtIO)
-    // Поиск устройства
-    for (int i = 0; i < 32; i++) {
-        uintptr_t slot_addr = PLAT_VIRTIO_MMIO_VADDR + (i * PLAT_VIRTIO_MMIO_STRIDE);
-        volatile VirtioMmioRegs* regs = (volatile VirtioMmioRegs*)slot_addr;
-        if (regs->magic_value == VIRTIO_MMIO_MAGIC && regs->device_id == VIRTIO_DEVICE_ID_BLOCK) {
-            g_disk_regs = regs;
-            break;
-        }
-    }
-
-    if (!g_disk_regs) {
-        sys_puts(console_ep, "[BLK] ERROR: Block device not found.\n");
+    // 2. Инициализация железа (EMMC2, PIO/polling — см. h/platform.h, emmc_init() выше)
+    if (!emmc_init((void*)PLAT_EMMC_VADDR, console_ep)) {
+        sys_puts(console_ep, "[BLK] ERROR: EMMC2 init failed.\n");
         // Как и выше — сигналим готовность перед выходом, иначе rootserver
         // навечно зависнет и не запустит остальные модули/shell.
+        // ВАЖНО: 'return' из main() здесь недопустим — без обвязки libc/_exit
+        // это уводит PC в мусор (см. PID:2 PC=0 фолт в логе живого железа) и
+        // watchdog уходит в бесконечный респавн. while(1) паркует процесс
+        // безопасно, ровно как уже сделано в других error-путях этого файла.
         seL4_SetMR(0, SYS_DRIVER_READY);
         seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-        return -1;
+        while(1) seL4_Yield();
     }
+    if (LOG_BLK) sys_puts(console_ep, "[BLK] EMMC2 initialized.\n");
 
-    // === WATCHDOG-SAFE RESET ===
-    // 1. Жесткий сброс устройства VirtIO. Запись 0 в status возвращает его в исходное состояние.
-    g_disk_regs->status = 0;
-
-    // 2. Очистка "грязной" SHM от старых дескрипторов, оставшихся от упавшего процесса.
-    // Это предотвращает ошибку "Virtqueue size exceeded" в QEMU при респавне.
-    for (int i = 0; i < 4096; i++) {
-        virtio_q_shm_base[i] = 0;
-    }
-    g_vq_avail_idx = 0; // Сбрасываем и наш внутренний счетчик
-
-    // 3. Теперь можно безопасно начать handshake
-    g_disk_regs->status |= 1; // ACKNOWLEDGE
-    g_disk_regs->status |= 2; // DRIVER
-    g_disk_regs->guest_features = 0;
-    g_disk_regs->status |= 8; // FEATURES_OK
-
-    // Настройка virtqueue
-    g_disk_regs->guest_page_size = 4096;
-    g_disk_regs->queue_sel = 0;
-    g_disk_regs->queue_num = 16;
-    g_disk_regs->queue_align = 64;
-    g_disk_regs->queue_pfn = (g_shm_paddr + 0x1000) / 4096;
-    g_disk_regs->status |= 4; // DRIVER_OK
-
-    // Статически настраиваем дескрипторы для 3-х компонентного запроса (заголовок, данные, статус)
-    volatile virtq_desc* vq_desc = (volatile virtq_desc*)((uintptr_t)virtio_q_shm_base + VQ_DESC_OFFSET);
-    
-    // Заголовок (читаемый устройством)
-    vq_desc[0].addr = (g_shm_paddr + 0x1000) + BLK_REQ_OFFSET;
-    vq_desc[0].len = sizeof(virtio_blk_req);
-    vq_desc[0].flags = 1; // VIRTQ_DESC_F_NEXT
-    vq_desc[0].next = 1;
-    
-    // Данные (записываемые устройством для чтения, читаемые для записи)
-    // Для чтения это место, куда устройство записывает данные.
-    vq_desc[1].flags = 1 | 2; // VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
-    vq_desc[1].next = 2; 
-    
-    // Статус (записываемый устройством)
-    vq_desc[2].addr = (g_shm_paddr + 0x1000) + BLK_STATUS_OFFSET;
-    vq_desc[2].len = 1;
-    vq_desc[2].flags = 2; // VIRTQ_DESC_F_WRITE
-    vq_desc[2].next = 0;
+    // 2.5. Ищем реальное начало FAT32-раздела (MBR или нет — см. комментарий
+    // у find_fat32_partition()) до монтирования, иначе fat32_init() прочитает
+    // не тот сектор.
+    find_fat32_partition(console_ep);
 
     // 3. Монтируем Файловую Систему!
-    // Передаем в нее указатель на функцию hardware_virtio_read
-    if (fat32_init(&g_file_system, hardware_virtio_read, hardware_virtio_write)) {
-        sys_puts(console_ep, "[BLK] FAT32 mounted.\n");
+    if (fat32_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
+        if (LOG_BLK) {
+            sys_puts(console_ep, "[BLK] FAT32 mounted.\n");
+            sys_puthex32(console_ep, "[BLK][FAT32] reserved_sectors  = ", g_file_system.reserved_sectors);
+            sys_puthex32(console_ep, "[BLK][FAT32] sectors_per_fat   = ", g_file_system.sectors_per_fat);
+            sys_puthex32(console_ep, "[BLK][FAT32] sectors_per_clus  = ", g_file_system.sectors_per_cluster);
+            sys_puthex32(console_ep, "[BLK][FAT32] root_cluster      = ", g_file_system.root_cluster);
+            sys_puthex32(console_ep, "[BLK][FAT32] data_start_sector = ", g_file_system.data_start_sector);
+        }
+
+        // Пользовательская рабочая директория — отделяем от загрузочных
+        // файлов (config.txt/u-boot.bin/образ ОС и т.д.), которые обязаны
+        // оставаться в корне FAT-раздела для U-Boot/прошивки. Создаём при
+        // первом запуске, если её ещё нет (fat32_mkdir() безопасно вернёт
+        // false, если уже существует, см. slot.found в fat32.cpp — ничего
+        // не портит), заходим в неё и остаёмся там при старте системы.
+        fat32_mkdir(&g_file_system, USER_ROOT_DIR); // false здесь = "уже существует", это ок
+        if (fat32_cd(&g_file_system, USER_ROOT_DIR)) {
+            if (LOG_BLK) {
+                sys_puts(console_ep, "[BLK] cwd set to ");
+                sys_puts(console_ep, USER_ROOT_DIR);
+                sys_puts(console_ep, "\n");
+            }
+        } else {
+            sys_puts(console_ep, "[BLK] WARNING: couldn't cd into ");
+            sys_puts(console_ep, USER_ROOT_DIR);
+            sys_puts(console_ep, ", staying at FAT root.\n");
+        }
     } else {
         sys_puts(console_ep, "[BLK] FAT32 mount failed.\n");
     }
@@ -377,8 +539,7 @@ int main(int argc, char *argv[]) {
 
             // fat32_format_dir_listing обходит ВСЮ цепочку кластеров каталога (а не
             // только первый сектор), поэтому директории, не помещающиеся в 512 байт,
-            // теперь перечисляются полностью. out_buf делит SHM-страницу с
-            // virtio_q_shm_base (g_shm_vaddr + 0x1000) — оставляем запас в лимите.
+            // теперь перечисляются полностью. Лимит — размер первой страницы SHM.
             fat32_format_dir_listing(&g_file_system, dir_cluster, g_shm_vaddr, 0x1000 - 8);
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));

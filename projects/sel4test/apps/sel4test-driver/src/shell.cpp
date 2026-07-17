@@ -66,6 +66,23 @@ static void sys_putdec(seL4_Word val) {
     while (j > 0) { char c[2] = {buf[--j], 0}; sys_puts(0, c); }
 }
 
+static void print_ip(seL4_CPtr console_ep, const uint8_t ip[4]) {
+    sys_putdec(ip[0]); sys_puts(console_ep, ".");
+    sys_putdec(ip[1]); sys_puts(console_ep, ".");
+    sys_putdec(ip[2]); sys_puts(console_ep, ".");
+    sys_putdec(ip[3]);
+}
+
+// Печатает микросекунды как "N.NNN" мс (для вывода в стиле обычного unix ping).
+static void print_rtt_ms(seL4_CPtr console_ep, uint32_t us) {
+    sys_putdec(us / 1000);
+    sys_puts(console_ep, ".");
+    uint32_t frac = us % 1000;
+    if (frac < 100) sys_puts(console_ep, "0");
+    if (frac < 10) sys_puts(console_ep, "0");
+    sys_putdec(frac);
+}
+
 // Универсальная запись в файловый дескриптор
 void sys_write(int fd, const char* str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -398,7 +415,11 @@ static void sys_recover(const char* driver_name) {
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 5));
 }
 
-static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
+// Возвращает true, если mailbox разблокировался сам (операция реально
+// завершилась), false — если пришлось снимать блокировку по таймауту (см.
+// использование в "ping": печатать статистику серии имеет смысл только в
+// первом случае — во втором никакой статистики в SHM ещё не записано).
+static bool wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
     volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
     int elapsed = 0;
     while (net_mailbox[0] == 1 && elapsed < timeout_ms) {
@@ -413,11 +434,13 @@ static void wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int t
         while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
         sys_puts(console_ep, "s). Unblocking shell.\n");
         net_mailbox[0] = 0; // Снимаем блокировку насильно
-        
+
         // НОВОЕ: Перезапуск зависшего сетевого драйвера!
         sys_puts(console_ep, "[SHELL] Initiating emergency recovery for net_driver...\n");
         sys_recover("net_driver");
+        return false;
     }
+    return true;
 }
 
 static void sys_wait(seL4_CPtr root_ep, int pid) {
@@ -452,7 +475,10 @@ static int sys_getpid(seL4_CPtr root_ep) {
 
 #define CWD_SIZE 64
 #define SHM_TOTAL_SIZE 16384
-static char current_working_dir[CWD_SIZE] = "/";
+// Стартовое значение отражает то, куда blk_driver сам переходит при
+// монтировании (см. USER_ROOT_DIR/fat32_cd в blk_driver.cpp main()) — иначе
+// pwd/приглашение показывали бы "/" пока реальный cwd на сервере уже "/root".
+static char current_working_dir[CWD_SIZE] = "/root";
 static char arg_buffer[512];
 
 // max_len - полный размер буфера target (включая место под '\0').
@@ -810,36 +836,70 @@ int main(int argc, char *argv[]) {
                 if (count_str && parse_port(count_str, &count) != 0) count = 1;
 
                 volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
-                
+
                 // Пытаемся распарсить как IP. Если не вышло — это домен!
                 if (parse_ipv4(target_str, ip) != 0) {
                     sys_puts(console_ep, "[SHELL] Target looks like a domain. Starting DNS resolution...\n");
                     net_mailbox[0] = 1;
                     net_send_text_command(net_ep, NET_CMD_RESOLVE, 0, 0, target_str);
-                    
-                    wait_for_net_mailbox(console_ep, timer_ep, 10000);
-                    
-                    if (net_mailbox[0] == 0) {
-                        seL4_Word packed_ip = *((seL4_Word*)(shm_base + 4064));
-                        if (packed_ip == 0) {
-                            sys_puts(console_ep, "[SHELL] DNS Error: Domain not found.\n");
-                            continue;
-                        }
-                        ip[0] = (packed_ip >> 24) & 0xFF; ip[1] = (packed_ip >> 16) & 0xFF;
-                        ip[2] = (packed_ip >> 8) & 0xFF;  ip[3] = packed_ip & 0xFF;
-                    } else {
+
+                    // ВАЖНО: используем именно возвращаемое значение, а не
+                    // "net_mailbox[0] == 0" — wait_for_net_mailbox() сама
+                    // насильно обнуляет mailbox и при таймауте тоже, так что
+                    // эта проверка всегда была бы true и читала бы протухший
+                    // IP от предыдущего успешного resolve (если был).
+                    if (!wait_for_net_mailbox(console_ep, timer_ep, 10000)) {
                         sys_puts(console_ep, "[SHELL] DNS Resolution failed.\n");
                         continue;
                     }
+
+                    seL4_Word packed_ip = *((seL4_Word*)(shm_base + 4064));
+                    if (packed_ip == 0) {
+                        sys_puts(console_ep, "[SHELL] DNS Error: Domain not found.\n");
+                        continue;
+                    }
+                    ip[0] = (packed_ip >> 24) & 0xFF; ip[1] = (packed_ip >> 16) & 0xFF;
+                    ip[2] = (packed_ip >> 8) & 0xFF;  ip[3] = packed_ip & 0xFF;
                 }
 
                 // Теперь у нас точно есть IP (распарсенный или полученный от DNS)
+                sys_puts(console_ep, "PING "); sys_puts(console_ep, target_str);
+                sys_puts(console_ep, " ("); print_ip(console_ep, ip); sys_puts(console_ep, ") 56(84) bytes of data.\n");
+
                 net_mailbox[0] = 1;
                 net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
-                
+
                 int timeout = 5000;
                 if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000;
-                wait_for_net_mailbox(console_ep, timer_ep, timeout);
+
+                // Статистику серии (см. net_driver.cpp: net_schedule_next_ping)
+                // печатаем только если mailbox разблокировался сам — при
+                // вынужденном таймауте net_driver ничего в SHM ещё не записал.
+                if (wait_for_net_mailbox(console_ep, timer_ep, timeout)) {
+                    uint32_t sent    = *((uint32_t*)(shm_base + 4068));
+                    uint32_t reply   = *((uint32_t*)(shm_base + 4072));
+                    uint32_t min_us  = *((uint32_t*)(shm_base + 4076));
+                    uint32_t max_us  = *((uint32_t*)(shm_base + 4080));
+                    uint32_t avg_us  = *((uint32_t*)(shm_base + 4084));
+                    uint32_t mdev_us = *((uint32_t*)(shm_base + 4088));
+                    uint32_t elapsed = *((uint32_t*)(shm_base + 4092));
+                    uint32_t loss_pct = sent > 0 ? ((sent - reply) * 100) / sent : 0;
+
+                    sys_puts(console_ep, "\n--- "); sys_puts(console_ep, target_str);
+                    sys_puts(console_ep, " ping statistics ---\n");
+                    sys_putdec(sent); sys_puts(console_ep, " packets transmitted, ");
+                    sys_putdec(reply); sys_puts(console_ep, " received, ");
+                    sys_putdec(loss_pct); sys_puts(console_ep, "% packet loss, time ");
+                    sys_putdec(elapsed); sys_puts(console_ep, "ms\n");
+
+                    if (reply > 0) {
+                        sys_puts(console_ep, "rtt min/avg/max/mdev = ");
+                        print_rtt_ms(console_ep, min_us); sys_puts(console_ep, "/");
+                        print_rtt_ms(console_ep, avg_us); sys_puts(console_ep, "/");
+                        print_rtt_ms(console_ep, max_us); sys_puts(console_ep, "/");
+                        print_rtt_ms(console_ep, mdev_us); sys_puts(console_ep, " ms\n");
+                    }
+                }
             }
 
             else if (my_strcmp(cmd_ptr, "send") == 0) {

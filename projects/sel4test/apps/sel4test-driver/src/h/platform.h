@@ -1,6 +1,17 @@
 #pragma once
 #include <stdint.h>
 
+// --- Флаги отладочных логов по компонентам. Гасят только рутинные
+// info/diagnostic-сообщения (регистровые дампы, "X initialized" и т.п.) —
+// ошибки/предупреждения печатаются всегда, независимо от этих флагов.
+// Включайте по одному, когда реально отлаживаете конкретный драйвер на
+// живом железе — не держите все разом, иначе лог захламляется. ---
+constexpr bool LOG_BRINGUP = false; // main.cpp: alloc_device_frame() дампы найденных untyped-регионов
+constexpr bool LOG_UART    = false;
+constexpr bool LOG_TIMER   = false;
+constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
+constexpr bool LOG_NET     = true;  // net_driver.cpp — самый свежий/менее обкатанный компонент
+
 // =====================================================================
 // Платформенно-зависимый слой.
 //
@@ -10,14 +21,14 @@
 // Bluetooth-модулю и требует либо dtoverlay=disable-bt в config.txt, либо
 // ручного включения тактовой частоты через VideoCore mailbox — оба пути
 // опробованы и оба не сработали на этой прошивке/сборке, см. историю в
-// ROADMAP.md/README.md). RTC и virtio-mmio (сеть/диск) — ещё нет, там
-// сохранены значения под QEMU 'virt', пока
-// timer_driver.cpp/blk_driver.cpp/net_driver.cpp не переписаны под
-// ARM generic timer / GENET / EMMC2 (блокеры Фазы 3.1-3.3 в ROADMAP.md).
+// ROADMAP.md/README.md). Таймер (Фаза 3.1) портирован на ARM generic timer
+// (не MMIO, см. ниже). Диск (Фаза 3.3) портирован на EMMC2. Сеть (Фаза 3.2)
+// портирована на GENET v5 (virtio-mmio полностью убран, был только
+// QEMU-плейсхолдером). Все 5 фаз Фазы 3 закрыты — остаётся только
+// опциональная периферия (USB/Wi-Fi/GPIO/HDMI/аудио/PCIe, Фаза 3.5).
 // Драйверы (main.cpp, uart_driver.cpp, timer_driver.cpp, blk_driver.cpp,
 // net_driver.cpp) ссылаются только на эти константы, а не на "магические"
-// адреса напрямую по коду — так что после переписывания RTC/virtio-mmio
-// драйверов останется поменять только значения здесь.
+// адреса напрямую по коду.
 // =====================================================================
 
 // --- Физические адреса устройств (см. alloc_device_frame() в main.cpp) ---
@@ -33,17 +44,28 @@
 // ниже), а не сам mini-UART блок (0xfe215040) — тот не выровнен на
 // страницу, а alloc_device_frame() умеет мапить только целые страницы.
 constexpr uintptr_t PLAT_UART_PADDR        = 0xfe215000ULL;             // RPi4: AUX-периферия (mini-UART внутри, +0x40)
-constexpr uintptr_t PLAT_RTC_PADDR         = 0x09010000ULL;             // PL031 (QEMU virt) — на RPi4 нет, блокер Фазы 3.1
-constexpr uintptr_t PLAT_VIRTIO_MMIO_PADDR = 0x0a000000ULL;             // virtio-mmio (QEMU virt) — на RPi4 нет, блокеры Фазы 3.2/3.3
-constexpr int        PLAT_VIRTIO_MMIO_SLOTS = 4;                        // Сколько слотов резервирует rootserver
+
+// Таймер (Фаза 3.1) не MMIO-устройство и не имеет физического адреса вовсе —
+// ARM generic timer читается прямой mrs-инструкцией из EL0 (CNTVCT_EL0/
+// CNTFRQ_EL0), см. hw_timer.cpp/timer_driver.cpp. PL031 (QEMU-плейсхолдер)
+// и его адрес/оффсеты полностью убраны, на реальном железе им замены нет.
+
+// Диск: EMMC2 (Arasan SDHCI), реальный контроллер SD-карты на RPi4 — заменяет
+// virtio-blk (Фаза 3.3, см. RPI4_EMMC2_* ниже, откуда взят адрес/IRQ).
+constexpr uintptr_t PLAT_EMMC_PADDR = 0xfe340000ULL;
+constexpr int        PLAT_EMMC_IRQ  = 158;                              // Не используется (PIO/polling), но фиксируем для симметрии
+
+// Сеть: GENET v5 (BCM2711 встроенный Ethernet MAC), реальный контроллер на
+// RPi4 — заменяет virtio-net (Фаза 3.2, см. RPI4_GENET_* ниже, откуда взят
+// адрес). Занимает 64KB (0x10000) — заметно больше EMMC2/UART.
+constexpr uintptr_t PLAT_GENET_PADDR = 0xfd580000ULL;
 
 // --- Виртуальные адреса, куда эти устройства маппятся в VSpace драйвера
 // (см. hw_vaddr в spawn_process(), main.cpp). Общие для всех процессов —
 // каждый драйвер видит свое устройство по одному и тому же литералу. ---
 constexpr uintptr_t PLAT_UART_VADDR         = 0x200000000ULL;
-constexpr uintptr_t PLAT_RTC_VADDR          = 0x200002000ULL;
-constexpr uintptr_t PLAT_VIRTIO_MMIO_VADDR  = 0x200004000ULL;
-constexpr uintptr_t PLAT_VIRTIO_MMIO_STRIDE = 0x200ULL; // Шаг перебора слотов при поиске устройства
+constexpr uintptr_t PLAT_EMMC_VADDR         = 0x200006000ULL;
+constexpr uintptr_t PLAT_GENET_VADDR        = 0x200008000ULL;
 
 // --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
 // от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
@@ -65,27 +87,250 @@ constexpr uint32_t  AUX_MU_CNTL_RX_EN   = (1u << 0);
 constexpr uint32_t  AUX_MU_CNTL_TX_EN   = (1u << 1);
 constexpr uint32_t  AUX_MU_IER_RX_INT   = (1u << 0);                    // Разрешить прерывание "есть данные для чтения"
 
-// Оффсеты по датащиту PL031 (RTCDR=0x00, RTCMR=0x04, RTCIMSC=0x10, RTCICR=0x1C).
-constexpr uintptr_t PL031_DR_OFFSET   = 0x00;                           // Data Register (текущее время, сек. с эпохи)
-constexpr uintptr_t PL031_MR_OFFSET   = 0x04;                           // Match Register
-constexpr uintptr_t PL031_IMSC_OFFSET = 0x10;                           // Interrupt Mask Set/Clear
-constexpr uintptr_t PL031_ICR_OFFSET  = 0x1C;                           // Interrupt Clear Register
-// ВНИМАНИЕ: timer_driver.cpp исторически читает/пишет IMSC (0x10) там, где по
-// датащиту нужен был бы ICR (0x1C), но это существующее (работающее в QEMU)
-// поведение — сохранено как есть, здесь только вынесено значение в константу.
-
 // --- Номера IRQ (GIC SPI), см. seL4_IRQControl_Get() в main.cpp ---
 constexpr int PLAT_UART_IRQ  = 125;                                     // RPi4: mini-UART, см. RPI4_UART1_MINIUART_IRQ ниже
                                                                           // (общий "aux" IRQ на mini-UART/SPI1/SPI2)
-constexpr int PLAT_TIMER_IRQ = 34;                                      // PL031 (QEMU virt) — блокер Фазы 3.1, см. PLAT_RTC_PADDR
+// Таймер IRQ отсутствует намеренно — ARM generic timer не даёт аппаратного
+// прерывания из EL0 на этой сборке ядра (см. RPI4_TIMER_PPI_* ниже и
+// hw_timer.cpp), поэтому регистрировать нечего.
 
-// --- virtio-mmio: константы самой спецификации virtio (не завязаны на
-// плату), но актуальны только пока есть virtio-net/virtio-blk. На
-// платформе с реальными контроллерами (Ethernet MAC, SDHCI и т.п.) этот
-// блок целиком уходит вместе с соответствующим кодом сканирования. ---
-constexpr uint32_t VIRTIO_MMIO_MAGIC      = 0x74726976u;                // "virt" в LE
-constexpr uint32_t VIRTIO_DEVICE_ID_NET   = 1;
-constexpr uint32_t VIRTIO_DEVICE_ID_BLOCK = 2;
+// --- EMMC2 (Arasan SDHCI-совместимый) — регистровая карта, смещения от
+// PLAT_EMMC_PADDR. Стандартный SD Host Controller layout (SDHCI Simplified
+// Spec), окно регистров в DT — 0x100 байт (0x00..0xFC), см. PLAT_EMMC_PADDR
+// выше. PIO/polling-режим (без DMA, без IRQ) — минимум подвижных частей для
+// первого запуска на живом железе, см. ROADMAP.md Фаза 3.3. ---
+constexpr uintptr_t EMMC_BLKSIZECNT_OFFSET = 0x04;  // [9:0]=размер блока, [31:16]=кол-во блоков
+constexpr uintptr_t EMMC_ARG1_OFFSET       = 0x08;
+constexpr uintptr_t EMMC_CMDTM_OFFSET      = 0x0C;  // [15:0]=transfer mode, [31:16]=команда+response type
+constexpr uintptr_t EMMC_RESP0_OFFSET      = 0x10;
+constexpr uintptr_t EMMC_RESP1_OFFSET      = 0x14;
+constexpr uintptr_t EMMC_RESP2_OFFSET      = 0x18;
+constexpr uintptr_t EMMC_RESP3_OFFSET      = 0x1C;
+constexpr uintptr_t EMMC_DATA_OFFSET       = 0x20;  // PIO порт данных (чтение/запись по 4 байта)
+constexpr uintptr_t EMMC_STATUS_OFFSET     = 0x24;
+constexpr uintptr_t EMMC_CONTROL0_OFFSET   = 0x28;
+constexpr uintptr_t EMMC_CONTROL1_OFFSET   = 0x2C;
+constexpr uintptr_t EMMC_INTERRUPT_OFFSET  = 0x30;  // write-1-to-clear
+constexpr uintptr_t EMMC_IRPT_MASK_OFFSET  = 0x34;
+constexpr uintptr_t EMMC_IRPT_EN_OFFSET    = 0x38;
+constexpr uintptr_t EMMC_CAP0_OFFSET       = 0x40;  // Capabilities: [13:8] = base clock frequency (МГц)
+constexpr uintptr_t EMMC_SLOTISR_VER_OFFSET = 0xFC; // [23:16] = Host Controller Version (0=v1,1=v2,2=v3)
+
+// STATUS (0x24) — биты состояния линий команды/данных
+constexpr uint32_t EMMC_STATUS_CMD_INHIBIT = (1u << 0);  // Нельзя слать новую команду
+constexpr uint32_t EMMC_STATUS_DAT_INHIBIT = (1u << 1);  // Линия DAT занята
+constexpr uint32_t EMMC_STATUS_DAT_ACTIVE  = (1u << 2);
+
+// CONTROL1 (0x2C) — тактирование + software reset
+constexpr uint32_t EMMC_C1_CLK_INTLEN   = (1u << 0);      // Включить внутренний клок
+constexpr uint32_t EMMC_C1_CLK_STABLE   = (1u << 1);      // RO: клок стабилен
+constexpr uint32_t EMMC_C1_CLK_EN       = (1u << 2);      // Подать клок на SD-шину
+constexpr uint32_t EMMC_C1_CLK_GENSEL   = (1u << 5);      // 0 = Divided Clock Mode
+constexpr uint32_t EMMC_C1_TOUNIT_MAX   = (0xEu << 16);   // Максимальный data timeout
+constexpr uint32_t EMMC_C1_SRST_HC      = (1u << 24);     // Software reset всего контроллера
+constexpr uint32_t EMMC_C1_SRST_CMD     = (1u << 25);
+constexpr uint32_t EMMC_C1_SRST_DATA    = (1u << 26);
+// Делитель клока (Divided Clock Mode, 8-bit): freq = base_clk / (2 * divisor), 0 => /1.
+// Идентификационная стадия (~400kHz) и рабочая стадия (~25MHz) — делители
+// подбираются в emmc_init() из фактической base clock (см. CAPABILITIES).
+constexpr uint32_t EMMC_C1_CLK_FREQ_SHIFT = 8;
+
+// INTERRUPT (0x30) / IRPT_MASK / IRPT_EN — общие биты статуса
+constexpr uint32_t EMMC_INT_CMD_DONE   = (1u << 0);   // Command Complete
+constexpr uint32_t EMMC_INT_DATA_DONE  = (1u << 1);   // Transfer Complete
+constexpr uint32_t EMMC_INT_WRITE_RDY  = (1u << 4);   // Buffer Write Ready
+constexpr uint32_t EMMC_INT_READ_RDY   = (1u << 5);   // Buffer Read Ready
+constexpr uint32_t EMMC_INT_ERROR_MASK = 0xFFFF0000u; // Любая ошибка (Command/Data Error Status, верхние 16 бит)
+constexpr uint32_t EMMC_INT_ALL_EN     = 0xFFFFFFFFu; // Маска "разрешить всё" для IRPT_MASK/IRPT_EN (нужна для чтения статусов даже без реальных IRQ)
+
+// CONTROL0 (0x28) — базовая настройка хоста
+constexpr uint32_t EMMC_C0_USE_4BIT    = (1u << 1);   // Ширина шины 4 бита (не используется в первой версии — см. план)
+// SD Bus Power (bits 8-11 в CONTROL0, аналог legacy SDHCI "Power Control"
+// байта на 0x29): SRST_HC гасит питание шины, найдено эмпирически на живом
+// железе (до сброса bits 8-11 = 0xF, после — 0x0) — без этого CMD_INHIBIT
+// висит вечно и ни одна команда никогда не завершается.
+constexpr uint32_t EMMC_C0_PWR_ON      = (1u << 8);
+constexpr uint32_t EMMC_C0_PWR_3V3     = (0x7u << 9);
+
+// CMDTM (0x0C) — response type (биты [17:16]) и флаги данных
+constexpr uint32_t EMMC_CMD_RSPNS_NONE = (0x0u << 16);
+constexpr uint32_t EMMC_CMD_RSPNS_136  = (0x1u << 16);
+constexpr uint32_t EMMC_CMD_RSPNS_48   = (0x2u << 16);
+constexpr uint32_t EMMC_CMD_RSPNS_48B  = (0x3u << 16); // R1b (с busy-сигналом на DAT0)
+constexpr uint32_t EMMC_CMD_CRCCHK_EN  = (1u << 19);
+constexpr uint32_t EMMC_CMD_IXCHK_EN   = (1u << 20);
+constexpr uint32_t EMMC_CMD_ISDATA     = (1u << 21);   // Data Present Select
+constexpr uint32_t EMMC_CMD_INDEX_SHIFT = 24;           // Индекс команды в битах [29:24]
+// Transfer Mode (биты [15:0] того же CMDTM)
+constexpr uint32_t EMMC_TM_BLKCNT_EN   = (1u << 1);
+constexpr uint32_t EMMC_TM_MULTI_BLOCK = (1u << 5);
+constexpr uint32_t EMMC_TM_DAT_DIR_READ = (1u << 4);    // 1 = card->host (чтение)
+
+// Коды SD-команд (используются как (CMDn << EMMC_CMD_INDEX_SHIFT) | response type | флаги)
+constexpr uint32_t EMMC_CMD_GO_IDLE        = 0;   // CMD0,  без ответа
+constexpr uint32_t EMMC_CMD_SEND_IF_COND   = 8;   // CMD8,  R7 (как R1/48bit)
+constexpr uint32_t EMMC_CMD_ALL_SEND_CID   = 2;   // CMD2,  R2/136bit
+constexpr uint32_t EMMC_CMD_SEND_REL_ADDR  = 3;   // CMD3,  R6 (как R1/48bit)
+constexpr uint32_t EMMC_CMD_SEND_CSD       = 9;   // CMD9,  R2/136bit
+constexpr uint32_t EMMC_CMD_SELECT_CARD    = 7;   // CMD7,  R1b/48bit+busy
+constexpr uint32_t EMMC_CMD_APP_CMD        = 55;  // CMD55, R1/48bit — префикс для ACMDn
+constexpr uint32_t EMMC_ACMD_SD_SEND_OP_COND = 41; // ACMD41 (после CMD55), R3/48bit (без CRC)
+constexpr uint32_t EMMC_CMD_READ_SINGLE    = 17;  // CMD17, R1/48bit + данные (host<-card)
+constexpr uint32_t EMMC_CMD_READ_MULTI     = 18;  // CMD18, R1/48bit + данные, multi-block
+constexpr uint32_t EMMC_CMD_WRITE_SINGLE   = 24;  // CMD24, R1/48bit + данные (host->card)
+constexpr uint32_t EMMC_CMD_WRITE_MULTI    = 25;  // CMD25, R1/48bit + данные, multi-block
+// ACMD41 HCS-бит (Host Capacity Support, запрашиваем поддержку SDHC/SDXC) и
+// бит готовности в ответе (OCR, бит 31)
+constexpr uint32_t EMMC_ACMD41_HCS      = (1u << 30);
+constexpr uint32_t EMMC_ACMD41_VOLTAGE  = 0x00FF8000u; // 3.2-3.4V window
+constexpr uint32_t EMMC_OCR_READY       = (1u << 31);
+
+// --- GENET v5 (BCM2711 Ethernet MAC) — регистровая карта, смещения от
+// PLAT_GENET_PADDR. Адаптировано 1:1 из проверенного рабочего референса —
+// /home/nikita/RPi4_SeL4/u-boot/drivers/net/bcmgenet.c (драйвер GENETv5
+// U-Boot, который этот же борд реально использует для сетевой части). См.
+// ROADMAP.md Фаза 3.2. ---
+constexpr uintptr_t GENET_SYS_REV_CTRL_OFFSET       = 0x00;
+constexpr uintptr_t GENET_SYS_PORT_CTRL_OFFSET      = 0x04;
+constexpr uintptr_t GENET_SYS_RBUF_FLUSH_CTRL_OFFSET = 0x08;
+constexpr uintptr_t GENET_EXT_RGMII_OOB_CTRL_OFFSET = 0x08C;  // 0x80 (EXT off) + 0x0c
+constexpr uintptr_t GENET_RBUF_CTRL_OFFSET          = 0x300;
+constexpr uintptr_t GENET_RBUF_TBUF_SIZE_CTRL_OFFSET = 0x3B4; // 0x300 + 0xb4
+constexpr uintptr_t GENET_UMAC_MAC0_OFFSET          = 0x80C;  // 0x800 (UMAC off) + 0x00c
+constexpr uintptr_t GENET_UMAC_MAC1_OFFSET          = 0x810;
+constexpr uintptr_t GENET_UMAC_CMD_OFFSET           = 0x808;
+constexpr uintptr_t GENET_UMAC_MAX_FRAME_LEN_OFFSET = 0x814;
+constexpr uintptr_t GENET_UMAC_TX_FLUSH_OFFSET      = 0xB34;  // 0x800 + 0x334
+constexpr uintptr_t GENET_UMAC_MIB_CTRL_OFFSET      = 0xD80;  // 0x800 + 0x580
+constexpr uintptr_t GENET_MDIO_CMD_OFFSET           = 0xE14;  // = RPI4_GENET_MDIO_OFFSET
+// MAC Destination Filter — таблица из 17 записей (broadcast/unicast/multicast),
+// не настраиваем её (нет реального смысла для диагностического трафика этой
+// ОС) — вместо этого гасим её целиком (=0, как в bcmgenet_set_rx_mode()
+// Linux-драйвера при promiscuous) и включаем CMD_PROMISC ниже. Без этого
+// приём кадров зависел бы от того, в каком состоянии MDF оставил предыдущий
+// инициализатор GENET (например, U-Boot, настроивший её под свой MAC) —
+// см. /home/nikita/workspace_nofing/common/drivers/net/ethernet/broadcom/genet/bcmgenet.c.
+constexpr uintptr_t GENET_UMAC_MDF_CTRL_OFFSET      = 0xE50;  // 0x800 + 0x650
+
+constexpr uint32_t GENET_PORT_MODE_EXT_GPHY = 3;
+constexpr uint32_t GENET_RGMII_LINK      = (1u << 4);
+constexpr uint32_t GENET_OOB_DISABLE     = (1u << 5);
+constexpr uint32_t GENET_RGMII_MODE_EN   = (1u << 6);
+constexpr uint32_t GENET_ID_MODE_DIS     = (1u << 16);
+constexpr uint32_t GENET_RBUF_ALIGN_2B   = (1u << 1);
+
+constexpr uint32_t GENET_CMD_TX_EN       = (1u << 0);
+constexpr uint32_t GENET_CMD_RX_EN       = (1u << 1);
+constexpr uint32_t GENET_UMAC_SPEED_10   = 0;
+constexpr uint32_t GENET_UMAC_SPEED_100  = 1;
+constexpr uint32_t GENET_UMAC_SPEED_1000 = 2;
+constexpr uint32_t GENET_CMD_SPEED_SHIFT = 2;
+constexpr uint32_t GENET_CMD_PROMISC     = (1u << 4);
+constexpr uint32_t GENET_CMD_SW_RESET    = (1u << 13);
+constexpr uint32_t GENET_CMD_LCL_LOOP_EN = (1u << 15);
+constexpr uint32_t GENET_MIB_RESET_RX    = (1u << 0);
+constexpr uint32_t GENET_MIB_RESET_RUNT  = (1u << 1);
+constexpr uint32_t GENET_MIB_RESET_TX    = (1u << 2);
+
+// MDIO (доступ к регистрам PHY через GENET_MDIO_CMD_OFFSET)
+constexpr uint32_t GENET_MDIO_START_BUSY = (1u << 29);
+constexpr uint32_t GENET_MDIO_READ_FAIL  = (1u << 28);
+constexpr uint32_t GENET_MDIO_RD         = (2u << 26);
+constexpr uint32_t GENET_MDIO_WR         = (1u << 26);
+constexpr uint32_t GENET_MDIO_PMD_SHIFT  = 21;
+constexpr uint32_t GENET_MDIO_REG_SHIFT  = 16;
+// Стандартные MII-регистры самой PHY (не GENET), адрес PHY = 1 (см. dts
+// ethernet-phy@1) — хардкодим, DT-парсера у нас нет.
+constexpr uint32_t GENET_PHY_ADDR        = 1;
+constexpr uint32_t MII_BMCR              = 0x00; // Basic Mode Control (бит 15 = reset)
+constexpr uint32_t MII_BMSR              = 0x01; // Basic Mode Status (бит 2 = link up)
+constexpr uint32_t MII_ADVERTISE         = 0x04; // что рекламируем на автосогласовании (10/100)
+constexpr uint32_t MII_LPA               = 0x05; // что рекламирует link partner (10/100)
+constexpr uint32_t MII_CTRL1000          = 0x09; // что рекламируем на автосогласовании (1000BASE-T)
+constexpr uint32_t MII_STAT1000          = 0x0A; // что рекламирует link partner (1000BASE-T)
+constexpr uint32_t MII_BMCR_RESET        = (1u << 15);
+constexpr uint32_t MII_BMSR_LINK_UP      = (1u << 2);
+constexpr uint32_t MII_BMSR_ANEGCOMPLETE = (1u << 5);
+// Стандартные (Clause 22, не вендор-специфичные) биты для вычисления реально
+// согласованной скорости/дуплекса — см. genet_resolve_link_speed() в
+// net_driver.cpp. Приоритет по IEEE 802.3: 1000FD > 1000HD > 100FD > 100HD
+// > 10FD > 10HD.
+constexpr uint32_t MII_ADV_10HALF   = (1u << 5);
+constexpr uint32_t MII_ADV_10FULL   = (1u << 6);
+constexpr uint32_t MII_ADV_100HALF  = (1u << 7);
+constexpr uint32_t MII_ADV_100FULL  = (1u << 8);
+constexpr uint32_t MII_CTRL1000_ADV_HALF = (1u << 8);
+constexpr uint32_t MII_CTRL1000_ADV_FULL = (1u << 9);
+constexpr uint32_t MII_STAT1000_LP_HALF  = (1u << 10);
+constexpr uint32_t MII_STAT1000_LP_FULL  = (1u << 11);
+
+// DMA-дескрипторы (256 фиксировано под адресацию регистровых блоков колец —
+// см. комментарий в плане/ROADMAP; реально используем меньше, RX_DESCS/TX_DESCS).
+constexpr uintptr_t GENET_RX_OFF          = 0x2000;
+constexpr uintptr_t GENET_TX_OFF          = 0x4000;
+constexpr uint32_t  GENET_TOTAL_DESCS     = 256;     // фиксировано железом (адресация блоков ниже)
+constexpr uint32_t  GENET_DMA_DESC_SIZE   = 12;       // LENGTH_STATUS(4)+ADDR_LO(4)+ADDR_HI(4)
+constexpr uintptr_t GENET_DMA_DESC_LENGTH_STATUS = 0x00;
+constexpr uintptr_t GENET_DMA_DESC_ADDRESS_LO    = 0x04;
+constexpr uintptr_t GENET_DMA_DESC_ADDRESS_HI    = 0x08;
+
+constexpr uint32_t GENET_RX_DESCS = 4;   // реально используемая глубина RX-кольца
+constexpr uint32_t GENET_TX_DESCS = 1;   // синхронная отправка по одному кадру
+
+constexpr uintptr_t GENET_RDMA_REG_OFF = GENET_RX_OFF + GENET_TOTAL_DESCS * GENET_DMA_DESC_SIZE;
+constexpr uintptr_t GENET_TDMA_REG_OFF = GENET_TX_OFF + GENET_TOTAL_DESCS * GENET_DMA_DESC_SIZE;
+constexpr uint32_t  GENET_DEFAULT_Q    = 0x10;         // "default"-очередь (16), как в U-Boot
+constexpr uintptr_t GENET_DMA_RING_SIZE = 0x40;
+constexpr uintptr_t GENET_DMA_RINGS_SIZE = GENET_DMA_RING_SIZE * (GENET_DEFAULT_Q + 1);
+constexpr uintptr_t GENET_TDMA_RING_REG_BASE = GENET_TDMA_REG_OFF + GENET_DEFAULT_Q * GENET_DMA_RING_SIZE;
+constexpr uintptr_t GENET_RDMA_RING_REG_BASE = GENET_RDMA_REG_OFF + GENET_DEFAULT_Q * GENET_DMA_RING_SIZE;
+// Оффсеты внутри *_RING_REG_BASE (общие для T/RDMA, см. bcmgenet.c)
+constexpr uintptr_t GENET_DMA_RING_BUF_SIZE_OFF   = 0x10;
+constexpr uintptr_t GENET_DMA_START_ADDR_OFF      = 0x14;
+constexpr uintptr_t GENET_DMA_END_ADDR_OFF        = 0x1C;
+constexpr uintptr_t GENET_DMA_MBUF_DONE_THRESH_OFF = 0x24;
+constexpr uintptr_t GENET_TDMA_READ_PTR_OFF        = 0x00;
+constexpr uintptr_t GENET_TDMA_CONS_INDEX_OFF      = 0x08;
+constexpr uintptr_t GENET_TDMA_PROD_INDEX_OFF      = 0x0C;
+constexpr uintptr_t GENET_TDMA_FLOW_PERIOD_OFF     = 0x28;
+constexpr uintptr_t GENET_TDMA_WRITE_PTR_OFF       = 0x2C;
+constexpr uintptr_t GENET_RDMA_WRITE_PTR_OFF       = 0x00;
+constexpr uintptr_t GENET_RDMA_PROD_INDEX_OFF      = 0x08;
+constexpr uintptr_t GENET_RDMA_CONS_INDEX_OFF      = 0x0C;
+constexpr uintptr_t GENET_RDMA_XON_XOFF_THRESH_OFF = 0x28;
+constexpr uintptr_t GENET_RDMA_READ_PTR_OFF        = 0x2C;
+constexpr uintptr_t GENET_TDMA_REG_BASE = GENET_TDMA_REG_OFF + GENET_DMA_RINGS_SIZE;
+constexpr uintptr_t GENET_RDMA_REG_BASE = GENET_RDMA_REG_OFF + GENET_DMA_RINGS_SIZE;
+constexpr uintptr_t GENET_DMA_RING_CFG_OFF  = 0x00;
+constexpr uintptr_t GENET_DMA_CTRL_OFF      = 0x04;
+constexpr uintptr_t GENET_DMA_SCB_BURST_SIZE_OFF = 0x0C;
+
+constexpr uint32_t GENET_DMA_EN                = (1u << 0);
+constexpr uint32_t GENET_DMA_RING_BUF_EN_SHIFT = 1;
+constexpr uint32_t GENET_DMA_BUFLENGTH_SHIFT   = 16;
+constexpr uint32_t GENET_DMA_RING_SIZE_SHIFT   = 16;
+constexpr uint32_t GENET_DMA_OWN               = 0x8000;
+constexpr uint32_t GENET_DMA_EOP               = 0x4000;
+constexpr uint32_t GENET_DMA_SOP               = 0x2000;
+constexpr uint32_t GENET_DMA_MAX_BURST_LENGTH  = 0x8;
+constexpr uint32_t GENET_DMA_TX_APPEND_CRC     = 0x0040;
+constexpr uint32_t GENET_DMA_TX_QTAG_SHIFT     = 7;
+constexpr uint32_t GENET_DMA_FC_THRESH_LO      = 5;
+constexpr uint32_t GENET_DMA_FC_THRESH_HI      = GENET_RX_DESCS >> 4; // 0 при RX_DESCS<16, как и было бы у u-boot с малым кольцом
+constexpr uint32_t GENET_DMA_FC_THRESH_VALUE   = (GENET_DMA_FC_THRESH_LO << 16) | GENET_DMA_FC_THRESH_HI;
+
+// Буфер на пакет — как у существующего virtio-net кода (net_driver.cpp),
+// с запасом на полный Ethernet-кадр.
+constexpr uint32_t GENET_RX_BUF_LENGTH = 1536;
+// Железо GENET само добавляет 2 байта паддинга в начало каждого принятого
+// кадра при RBUF_ALIGN_2B (см. net_hw_init) — чтобы IP-заголовок (после
+// 14-байтового Ethernet-заголовка) оказался выровнен на 4 байта. Дескриптор
+// LENGTH_STATUS включает эти 2 байта в свою длину — их нужно вычитать/
+// пропускать при чтении принятого кадра (см. bcmgenet.c: RX_BUF_OFFSET,
+// bcmgenet_gmac_eth_recv()). Без этого каждый принятый кадр читается со
+// сдвигом на 2 байта и вся протокольная логика видит мусор вместо реальных
+// полей — отсюда "ничего не приходит" при отправке ARP/DHCP-запросов.
+constexpr uint32_t GENET_RX_BUF_OFFSET = 2;
 
 // =====================================================================
 // Raspberry Pi 4 (BCM2711) — реальные физические адреса.
@@ -107,19 +352,19 @@ constexpr uint32_t VIRTIO_DEVICE_ID_BLOCK = 2;
 // т.е. итог совпадает: ARM_PADDR = BUS_ADDR + 0x80000000 для всех
 // периферийных блоков /soc и /scb, и отдельная константа для GIC.
 //
-// IRQ ниже — уже переведены из "сырого" SPI-номера в DT (interrupts =
+// IRQ ниже (SPI) — уже переведены из "сырого" SPI-номера в DT (interrupts =
 // <0 N 4>) в итоговый GIC-номер по формуле GIC_IRQ = N + 32, т.к. это
 // то представление, которое ожидает seL4_IRQControl_Get() (см. main.cpp,
-// сравни с PLAT_UART_IRQ/PLAT_TIMER_IRQ выше — там та же конвенция для
-// QEMU 'virt': DT SPI 1 -> 33, SPI 2 -> 34).
+// сравни с PLAT_UART_IRQ выше — та же конвенция для QEMU 'virt': DT SPI 1 ->
+// 33). PPI (RPI4_TIMER_PPI_*) — отдельная формула, GIC_IRQ = 16 + PPI.
 //
-// UART (RPI4_UART1_MINIUART_PADDR/IRQ) уже зеркалирован в активные
-// PLAT_UART_* выше — драйверы (main.cpp/uart_driver.cpp) реально работают
-// с этими адресами. Остальное (RTC/EMMC2/GENET и т.д.) пока используется
-// только как справочный набор адресов под будущее переключение (см.
-// ROADMAP.md, Фаза 3.1-3.3), плюс задел под периферию, которая пока не
-// нужна ОС, но появится в дальнейшем (USB, Wi-Fi/BT, GPIO общего
-// назначения, HDMI, аудио, PCIe/NVMe).
+// UART (RPI4_UART1_MINIUART_PADDR/IRQ) и таймер (RPI4_TIMER_PPI_*, хоть и
+// не MMIO/IRQ в итоге — см. platform.h выше) уже портированы, драйверы
+// реально работают с этими данными. Остальное (EMMC2/GENET и т.д.) пока
+// используется как справочный набор адресов под будущее переключение (см.
+// ROADMAP.md, Фаза 3.2), плюс задел под периферию, которая пока не нужна
+// ОС, но появится в дальнейшем (USB, Wi-Fi/BT, GPIO общего назначения,
+// HDMI, аудио, PCIe/NVMe).
 // =====================================================================
 
 // --- GIC-400 (тот же PL011/GICv2 стек, что и в QEMU, другие адреса) ---
@@ -147,21 +392,33 @@ constexpr int        RPI4_UART0_PL011_IRQ  = 153;                       // DT SP
 constexpr uintptr_t RPI4_UART1_MINIUART_PADDR = 0xfe215040ULL;          // DT serial@7e215040, "brcm,bcm2835-aux-uart" (не PrimeCell, другой регистровый формат!)
 constexpr int        RPI4_UART1_MINIUART_IRQ  = 125;                    // DT SPI 0x5d=93 -> GIC 93+32 (общий "aux" IRQ)
 
-// --- ARM Generic Timer (CNTPCT_EL0) — заменяет отсутствующий PL031.
-// PPI, поэтому номер на всех ядрах одинаковый; GIC_IRQ = 16 + PPI. ---
+// --- ARM Generic Timer — заменяет отсутствующий PL031 (Фаза 3.1, готово).
+// PPI, поэтому номер на всех ядрах одинаковый; GIC_IRQ = 16 + PPI. На
+// практике не используются: CNTVCT_EL0/CNTFRQ_EL0 читаются прямой
+// mrs-инструкцией из EL0 без всякого IRQ/маппинга (см. hw_timer.cpp), а
+// регистры сравнения/управления (которые и генерировали бы эти PPI) с EL0
+// на этой сборке ядра недоступны (EXPORT_PTMR_USER/VTMR_USER=false в
+// gen_config) — оставлены как справочные на случай смены конфигурации ядра
+// (например, MCS + scheduling contexts) в будущем. ---
 constexpr int RPI4_TIMER_PPI_SECURE       = 29;                         // DT PPI 13 (0x0d) — secure phys timer
-constexpr int RPI4_TIMER_PPI_NONSECURE    = 30;                         // DT PPI 14 (0x0e) — non-secure phys timer (этот используем из EL1)
+constexpr int RPI4_TIMER_PPI_NONSECURE    = 30;                         // DT PPI 14 (0x0e) — non-secure phys timer
 constexpr int RPI4_TIMER_PPI_VIRTUAL      = 27;                         // DT PPI 11 (0x0b)
 constexpr int RPI4_TIMER_PPI_HYP          = 26;                         // DT PPI 10 (0x0a)
 
 // --- Диск: EMMC2 (Arasan SDHCI) — реальный контроллер SD-карты,
-// заменяет virtio-blk. FAT32-логика поверх (см. ROADMAP.md) переиспользуется. ---
+// заменяет virtio-blk. FAT32-логика поверх (см. ROADMAP.md) переиспользуется.
+// Фаза 3.3 сделана: адрес/IRQ уже зеркалированы в активные PLAT_EMMC_* выше
+// (blk_driver.cpp реально работает с этими адресами), здесь остаются только
+// как справочные RPI4_-константы для единообразия с остальным блоком. ---
 constexpr uintptr_t RPI4_EMMC2_PADDR = 0xfe340000ULL;                   // DT /emmc2bus/mmc@7e340000, "brcm,bcm2711-emmc2"
 constexpr uintptr_t RPI4_EMMC2_SIZE  = 0x100ULL;
 constexpr int        RPI4_EMMC2_IRQ  = 158;                             // DT SPI 0x7e=126 -> GIC 126+32
 
 // --- Сеть: GENET v5 (BCM2711 встроенный Ethernet MAC) — заменяет
-// virtio-net. ARP/UDP/NTP/DNS-логика поверх переиспользуется. ---
+// virtio-net. ARP/UDP/NTP/DNS-логика поверх переиспользуется. Фаза 3.2
+// сделана: адрес уже зеркалирован в активный PLAT_GENET_PADDR выше
+// (net_driver.cpp реально работает с этим адресом), IRQ не используется
+// (net_driver — чистый polling, как и раньше с virtio-net). ---
 constexpr uintptr_t RPI4_GENET_PADDR      = 0xfd580000ULL;              // DT /scb/ethernet@7d580000, "brcm,bcm2711-genet-v5"
 constexpr uintptr_t RPI4_GENET_SIZE       = 0x10000ULL;
 constexpr int        RPI4_GENET_IRQ_A     = 189;                        // DT SPI 0x9d=157 -> GIC 157+32
@@ -185,7 +442,10 @@ constexpr int        RPI4_USB_DWC2_IRQ_SOFT = 72;                       // DT SP
 // --- Wi-Fi / Bluetooth (BCM43455) — отдельный SDIO-стек, сильно
 // отличается от genet. Wi-Fi висит на выделенном SD-хосте (SD1,
 // non-removable, узел brcm,bcm4329-fmac), Bluetooth — на PL011 UART0
-// выше (RPI4_UART0_PL011_PADDR), НЕ отдельный MMIO-блок. ---
+// выше (RPI4_UART0_PL011_PADDR), НЕ отдельный MMIO-блок. Реализация — вне
+// рамок текущего порта (проприетарная прошивка + brcmfmac-протокол, на
+// порядок больше EMMC2/GENET вместе), см. wifi_driver.cpp (заглушка,
+// не участвует в сборке) для архитектурного задела. ---
 constexpr uintptr_t RPI4_WIFI_SDIO_PADDR = 0xfe300000ULL;               // DT /soc/mmcnr@7e300000, "brcm,bcm2835-mmc" (SD1, wifi@1 = bcm4329-fmac)
 constexpr uintptr_t RPI4_WIFI_SDIO_SIZE  = 0x100ULL;
 constexpr int        RPI4_WIFI_SDIO_IRQ  = 158;                         // DT SPI 0x7e=126 -> GIC 126+32 (та же линия, что и EMMC2 — так в самом DT, см. bcm2711-rpi-4-b.dts)
