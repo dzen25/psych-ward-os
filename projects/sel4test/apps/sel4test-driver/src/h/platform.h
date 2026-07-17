@@ -4,24 +4,37 @@
 // =====================================================================
 // Платформенно-зависимый слой.
 //
-// Все физические/виртуальные адреса устройств, номера IRQ и оффсеты
-// регистров, специфичные для ТЕКУЩЕЙ целевой машины (QEMU 'virt',
-// AArch64/ARMv8: PL011 UART + PL031 RTC + virtio-mmio), собраны здесь.
+// Целевая платформа — Raspberry Pi 4 (BCM2711), AArch64/ARMv8. Порт идёт
+// поэтапно (см. ROADMAP.md, Фаза 3): UART уже переключён на реальные
+// адреса железа — mini-UART (UART1), а не PL011 (UART0, физически отдан
+// Bluetooth-модулю и требует либо dtoverlay=disable-bt в config.txt, либо
+// ручного включения тактовой частоты через VideoCore mailbox — оба пути
+// опробованы и оба не сработали на этой прошивке/сборке, см. историю в
+// ROADMAP.md/README.md). RTC и virtio-mmio (сеть/диск) — ещё нет, там
+// сохранены значения под QEMU 'virt', пока
+// timer_driver.cpp/blk_driver.cpp/net_driver.cpp не переписаны под
+// ARM generic timer / GENET / EMMC2 (блокеры Фазы 3.1-3.3 в ROADMAP.md).
 // Драйверы (main.cpp, uart_driver.cpp, timer_driver.cpp, blk_driver.cpp,
 // net_driver.cpp) ссылаются только на эти константы, а не на "магические"
-// адреса напрямую по коду.
-//
-// При портировании на другую платформу (например, Raspberry Pi 4 —
-// BCM2711, тоже AArch64, но другой UART/RTC/сеть без virtio) нужно менять
-// именно этот файл, а не искать адреса по всем .cpp. Часть констант ниже
-// (virtio-mmio) на платформе без virtio просто не понадобится вовсе —
-// это сигнал, какие драйверы придется переписывать целиком, а не адаптировать.
+// адреса напрямую по коду — так что после переписывания RTC/virtio-mmio
+// драйверов останется поменять только значения здесь.
 // =====================================================================
 
 // --- Физические адреса устройств (см. alloc_device_frame() в main.cpp) ---
-constexpr uintptr_t PLAT_UART_PADDR        = 0x09000000ULL;             // PL011
-constexpr uintptr_t PLAT_RTC_PADDR         = 0x09010000ULL;             // PL031
-constexpr uintptr_t PLAT_VIRTIO_MMIO_PADDR = 0x0a000000ULL;             // База слотов virtio-mmio
+// UART: используем mini-UART (UART1, AUX-периферия), а не PL011 (UART0).
+// PL011 на реальной плате физически отдан Bluetooth-модулю и требует
+// либо dtoverlay=disable-bt в config.txt (это ломает elfloader — см.
+// историю отладки), либо ручного включения тактовой частоты через
+// VideoCore mailbox (не удалось добиться ответа от mailbox на этой
+// прошивке). mini-UART же тактуется от VPU-ядра всегда и УЖЕ физически
+// работает на GPIO14/15 без какой-либо настройки с нашей стороны — это
+// подтверждено: именно через него видны все логи U-Boot/ядра при живой
+// загрузке. Адрес — база AUX-периферии (см. RPI4_UART1_MINIUART_PADDR
+// ниже), а не сам mini-UART блок (0xfe215040) — тот не выровнен на
+// страницу, а alloc_device_frame() умеет мапить только целые страницы.
+constexpr uintptr_t PLAT_UART_PADDR        = 0xfe215000ULL;             // RPi4: AUX-периферия (mini-UART внутри, +0x40)
+constexpr uintptr_t PLAT_RTC_PADDR         = 0x09010000ULL;             // PL031 (QEMU virt) — на RPi4 нет, блокер Фазы 3.1
+constexpr uintptr_t PLAT_VIRTIO_MMIO_PADDR = 0x0a000000ULL;             // virtio-mmio (QEMU virt) — на RPi4 нет, блокеры Фазы 3.2/3.3
 constexpr int        PLAT_VIRTIO_MMIO_SLOTS = 4;                        // Сколько слотов резервирует rootserver
 
 // --- Виртуальные адреса, куда эти устройства маппятся в VSpace драйвера
@@ -32,14 +45,25 @@ constexpr uintptr_t PLAT_RTC_VADDR          = 0x200002000ULL;
 constexpr uintptr_t PLAT_VIRTIO_MMIO_VADDR  = 0x200004000ULL;
 constexpr uintptr_t PLAT_VIRTIO_MMIO_STRIDE = 0x200ULL; // Шаг перебора слотов при поиске устройства
 
-// --- Оффсеты регистров внутри блоков (ARM PrimeCell PL011/PL031) ---
-constexpr uintptr_t PL011_DR_OFFSET   = 0x00;                           // Data Register
-constexpr uintptr_t PL011_FR_OFFSET   = 0x18;                           // Flag Register
-constexpr uintptr_t PL011_IMSC_OFFSET = 0x38;                           // Interrupt Mask Set/Clear
-constexpr uintptr_t PL011_ICR_OFFSET  = 0x44;                           // Interrupt Clear Register
-constexpr uint32_t  PL011_FR_TXFF     = (1u << 5);                      // TX FIFO full
-constexpr uint32_t  PL011_FR_RXFE     = (1u << 4);                      // RX FIFO empty
-constexpr uint32_t  PL011_INT_RX_BIT  = (1u << 4);                      // Бит Receive Interrupt в IMSC/ICR
+// --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
+// от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
+// формат — отдельные однобитовые флаги в LSR вместо PL011's DR/FR. ---
+constexpr uintptr_t AUX_ENABLES_OFFSET = 0x04;                          // Общий для aux-периферии (mini-UART/SPI1/SPI2)
+constexpr uint32_t  AUX_ENABLES_UART   = (1u << 0);                     // Включить mini-UART
+constexpr uintptr_t AUX_MU_IO_OFFSET   = 0x40;                          // Data Register (TX при записи, RX при чтении)
+constexpr uintptr_t AUX_MU_IER_OFFSET  = 0x44;                          // Interrupt Enable
+constexpr uintptr_t AUX_MU_IIR_OFFSET  = 0x48;                          // Interrupt Identify / запись чистит FIFO
+constexpr uintptr_t AUX_MU_LCR_OFFSET  = 0x4C;                          // Line Control (биты 0-1: 11 = 8 бит данных)
+constexpr uintptr_t AUX_MU_MCR_OFFSET  = 0x50;                          // Modem Control
+constexpr uintptr_t AUX_MU_LSR_OFFSET  = 0x54;                          // Line Status
+constexpr uintptr_t AUX_MU_CNTL_OFFSET = 0x60;                          // Extra Control (биты 0-1: RX/TX enable)
+constexpr uintptr_t AUX_MU_BAUD_OFFSET = 0x68;                          // Baudrate
+constexpr uint32_t  AUX_MU_LSR_RX_READY = (1u << 0);                    // Данные готовы к чтению (аналог "не RXFE")
+constexpr uint32_t  AUX_MU_LSR_TX_EMPTY = (1u << 5);                    // Можно писать следующий байт (аналог "не TXFF")
+constexpr uint32_t  AUX_MU_LCR_8BIT     = 0x3u;                         // 8 бит данных, без чётности, 1 стоп-бит
+constexpr uint32_t  AUX_MU_CNTL_RX_EN   = (1u << 0);
+constexpr uint32_t  AUX_MU_CNTL_TX_EN   = (1u << 1);
+constexpr uint32_t  AUX_MU_IER_RX_INT   = (1u << 0);                    // Разрешить прерывание "есть данные для чтения"
 
 // Оффсеты по датащиту PL031 (RTCDR=0x00, RTCMR=0x04, RTCIMSC=0x10, RTCICR=0x1C).
 constexpr uintptr_t PL031_DR_OFFSET   = 0x00;                           // Data Register (текущее время, сек. с эпохи)
@@ -51,8 +75,9 @@ constexpr uintptr_t PL031_ICR_OFFSET  = 0x1C;                           // Inter
 // поведение — сохранено как есть, здесь только вынесено значение в константу.
 
 // --- Номера IRQ (GIC SPI), см. seL4_IRQControl_Get() в main.cpp ---
-constexpr int PLAT_UART_IRQ  = 33;
-constexpr int PLAT_TIMER_IRQ = 34;
+constexpr int PLAT_UART_IRQ  = 125;                                     // RPi4: mini-UART, см. RPI4_UART1_MINIUART_IRQ ниже
+                                                                          // (общий "aux" IRQ на mini-UART/SPI1/SPI2)
+constexpr int PLAT_TIMER_IRQ = 34;                                      // PL031 (QEMU virt) — блокер Фазы 3.1, см. PLAT_RTC_PADDR
 
 // --- virtio-mmio: константы самой спецификации virtio (не завязаны на
 // плату), но актуальны только пока есть virtio-net/virtio-blk. На
@@ -88,13 +113,13 @@ constexpr uint32_t VIRTIO_DEVICE_ID_BLOCK = 2;
 // сравни с PLAT_UART_IRQ/PLAT_TIMER_IRQ выше — там та же конвенция для
 // QEMU 'virt': DT SPI 1 -> 33, SPI 2 -> 34).
 //
-// Ничего из этого пока не используется драйверами (main.cpp/uart_driver/
-// timer_driver/blk_driver/net_driver по-прежнему собраны под QEMU 'virt'
-// и ссылаются на константы PLAT_* выше). Это справочный набор адресов
-// для будущего переключения платформы — часть портирована уже сейчас
-// (диск/сеть/UART/GIC из ROADMAP.md), часть — задел под периферию,
-// которая пока не нужна ОС, но появится в дальнейшем (USB, Wi-Fi/BT,
-// GPIO общего назначения, HDMI, аудио, PCIe/NVMe).
+// UART (RPI4_UART1_MINIUART_PADDR/IRQ) уже зеркалирован в активные
+// PLAT_UART_* выше — драйверы (main.cpp/uart_driver.cpp) реально работают
+// с этими адресами. Остальное (RTC/EMMC2/GENET и т.д.) пока используется
+// только как справочный набор адресов под будущее переключение (см.
+// ROADMAP.md, Фаза 3.1-3.3), плюс задел под периферию, которая пока не
+// нужна ОС, но появится в дальнейшем (USB, Wi-Fi/BT, GPIO общего
+// назначения, HDMI, аудио, PCIe/NVMe).
 // =====================================================================
 
 // --- GIC-400 (тот же PL011/GICv2 стек, что и в QEMU, другие адреса) ---
@@ -103,12 +128,20 @@ constexpr uintptr_t RPI4_GICC_PADDR = 0xff842000ULL;                    // CPU i
 constexpr uintptr_t RPI4_GICH_PADDR = 0xff844000ULL;                    // Virt iface,    DT 0x40044000 (hypervisor, не нужен без виртуализации)
 constexpr uintptr_t RPI4_GICV_PADDR = 0xff846000ULL;                    // Virt CPU iface,DT 0x40046000
 
-// --- UART: на RPi4 их несколько, PL011 (UART0) физически разведён на
-// Bluetooth-модуль, а не на GPIO14/15 (это делает firmware/dtoverlay
-// disable-bt) — mini-UART (UART1) сидит на GPIO-заголовке по умолчанию.
-// Для нашего bare-metal консольного порта пригоден любой; PL011 — как
-// более полнофункциональный (FIFO, IrDA и т.п., тот же IP, что и в
-// QEMU 'virt', поэтому driver-код можно переиспользовать почти как есть). ---
+// --- UART: на RPi4 их несколько. PL011 (UART0) по умолчанию (в стоковом
+// bcm2711-rpi-4-b.dts, узел uart0_pins) разведён на GPIO32/33, которые
+// физически ведут на Bluetooth-модуль, а не на 40-пиновый заголовок;
+// mini-UART (UART1) по умолчанию сидит на GPIO14/15 (ALT5) и УЖЕ работает
+// без какой-либо настройки с нашей стороны — используем именно его (см.
+// PLAT_UART_PADDR выше). У SoC есть альтернативный пинмукс для PL011
+// (узел uart0-gpio14, ALT0 на тех же GPIO14/15), который в Raspberry Pi OS
+// включается через dtoverlay=disable-bt — но на практике это либо ломает
+// наш elfloader (пробовали — плата переставала грузиться дальше
+// "Starting application"), либо требует ручного включения тактовой
+// частоты PL011 через VideoCore mailbox (пробовали — mailbox не отвечал,
+// STATUS/READ читались одинаковым неизменным значением). mini-UART
+// избавляет от обеих проблем ценой другого (не PrimeCell) регистрового
+// формата — см. AUX_MU_* константы выше. ---
 constexpr uintptr_t RPI4_UART0_PL011_PADDR = 0xfe201000ULL;             // DT serial@7e201000, "arm,pl011"
 constexpr int        RPI4_UART0_PL011_IRQ  = 153;                       // DT SPI 0x79=121 -> GIC 121+32
 constexpr uintptr_t RPI4_UART1_MINIUART_PADDR = 0xfe215040ULL;          // DT serial@7e215040, "brcm,bcm2835-aux-uart" (не PrimeCell, другой регистровый формат!)

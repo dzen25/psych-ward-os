@@ -85,6 +85,44 @@ pip install -r requirements.txt
 
 ---
 
+<details>
+<summary><b>🔨 Компиляция прошивок: тестовая и основная (клик, чтобы развернуть)</b></summary>
+
+Две разные прошивки, два разных дерева исходников (см. «Структура порта» выше) — не перепутать.
+
+### Тестовая прошивка (`sel4test` hello-world, Фаза 1.3)
+
+Собирается **вне** этого репозитория, в отдельной папке `~/sel4-rpi4-hello`:
+
+```bash
+mkdir -p ~/sel4-rpi4-hello && cd ~/sel4-rpi4-hello
+repo init -u https://github.com/seL4/sel4test-manifest.git
+repo sync
+mkdir cbuild && cd cbuild
+../init-build.sh -DPLATFORM=rpi4 -DAARCH64=1 -DRPI4_MEMORY=<реальный RAM платы: 1024|2048|4096|8192>
+ninja
+# результат: images/sel4test-driver-image-arm-bcm2711
+```
+
+⚠️ `-DRPI4_MEMORY` обязателен — без него по умолчанию считается 8GB, и на плате с меньшим объёмом памяти загрузка может падать.
+
+### Основная прошивка (`psych-ward-os`, Фаза 3)
+
+Собирается **в этом репозитории**, той же связкой `init-build.sh` + `ninja`, что и на ветке `main` под QEMU, но с платформой `rpi4` вместо `qemu-arm-virt`:
+
+```bash
+mkdir -p build-rpi4 && cd build-rpi4
+../init-build.sh -DPLATFORM=rpi4 -DAARCH64=1 -DRPI4_MEMORY=<реальный RAM платы: 1024|2048|4096|8192>
+ninja
+# результат: images/sel4test-driver-image-arm-bcm2711 (root task — уже psych-ward-os, не hello-world)
+```
+
+Существующая папка `build/` в репозитории уже сконфигурирована под `-DPLATFORM=qemu-arm-virt` (наследие ветки `main`) — для rpi4 нужна отдельная чистая build-директория, а не пересборка в той же папке.
+
+</details>
+
+---
+
 ## Roadmap
 
 Подробная дорожная карта по фазам (0–3, с подпунктами) и сводный чек-лист по всем шагам вынесены в отдельный файл — **[ROADMAP.md](ROADMAP.md)**.

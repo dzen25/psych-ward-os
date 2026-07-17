@@ -2,40 +2,51 @@
 #include "h/hw_timer.h"
 #include "h/platform.h"
 
-volatile uint32_t *uart_dr;
-volatile uint32_t *uart_fr;
-volatile uint32_t *uart_imsc; // Interrupt Mask Set/Clear
-volatile uint32_t *uart_icr;  // Interrupt Clear Register
+volatile uint32_t *uart_io;   // AUX_MU_IO — TX при записи, RX при чтении
+volatile uint32_t *uart_lsr;  // AUX_MU_LSR — статусные биты (готовность RX/TX)
+volatile uint32_t *uart_ier;  // AUX_MU_IER — маска прерываний
+volatile uint32_t *uart_iir;  // AUX_MU_IIR — идентификация/сброс прерывания
 
 void uart_init(void *vaddr) {
-    uart_dr = (volatile uint32_t*)((char*)vaddr + PL011_DR_OFFSET);
-    uart_fr = (volatile uint32_t*)((char*)vaddr + PL011_FR_OFFSET);
-    uart_imsc = (volatile uint32_t*)((char*)vaddr + PL011_IMSC_OFFSET);
-    uart_icr = (volatile uint32_t*)((char*)vaddr + PL011_ICR_OFFSET);
+    volatile uint32_t *aux_enables = (volatile uint32_t*)((char*)vaddr + AUX_ENABLES_OFFSET);
+    uart_io  = (volatile uint32_t*)((char*)vaddr + AUX_MU_IO_OFFSET);
+    uart_ier = (volatile uint32_t*)((char*)vaddr + AUX_MU_IER_OFFSET);
+    uart_iir = (volatile uint32_t*)((char*)vaddr + AUX_MU_IIR_OFFSET);
+    uart_lsr = (volatile uint32_t*)((char*)vaddr + AUX_MU_LSR_OFFSET);
+    volatile uint32_t *uart_lcr  = (volatile uint32_t*)((char*)vaddr + AUX_MU_LCR_OFFSET);
+    volatile uint32_t *uart_cntl = (volatile uint32_t*)((char*)vaddr + AUX_MU_CNTL_OFFSET);
+
+    // mini-UART уже включена и настроена прошивкой (baud рег. НЕ трогаем —
+    // тактуется от VPU-ядра, риск неверно посчитать делитель; см. platform.h).
+    // Но явно включаем AUX/8-бит/RX/TX на случай, если это первый доступ —
+    // идемпотентно, не сбивает уже работающую конфигурацию прошивки/ядра.
+    *aux_enables |= AUX_ENABLES_UART;
+    *uart_lcr = AUX_MU_LCR_8BIT;
+    *uart_cntl = AUX_MU_CNTL_RX_EN | AUX_MU_CNTL_TX_EN;
 }
 
 void uart_enable_interrupts() {
-    // Включаем Receive Interrupt Mask (бит 4)
-    *uart_imsc |= PL011_INT_RX_BIT;
+    *uart_ier |= AUX_MU_IER_RX_INT;
 }
 
 void uart_clear_interrupts() {
-    // Сбрасываем Receive Interrupt (бит 4)
-    *uart_icr = PL011_INT_RX_BIT;
+    // У mini-UART нет отдельного "write 1 to clear" регистра как ICR у
+    // PL011 — запись в IIR сбрасывает FIFO/подтверждает прерывание.
+    *uart_iir = 0;
 }
 
 void uart_putchar(char c) {
-    while ((*uart_fr) & PL011_FR_TXFF);
-    *uart_dr = c;
+    while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY));
+    *uart_io = c;
 }
 
 int uart_havechar() {
-    return !((*uart_fr) & PL011_FR_RXFE);
+    return (*uart_lsr) & AUX_MU_LSR_RX_READY;
 }
 
 char uart_getchar() {
     while (!uart_havechar()) seL4_Yield();
-    return (char)(*uart_dr & 0xFF);
+    return (char)(*uart_io & 0xFF);
 }
 
 void uart_puts(const char *s) {

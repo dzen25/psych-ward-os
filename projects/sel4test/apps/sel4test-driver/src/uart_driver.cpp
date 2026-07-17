@@ -16,9 +16,9 @@ static volatile int tx_tail = 0;
 static char line_buffers[MAX_CLIENTS][LINE_BUFFER_SIZE];
 static int line_buffer_pos[MAX_CLIENTS] = {0};
 
-// Глобальные указатели на регистры для функции flush_buffer
-static volatile seL4_Uint32 *uart_dr = nullptr;
-static volatile seL4_Uint32 *uart_fr = nullptr;
+// Глобальные указатели на регистры для функции flush_buffer (mini-UART, см. platform.h)
+static volatile seL4_Uint32 *uart_io = nullptr;
+static volatile seL4_Uint32 *uart_lsr = nullptr;
 static char* shm_vaddr = nullptr;
 
 static inline seL4_IPCBuffer* get_local_ipc() {
@@ -32,11 +32,11 @@ void __assert_fail(const char *assertion, const char *file, int line, const char
 
 static void uart_putc(char c) {
     if (c == '\n') {
-        while ((*uart_fr) & PL011_FR_TXFF);
-        *uart_dr = '\r';
+        while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY));
+        *uart_io = '\r';
     }
-    while ((*uart_fr) & PL011_FR_TXFF);
-    *uart_dr = c;
+    while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY));
+    *uart_io = c;
 }
 
 static void flush_buffer() {
@@ -44,8 +44,8 @@ static void flush_buffer() {
     // Эта операция неблокирующая: если FIFO полон, цикл немедленно
     // завершится, и драйвер вернется к ожиданию новых событий.
     // Остаток данных будет отправлен на следующей итерации.
-    while (tx_tail != tx_head && (((*uart_fr) & PL011_FR_TXFF) == 0)) {
-        *uart_dr = tx_buffer[tx_tail];
+    while (tx_tail != tx_head && ((*uart_lsr) & AUX_MU_LSR_TX_EMPTY)) {
+        *uart_io = tx_buffer[tx_tail];
         tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
     }
 }
@@ -72,8 +72,8 @@ int main(int argc, char *argv[]) {
         __assert_fail("Null Capability Detected in Driver Init!", __FILE__, __LINE__, __func__);
     }
 
-    uart_dr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + PL011_DR_OFFSET);
-    uart_fr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + PL011_FR_OFFSET);
+    uart_io  = (volatile seL4_Uint32*)(PLAT_UART_VADDR + AUX_MU_IO_OFFSET);
+    uart_lsr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + AUX_MU_LSR_OFFSET);
     char kbd_buffer[128]; int head = 0, tail = 0;
 
     seL4_SetMR(0, SYS_DRIVER_READY);
@@ -85,8 +85,8 @@ int main(int argc, char *argv[]) {
 
         if (badge == 1) {
             // Прерывание от клавиатуры
-            while (((*uart_fr) & PL011_FR_RXFE) == 0) {
-                char c = *uart_dr;
+            while ((*uart_lsr) & AUX_MU_LSR_RX_READY) {
+                char c = *uart_io;
                 int next_head = (head + 1) % 128;
                 if (next_head == tail) {
                     // Буфер полон — читатель не успевает вычитывать. Отбрасываем
