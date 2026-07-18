@@ -338,7 +338,7 @@ static int g_udp_rx_len = 0;
 // натурально тормозила главный цикл ровно тогда, когда мог прийти настоящий
 // ответ на исходящий ping — прямое подозрение на часть "случайных" таймаутов.
 static seL4_CPtr g_blk_ep = 0;
-static const char* NET_LOG_PATH = "/root/net_udp.log";
+static const char* NET_LOG_PATH = PATH_NET_UDP_LOG; // см. platform.h — единый источник известных путей
 // С запасом под лимит blk_driver'а (SYS_WRITE_FILE клампит len до 4096).
 static const uint32_t NET_LOG_BUF_CAP = 3584;
 static char g_udp_log_buf[NET_LOG_BUF_CAP];
@@ -1579,18 +1579,50 @@ static int fmt_ip(char* buf, const uint8_t ip[4]) {
     return pos;
 }
 
+// Общий межпроцессный спинлок на офсет 0/128 разделяемой SHM — та же
+// физическая память и тот же офсет 4096, что и vfs_spinlock_ptr в shell.cpp
+// (см. комментарий там). Нужен, потому что net_log_flush() ниже пишет в тот
+// же офсет 0/128, что shell использует для ЛЮБОГО файлового syscall'а
+// (ps/cat/touch/...) — без этого лока фоновая запись журнала (по приходу
+// произвольного UDP-пакета, независимо от команд шелла) может перезаписать
+// буфер посреди чужого запроса (был замечен на живом железе: `ps` иногда
+// печатал "/root/net_udp.log" вместо таблицы процессов).
+// ВАЖНО: обычные volatile чтение/запись, БЕЗ __sync_lock_test_and_set/
+// __sync_lock_release. Эта SHM мапится некэшируемой Device-памятью
+// (map_frame_robust(), main.cpp — ради когерентности с GENET DMA), а
+// exclusive-load/store инструкции (LDXR/STXR, именно в них компилируются
+// __sync_lock_*) на Device-памяти по спеке ARM имеют непредсказуемое
+// поведение — именно это уронило ВЕСЬ kernel seL4 на живом железе
+// необрабатываемым исключением шины ("halting... Kernel entry via Unknown
+// (0)"), причём сразу при загрузке (net_log_flush() вызывается в main()
+// безусловно), а не что-то специфичное для Wi-Fi. Настоящий hardware-atomic
+// тут и не нужен: система однопроцессорная (SMP OFF, easy-settings.cmake) —
+// переключение контекста происходит только на syscall/yield, а не посреди
+// пары "прочитать/проверить -> записать" ниже.
+static inline void net_vfs_lock() {
+    volatile int* lock = (volatile int*)(g_shm_vaddr + 4096);
+    while (*lock) seL4_Yield();
+    *lock = 1;
+}
+static inline void net_vfs_unlock() {
+    volatile int* lock = (volatile int*)(g_shm_vaddr + 4096);
+    *lock = 0;
+}
+
 // Перезаписывает /root/net_udp.log целиком текущим содержимым g_udp_log_buf —
 // вызывается и с пустым буфером один раз при старте (см. main()), чтобы
 // журнал гарантированно очищался при каждом запуске net_driver, даже если за
 // сессию не придёт ни одного пакета.
 static void net_log_flush() {
     if (g_blk_ep == 0 || g_shm_vaddr == nullptr) return;
+    net_vfs_lock();
     int path_len = my_strlen(NET_LOG_PATH);
     my_memcpy(g_shm_vaddr, NET_LOG_PATH, path_len + 1); // включая нуль-терминатор
     my_memcpy(g_shm_vaddr + 128, g_udp_log_buf, g_udp_log_len);
     seL4_SetMR(0, 113); // SYS_WRITE_FILE
     seL4_SetMR(1, g_udp_log_len);
     seL4_Call(g_blk_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    net_vfs_unlock();
 }
 
 static void net_log_udp(seL4_CPtr timer_ep, const uint8_t src_ip[4], uint16_t src_port, int payload_len) {

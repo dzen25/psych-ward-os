@@ -29,6 +29,19 @@ static inline uint64_t read_cntfrq() {
     return val;
 }
 
+// Термодатчик AVS RO thermal (см. platform.h) — единственный MMIO-регистр,
+// который этому процессу реально нужен, поэтому не заводим под него
+// отдельный драйвер: та же экономия, что и с ARM generic timer выше —
+// один регистр статуса, ни DMA, ни IRQ, ни инициализации.
+static bool read_cpu_temp_mC(int32_t *out_mC) {
+    volatile uint32_t *status = (volatile uint32_t*)(PLAT_AVS_VADDR + AVS_RO_TEMP_STATUS_OFFSET);
+    uint32_t val = *status;
+    if (!(val & AVS_RO_TEMP_STATUS_VALID_MSK)) return false;
+    int32_t raw = (int32_t)(val & AVS_RO_TEMP_STATUS_DATA_MSK);
+    *out_mC = AVS_TEMP_SLOPE_MC * raw + AVS_TEMP_OFFSET_MC;
+    return true;
+}
+
 int main(int argc, char *argv[]) {
     // 2. Достаем настоящий адрес буфера
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -78,6 +91,12 @@ int main(int argc, char *argv[]) {
             ntp_offset_seconds = (seL4_Int64)seL4_GetMR(1);
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 6) { // SYS_GET_TEMP: температура кристалла (см. AVS RO thermal выше)
+            int32_t temp_mC = 0;
+            bool valid = read_cpu_temp_mC(&temp_mC);
+            seL4_SetMR(0, valid ? 0 : 1); // 0 = ok, 1 = датчик еще не выдал валидное показание
+            seL4_SetMR(1, (seL4_Word)(int64_t)temp_mC);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
         }

@@ -10,7 +10,23 @@ constexpr bool LOG_BRINGUP = false; // main.cpp: alloc_device_frame() дампы
 constexpr bool LOG_UART    = false;
 constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
-constexpr bool LOG_NET     = true;  // net_driver.cpp — самый свежий/менее обкатанный компонент
+constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежий/менее обкатанный компонент
+
+// --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
+// абсолютные (с ведущего '/'), чтобы не зависеть от current_dir_cluster —
+// blk_driver.cpp делает mkdir+cd в "/root" при старте (см. USER_ROOT_DIR
+// там же), поэтому ЛЮБОЙ относительный (без ведущего '/') путь, отправленный
+// через SYS_READ_FILE/SYS_WRITE_FILE, резолвится уже ВНУТРИ "/root", а не в
+// истинном корне FAT-раздела — где живут файлы загрузчика (config.txt,
+// U-BOOT.BIN и т.п.). Раньше wifi_driver.cpp посылал голое "wifi_fw.bin" —
+// на живом железе это заставляло искать файл внутри "/root", хотя сам файл
+// лежал на SD-карте на уровень выше (в истинном корне раздела) — драйвер
+// был не виноват, было просто разное соглашение о том, где искать. Все
+// новые файлы драйверов (прошивка/логи/конфиги) кладите d соответсвующие папки на
+// SD-карте и используйте эти константы вместо строк по месту. ---
+constexpr const char* PATH_NET_UDP_LOG   = "/root/net_udp.log";
+constexpr const char* PATH_WIFI_FW       = "/wifi/wifi_fw.bin";
+constexpr const char* PATH_WIFI_NVRAM    = "/wifi/wifi_nvram.txt";
 
 // =====================================================================
 // Платформенно-зависимый слой.
@@ -60,12 +76,30 @@ constexpr int        PLAT_EMMC_IRQ  = 158;                              // Не 
 // адрес). Занимает 64KB (0x10000) — заметно больше EMMC2/UART.
 constexpr uintptr_t PLAT_GENET_PADDR = 0xfd580000ULL;
 
+// Термодатчик: AVS RO thermal (единственный температурный датчик BCM2711,
+// доступный без прошивки VideoCore — см. RPI4_AVS_MONITOR_* ниже, откуда
+// взят адрес). Живёт в том же процессе, что и таймер (timer_driver) — оба
+// читают железо напрямую без DMA/IRQ, отдельный процесс не нужен.
+constexpr uintptr_t PLAT_AVS_PADDR = 0xfd5d2000ULL;
+
+// Wi-Fi (Фаза 4, Милстоун 4.1): сам SDIO-хост-контроллер, на котором висит
+// BCM43455 (см. RPI4_WIFI_SDIO_* ниже, откуда взят адрес). Это НЕ тот же
+// контроллер, что EMMC2 (PLAT_EMMC_PADDR) — DT compatible "brcm,bcm2835-sdhci"
+// против "brcm,bcm2711-emmc2" у EMMC2, другой физический блок, но тот же
+// стандартный SDHCI Simplified Spec регистровый layout (см. EMMC_* ниже —
+// переиспользуются как есть, просто с этим PADDR). В этом милстоуне —
+// только сам хост-контроллер + сырые SDIO-команды (CMD5/CMD52), без
+// backplane/прошивки/сетевого протокола (см. ROADMAP.md Фаза 4).
+constexpr uintptr_t PLAT_WIFI_SDIO_PADDR = 0xfe300000ULL;
+
 // --- Виртуальные адреса, куда эти устройства маппятся в VSpace драйвера
 // (см. hw_vaddr в spawn_process(), main.cpp). Общие для всех процессов —
 // каждый драйвер видит свое устройство по одному и тому же литералу. ---
 constexpr uintptr_t PLAT_UART_VADDR         = 0x200000000ULL;
 constexpr uintptr_t PLAT_EMMC_VADDR         = 0x200006000ULL;
 constexpr uintptr_t PLAT_GENET_VADDR        = 0x200008000ULL;
+constexpr uintptr_t PLAT_AVS_VADDR          = 0x200019000ULL;
+constexpr uintptr_t PLAT_WIFI_SDIO_VADDR    = 0x20001a000ULL;
 
 // --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
 // от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
@@ -332,6 +366,357 @@ constexpr uint32_t GENET_RX_BUF_LENGTH = 1536;
 // полей — отсюда "ничего не приходит" при отправке ARP/DHCP-запросов.
 constexpr uint32_t GENET_RX_BUF_OFFSET = 2;
 
+// --- AVS RO thermal (термодатчик BCM2711) — регистровая карта, смещение от
+// PLAT_AVS_PADDR. Единственный регистр статуса температуры кристалла,
+// найден по эталонному Linux-драйверу того же чипа —
+// /home/nikita/workspace_nofing/common/drivers/thermal/broadcom/bcm2711_thermal.c
+// (compatible "brcm,bcm2711-thermal", родительский syscon-узел
+// "avs-monitor@7d5d2000"). В отличие от VideoCore mailbox (который в этой
+// же сессии не отвечал при попытке достать реальный MAC-адрес, см.
+// net_driver.cpp/README.md) этот регистр читается напрямую по MMIO, без
+// прошивки/протокола — предпочтительный путь по уже устоявшейся в этом
+// порту практике (UART/EMMC2/GENET тоже все raw MMIO). ---
+constexpr uintptr_t AVS_RO_TEMP_STATUS_OFFSET = 0x200;
+// Бит валидности показания — см. AVS_RO_TEMP_STATUS_VALID_MSK в референсе
+// (BIT(16) | BIT(10)); данные — 10 бит [9:0].
+constexpr uint32_t AVS_RO_TEMP_STATUS_VALID_MSK = (1u << 16) | (1u << 10);
+constexpr uint32_t AVS_RO_TEMP_STATUS_DATA_MSK  = 0x3FFu;
+// Линейное преобразование сырого кода АЦП в миллиградусы Цельсия:
+// temp_mC = slope * raw + offset. Коэффициенты — из device tree ядра Linux
+// для этого же SoC (bcm2711.dtsi: `&cpu_thermal { coefficients = <(-487) 410040>; }`),
+// не датащит-константа общего вида — специфично для BCM2711.
+constexpr int32_t AVS_TEMP_SLOPE_MC  = -487;
+constexpr int32_t AVS_TEMP_OFFSET_MC = 410040;
+
+// --- Wi-Fi (BCM43455) SDIO — команды и битовые поля аргументов, отдельные
+// от SD-memory команд EMMC_CMD_* выше (EMMC_* регистровые СМЕЩЕНИЯ
+// (CMDTM/ARG1/RESP/DATA/STATUS/CONTROL0/CONTROL1/INTERRUPT/CAP0) при этом
+// переиспользуются как есть — это тот же стандартный SDHCI layout, см.
+// PLAT_WIFI_SDIO_PADDR выше). Формат аргументов — из спеки SDIO (сверено с
+// /home/nikita/workspace_nofing/common/include/linux/mmc/sdio.h). ---
+constexpr uint32_t SDIO_CMD_SEND_OP_COND = 5;   // CMD5,  R4/48bit, БЕЗ CRC-проверки (в отличие от SD-memory команд)
+constexpr uint32_t SDIO_CMD_RW_DIRECT    = 52;  // CMD52, R5/48bit — байтовое чтение/запись регистра функции
+// CMD52 argument: [31]=R/W, [30:28]=номер функции, [27]=RAW, [25:9]=адрес регистра, [7:0]=данные (при записи)
+constexpr uint32_t SDIO_ARG_RW_FLAG        = (1u << 31);  // 1 = запись
+constexpr uint32_t SDIO_ARG_FUNC_SHIFT     = 28;
+constexpr uint32_t SDIO_ARG_RAW_FLAG       = (1u << 27);  // Read After Write
+constexpr uint32_t SDIO_ARG_REG_ADDR_SHIFT = 9;
+constexpr uint32_t SDIO_ARG_DATA_MASK      = 0xFFu;
+// Функция 0 (CCCR/FBR, общие регистры карты — не WLAN-данные, те в функциях 1/2)
+constexpr uint32_t SDIO_FUNC_0 = 0;
+// F0 CCCR offset 0x00 — версия CCCR/FBR (см. SDIO_CCCR_CCCR в linux/mmc/sdio.h).
+// Читаем этот регистр в Милстоуне 4.1 как доказательство, что чип отвечает.
+constexpr uint32_t SDIO_CCCR_CCCR_OFFSET = 0x00;
+// CMD5 (R4) response, бит 31 — "card ready" (питание/OCR-договорённость
+// завершена). Как и ACMD41 в blk_driver.cpp, CMD5 нужно слать в цикле, пока
+// карта не выставит этот бит — иначе последующие команды (CMD52 и т.д.)
+// могут не проходить, потому что чип ещё занят собственной инициализацией.
+constexpr uint32_t SDIO_R4_READY = (1u << 31);
+
+// F0 CCCR offset 0x02/0x03 — Input/Output Enable и Ready (см. SDIO_CCCR_IOEx/
+// SDIO_CCCR_IORx в linux/mmc/sdio.h). Прежде чем к функции N (N>=1, здесь —
+// backplane-функция 1) можно обращаться CMD52/CMD53, хост обязан выставить
+// бит N в IOEx и дождаться того же бита в IORx (карта включает функцию не
+// мгновенно) — это отдельный от CMD3/CMD7 шаг card-инициализации, специфичный
+// для SDIO-функций, и без него CMD53 к F1 не проходит.
+constexpr uint32_t SDIO_CCCR_IOEx_OFFSET = 0x02;
+constexpr uint32_t SDIO_CCCR_IORx_OFFSET = 0x03;
+
+// --- Wi-Fi (BCM43455) Милстоун 4.2 — backplane (внутренняя шина чипа):
+// enumeration ядер, сброс ARM-ядра, заливка прошивки/NVRAM. Все константы
+// сверены построчно с эталонным
+// /home/nikita/workspace_nofing/common/drivers/net/wireless/broadcom/brcm80211/brcmfmac/
+// (chip.c, bcma_regs.h, chipcommon.h, soc.h) для семейства чипов 0x4345
+// (43454/43455/43456 — один Chip ID, отличаются только chiprev). ---
+constexpr uint32_t SDIO_CMD_RW_EXTENDED = 53; // CMD53, R5/48bit — блочное чтение/запись (SDIO_RW_EXTENDED)
+// CMD53 argument: [31]=R/W, [30:28]=функция, [27]=Block mode, [26]=Increment
+// address, [25:9]=адрес регистра, [8:0]=байт/блок-каунт (см. linux/mmc/sdio.h:26-35).
+constexpr uint32_t SDIO_ARG_BLOCK_MODE_FLAG = (1u << 27);
+constexpr uint32_t SDIO_ARG_INCR_ADDR_FLAG  = (1u << 26);
+constexpr uint32_t SDIO_ARG_COUNT_MASK      = 0x1FFu; // [8:0]
+
+// Функция 1 (backplane-доступ) — окно 32KB (0x8000): адрес окна выставляется
+// тремя байтовыми регистрами (CMD52 к F1), офсет ВНУТРИ окна идёт как обычный
+// F1-адрес в аргументе CMD52/53.
+constexpr uint32_t SBSDIO_FUNC_1              = 1;
+constexpr uint32_t SBSDIO_FUNC1_SBADDRLOW     = 0x1000A;
+constexpr uint32_t SBSDIO_FUNC1_SBADDRMID     = 0x1000B;
+constexpr uint32_t SBSDIO_FUNC1_SBADDRHIGH    = 0x1000C;
+constexpr uint32_t SBSDIO_SBWINDOW_MASK       = 0xffff8000u;
+constexpr uint32_t SBSDIO_SB_OFT_ADDR_MASK    = 0x07FFFu;   // офсет внутри окна -> младшие 15 бит F1-адреса
+constexpr uint32_t SBSDIO_SB_ACCESS_2_4B_FLAG = 0x08000u;   // 32-битный (не байтовый) доступ
+constexpr uint32_t SBSDIO_WINDOW_SIZE         = 0x8000u;    // 32KB — макс. кусок без переключения окна
+
+// Тактовая частота САМОГО ЧИПА (F1-регистр CHIPCLKCSR) — не путать с частотой
+// хостовой SDIO-шины (EMMC_CONTROL1/sdio_set_clock_divider выше). Обязательный
+// шаг перед любой РЕАЛЬНОЙ backplane bulk-передачей (см. wifi_request_alp_
+// clock()/wifi_request_ht_clock() в wifi_driver.cpp и эталонный
+// brcmf_sdio_buscoreprep()/brcmf_sdio_clkctl() в sdio.c/sdio.h:83-95).
+constexpr uint32_t SBSDIO_FUNC1_CHIPCLKCSR    = 0x1000E;
+constexpr uint32_t SBSDIO_FUNC1_SDIOPULLUP    = 0x1000F;
+constexpr uint8_t  SBSDIO_FORCE_ALP           = 0x01;
+constexpr uint8_t  SBSDIO_FORCE_HT            = 0x02;
+constexpr uint8_t  SBSDIO_ALP_AVAIL_REQ       = 0x08;
+constexpr uint8_t  SBSDIO_HT_AVAIL_REQ        = 0x10;
+constexpr uint8_t  SBSDIO_FORCE_HW_CLKREQ_OFF = 0x20;
+constexpr uint8_t  SBSDIO_ALP_AVAIL           = 0x40;
+constexpr uint8_t  SBSDIO_HT_AVAIL            = 0x80;
+constexpr uint8_t  SBSDIO_AVBITS              = SBSDIO_HT_AVAIL | SBSDIO_ALP_AVAIL;
+
+// Размер блока функции 1 (FBR — Function Basic Register, НЕ F1-собственное
+// адресное пространство — поэтому CMD52 сюда идёт с функцией 0, как и CCCR,
+// см. sdio_f0_write_byte() в wifi_driver.cpp!). SDIO_FBR_BASE(1)=1*0x100,
+// +0x10 = I/O Block Size (2 байта, LE). См. эталонный bcmsdh.c:
+// "sdio_set_block_size(sdiodev->func1, SDIO_FUNC1_BLOCKSIZE)" — 64 байта,
+// используется как размер блока для ВСЕХ последующих CMD53 block-mode
+// передач (заливка прошивки/NVRAM). Раньше вся заливка шла байтовым режимом
+// без этого шага — похоже, именно из-за этого чип возвращал Data CRC Error
+// на первом же куске крупнее одного слова.
+constexpr uint32_t SDIO_FBR_BASE_FUNC1     = 0x100;
+constexpr uint32_t SDIO_FBR_BLKSIZE_OFFSET = 0x10;
+constexpr uint32_t SDIO_FUNC1_BLOCKSIZE    = 64;
+
+// Chipcommon (ядро #0) — фиксированный, известный адрес на backplane (НЕ через
+// EROM — это отправная точка самого EROM-перечисления).
+constexpr uint32_t SI_ENUM_BASE          = 0x18000000u;
+constexpr uint32_t CHIPCOMMON_CHIPID_OFFSET  = 0x00; // chip ID + rev + packaging
+constexpr uint32_t CHIPCOMMON_EROMPTR_OFFSET = 0xFC; // адрес таблицы EROM (перечисление остальных ядер)
+constexpr uint32_t BRCM_CC_4345_CHIP_ID  = 0x4345;   // 43454/43455/43456 — общий Chip ID
+
+// EROM (Enumeration ROM) — дескрипторы по 4 байта, тип в младших 4 битах.
+constexpr uint32_t DMP_DESC_TYPE_MSK      = 0x0000000Fu;
+constexpr uint32_t DMP_DESC_EMPTY         = 0x00000000u;
+constexpr uint32_t DMP_DESC_VALID         = 0x00000001u; // бит "валидный дескриптор" (LSB)
+constexpr uint32_t DMP_DESC_COMPONENT     = 0x00000001u;
+constexpr uint32_t DMP_DESC_MASTER_PORT   = 0x00000003u;
+constexpr uint32_t DMP_DESC_ADDRESS       = 0x00000005u;
+constexpr uint32_t DMP_DESC_ADDRSIZE_GT32 = 0x00000008u; // доп. бит: есть ещё слово (64-бит адрес/размер)
+constexpr uint32_t DMP_DESC_EOT           = 0x0000000Fu; // конец таблицы
+
+constexpr uint32_t DMP_COMP_PARTNUM   = 0x000FFF00u; // Core ID
+constexpr uint32_t DMP_COMP_PARTNUM_S = 8;
+constexpr uint32_t DMP_COMP_NUM_SWRAP   = 0x00F80000u;
+constexpr uint32_t DMP_COMP_NUM_SWRAP_S = 19;
+constexpr uint32_t DMP_COMP_NUM_MWRAP   = 0x0007C000u;
+constexpr uint32_t DMP_COMP_NUM_MWRAP_S = 14;
+
+constexpr uint32_t DMP_SLAVE_ADDR_BASE   = 0xFFFFF000u; // база региона (адрес & эта маска)
+constexpr uint32_t DMP_SLAVE_TYPE        = 0x000000C0u;
+constexpr uint32_t DMP_SLAVE_TYPE_S      = 6;
+constexpr uint32_t DMP_SLAVE_TYPE_SLAVE  = 0; // обычные регистры ядра -> "base"
+constexpr uint32_t DMP_SLAVE_TYPE_SWRAP  = 2; // wrapper (IOCTL/reset-control) у обычного ядра -> "wrap"
+constexpr uint32_t DMP_SLAVE_TYPE_MWRAP  = 3; // wrapper у ядра с master-портом (см. DMP_DESC_MASTER_PORT)
+constexpr uint32_t DMP_SLAVE_SIZE_TYPE   = 0x00000030u;
+constexpr uint32_t DMP_SLAVE_SIZE_TYPE_S = 4;
+constexpr uint32_t DMP_SLAVE_SIZE_4K     = 0;
+constexpr uint32_t DMP_SLAVE_SIZE_8K     = 1;
+constexpr uint32_t DMP_SLAVE_SIZE_DESC   = 3; // размер не 4K/8K — следующее слово содержит явный размер, пропустить
+
+// Core ID нужных нам ядер (см. bcma_regs.h/bcma.h).
+constexpr uint32_t BCMA_CORE_ARM_CR4 = 0x83E; // ARM-ядро, исполняет прошивку
+constexpr uint32_t BCMA_CORE_80211   = 0x812; // D11 — 802.11 MAC
+
+// BCMA wrapper-регистры (офсеты ОТ wrapbase найденного через EROM).
+constexpr uint32_t BCMA_IOCTL           = 0x408;
+constexpr uint32_t BCMA_IOCTL_CLK       = 0x1;
+constexpr uint32_t BCMA_IOCTL_FGC       = 0x2;
+constexpr uint32_t BCMA_RESET_CTL       = 0x800;
+constexpr uint32_t BCMA_RESET_CTL_RESET = 0x1;
+
+constexpr uint32_t ARMCR4_BCMA_IOCTL_CPUHALT = 0x0020; // держит ARM CR4 в halt (не running), но вне reset
+constexpr uint32_t D11_BCMA_IOCTL_PHYCLOCKEN = 0x0004;
+constexpr uint32_t D11_BCMA_IOCTL_PHYRESET   = 0x0008;
+
+// ARMCR4 TCM RAM — регистры офсетом ОТ base ядра CR4 (НЕ wrapbase), нужны
+// только для вычисления реального размера RAM (адрес начала RAM хардкожен
+// для этого чипа, см. BRCM_4345_RAMBASE).
+constexpr uint32_t ARMCR4_CAP      = 0x04;
+constexpr uint32_t ARMCR4_BANKIDX  = 0x40;
+constexpr uint32_t ARMCR4_BANKINFO = 0x44;
+constexpr uint32_t ARMCR4_TCBANB_MASK  = 0xFu;
+constexpr uint32_t ARMCR4_TCBANB_SHIFT = 0;
+constexpr uint32_t ARMCR4_TCBBNB_MASK  = 0xF0u;
+constexpr uint32_t ARMCR4_TCBBNB_SHIFT = 4;
+constexpr uint32_t ARMCR4_BSZ_MASK  = 0x3Fu;
+constexpr uint32_t ARMCR4_BSZ_MULT  = 8192u;
+
+// TCM RAM base для чипов 0x4345/43454 (brcmf_chip_tcm_rambase) — хардкод,
+// т.к. зависит только от Chip ID, не вычисляется динамически.
+constexpr uint32_t BRCM_4345_RAMBASE = 0x198000u;
+
+// =====================================================================
+// Wi-Fi (BCM43455) Милстоун 4.3 — sdpcm-канал (SDIO-функция 2) + CDC/BDC
+// IOCTL. Все константы сверены построчно с эталонным sdio.c/bcdc.c/fwil.c
+// (см. wifi_driver.cpp, шапка соответствующего блока) агентом-исследователем
+// с цитатами file:line — не догадки. ---
+// =====================================================================
+
+// Ещё одно ядро для EROM-скана (см. wifi_erom_scan()) — "SDIO/PCMCIA core",
+// шлюз к sdpcm-регистрам (intstatus/mailbox) ниже.
+constexpr uint32_t BCMA_CORE_SDIO_DEV = 0x829;
+
+// SDIO-функция 2 — потоковый FIFO-порт данных (НЕ окно в адресное
+// пространство чипа, как F1 — SBSDIO_SB_*/backplane_set_window() сюда не
+// относятся вообще).
+constexpr uint32_t SBSDIO_FUNC_2        = 2;
+constexpr uint32_t SDIO_FBR_BASE_FUNC2  = 0x200; // SDIO_FBR_BASE(2) = 2*0x100
+constexpr uint32_t SDIO_FUNC2_BLOCKSIZE = 512;
+
+// sdpcmd_regs — офсеты ОТ base ядра BCMA_CORE_SDIO_DEV, читаются/пишутся
+// уже существующими backplane_read32/write32 (F1, тем же путём, что и
+// chipcommon/CR4/D11 регистры в Милстоуне 4.2 — это обычные backplane-
+// регистры, просто на другом ядре).
+constexpr uint32_t SDPCMD_INTSTATUS         = 0x020;
+constexpr uint32_t SDPCMD_HOSTINTMASK       = 0x024;
+constexpr uint32_t SDPCMD_TOSBMAILBOX       = 0x040;
+constexpr uint32_t SDPCMD_TOHOSTMAILBOX     = 0x044;
+constexpr uint32_t SDPCMD_TOSBMAILBOXDATA   = 0x048;
+constexpr uint32_t SDPCMD_TOHOSTMAILBOXDATA = 0x04C;
+
+// intstatus/hostintmask биты.
+constexpr uint32_t I_HMB_SW_MASK   = 0x000000f0u;
+constexpr uint32_t I_HMB_FRAME_IND = (1u << 6);
+constexpr uint32_t I_HMB_HOST_INT  = (1u << 7);
+constexpr uint32_t I_CHIPACTIVE    = (1u << 29);
+constexpr uint32_t HOSTINTMASK     = I_HMB_SW_MASK | I_CHIPACTIVE; // 0x200000f0
+
+// tosbmailbox / tohostmailboxdata биты.
+constexpr uint32_t SMB_INT_ACK       = 2u;
+constexpr uint32_t HMB_DATA_FWHALT   = 0x0010u;
+constexpr uint32_t HMB_DATA_DEVREADY = 0x0002u;
+constexpr uint32_t HMB_DATA_FWREADY  = 0x0008u;
+
+constexpr uint32_t SDPCM_PROT_VERSION     = 4;
+constexpr uint32_t SMB_DATA_VERSION_SHIFT = 16;
+
+// sdpcm software header — 12 байт (4 hwhdr + 8 swhdr), см. таблицу байт в
+// wifi_driver.cpp (sdpcm_send_ctrl()/sdpcm_wait_and_read_ctrl()).
+constexpr uint32_t SDPCM_HDRLEN          = 12;
+constexpr uint32_t SDPCM_CONTROL_CHANNEL = 0;
+constexpr uint32_t BRCMF_FIRSTREAD       = 64;
+
+// BCDC dcmd envelope — 16 байт (cmd/len/flags/status, все __le32).
+constexpr uint32_t BCDC_DCMD_ERROR    = 0x01u;
+constexpr uint32_t BCDC_DCMD_SET      = 0x02u;
+constexpr uint32_t BCDC_DCMD_IF_SHIFT = 12;
+constexpr uint32_t BCDC_DCMD_ID_SHIFT = 16;
+
+// dcmd-команды.
+constexpr uint32_t BRCMF_C_GET_VERSION = 1;
+constexpr uint32_t BRCMF_C_GET_VAR     = 262;
+constexpr uint32_t BRCMF_C_SET_VAR     = 263;
+
+// Watermark/MES — специфично для чипа BCM43455 ("CY_43455" в эталоне).
+constexpr uint32_t SBSDIO_WATERMARK         = 0x10008;
+constexpr uint32_t CY_43455_F2_WATERMARK    = 0x60;
+constexpr uint32_t SBSDIO_DEVICE_CTL        = 0x10009;
+constexpr uint32_t SBSDIO_DEVCTL_F2WM_ENAB  = 0x10;
+constexpr uint32_t SBSDIO_FUNC1_MESBUSYCTRL = 0x1001D;
+constexpr uint32_t CY_43455_MESBUSYCTRL     = 0xD0; // MES_WATERMARK(0x50)|MESBUSYCTRL_ENAB(0x80)
+
+// =====================================================================
+// Милстоун 4.4 — подключение к точке доступа (WPA2-PSK). Все значения
+// сверены построчно с эталоном (cfg80211.c/fwil.h/fwil_types.h/fweh.h/
+// bcdc.c) — см. ROADMAP.md/память проекта для деталей исследования.
+// =====================================================================
+
+// Ещё несколько dcmd-команд (см. BRCMF_C_GET_VERSION/GET_VAR/SET_VAR выше).
+constexpr uint32_t BRCMF_C_UP           = 2;   // fwil.h — "включить радио" (brcmf_config_dongle(): "make sure RF is ready for work", значение 0 — не булев флаг, просто аргумент dcmd)
+constexpr uint32_t BRCMF_C_SET_INFRA    = 20;  // fwil.h — режим интерфейса: infra=1 (Infrastructure/станция) vs 0 (IBSS/ad-hoc). brcmf_config_dongle() -> brcmf_cfg80211_change_iface() шлёт это ОДИН РАЗ при переходе интерфейса в UP — без этого шага прошивка, похоже, не понимает, что мы клиент, подключающийся к AP, и join молча не запускает реальную ассоциацию.
+constexpr uint32_t BRCMF_C_SET_PM       = 86;  // fwil.h — power-management режим (PM_OFF=0/PM_FAST=2, defs.h)
+constexpr uint32_t BRCMF_C_SET_SSID     = 26;  // fwil.h — raw dcmd, fallback-путь join (не используется, есть iovar "join")
+constexpr uint32_t BRCMF_C_SET_WSEC_PMK = 268; // fwil.h — raw dcmd, отправка готового 32-байтного PMK
+
+// wsec/wpa_auth биты (brcmu_wifi.h) — итоговое значение wpa_auth, которое
+// реально "приживается" после brcmf_set_key_mgmt() в эталоне — 0x80 (одна
+// только PSK-часть), а не промежуточное 0xC0 (PSK|UNSPECIFIED) из
+// brcmf_set_wpa_version().
+constexpr uint32_t WSEC_AES_ENABLED       = 0x0004u;
+constexpr uint32_t WPA2_AUTH_PSK          = 0x0080u;
+constexpr uint32_t BRCMF_WSEC_MAX_PSK_LEN = 32;
+
+// struct brcmf_wsec_pmk_le (fwil_types.h): key_len(le16)+flags(le16)+
+// key[2*32+1]. flags всегда 0 у эталона (передаём готовый бинарный PMK,
+// НЕ ASCII-пароль — прошивка не поддерживает WSEC_PASSPHRASE в этом пути,
+// см. память проекта) — PBKDF2 делаем сами (см. wifi_driver.cpp).
+constexpr uint32_t BRCMF_WSEC_PMK_KEY_BUF_LEN = 2 * BRCMF_WSEC_MAX_PSK_LEN + 1; // 65
+constexpr uint32_t BRCMF_WSEC_PMK_LE_LEN = 4 + BRCMF_WSEC_PMK_KEY_BUF_LEN; // 2+2+65 = 69
+
+// struct brcmf_ssid_le: SSID_len(le32) + SSID[32] (IEEE80211_MAX_SSID_LEN).
+constexpr uint32_t IEEE80211_MAX_SSID_LEN = 32;
+constexpr uint32_t BRCMF_SSID_LE_LEN = 4 + IEEE80211_MAX_SSID_LEN; // 36
+
+// struct brcmf_join_scan_params_le: scan_type(u8)+3pad+nprobes/active_time/
+// passive_time/home_time (все le32) = 20 байт.
+constexpr uint32_t BRCMF_JOIN_SCAN_PARAMS_LE_LEN = 20;
+
+// Реально уезжающий на провод размер struct brcmf_ext_join_params_le —
+// ТОЛЬКО до конца assoc_le.chanspec_num (без chanspec_list[]), когда канал
+// не указан (offsetof(ext_join_params_le,assoc_le) + offsetof(assoc_params_le,
+// chanspec_list) в эталоне, cfg80211.c) — bssid(6)+pad(2)+chanspec_num(4)=12.
+constexpr uint32_t BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN = 12;
+constexpr uint32_t BRCMF_EXT_JOIN_PARAMS_LE_LEN =
+    BRCMF_SSID_LE_LEN + BRCMF_JOIN_SCAN_PARAMS_LE_LEN + BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN; // 36+20+12 = 68
+
+// BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
+// ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от
+// 16-байтного dcmd-заголовка на CONTROL(0)-канале (см. BCDC_DCMD_* выше).
+constexpr uint32_t BCDC_HEADER_LEN     = 4;
+constexpr uint32_t BCDC_PROTO_VER      = 2;
+constexpr uint32_t BCDC_FLAG_VER_SHIFT = 4;
+constexpr uint32_t BCDC_FLAG_SUM_GOOD  = 0x04u;
+
+// sdpcm software-заголовок: номер канала (byte5 & 0x0F, см. SDPCM_CONTROL_
+// CHANNEL=0 выше) — данные и асинхронные события прошивки идут по ДРУГИМ
+// каналам, которые этот проект раньше вообще не читал.
+constexpr uint32_t SDPCM_EVENT_CHANNEL = 1;
+constexpr uint32_t SDPCM_DATA_CHANNEL  = 2;
+
+// Заголовок события прошивки (fweh.h): ethhdr(14) + brcm_ethhdr(10) +
+// brcmf_event_msg_be(48) = 72 байта, ВСЕ поля big-endian (в отличие от
+// остального sdpcm/BCDC, который little-endian!).
+constexpr uint16_t ETH_P_LINK_CTL            = 0x886C;
+constexpr uint8_t  BCMILCP_BCM_SUBTYPE_EVENT = 1;
+// BRCM_OUI = {0x00, 0x10, 0x18} — см. использование в wifi_driver.cpp.
+constexpr uint32_t ETHHDR_LEN       = 14; // dest[6]+src[6]+proto(be16)
+constexpr uint32_t BRCM_ETHHDR_LEN  = 10; // subtype/length(be16 each)+version(1)+oui[3]+usr_subtype(be16)
+constexpr uint32_t BRCMF_EVENT_MSG_BE_LEN = 48;
+constexpr uint32_t BRCMF_EVENT_HDR_LEN = ETHHDR_LEN + BRCM_ETHHDR_LEN + BRCMF_EVENT_MSG_BE_LEN; // 72
+
+// Коды событий (fweh.h, brcmf_fweh_event_code) — только те, что нужны для
+// отслеживания join/handshake (успех = SET_SSID/SUCCESS И PSK_SUP/
+// FWSUP_COMPLETED оба увидены; см. brcmf_is_linkup/brcmf_is_nonetwork).
+constexpr uint32_t BRCMF_E_SET_SSID     = 0;
+constexpr uint32_t BRCMF_E_AUTH         = 3;
+constexpr uint32_t BRCMF_E_DEAUTH       = 5;
+constexpr uint32_t BRCMF_E_DEAUTH_IND   = 6;
+constexpr uint32_t BRCMF_E_ASSOC_IND    = 8;
+constexpr uint32_t BRCMF_E_DISASSOC_IND = 12;
+constexpr uint32_t BRCMF_E_LINK         = 16;
+constexpr uint32_t BRCMF_E_PSK_SUP      = 46;
+constexpr uint32_t BRCMF_E_ESCAN_RESULT = 69; // диагностика: "видит ли прошивка вообще что-то в эфире" независимо от join
+
+constexpr uint32_t BRCMF_E_STATUS_SUCCESS         = 0;
+constexpr uint32_t BRCMF_E_STATUS_NO_NETWORKS     = 3;
+constexpr uint32_t BRCMF_E_STATUS_PARTIAL         = 8;  // escan: промежуточный результат (эталон: brcmf_cfg80211_escan_handler)
+constexpr uint32_t BRCMF_E_STATUS_FWSUP_COMPLETED = 6; // ТОЛЬКО для события PSK_SUP — то же числовое значение, что и UNSOLICITED для остальных событий, разный смысл в зависимости от event_type
+constexpr uint32_t BRCMF_E_STATUS_FWSUP_TIMEOUT   = 7;
+constexpr uint32_t BRCMF_EVENT_MSG_LINK = 0x01u;
+
+// Диагностика: iovar "escan" (не raw dcmd BRCMF_C_SCAN=50 — тот в эталоне
+// используется только для ABORT, реальный скан всегда идёт через "escan").
+// struct brcmf_escan_params_le { version(le32); action(le16); sync_id(le16);
+// struct brcmf_scan_params_le params_le; } — без каналов/SSID-массива (слепой
+// скан всех каналов/SSID) params_le заканчивается на channel_num, БЕЗ
+// channel_list (BRCMF_SCAN_PARAMS_FIXED_SIZE=64 — фиксированная часть).
+constexpr uint32_t BRCMF_ESCAN_REQ_VERSION   = 1;
+constexpr uint16_t WL_ESCAN_ACTION_START     = 1;
+constexpr uint32_t DOT11_BSSTYPE_ANY         = 2;
+constexpr uint32_t BRCMF_SCANTYPE_ACTIVE     = 0;
+constexpr uint32_t BRCMF_SCAN_PARAMS_FIXED_SIZE = 64; // brcmf_scan_params_le до channel_num включительно, без channel_list
+constexpr uint32_t BRCMF_ESCAN_PARAMS_HDR_LEN   = 8;  // version(4)+action(2)+sync_id(2)
+constexpr uint32_t BRCMF_ESCAN_BLIND_LEN = BRCMF_ESCAN_PARAMS_HDR_LEN + BRCMF_SCAN_PARAMS_FIXED_SIZE; // 72
+
 // =====================================================================
 // Raspberry Pi 4 (BCM2711) — реальные физические адреса.
 //
@@ -404,6 +789,13 @@ constexpr int RPI4_TIMER_PPI_SECURE       = 29;                         // DT PP
 constexpr int RPI4_TIMER_PPI_NONSECURE    = 30;                         // DT PPI 14 (0x0e) — non-secure phys timer
 constexpr int RPI4_TIMER_PPI_VIRTUAL      = 27;                         // DT PPI 11 (0x0b)
 constexpr int RPI4_TIMER_PPI_HYP          = 26;                         // DT PPI 10 (0x0a)
+
+// --- Термодатчик: AVS RO thermal — единственный сенсор температуры кристалла
+// на BCM2711, доступный без прошивки VideoCore (см. AVS_RO_TEMP_STATUS_OFFSET
+// выше). Родительский узел в DT — syscon "avs-monitor", ребёнок — "thermal"
+// (#thermal-sensor-cells=0, сам сенсор регистров не добавляет, только имя). ---
+constexpr uintptr_t RPI4_AVS_MONITOR_PADDR = 0xfd5d2000ULL;             // DT /soc/avs-monitor@7d5d2000, "brcm,bcm2711-avs-monitor"
+constexpr uintptr_t RPI4_AVS_MONITOR_SIZE  = 0xf00ULL;
 
 // --- Диск: EMMC2 (Arasan SDHCI) — реальный контроллер SD-карты,
 // заменяет virtio-blk. FAT32-логика поверх (см. ROADMAP.md) переиспользуется.

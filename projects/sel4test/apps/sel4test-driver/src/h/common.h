@@ -14,6 +14,7 @@ enum BootIPCSlot {
     BOOT_NET_EP     = 102,
     BOOT_ROOT_EP    = 103,
     BOOT_IRQ_EP     = 104,
+    BOOT_WIFI_EP    = 105, // wifi_driver слушает команды шелла (см. ROADMAP.md Фаза 4)
 };
 
 // Слот CSpace процесса, в который ядро минтит capability активного пайпа

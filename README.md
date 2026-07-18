@@ -19,7 +19,7 @@ seL4 официально поддерживает Raspberry Pi 4 (`-DPLATFORM=r
 - [x] **Диск:** `virtio-blk` → EMMC2/SD-контроллер BCM2711 (свой драйвер, FAT32-логика поверх переиспользуется как есть)
 - [x] **Сеть:** `virtio-net` → genet, Ethernet MAC BCM2711 (свой драйвер + DHCP/ARP-клиент поверх; ARP/UDP/NTP/DNS-логика переиспользуется как есть)
 - [x] **RTC/время:** PL031 (battery-backed RTC) физически отсутствует на плате → ARM generic timer (`CNTVCT_EL0`, не `CNTPCT_EL0` — см. ROADMAP 3.1) для аптайма + NTP-клиент как источник wall-clock
-- [x] **UART/GIC:** PL011/GICv2 на плате те же самые, что и на QEMU — только другие адреса в `platform.h`
+- [x] **UART/GIC:** PL011/GICv2 на плате те же самые, что и на QEMU — только другие адреса в `platform.h` подробнее про отладку в папке `uart-wifi_JTAG`
 
 Дальше в работе (Фаза 4):
 

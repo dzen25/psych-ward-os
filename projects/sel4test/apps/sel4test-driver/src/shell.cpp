@@ -9,6 +9,12 @@
 // Системные часы (SYS_GET_TIME) всегда хранятся в UTC — здесь только отображение.
 static const int TZ_OFFSET_HOURS = 3;
 
+// Ширина терминала для автоматического переноса длинных строк (см. sys_puts
+// ниже) — большинство serial-консолей (minicom/screen/QEMU chardev), которыми
+// реально подключаются к этой ОС, сами не переносят строки по словам, а
+// просто обрезают/наезжают текст при достижении края экрана.
+static const int SHELL_TERM_WIDTH = 80;
+
 // Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
 static char ls_thread_stack[16384] __attribute__((aligned(16)));
 static char grep_thread_stack[16384] __attribute__((aligned(16)));
@@ -16,16 +22,28 @@ static char grep_thread_stack[16384] __attribute__((aligned(16)));
 static char* shm_base = nullptr;
 static volatile int* vfs_spinlock_ptr = nullptr;
 
+// ВАЖНО: обычные volatile чтение/запись, БЕЗ __sync_lock_test_and_set/
+// __sync_lock_release. Разделяемая SHM (см. vfs_spinlock_ptr ниже) мапится
+// некэшируемой Device-памятью (map_frame_robust(), main.cpp — ради
+// когерентности с GENET DMA), а exclusive-load/store инструкции (LDXR/STXR,
+// именно в них компилируются __sync_lock_*) на Device-памяти по спеке ARM
+// имеют непредсказуемое поведение — на живом железе это уронило ВЕСЬ kernel
+// seL4 необрабатываемым исключением шины ("halting... Kernel entry via
+// Unknown (0)"), а не просто эту функцию. Настоящий hardware-atomic тут и не
+// нужен: система однопроцессорная (SMP OFF, easy-settings.cmake) — переключение
+// контекста происходит только на syscall/yield, а не посреди пары "прочитать
+// проверить -> записать" ниже, так что обычного volatile-флага достаточно.
 void vfs_lock() {
     if (!vfs_spinlock_ptr) return; // Guard against early calls
-    while (__sync_lock_test_and_set(vfs_spinlock_ptr, 1)) {
-        seL4_Yield(); 
+    while (*vfs_spinlock_ptr) {
+        seL4_Yield();
     }
+    *vfs_spinlock_ptr = 1;
 }
 
 void vfs_unlock() {
     if (!vfs_spinlock_ptr) return;
-    __sync_lock_release(vfs_spinlock_ptr);
+    *vfs_spinlock_ptr = 0;
 }
 
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
@@ -42,9 +60,86 @@ static seL4_Word my_strlen(const char *s);
 static void sys_write(int fd, const char* str);
 static char sys_read_fd(int fd);
 
-// Единая защищенная функция вывода
+// Текущая колонка курсора на терминале и флаг "внутри ANSI CSI-
+// последовательности" — оба персистентны МЕЖДУ вызовами sys_puts, т.к. одна
+// логическая строка вывода в этом файле почти всегда строится несколькими
+// последовательными вызовами sys_puts (см. print_ip/print_localtime/
+// sys_putdec и т.п. ниже), а одна ANSI-последовательность (курсор/очистка
+// строки в редакторе командной строки, см. цикл ввода в main()) может быть
+// точно так же разбита по кусочкам, например "\x1b[" + sys_putdec(N) + "D".
+static int  g_console_col       = 0;
+static bool g_console_in_escape = false;
+
+// Допечатывает накопленное слово с учетом переноса на SHELL_TERM_WIDTH и
+// сбрасывает буфер слова. Вынесено отдельно, т.к. нужно вызывать из
+// нескольких точек sys_puts (пробел/перевод строки/ESC/конец вызова).
+static void sys_puts_flush_word(char *word, int *word_len) {
+    if (*word_len == 0) return;
+    if (g_console_col > 0 && g_console_col + *word_len > SHELL_TERM_WIDTH) {
+        sys_write(1, "\n");
+        g_console_col = 0;
+    }
+    word[*word_len] = '\0';
+    sys_write(1, word);
+    g_console_col += *word_len;
+    *word_len = 0;
+}
+
+// Единая защищенная функция вывода. Помимо самой записи в stdout, переносит
+// длинные строки по границам слов на ширину SHELL_TERM_WIDTH — большинство
+// serial-консолей, которыми реально пользуются с этой ОС (minicom/screen/
+// QEMU chardev), сами не переносят строки, а обрезают/наезжают текст при
+// достижении края экрана. ANSI CSI-последовательности (используются для
+// курсора/очистки строки в редакторе командной строки) проходят насквозь,
+// не считаются в колонку и никогда не разрываются переносом.
 static void sys_puts(seL4_CPtr _ignored, const char *str) {
-    sys_write(1, str); // Write to STDOUT
+    char word[SHELL_TERM_WIDTH + 1];
+    int word_len = 0;
+
+    for (const char *p = str; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+
+        if (g_console_in_escape) {
+            char buf[2] = {(char)c, 0};
+            sys_write(1, buf);
+            if (c >= 0x40 && c <= 0x7E) g_console_in_escape = false;
+            continue;
+        }
+
+        if (c == 27) { // ESC — начало ANSI CSI-последовательности
+            sys_puts_flush_word(word, &word_len);
+            g_console_in_escape = true;
+            char buf[2] = {(char)c, 0};
+            sys_write(1, buf);
+            continue;
+        }
+
+        if (c == '\n' || c == '\r') {
+            sys_puts_flush_word(word, &word_len);
+            char buf[2] = {(char)c, 0};
+            sys_write(1, buf);
+            g_console_col = 0;
+            continue;
+        }
+
+        if (c == ' ') {
+            sys_puts_flush_word(word, &word_len);
+            if (g_console_col >= SHELL_TERM_WIDTH) {
+                sys_write(1, "\n");
+                g_console_col = 0;
+            } else {
+                sys_write(1, " ");
+                g_console_col++;
+            }
+            continue;
+        }
+
+        if (word_len >= SHELL_TERM_WIDTH) {
+            sys_puts_flush_word(word, &word_len); // Само слово длиннее ширины терминала — форсируем разрыв
+        }
+        word[word_len++] = (char)c;
+    }
+    sys_puts_flush_word(word, &word_len);
 }
 
 // Helper to print a 64-bit value in hex via IPC.
@@ -81,6 +176,15 @@ static void print_rtt_ms(seL4_CPtr console_ep, uint32_t us) {
     if (frac < 100) sys_puts(console_ep, "0");
     if (frac < 10) sys_puts(console_ep, "0");
     sys_putdec(frac);
+}
+
+// Печатает миллиградусы Цельсия как "N.N C" (см. sys_get_temp_mC).
+static void print_temp_c(seL4_CPtr console_ep, int32_t temp_mC) {
+    if (temp_mC < 0) { sys_puts(console_ep, "-"); temp_mC = -temp_mC; }
+    sys_putdec((seL4_Word)(temp_mC / 1000));
+    sys_puts(console_ep, ".");
+    sys_putdec((seL4_Word)((temp_mC / 100) % 10));
+    sys_puts(console_ep, " C");
 }
 
 // Универсальная запись в файловый дескриптор
@@ -330,6 +434,18 @@ static char sys_read(seL4_CPtr _ignored) {
     return sys_read_fd(0);
 }
 
+// Блокирующее чтение одного байта: пропускает "нет данных" (-1/255) от
+// uart_driver, пока реальный байт не придёт. Нужно и для обычного ввода, и
+// для дочтения байтов ANSI-последовательности стрелки (см. цикл ввода ниже) —
+// после ESC второй и третий байт могут ещё не долететь до kbd_buffer.
+static char sys_read_blocking(seL4_CPtr console_ep) {
+    while (1) {
+        char c = sys_read(console_ep);
+        if (c == (char)-1 || c == (char)255) { seL4_Yield(); continue; }
+        return c;
+    }
+}
+
 static seL4_Word sys_get_time(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 3); // 3 = SYS_GET_TIME
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
@@ -341,6 +457,17 @@ static seL4_Word sys_get_uptime(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 4); // 4 = SYS_GET_UPTIME
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return seL4_GetMR(0);
+}
+
+// Температура кристалла (миллиградусы Цельсия), см. SYS_GET_TEMP в
+// timer_driver.cpp. Возвращает false, пока AVS-датчик еще не выдал
+// валидное показание (единичные мс сразу после старта).
+static bool sys_get_temp_mC(seL4_CPtr timer_ep, int32_t *out_mC) {
+    seL4_SetMR(0, 6); // 6 = SYS_GET_TEMP
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word status = seL4_GetMR(0);
+    *out_mC = (int32_t)(int64_t)seL4_GetMR(1);
+    return status == 0;
 }
 
 // Разбивает число дней с 1970-01-01 на (год, месяц, день) в пролептическом
@@ -481,6 +608,27 @@ static int sys_getpid(seL4_CPtr root_ep) {
 static char current_working_dir[CWD_SIZE] = "/root";
 static char arg_buffer[512];
 
+// История команд — только в оперативной памяти (кольцевой буфер), сбрасывается
+// при перезапуске shell. Размер строки (64) совпадает с буфером cmd[] в main().
+#define CMD_HISTORY_SIZE 16
+static char cmd_history[CMD_HISTORY_SIZE][64];
+static int cmd_history_count = 0;
+static int cmd_history_head = 0; // индекс слота для следующей записи
+
+static void history_push(const char *cmd) {
+    if (!cmd || !cmd[0]) return;
+    my_strlcpy(cmd_history[cmd_history_head], cmd, (int)sizeof(cmd_history[0]));
+    cmd_history_head = (cmd_history_head + 1) % CMD_HISTORY_SIZE;
+    if (cmd_history_count < CMD_HISTORY_SIZE) cmd_history_count++;
+}
+
+// distance_back: 1 = последняя выполненная команда, 2 = предпоследняя, и т.д.
+static const char *history_get(int distance_back) {
+    if (distance_back < 1 || distance_back > cmd_history_count) return nullptr;
+    int idx = (cmd_history_head - distance_back + CMD_HISTORY_SIZE) % CMD_HISTORY_SIZE;
+    return cmd_history[idx];
+}
+
 // max_len - полный размер буфера target (включая место под '\0').
 // Результат всегда '\0'-терминирован в пределах [0, max_len); при
 // переполнении путь молча обрезается, но выхода за границы буфера не происходит.
@@ -596,6 +744,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];        
     seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];
     seL4_CPtr blk_ep     = ipc->msg[BOOT_BLK_EP];
+    seL4_CPtr wifi_ep    = ipc->msg[BOOT_WIFI_EP]; // Фаза 4, Милстоун 4.1 (см. wifi_driver.cpp)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -614,6 +763,20 @@ int main(int argc, char *argv[]) {
 
     shm_base = (char*)seL4_GetMR(0);
     // Physical address is not needed by the shell, only by DMA-capable drivers.
+
+    // Общий межпроцессный спинлок на офсет 0/128 разделяемой SHM (16КБ, те же
+    // физические страницы у shell/rootserver/blk_driver/net_driver — см.
+    // SYS_SHM_GET). Раньше vfs_spinlock_ptr никогда не присваивался — все
+    // вызовы vfs_lock()/vfs_unlock() ниже были тихими no-op'ами. Пока это не
+    // было заметно: shell был единственным, кто писал в офсет 0/128. Как
+    // только net_driver.cpp сам стал писать туда же (net_log_flush(), журнал
+    // /root/net_udp.log — фоновая, независимая от команд шелла активность),
+    // гонка стала реальной: `ps` (пишет в тот же офсет 0 через rootserver)
+    // мог получить обратно "/root/net_udp.log" вместо таблицы процессов,
+    // если net_driver успевал перезаписать буфер между ответом рутсервера и
+    // чтением его шеллом. Офсет 4096 — сразу после последнего занятого поля
+    // net_driver'а (ping-статистика, 4068..4092, см. net_driver.cpp).
+    vfs_spinlock_ptr = (volatile int*)(shm_base + 4096);
 
     if (shm_base == nullptr) {
         sys_puts(console_ep, "[SHELL] FATAL: Failed to get dynamic SHM!\n");
@@ -711,31 +874,83 @@ int main(int argc, char *argv[]) {
         sys_flush(console_ep); // <--- СБРОС: чтобы prompt появился мгновенно!
         
         char cmd[64]; int i = 0;
-        
-        // 2. Читаем ввод с защитой от непечатных символов и ANSI-мусора
+        int cur = 0;             // позиция курсора внутри cmd, 0..i (стрелки влево/вправо двигают её)
+        int hist_nav = 0;        // 0 = не листаем историю; иначе "N команд назад от последней"
+        char saved_line[64];     // то, что было набрано до первого Up — восстанавливается по Down
+        saved_line[0] = '\0';
+
+        // 2. Читаем ввод: печатные символы (вставка по курсору), Backspace,
+        // и ANSI-стрелки ESC '[' 'A'/'B'/'C'/'D' (up/down/right/left).
         while (i < 63) {
-            char c = sys_read(console_ep); 
-            
-            if (c == (char)-1 || c == (char)255) { seL4_Yield(); continue; }
-            if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; } // Здесь \n сбросит буфер автоматически
-            else if (c == 127 || c == '\b') { 
-                if (i > 0) { 
-                    i--; 
-                    sys_puts(console_ep, "\b \b"); 
-                    sys_flush(console_ep); // <--- СБРОС: чтобы буква стерлась мгновенно!
-                } 
-            } 
-            // ИСПРАВЛЕНИЕ: Берем только печатные символы (игнорируем стрелочки и спецкоды)
-            else if (c >= 32 && c <= 126) { 
-                char tmp[2] = {c, 0}; 
-                sys_puts(console_ep, tmp); 
-                sys_flush(console_ep); // <--- СБРОС: чтобы набираемая буква появилась мгновенно!
-                cmd[i++] = c; 
+            char c = sys_read_blocking(console_ep);
+
+            if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; }
+
+            else if (c == 27) { // ESC — читаем ещё 2 байта, чтобы распознать стрелку
+                char c1 = sys_read_blocking(console_ep);
+                if (c1 != '[') continue;
+                char c2 = sys_read_blocking(console_ep);
+
+                if (c2 == 'D') { // Влево
+                    if (cur > 0) { cur--; sys_puts(console_ep, "\x1b[D"); sys_flush(console_ep); }
+                }
+                else if (c2 == 'C') { // Вправо
+                    if (cur < i) { cur++; sys_puts(console_ep, "\x1b[C"); sys_flush(console_ep); }
+                }
+                else if (c2 == 'A' || c2 == 'B') { // Вверх/вниз — навигация по истории команд
+                    if (c2 == 'A') {
+                        if (hist_nav == 0) my_strlcpy(saved_line, cmd, (int)sizeof(saved_line));
+                        if (hist_nav < cmd_history_count) hist_nav++;
+                    } else {
+                        if (hist_nav > 0) hist_nav--;
+                    }
+                    const char *new_line = (hist_nav == 0) ? saved_line : history_get(hist_nav);
+
+                    // Стираем текущую строку на терминале (курсор к началу, затем до конца строки)
+                    // и печатаем выбранную из истории команду взамен.
+                    if (cur > 0) { sys_puts(console_ep, "\x1b["); sys_putdec((seL4_Word)cur); sys_puts(console_ep, "D"); }
+                    sys_puts(console_ep, "\x1b[K");
+
+                    i = my_strlcpy(cmd, new_line, (int)sizeof(cmd));
+                    cur = i;
+                    sys_puts(console_ep, cmd);
+                    sys_flush(console_ep);
+                }
+            }
+
+            else if (c == 127 || c == '\b') {
+                if (cur > 0) {
+                    hist_nav = 0;
+                    for (int k = cur - 1; k < i - 1; k++) cmd[k] = cmd[k + 1];
+                    i--; cur--;
+                    cmd[i] = '\0';
+
+                    sys_puts(console_ep, "\b");      // курсор на позицию удаляемого символа
+                    sys_puts(console_ep, cmd + cur);  // перепечатать хвост строки после удаления
+                    sys_puts(console_ep, " ");        // затереть "хвост" от старой, более длинной строки
+                    int back = (i - cur) + 1;
+                    sys_puts(console_ep, "\x1b["); sys_putdec((seL4_Word)back); sys_puts(console_ep, "D");
+                    sys_flush(console_ep);
+                }
+            }
+
+            else if (c >= 32 && c <= 126) {
+                hist_nav = 0;
+                for (int k = i; k > cur; k--) cmd[k] = cmd[k - 1];
+                cmd[cur] = c;
+                i++; cur++;
+                cmd[i] = '\0';
+
+                sys_puts(console_ep, cmd + cur - 1); // новый символ + всё, что после него по курсору
+                int back = i - cur;
+                if (back > 0) { sys_puts(console_ep, "\x1b["); sys_putdec((seL4_Word)back); sys_puts(console_ep, "D"); }
+                sys_flush(console_ep);
             }
         }
         cmd[i] = '\0';
-        
+
         if (i > 0) {
+            history_push(cmd);
 
             // НОВОЕ: Пропускаем пробелы в начале команды
             char *cmd_ptr = cmd;
@@ -816,6 +1031,15 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "date") == 0) {
                 seL4_Word epoch_ms = sys_get_time(timer_ep);
                 print_localtime(console_ep, epoch_ms, TZ_OFFSET_HOURS);
+            }
+
+            else if (my_strcmp(cmd_ptr, "temp") == 0) {
+                int32_t temp_mC;
+                if (sys_get_temp_mC(timer_ep, &temp_mC)) {
+                    sys_puts(console_ep, "CPU: "); print_temp_c(console_ep, temp_mC); sys_puts(console_ep, "\n");
+                } else {
+                    sys_puts(console_ep, "temp: sensor not ready yet\n");
+                }
             }
 
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
@@ -987,6 +1211,83 @@ int main(int argc, char *argv[]) {
                 wait_for_net_mailbox(console_ep, timer_ep, 5000);
             }
 
+            else if (my_strcmp(cmd_ptr, "wifiprobe") == 0) {
+                // Фаза 4, Милстоун 4.1 (см. wifi_driver.cpp) — диагностика
+                // SDIO-хост-бринг-апа. В отличие от net-команд выше, это
+                // мгновенный синхронный запрос (просто отдаёт последние
+                // сохранённые значения CMD5/CMD52), поэтому seL4_Call вместо
+                // seL4_Send+mailbox-poll.
+                if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+
+                seL4_SetMR(0, 1); // WIFI_CMD_PROBE_STATUS
+                seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_Word status   = seL4_GetMR(0);
+                seL4_Word ocr      = seL4_GetMR(1);
+                seL4_Word cccr     = seL4_GetMR(2);
+                seL4_Word fw_alive = seL4_GetMR(3);
+                seL4_Word shaddr   = seL4_GetMR(4);
+                seL4_Word sdpcm_ok = seL4_GetMR(5);
+
+                sys_puts(console_ep, status == 0 ? "SDIO probe: OK\n" : "SDIO probe: FAILED (see boot log)\n");
+                sys_puts(console_ep, "  CMD5 OCR:  0x"); sys_puthex(ocr);  sys_puts(console_ep, "\n");
+                sys_puts(console_ep, "  F0 CCCR:   0x"); sys_puthex(cccr); sys_puts(console_ep, "\n");
+                // Милстоун 4.2 (backplane/прошивка) — см. wifi_driver.cpp.
+                sys_puts(console_ep, fw_alive ? "  Firmware:  ALIVE\n" : "  Firmware:  not alive (see boot log)\n");
+                sys_puts(console_ep, "  shaddr:    0x"); sys_puthex(shaddr); sys_puts(console_ep, "\n");
+                // Милстоун 4.3 (sdpcm/IOCTL) — см. wifi_driver.cpp.
+                sys_puts(console_ep, sdpcm_ok ? "  sdpcm:     OK (см. лог загрузки — версия прошивки)\n" : "  sdpcm:     FAILED (see boot log)\n");
+            }
+
+            else if (my_strcmp(cmd_ptr, "wifi") == 0) {
+                // Милстоун 4.4 (см. wifi_driver.cpp: wifi_connect()) —
+                // SSID/пароль не влезают в message registers, передаём через
+                // разделяемую SHM (те же смещения, что WIFI_SHM_*_OFFSET в
+                // wifi_driver.cpp — область 8192+ ничем больше не занята,
+                // см. vfs_spinlock_ptr на 4096 выше). seL4_Call, как
+                // wifiprobe, но может занять до ~15с (см. wifi_driver.cpp
+                // wifi_wait_for_join_result) — шелл будет заблокирован,
+                // пока прошивка не завершит (или не провалит) handshake.
+                if (!arg) { sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n"); continue; }
+                char *cursor = arg;
+                char *subcmd = next_token(&cursor);
+                if (!subcmd || my_strcmp(subcmd, "connect") != 0) {
+                    sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n");
+                    continue;
+                }
+                char *ssid = next_token(&cursor);
+                char *pass = cursor;
+                while (pass && *pass == ' ') pass++;
+                if (!ssid || !pass || pass[0] == '\0') {
+                    sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n");
+                    continue;
+                }
+                if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+
+                uint32_t ssid_len = 0; while (ssid[ssid_len] && ssid_len < 32) ssid_len++;
+                uint32_t pass_len = 0; while (pass[pass_len] && pass_len < 63) pass_len++;
+
+                *(uint32_t*)(shm + 8192) = ssid_len;
+                for (uint32_t i = 0; i < 32; i++) (shm + 8196)[i] = (i < ssid_len) ? ssid[i] : '\0';
+                *(uint32_t*)(shm + 8228) = pass_len;
+                for (uint32_t i = 0; i < 64; i++) (shm + 8232)[i] = (i < pass_len) ? pass[i] : '\0';
+
+                sys_puts(console_ep, "Connecting to \""); sys_puts(console_ep, ssid);
+                sys_puts(console_ep, "\" (WPA2-PSK) — this can take up to ~15s while firmware completes the 4-way handshake...\n");
+
+                seL4_SetMR(0, 2); // WIFI_CMD_CONNECT
+                seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_Word result = seL4_GetMR(0);
+                seL4_Word reason = seL4_GetMR(1);
+
+                if (result == 0) {
+                    sys_puts(console_ep, "Connected!\n");
+                } else {
+                    sys_puts(console_ep, "Connect FAILED (code "); sys_putdec(result);
+                    sys_puts(console_ep, ", reason "); sys_putdec(reason);
+                    sys_puts(console_ep, ") — see driver log above for details.\n");
+                }
+            }
+
             else if (my_strcmp(cmd_ptr, "ls") == 0) {
                 char *shm = shm_base; 
                 if (arg) { build_absolute_path(shm, arg, SHM_TOTAL_SIZE); }
@@ -1078,7 +1379,14 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "ps") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
 
-                ipc->msg[0] = 104; 
+                // SYS_PS пишет таблицу процессов в тот же офсет 0 разделяемой
+                // SHM, что и net_driver.cpp (net_log_flush, журнал UDP) —
+                // держим лок на весь путь "запрос -> ответ рутсервера ->
+                // чтение shm", иначе фоновая запись net_driver может
+                // перезаписать буфер до того, как мы его прочитаем (см.
+                // vfs_spinlock_ptr выше).
+                vfs_lock();
+                ipc->msg[0] = 104;
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 if (is_piping) {
                     sys_write(pipe_fd, shm);
@@ -1086,6 +1394,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     sys_puts(console_ep, shm);
                 }
+                vfs_unlock();
             }
 
             else if (my_strcmp(cmd_ptr, "kill") == 0) {
@@ -1308,7 +1617,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi, touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

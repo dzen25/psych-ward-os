@@ -88,6 +88,22 @@ static uintptr_t global_ipc_temp_vaddr = 0x200800000ULL;
 static char* rootserver_shm_base = (char*)0x502000ULL; // Адрес SHM внутри Rootserver-а
 static seL4_CPtr shm_frames[4]; // Массив Capability для 4-х страниц SHM
 
+// rootserver_shm_base мапится КЭШИРУЕМО (см. цикл маппинга в main()), а все
+// остальные процессы (shell/blk_driver/net_driver/...) видят ЭТУ ЖЕ
+// физическую память некэшируемо (map_frame_robust()). Без явного cache
+// maintenance рутсервер рискует: (а) записать данные, которые останутся в
+// dirty-кэше и не долетят до RAM к моменту, когда некэшируемый читатель их
+// ждёт (например, SYS_PS — таблица процессов для `ps`), или (б) прочитать
+// устаревшую закэшированную копию вместо того, что кто-то другой только что
+// записал некэшируемо (например, load_elf_from_disk — ответ blk_driver).
+// Вызывать после записи (перед тем, как другой процесс должен её увидеть)
+// и/или перед чтением (после того, как другой процесс мог что-то записать).
+static void flush_rootserver_shm() {
+    for (int i = 0; i < 4; i++) {
+        seL4_ARM_Page_CleanInvalidate_Data(shm_frames[i], 0, 4096);
+    }
+}
+
 static uintptr_t untyped_watermarks[256] = {0};
 
 static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, uintptr_t target_paddr, seL4_CPtr root_cnode) {
@@ -128,6 +144,30 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
     if (untyped_watermarks[idx] == 0)
         untyped_watermarks[idx] = info->untypedList[idx].paddr;
 
+    // Этот аллокатор — чистый bump-allocator по возрастанию: retype всегда
+    // отдаёт СЛЕДУЮЩИЙ физический фрейм от текущего watermark'а, независимо
+    // от того, какой target_paddr запрошен. Если target_paddr уже ПОЗАДИ
+    // watermark'а (т.е. какой-то более ранний вызов alloc_device_frame() для
+    // ЭТОГО ЖЕ untyped-региона уже увёл watermark дальше вперёд), функция
+    // молча вернула бы фрейм по совершенно другому физическому адресу — не
+    // тому устройству, которое просили, а какому-то соседнему/уже занятому.
+    // Ровно так и была найдена эта проверка: PLAT_WIFI_SDIO_PADDR (0xfe300000)
+    // allocировался ПОСЛЕ PLAT_EMMC_PADDR (0xfe340000) в том же untyped —
+    // wifi_driver получил чужой фрейм (фактически чуть выше EMMC2) и его
+    // SDIO-транзакции разбудили/сломали реальный EMMC2, а не WiFi-чип (см.
+    // ROADMAP.md, Милстоун 4.1 — упавший CMD0 в blk_driver ровно в тот момент,
+    // когда включили RPI4_ENABLE_WIFI). Падаем громко здесь же, а не отдаём
+    // тихо неверный фрейм — единственный порядок вызовов, который надёжен,
+    // это строго по возрастанию target_paddr в пределах одного untyped-региона.
+    if (target_paddr < untyped_watermarks[idx]) {
+        seL4_DebugPutString((char*)"[BRINGUP] alloc_device_frame: target_paddr BEHIND watermark (out-of-order call for this untyped region) target_paddr=0x");
+        for (int nib = 15; nib >= 0; nib--) seL4_DebugPutChar("0123456789abcdef"[(target_paddr >> (nib * 4)) & 0xF]);
+        seL4_DebugPutString((char*)" watermark=0x");
+        for (int nib = 15; nib >= 0; nib--) seL4_DebugPutChar("0123456789abcdef"[(untyped_watermarks[idx] >> (nib * 4)) & 0xF]);
+        seL4_DebugPutString((char*)"\n");
+        while(1); // отдать неверный фрейм намного хуже, чем зависнуть здесь
+    }
+
     seL4_CPtr untyped_cap = alloc.get_untyped_cap(idx);
 
     // Выравниваем waterMark до целевого адреса
@@ -143,8 +183,12 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
     return frame;
 }
 
+// 256 хватает с запасом: wifi_driver со своими статическими буферами прошивки/NVRAM
+// (~708KB) сам по себе требует ~180-200 отслеживаемых ELF-страничных фреймов.
+#define MAX_TRACKED_CAPS 256
+
 struct CapTracker {
-    seL4_CPtr caps[64];
+    seL4_CPtr caps[MAX_TRACKED_CAPS];
     int count;
 };
 
@@ -170,6 +214,8 @@ struct ProcessControlBlock {
     seL4_CPtr hw_frame;
     seL4_CPtr net_cmd_recv_ep;
     seL4_CPtr net_cmd_send_ep;
+    seL4_CPtr wifi_cmd_recv_ep;
+    seL4_CPtr wifi_cmd_send_ep;
 
     CapTracker cap_tracker;
 
@@ -207,7 +253,7 @@ static seL4_CPtr alloc_and_track_cap(PsychAllocator &alloc, ProcessControlBlock 
         while(1);
     }
 
-    if (pcb.cap_tracker.count < 64) {
+    if (pcb.cap_tracker.count < MAX_TRACKED_CAPS) {
         pcb.cap_tracker.caps[pcb.cap_tracker.count++] = cap;
     } else {
         uart_puts("PANIC: Process exceeded capability tracking limit!\n");
@@ -241,19 +287,21 @@ static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load
         // Драйвер перезаписывает SHM, поэтому имя файла восстанавливаем перед каждым запросом
         strncpy(shm, filename, 63);
         shm[63] = '\0';
-        
+        flush_rootserver_shm(); // иначе имя файла может не долететь до RAM к моменту, когда blk_driver его некэшируемо прочитает
+
         seL4_SetMR(0, 119); // SYS_READ_FILE
         seL4_SetMR(1, total_read); // Передаем СМЕЩЕНИЕ (offset)
-        
+
         seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2);
         seL4_Call(blk_ep, msg);
-        
+
         int status = seL4_GetMR(0);
         int bytes_read = seL4_GetMR(1);
-        
+
         if (status != 0) return -1; // Ошибка чтения или файл не найден
         if (bytes_read == 0) break;    // Конец файла (EOF)
-        
+
+        flush_rootserver_shm(); // иначе можем прочитать устаревшую закэшированную копию вместо свежего ответа blk_driver
         // Копируем полученный безопасный кусок в большой буфер Rootserver'а
         memcpy(load_buffer + total_read, shm, bytes_read);
         total_read += bytes_read;
@@ -317,7 +365,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          seL4_CPtr irq_ntfn, seL4_CPtr irq_handler, seL4_CPtr hw_frame,
                          const char *args_payload = nullptr,
                          seL4_CPtr net_cmd_recv_ep = 0,
-                         seL4_CPtr net_cmd_send_ep = 0) {
+                         seL4_CPtr net_cmd_send_ep = 0,
+                         seL4_CPtr wifi_cmd_recv_ep = 0,
+                         seL4_CPtr wifi_cmd_send_ep = 0) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -362,7 +412,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_net_send_ep = 3;
     seL4_Word local_irq_handler = 4;
     seL4_Word local_net_recv_ep = 5;
+    seL4_Word local_wifi_send_ep = 6; // Wi-Fi (Фаза 4): шелл шлёт диагностические команды wifi_driver
     seL4_Word local_blk_ep      = 7; // VFS/Block Driver Endpoint
+    seL4_Word local_wifi_recv_ep = 8; // Wi-Fi (Фаза 4): wifi_driver слушает на этом слоте (см. BOOT_WIFI_EP)
     seL4_Word local_syscall_ep  = 10; // <-- Локальный индекс для Faults и Syscalls
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
@@ -383,6 +435,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (net_cmd_send_ep != 0) check_err(seL4_CNode_Mint(child_cnode, local_net_send_ep, 8, root_cnode, net_cmd_send_ep, seL4_WordBits, seL4_AllRights, pid), "Mint net send ep");
     if (irq_handler != 0) check_err(seL4_CNode_Copy(child_cnode, local_irq_handler, 8, root_cnode, irq_handler, seL4_WordBits, seL4_AllRights), "Copy IRQ handler");
     if (net_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_net_recv_ep, 8, root_cnode, net_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy net recv ep");
+    if (wifi_cmd_send_ep != 0) check_err(seL4_CNode_Mint(child_cnode, local_wifi_send_ep, 8, root_cnode, wifi_cmd_send_ep, seL4_WordBits, seL4_AllRights, pid), "Mint wifi send ep");
+    if (wifi_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_wifi_recv_ep, 8, root_cnode, wifi_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy wifi recv ep");
 
     pcb.cspace = child_cnode;
     pcb.badged_ep = badged_ep; // Оставляем глобальный в pcb для нужд ядра
@@ -394,6 +448,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.hw_frame = hw_frame;
     pcb.net_cmd_recv_ep = net_cmd_recv_ep;
     pcb.net_cmd_send_ep = net_cmd_send_ep;
+    pcb.wifi_cmd_recv_ep = wifi_cmd_recv_ep;
+    pcb.wifi_cmd_send_ep = wifi_cmd_send_ep;
 
     elf_t elf;
     elf_newFile(elf_file, elf_size, &elf);
@@ -497,10 +553,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     child_ipc_ptr->msg[BOOT_ROOT_EP] = local_syscall_ep;
 
-    // is_driver == 2 (timer) намеренно исключён: ARM generic timer читается
-    // прямой mrs-инструкцией из EL0 и не мапится как MMIO (см. hw_timer.cpp,
-    // main() выше) — hw_frame для него всегда 0, мапить нечего.
-    if (hw_frame != 0 && (is_driver == 1 || is_driver == 3 || is_driver == 4)) { // Any driver with real MMIO
+    // is_driver == 2 (timer): ARM generic timer сам по себе читается прямой
+    // mrs-инструкцией из EL0 и не мапится как MMIO (см. hw_timer.cpp, main()
+    // выше) — но тот же процесс теперь дополнительно читает термодатчик AVS
+    // RO thermal, который MMIO-регистр как обычно, поэтому hw_frame для
+    // timer_driver больше не всегда 0 (см. avs_frame выше).
+    if (hw_frame != 0 && (is_driver == 1 || is_driver == 2 || is_driver == 3 || is_driver == 4 || is_driver == 5)) { // Any driver with real MMIO
         seL4_CPtr drv_pud = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pd  = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pt  = alloc_and_track_cap(alloc, pcb);
@@ -509,6 +567,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
 
         uintptr_t hw_vaddr = (is_driver == 1) ? PLAT_UART_VADDR :
+                             (is_driver == 2) ? PLAT_AVS_VADDR :
+                             (is_driver == 5) ? PLAT_WIFI_SDIO_VADDR :
                              ((is_driver == 3) ? PLAT_EMMC_VADDR : PLAT_GENET_VADDR);
 
         seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
@@ -543,6 +603,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
             child_ipc_ptr->msg[BOOT_NET_EP] = local_net_recv_ep;
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
+        } else if (is_driver == 5) { // Wi-Fi driver (Фаза 4) - сервер для шелла, клиент консоли и blk (Милстоун 4.2: чтение прошивки/NVRAM с SD)
+            child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
+            child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_recv_ep;
+            child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
         }
 
     } else {
@@ -550,6 +614,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
         child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
         child_ipc_ptr->msg[BOOT_NET_EP] = local_net_send_ep;
+        child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_send_ep;
         child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
     }
 
@@ -672,7 +737,8 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                                     meta.is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                     meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
-                                    nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep);
+                                    nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep,
+                                    meta.wifi_cmd_recv_ep, meta.wifi_cmd_send_ep);
         
         if (new_pid > 0) {
             uart_puts("[WATCHDOG] Service restored successfully. New PID: "); uart_putdec(new_pid); uart_puts("\n");
@@ -728,11 +794,32 @@ int main(int argc, char *argv[]) {
     constexpr bool RPI4_ENABLE_TIMER = true;
     constexpr bool RPI4_ENABLE_BLK   = true;
     constexpr bool RPI4_ENABLE_NET   = true;
+    // Wi-Fi (Фаза 4, Милстоун 4.1 — см. ROADMAP.md): выключено по умолчанию.
+    // ВАЖНО: последний живой тест с циклом повтора CMD5 положил ВЕСЬ ядро
+    // (seL4 "halting... Kernel entry via Unknown (0)" — это фатальный
+    // необрабатываемый kernel-level halt, скорее всего SError/внешний abort
+    // от повторной отправки CMD5 без паузы этому квирковому legacy-SDHCI
+    // блоку, а не обычный recoverable page fault пользовательского процесса).
+    // Такое требует физического перезапуска платы, а не просто перезаливки —
+    // держим выключенным, пока не добавлена пошаговая диагностика и не
+    // сделан повтор менее агрессивным (см. wifi_driver.cpp).
+    constexpr bool RPI4_ENABLE_WIFI  = true;
 
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
     seL4_CPtr emmc_frame = 0;
+    seL4_CPtr avs_frame = 0;
+    seL4_CPtr wifi_sdio_frame = 0;
     // GENET занимает 64KB (0x10000) — 16 страниц, а не один слот, как EMMC2.
     seL4_CPtr genet_frames[16] = {0};
+    // ВАЖНО: PLAT_WIFI_SDIO_PADDR (0xfe300000) лежит в ТОМ ЖЕ untyped-регионе,
+    // что и PLAT_EMMC_PADDR (0xfe340000), и физически МЕНЬШЕ него — поэтому
+    // должен аллоцироваться СТРОГО ДО EMMC2 (см. проверку "target_paddr BEHIND
+    // watermark" в alloc_device_frame() выше). Раньше это было наоборот и
+    // wifi_driver получал чужой (EMMC2-соседний) физический фрейм, что портило
+    // реальный SD-контроллер при живом тесте — см. ROADMAP.md, Милстоун 4.1.
+    if (RPI4_ENABLE_WIFI) {
+        wifi_sdio_frame = alloc_device_frame(info, alloc, PLAT_WIFI_SDIO_PADDR, root_cnode);
+    }
     if (RPI4_ENABLE_BLK) {
         emmc_frame = alloc_device_frame(info, alloc, PLAT_EMMC_PADDR, root_cnode);
     }
@@ -740,6 +827,11 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 16; i++) {
             genet_frames[i] = alloc_device_frame(info, alloc, PLAT_GENET_PADDR + (i * 4096), root_cnode);
         }
+    }
+    if (RPI4_ENABLE_TIMER) {
+        // AVS RO thermal (0xf00 байт регистров) умещается в одну страницу,
+        // как EMMC2 — читается тем же процессом, что и таймер (timer_driver).
+        avs_frame = alloc_device_frame(info, alloc, PLAT_AVS_PADDR, root_cnode);
     }
 
     // ВАЖНО: MMIO должен маппиться некэшируемым (Device memory), иначе CPU
@@ -783,7 +875,8 @@ int main(int argc, char *argv[]) {
         if (!RPI4_ENABLE_NET)   uart_puts(" net DISABLED (ping/send/... will hang);");
         uart_puts("\n");
     } else {
-        uart_puts("[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
+        uart_puts(RPI4_ENABLE_WIFI ? "[ROOT] Booting UART / Timer / Block / Net / Wifi / Shell...\n"
+                                    : "[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
     }
 
     seL4_CPtr ep = alloc.alloc_slot();
@@ -801,7 +894,22 @@ int main(int argc, char *argv[]) {
             uart_puts("[ROOT] FATAL: Failed to allocate normal RAM for SHM!\n");
             while(1);
         }
-        // Мапим эти физические фреймы в виртуальную память Rootserver'а
+        // Мапим эти физические фреймы в виртуальную память Rootserver'а —
+        // ОБЯЗАТЕЛЬНО кэшируемой (seL4_ARM_Default_VMAttributes), в отличие
+        // от map_frame_robust() ниже (та мапит некэшируемо ради когерентности
+        // с GENET DMA). Пробовали сделать и здесь некэшируемо (для той же
+        // когерентности с другими процессами) — но Device-память на ARM
+        // требует строго выровненных обращений, а `strcpy()`/аналоги из
+        // muslc (используются, например, в SYS_PS ниже) этого не гарантируют
+        // — сразу же Alignment Fault прямо в потоке rootserver. Поэтому
+        // остаёмся на кэшируемом маппинге, а когерентность с некэшируемыми
+        // читателями/писателями (shell/blk_driver/net_driver и т.д., все
+        // видят эту же физическую память через map_frame_robust()) обеспечиваем
+        // явным cache maintenance — см. flush_rootserver_shm() ниже,
+        // вызывается в каждом syscall-хендлере, который пишет сюда данные
+        // для чужого некэшируемого чтения (SYS_PS и т.п.), а также перед
+        // рутсерверным чтением того, что кто-то другой записал некэшируемо
+        // (load_elf_from_disk — ответ blk_driver).
         seL4_ARM_Page_Map(shm_frames[i], root_vspace, (uintptr_t)rootserver_shm_base + (i * 4096),
                           seL4_AllRights, seL4_ARM_Default_VMAttributes);
     }
@@ -812,6 +920,9 @@ int main(int argc, char *argv[]) {
     seL4_CPtr net_cmd_ep = alloc.alloc_slot();
     seL4_CPtr net_cmd_recv_ep = alloc.alloc_slot();
     seL4_CPtr net_cmd_send_ep = alloc.alloc_slot();
+    seL4_CPtr wifi_cmd_ep = 0;
+    seL4_CPtr wifi_cmd_recv_ep = 0;
+    seL4_CPtr wifi_cmd_send_ep = 0;
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, console_ep, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, timer_ep, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, blk_ep, 1);
@@ -820,6 +931,23 @@ int main(int argc, char *argv[]) {
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanRead);
     seL4_CNode_Copy(root_cnode, net_cmd_send_ep, seL4_WordBits,
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CapRights_new(0, 1, 0, 1)); // Write + Grant
+    // Wi-Fi (Фаза 4, Милстоун 4.1) — тот же паттерн клиент/сервер, что и net_cmd_*
+    // выше: wifi_driver слушает на recv-копии, шелл шлёт диагностику через send-копию.
+    // ВАЖНО: строго под RPI4_ENABLE_WIFI, как и любой другой ресурс, завязанный
+    // на конкретный RPI4_ENABLE_* флаг (emmc_frame/genet_frames/avs_frame выше
+    // тоже аллоцируются только под своим флагом) — при выключенном wifi этот
+    // код не должен потреблять вообще ничего лишнего (раньше по ошибке создавался
+    // безусловно, см. ROADMAP.md Милстоун 4.1 — расследование halt'а на живом железе).
+    if (RPI4_ENABLE_WIFI) {
+        wifi_cmd_ep = alloc.alloc_slot();
+        wifi_cmd_recv_ep = alloc.alloc_slot();
+        wifi_cmd_send_ep = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, wifi_cmd_ep, 1);
+        seL4_CNode_Copy(root_cnode, wifi_cmd_recv_ep, seL4_WordBits,
+                        root_cnode, wifi_cmd_ep, seL4_WordBits, seL4_CanRead);
+        seL4_CNode_Copy(root_cnode, wifi_cmd_send_ep, seL4_WordBits,
+                        root_cnode, wifi_cmd_ep, seL4_WordBits, seL4_CapRights_new(0, 1, 0, 1)); // Write + Grant
+    }
 
     // Таймер (ARM generic timer) не MMIO-устройство и не генерирует IRQ,
     // доступный из EL0 на этой сборке ядра (см. hw_timer.cpp) — никакой
@@ -844,7 +972,7 @@ int main(int argc, char *argv[]) {
     if (RPI4_ENABLE_TIMER) {
     // Запускаем Драйвер Таймера (is_driver = 2)
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, 0) < 0) {
+                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, avs_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
@@ -865,6 +993,18 @@ int main(int argc, char *argv[]) {
     }
     }
 
+    if (RPI4_ENABLE_WIFI) {
+    // Запускаем Wi-Fi драйвер (is_driver = 5, Фаза 4, Милстоун 4.1). Не
+    // критичный для загрузки — SYS_DRIVER_READY для is_driver вне 1..4
+    // игнорируется рутсервером (см. case SYS_DRIVER_READY ниже), так что
+    // зависание/провал пробы SDIO не блокирует остальные драйверы/шелл.
+    if (spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                      5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, wifi_sdio_frame, nullptr,
+                      0, 0, wifi_cmd_recv_ep, 0) < 0) {
+        uart_puts("PANIC: Wi-Fi Driver failed to load!\n"); while(1);
+    }
+    }
+
     // Запускаем Оболочку (is_driver = 0). Сама оболочка при старте блокируется
     // на SYS_WAIT_ALL_DRIVERS_READY (см. главный цикл ниже и shell.cpp) —
     // поэтому ее собственный баннер/приглашение печатаются только после того,
@@ -873,7 +1013,7 @@ int main(int argc, char *argv[]) {
     // никакого отдельного списка "кого ждать" не требуется.
     if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       0, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, 0, nullptr,
-                      0, net_cmd_send_ep) < 0) {
+                      0, net_cmd_send_ep, 0, wifi_cmd_send_ep) < 0) {
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
 
@@ -1163,17 +1303,19 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_DOCTOR: {
-                char *shm = rootserver_shm_base; 
+                char *shm = rootserver_shm_base;
+                flush_rootserver_shm(); // "пациент" мог записать некэшируемо — иначе рутсервер прочитает устаревшую копию
                 uart_puts("\n[DOCTOR] Patient wrote in SHM: \"");
                 uart_puts(shm);
                 uart_puts("\"\n");
-                
+
                 const char* reply = "Take 2 bytes of C++ and call me in the morning.";
                 int i = 0;
                 while(reply[i]) { shm[i] = reply[i]; i++; }
                 shm[i] = '\0';
 
-                seL4_SetMR(0, 0); 
+                flush_rootserver_shm(); // чтобы "пациент" некэшируемо увидел свежий ответ
+                seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
@@ -1438,6 +1580,7 @@ int main(int argc, char *argv[]) {
                         strcpy(shm + offset, "\n"); offset++;
                     }
                 }
+                flush_rootserver_shm(); // иначе шелл может некэшируемо прочитать не эту таблицу, а что-то устаревшее (см. flush_rootserver_shm())
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
@@ -1524,9 +1667,18 @@ int main(int argc, char *argv[]) {
 
             case SYS_DRIVER_READY: {
                 int drv = (sender_pid > 0) ? pcbs[sender_pid].is_driver : 0;
+                // Печатаем "ready" для ЛЮБОГО настоящего драйвера (1..5,
+                // включая wifi_driver — Фаза 4, Милстоун 4.1), чтобы он был
+                // виден в логе наравне с остальными. Но в driver_ready[]/
+                // all_drivers_ready() по-прежнему учитываются только 1..4 —
+                // wifi всё ещё экспериментальный (см. RPI4_ENABLE_WIFI), и
+                // зависание/провал его пробы не должно блокировать загрузку
+                // остальных модулей и шелла.
+                if (drv >= 1 && drv <= 5) {
+                    uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
+                }
                 if (drv >= 1 && drv <= 4) {
                     driver_ready[drv] = true;
-                    uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
 
                     // Отпускаем shell, ждавший на SYS_WAIT_ALL_DRIVERS_READY — ОТДЕЛЬНЫМ
                     // Send на сохраненный reply-cap, а не seL4_Reply() (тот отвечал бы

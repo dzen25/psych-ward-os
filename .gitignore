@@ -2,7 +2,6 @@ build/
 build-rpi4/
 .vscode/
 *.log
-*.bin
 fat32.img
 /mnt
 /home/nikita/psych-ward-os/projects/sel4test/apps/sel4test-driver/fat32.img

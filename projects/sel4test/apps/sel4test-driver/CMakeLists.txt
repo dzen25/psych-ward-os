@@ -49,6 +49,13 @@ target_link_options(net_driver PRIVATE "-nostdlib" "-static")
 target_link_options(net_driver PRIVATE "-Wl,-e,_start")
 target_link_libraries(net_driver sel4 sel4runtime muslc)
 
+# Wi-Fi драйвер (Фаза 4, Милстоун 4.1 — SDIO host bring-up, см. ROADMAP.md)
+add_executable(wifi_driver src/wifi_driver.cpp)
+target_include_directories(wifi_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+target_link_options(wifi_driver PRIVATE "-nostdlib" "-static")
+target_link_options(wifi_driver PRIVATE "-Wl,-e,_start")
+target_link_libraries(wifi_driver sel4 sel4runtime muslc)
+
 # ===================================================================
 # --- СБОРКА VFS (RAM-ДИСКА) ВРУЧНУЮ ---
 # ===================================================================
@@ -64,6 +71,7 @@ echo 'timer_driver' >> file_list.txt
 echo 'shell' >> file_list.txt
 echo 'blk_driver' >> file_list.txt
 echo 'net_driver' >> file_list.txt # <--- ДОБАВЬ ЭТУ СТРОКУ
+echo 'wifi_driver' >> file_list.txt
 cat file_list.txt | cpio -o -H newc > archive.cpio
 
 echo '.section ._archive_cpio,\"aw\"' > archive.S
@@ -80,8 +88,9 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:shell>" "${CMAKE_CURRENT_BINARY_DIR}/shell"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:blk_driver>" "${CMAKE_CURRENT_BINARY_DIR}/blk_driver"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:net_driver>" "${CMAKE_CURRENT_BINARY_DIR}/net_driver"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:wifi_driver>" "${CMAKE_CURRENT_BINARY_DIR}/wifi_driver"
     COMMAND bash "${CMAKE_CURRENT_BINARY_DIR}/pack_vfs.sh"
-    DEPENDS uart_driver timer_driver shell blk_driver net_driver
+    DEPENDS uart_driver timer_driver shell blk_driver net_driver wifi_driver
 )
 
 # ===================================================================
