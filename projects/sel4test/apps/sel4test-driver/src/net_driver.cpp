@@ -300,6 +300,16 @@ static uint32_t g_rx_c_index = 0;   // наш локальный "consumer index
 static uint32_t g_rx_index = 0;     // индекс текущего RX-дескриптора (wrap по GENET_RX_DESCS)
 static uint32_t g_tx_index = 0;     // индекс текущего TX-дескриптора (wrap по GENET_TX_DESCS)
 
+// Счётчики пробуждений главного цикла (см. main()) — по бейджу
+// NET_EVENT_GENET_RX (реальный GIC IRQ приёма) отдельно от NET_EVENT_HEARTBEAT
+// (периодический 100мс тик, см. timer_driver.cpp). Единственный практический
+// способ подтвердить на живом железе, что RX действительно приходит по
+// прерыванию, а не только "кажется рабочим" из-за heartbeat, который тоже
+// дренирует кольцо (см. ROADMAP.md 4.5, живой баг ethertype=0/разрыв SHM) —
+// печатаются в `netstat`.
+static uint32_t g_genet_irq_wakeups = 0;
+static uint32_t g_heartbeat_wakeups = 0;
+
 enum NetCommand {
     NET_CMD_NONE = 0,
     NET_CMD_PING = 1,
@@ -590,8 +600,7 @@ static void genet_phy_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     }
     g_phy_link_up = link_up;
     g_link_next_check_uptime_ms = sys_get_uptime_ms(timer_ep) + LINK_CHECK_INTERVAL_MS;
-    sys_puts(console_ep, link_up ? "[NET] PHY link up.\n"
-                                  : "[NET] PHY link not up yet (cable unplugged?) — will keep watching, not blocking boot.\n");
+    if (link_up) sys_puts(console_ep, "[NET] PHY link up.\n");
 }
 
 // Периодическая (не чаще LINK_CHECK_INTERVAL_MS) проверка линка через MDIO —
@@ -766,7 +775,21 @@ bool net_hw_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
                   genet_read32(GENET_RDMA_REG_BASE + GENET_DMA_CTRL_OFF) | dma_ctrl);
 
     genet_phy_init(console_ep, timer_ep);
-    genet_apply_link(console_ep); // RGMII OOB control + скорость + TX/RX enable (см. genet_apply_link())
+    // Если кабель ещё не воткнут — нечего резолвить (ANEG не проходил),
+    // genet_apply_link() тут дал бы только гадательное "1000 (ANEG не
+    // разрешился, догадка)". net_check_link_status() вызовет её по-настоящему,
+    // когда линк реально появится (см. там же).
+    if (g_phy_link_up) genet_apply_link(console_ep); // RGMII OOB control + скорость + TX/RX enable (см. genet_apply_link())
+
+    // Фаза 4.5 (см. ROADMAP.md) — реальный GIC IRQ на приём кадра вместо
+    // безусловного опроса net_hw_poll_rx() на каждой итерации главного
+    // цикла. Порядок — как в эталонном bcmgenet.c: замаскировать всё,
+    // сбросить залежавшиеся pending-биты, потом размаскировать только то,
+    // что нужно (см. platform.h/INTRL2_CPU_* — НЕ было в проекте раньше,
+    // сверено с /home/nikita/kernel_xiaomi_vince/.../bcmgenet.h).
+    genet_write32(INTRL2_CPU_MASK_SET, 0xFFFFFFFFu);
+    genet_write32(INTRL2_CPU_CLEAR, 0xFFFFFFFFu);
+    genet_write32(INTRL2_CPU_MASK_CLEAR, UMAC_IRQ_RXDMA_DONE);
 
     g_net_up = true;
     return true;
@@ -1361,13 +1384,11 @@ static bool net_require_ip(seL4_CPtr console_ep) {
     return false;
 }
 
-static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr net_cmd_ep) {
-    if (net_cmd_ep == 0) return;
-
-    seL4_Word sender_badge = 0;
-    seL4_MessageInfo_t info = seL4_NBRecv(net_cmd_ep, &sender_badge);
-    if (sender_badge == 0) return;
-
+// Фаза 4.5 (см. ROADMAP.md): раньше сама делала seL4_NBRecv(net_cmd_ep) —
+// теперь сообщение уже получено ГЛАВНЫМ циклом (обычный блокирующий
+// seL4_Recv, комбинированный с GENET RX/heartbeat нотификацией, см. main()
+// ниже), эта функция только разбирает уже лежащие в IPC-буфере MR.
+static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_MessageInfo_t info) {
     int len = seL4_MessageInfo_get_length(info);
     if (len == 0) return;
 
@@ -1462,6 +1483,10 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CP
         put_dec(console_ep, g_tx_index);
         sys_puts(console_ep, " rx_c_idx=");
         put_dec(console_ep, g_rx_c_index);
+        sys_puts(console_ep, " rx_irq_wakeups=");
+        put_dec(console_ep, g_genet_irq_wakeups);
+        sys_puts(console_ep, " heartbeat_wakeups=");
+        put_dec(console_ep, g_heartbeat_wakeups);
         sys_puts(console_ep, " default_udp=");
         put_ip(console_ep, default_udp_ip);
         sys_puts(console_ep, ":");
@@ -1972,13 +1997,12 @@ int main(int argc, char *argv[]) {
     seL4_CPtr net_cmd_ep = ipc->msg[BOOT_NET_EP];
     seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];
+    seL4_CPtr irq_ep     = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: настоящая IRQHandler-капа GENET RX (RPI4_GENET_IRQ_A), не общая ни с кем
     g_blk_ep = ipc->msg[7]; // см. main.cpp: local_blk_ep=7 — нужен только для net_log_udp()
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
     }
-
-    sys_puts(console_ep, "\n[NET] Server online.\n");
 
     // =========================================================
     // 1. ДИНАМИЧЕСКИЙ ЗАПРОС SHM (Убираем хардкод)
@@ -2010,6 +2034,17 @@ int main(int argc, char *argv[]) {
         sys_puts(console_ep, "[NET] ERROR: GENET init failed, network unavailable.\n");
     }
 
+    // Фаза 4.5 (см. ROADMAP.md): подписка на периодический будильник от
+    // timer_driver — DHCP/ARP/ping/link-таймауты завязаны на wall-clock, а
+    // не на GENET RX IRQ, им нужен отдельный "тик" даже когда кадры не
+    // приходят вообще (см. SYS_TIMER_HEARTBEAT_SUBSCRIBE в timer_driver.cpp).
+    // 100мс — с большим запасом ниже самого мелкого из реальных интервалов
+    // (LINK_CHECK_INTERVAL_MS=1000 и т.д., см. константы выше) — не задержит
+    // ничего заметно, но НАМНОГО реже, чем прежний busy-yield без сна вообще.
+    seL4_SetMR(0, 9); // 9 = SYS_TIMER_HEARTBEAT_SUBSCRIBE
+    seL4_SetMR(1, 100);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
     // Не ждём ни PHY-линка, ни NTP-синхронизации — сигналим готовность сразу,
     // иначе при отключённом кабеле/недоступной сети вся загрузка (включая
     // shell) вставала бы на паузу. NTP (если и когда сеть появится) идёт
@@ -2019,17 +2054,43 @@ int main(int argc, char *argv[]) {
     // "boot-time sync" пути не нужно.
     signal_net_driver_ready(root_ep);
 
-    while(1) {
-        if (g_net_up) {
-            net_check_link_status(console_ep, timer_ep);
-            net_check_dhcp(console_ep, timer_ep);
-            net_poll(console_ep, timer_ep, root_ep);
-            net_handle_command(console_ep, timer_ep, net_cmd_ep);
-            net_check_ping_timeout(console_ep, timer_ep);
-            net_check_ping_send(console_ep, timer_ep);
-            net_check_ntp_resync(console_ep, timer_ep);
+    // Главный цикл (Фаза 4.5) — раньше был busy-yield с net_hw_poll_rx()
+    // на КАЖДОЙ итерации и seL4_NBRecv() на команды клиента; теперь обычный
+    // блокирующий seL4_Recv(), скомбинированный с нотификацией net_driver'а
+    // (см. NET_EVENT_GENET_RX/NET_EVENT_HEARTBEAT в common.h, TCB-bind в
+    // main.cpp) — поток реально спит, пока не случится ЛИБО кадр, ЛИБО тик
+    // будильника, ЛИБО настоящее клиентское сообщение на net_cmd_ep.
+    while (1) {
+        seL4_Word badge = 0;
+        seL4_MessageInfo_t info = seL4_Recv(net_cmd_ep, &badge);
+
+        if (badge & (NET_EVENT_GENET_RX | NET_EVENT_HEARTBEAT)) {
+            if (badge & NET_EVENT_GENET_RX) {
+                // Сброс sticky-бита ПЕРЕД Ack (см. живой урок с EMMC2 в
+                // blk_driver.cpp/ROADMAP.md 4.5) — порядок как в эталонном
+                // bcmgenet.c: снимок текущего статуса, CLEAR, потом Ack.
+                // Здесь это не грозит межпроцессным голоданием (собственная
+                // линия, Ack делает тот же поток, что и обработку), но
+                // порядок всё равно важен для чистоты — иначе GIC увидит
+                // линию ещё "поднятой" и тут же передоставит то же событие.
+                genet_write32(INTRL2_CPU_CLEAR, UMAC_IRQ_RXDMA_DONE);
+                seL4_IRQHandler_Ack(irq_ep);
+                g_genet_irq_wakeups++;
+            }
+            if (badge & NET_EVENT_HEARTBEAT) g_heartbeat_wakeups++;
+            if (g_net_up) {
+                net_check_link_status(console_ep, timer_ep);
+                net_check_dhcp(console_ep, timer_ep);
+                net_poll(console_ep, timer_ep, root_ep);
+                net_check_ping_timeout(console_ep, timer_ep);
+                net_check_ping_send(console_ep, timer_ep);
+                net_check_ntp_resync(console_ep, timer_ep);
+            }
+            continue;
         }
-        seL4_Yield();
+
+        // Обычное сообщение от клиента (badge = pid, не бит нотификации).
+        if (g_net_up) net_handle_command(console_ep, timer_ep, info);
     }
 
     return 0;

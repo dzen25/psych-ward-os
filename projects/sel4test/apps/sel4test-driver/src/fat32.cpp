@@ -110,8 +110,28 @@ static uint32_t fat_get_entry(FAT32_Instance* fs, uint32_t cluster) {
     return entries[sector_offset / 4] & 0x0FFFFFFF;
 }
 
+// Кэш последовательного чтения файла (см. read_chain_data ниже) — все реальные
+// вызывающие (wifi firmware/NVRAM/CLM, cat больших файлов) читают файл строго по
+// возрастающему offset кусками по FAT32_MAX_IO_CHUNK. Без кэша каждый такой вызов
+// заново проходил ВСЮ цепочку FAT от начала файла (и fat_chain_has_cycle, и
+// skip_clusters — оба O(длины цепочки)), т.е. O(N^2) обращений к FAT-таблице на
+// файл длиной N кластеров, каждое отдельным чтением сектора с диска — на живом
+// железе именно это, а не PIO/ширина SDIO-шины, давало ~5.8с на заливку 645КБ
+// прошивки (см. ROADMAP.md/память, U-Boot читает тот же тип карты на 17МиБ/с).
+// Инвалидируется в fat_set_entry() — на любое изменение FAT-таблицы (запись,
+// truncate, rename, free) кэш сбрасывается, следующее чтение просто пойдёт
+// холодным (медленным, но всегда корректным) путём с нуля.
+struct FatSeqCursor {
+    FAT32_Instance* fs;
+    uint32_t start_cluster;
+    uint32_t offset;   // offset, с которого продолжится следующее чтение
+    uint32_t cluster;  // кластер, соответствующий этому offset (0 = конец цепочки)
+};
+static FatSeqCursor g_fat_seq_cursor = {nullptr, 0, 0, 0};
+
 // Записывает запись FAT во ВСЕ копии таблицы (fs->fat_count), как того требует спецификация.
 static bool fat_set_entry(FAT32_Instance* fs, uint32_t cluster, uint32_t value) {
+    g_fat_seq_cursor.fs = nullptr; // см. комментарий у FatSeqCursor выше
     uint32_t fat_offset = cluster * 4;
     uint32_t sector_offset = fat_offset % fs->bytes_per_sector;
     char buf[512];
@@ -223,16 +243,27 @@ static const uint32_t FAT32_MAX_IO_CHUNK = 4096;
 static uint32_t read_chain_data(FAT32_Instance* fs, uint32_t start_cluster, uint32_t offset, char* out_buffer, uint32_t max_len) {
     uint32_t bytes_per_cluster = (uint32_t)fs->bytes_per_sector * fs->sectors_per_cluster;
     if (bytes_per_cluster == 0 || start_cluster < 2) return 0;
-    if (fat_chain_has_cycle(fs, start_cluster)) return 0; // Повреждённая (зацикленная) цепочка файла
     if (max_len > FAT32_MAX_IO_CHUNK) max_len = FAT32_MAX_IO_CHUNK;
 
-    uint32_t cluster = start_cluster;
-    uint32_t skip_clusters = offset / bytes_per_cluster;
-    for (uint32_t i = 0; i < skip_clusters; i++) {
-        if (cluster < 2) return 0;
-        uint32_t next = fat_get_entry(fs, cluster);
-        if (!cluster_has_next(next)) return 0; // offset выходит за пределы реальной цепочки
-        cluster = next;
+    uint32_t cluster;
+    // Тёплое продолжение предыдущего последовательного чтения ЭТОГО ЖЕ файла с
+    // ТОЧНО того offset, на котором оно остановилось — цепочка от начала файла
+    // до этой точки уже пройдена и проверена раньше (см. FatSeqCursor выше),
+    // не гоняем skip_clusters/fat_chain_has_cycle заново. Любое расхождение
+    // (другой файл, "прыжок"/seek, offset назад) — обычный холодный путь.
+    if (g_fat_seq_cursor.fs == fs && g_fat_seq_cursor.start_cluster == start_cluster &&
+        g_fat_seq_cursor.offset == offset) {
+        cluster = g_fat_seq_cursor.cluster;
+    } else {
+        if (fat_chain_has_cycle(fs, start_cluster)) return 0; // Повреждённая (зацикленная) цепочка файла
+        cluster = start_cluster;
+        uint32_t skip_clusters = offset / bytes_per_cluster;
+        for (uint32_t i = 0; i < skip_clusters; i++) {
+            if (cluster < 2) { g_fat_seq_cursor.fs = nullptr; return 0; }
+            uint32_t next = fat_get_entry(fs, cluster);
+            if (!cluster_has_next(next)) { g_fat_seq_cursor.fs = nullptr; return 0; } // offset выходит за пределы реальной цепочки
+            cluster = next;
+        }
     }
 
     static char staging[FAT32_MAX_IO_CHUNK];
@@ -262,6 +293,16 @@ static uint32_t read_chain_data(FAT32_Instance* fs, uint32_t start_cluster, uint
     }
 
     my_memcpy(out_buffer, staging, copied);
+
+    // Запоминаем позицию НА КОНЕЦ этого чтения — если следующий вызов попросит
+    // ровно offset+copied того же файла (обычное последовательное чтение по
+    // кругу chunk'ов), read_chain_data продолжит с этого cluster без повторного
+    // прохода цепочки с нуля.
+    g_fat_seq_cursor.fs = fs;
+    g_fat_seq_cursor.start_cluster = start_cluster;
+    g_fat_seq_cursor.offset = offset + copied;
+    g_fat_seq_cursor.cluster = (cluster >= 2) ? cluster : 0;
+
     return copied;
 }
 
@@ -319,6 +360,29 @@ struct DirSlot {
 
     uint32_t last_clus;    // Последний кластер цепочки каталога (для роста, если !has_free)
 };
+
+// Кэш резолва пути (см. FatSeqCursor выше — тот же принцип, только уровнем выше):
+// fat32_read_file() вызывается на КАЖДЫЙ чанк одного и того же последовательного
+// чтения с ТЕМ ЖЕ filename, и без этого кэша каждый раз заново гонял
+// fat32_resolve_parent+dir_scan — обход каталога с нуля (свой FAT-обход внутри
+// dir_scan тоже не бесплатен). Именно это, а не read_chain_data, оставалось
+// узким местом после первого фикса (~1.1с вместо ~5.9с на живом железе — FatSeq-
+// Cursor убрал квадратичность по цепочке ФАЙЛА, но не трогал повторный резолв
+// каталога). Ключ — путь (строка) + fs + CWD на момент резолва (чтобы
+// относительный путь корректно переразрешался при смене CWD). Инвалидируется
+// в любой мутирующей операции (create/write/delete/rename/mkdir) — на промахе
+// обычный путь с нуля, как раньше.
+struct FatPathCache {
+    FAT32_Instance* fs;
+    char path[64];
+    uint32_t cwd_at_lookup;
+    DirSlot slot;
+};
+static FatPathCache g_fat_path_cache{};
+
+static inline void fat_invalidate_path_cache() {
+    g_fat_path_cache.fs = nullptr;
+}
 
 // Ищет 8.3/LFN-запись с именем target_name в каталоге dir_cluster, обходя ВСЮ цепочку
 // его кластеров и все сектора внутри каждого кластера (в отличие от старого кода,
@@ -797,13 +861,30 @@ bool fat32_list_directory(FAT32_Instance* fs, const char* path, char* out_buffer
 
 bool fat32_read_file(FAT32_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read) {
     *bytes_read = 0;
-    char basename[64];
-    uint32_t parent_clus = fat32_resolve_parent(fs, filename, basename);
-    if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
-    if (parent_clus == 0) parent_clus = fs->root_cluster;
 
     DirSlot slot;
-    if (!dir_scan(fs, parent_clus, basename, &slot) || !slot.found) return false;
+    bool have_slot = false;
+    if (g_fat_path_cache.fs == fs && g_fat_path_cache.cwd_at_lookup == fs->current_dir_cluster &&
+        my_strcmp(g_fat_path_cache.path, filename) == 0) {
+        slot = g_fat_path_cache.slot;
+        have_slot = true;
+    }
+
+    if (!have_slot) {
+        char basename[64];
+        uint32_t parent_clus = fat32_resolve_parent(fs, filename, basename);
+        if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
+        if (parent_clus == 0) parent_clus = fs->root_cluster;
+
+        if (!dir_scan(fs, parent_clus, basename, &slot) || !slot.found) return false;
+
+        g_fat_path_cache.fs = fs;
+        int fnlen = 0;
+        while (filename[fnlen] && fnlen < 63) { g_fat_path_cache.path[fnlen] = filename[fnlen]; fnlen++; }
+        g_fat_path_cache.path[fnlen] = '\0';
+        g_fat_path_cache.cwd_at_lookup = fs->current_dir_cluster;
+        g_fat_path_cache.slot = slot;
+    }
 
     if (offset >= slot.size) return true; // Достигнут конец файла (EOF)
 
@@ -934,6 +1015,7 @@ bool fat32_read_text_file(FAT32_Instance* fs, const char* path, char* out_buffer
 
 // === СОЗДАНИЕ ПУСТОГО ФАЙЛА (touch) ===
 bool fat32_create_file(FAT32_Instance* fs, const char* path) {
+    fat_invalidate_path_cache();
     char basename[64];
     uint32_t parent_clus = fat32_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false; // Неверный путь
@@ -972,6 +1054,7 @@ bool fat32_create_file(FAT32_Instance* fs, const char* path) {
 // в отличие от старого кода, который писал только в один кластер, тихо затирая
 // соседние (чужие) кластеры на диске при len больше одного кластера.
 bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, uint32_t len) {
+    fat_invalidate_path_cache();
     char basename[64];
     uint32_t parent_clus = fat32_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -1036,6 +1119,7 @@ bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, ui
 // В отличие от старого кода, после удаления записи каталога освобождает всю цепочку
 // кластеров файла (fat_free_chain) — иначе место на диске тихо утекало бы навсегда.
 bool fat32_delete_file(FAT32_Instance* fs, const char* path) {
+    fat_invalidate_path_cache();
     char basename[64];
     uint32_t parent_clus = fat32_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -1119,6 +1203,7 @@ bool fat32_delete_file(FAT32_Instance* fs, const char* path) {
 // LFN-записей (не входит в объявленный объём переработки) — сохраняется старое
 // ограничение исходного кода.
 bool fat32_rename_file(FAT32_Instance* fs, const char* old_path, const char* new_path) {
+    fat_invalidate_path_cache();
     char old_basename[64];
     uint32_t old_parent_clus = fat32_resolve_parent(fs, old_path, old_basename);
     if (old_parent_clus == 0xFFFFFFFF || old_basename[0] == '\0') return false;
@@ -1163,6 +1248,7 @@ bool fat32_rename_file(FAT32_Instance* fs, const char* old_path, const char* new
 
 // === СОЗДАНИЕ ДИРЕКТОРИИ (mkdir) ===
 bool fat32_mkdir(FAT32_Instance* fs, const char* path) {
+    fat_invalidate_path_cache();
     char basename[64];
     uint32_t parent_clus = fat32_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;

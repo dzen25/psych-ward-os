@@ -19,12 +19,7 @@ constexpr bool LOG_WIFI    = true;  // wifi_driver.cpp — новые коман
 // там же), поэтому ЛЮБОЙ относительный (без ведущего '/') путь, отправленный
 // через SYS_READ_FILE/SYS_WRITE_FILE, резолвится уже ВНУТРИ "/root", а не в
 // истинном корне FAT-раздела — где живут файлы загрузчика (config.txt,
-// U-BOOT.BIN и т.п.). Раньше wifi_driver.cpp посылал голое "wifi_fw.bin" —
-// на живом железе это заставляло искать файл внутри "/root", хотя сам файл
-// лежал на SD-карте на уровень выше (в истинном корне раздела) — драйвер
-// был не виноват, было просто разное соглашение о том, где искать. Все
-// новые файлы драйверов (прошивка/логи/конфиги) кладите d соответсвующие папки на
-// SD-карте и используйте эти константы вместо строк по месту. ---
+// U-BOOT.BIN и т.п.). 
 constexpr const char* PATH_NET_UDP_LOG   = "/root/net_udp.log";
 constexpr const char* PATH_WIFI_FW       = "/wifi/wifi_fw.bin";
 constexpr const char* PATH_WIFI_NVRAM    = "/wifi/wifi_nvram.txt";
@@ -115,14 +110,53 @@ constexpr uintptr_t PLAT_AVS_PADDR = 0xfd5d2000ULL;
 // backplane/прошивки/сетевого протокола (см. ROADMAP.md Фаза 4).
 constexpr uintptr_t PLAT_WIFI_SDIO_PADDR = 0xfe300000ULL;
 
+// VideoCore mailbox (Фаза 4.6, расследование DVFS — см. ROADMAP.md): ARM
+// property-tag интерфейс, единственный штатный способ менять частоту/
+// напряжение ARM-ядер на BCM2711 (нет прямых регистров, в отличие от
+// AVS-термодатчика выше). MAILBOX_BASE = PERIPHERAL_BASE + 0xB880 —
+// НЕ выровнен на страницу (см. тот же приём для mini-UART в
+// PLAT_UART_PADDR выше: страница берётся ниже по адресу, регистры
+// считаются оффсетом от неё, не от начала страницы). Раньше (см.
+// комментарии у RPI4_UART1_MINIUART_PADDR ниже) уже пробовали дёрнуть
+// смену тактовой PL011 через этот канал — mailbox не ответил; текущий
+// пробник (`mboxprobe` в шелле) проверяет менее специфичным тегом
+// (GET_FIRMWARE_REVISION), чтобы понять — мёртв канал целиком, или
+// не так был сформирован именно тот, более ранний запрос.
+constexpr uintptr_t PLAT_MBOX_PADDR = 0xfe00b000ULL;             // страница, кратная 0x1000
+
 // --- Виртуальные адреса, куда эти устройства маппятся в VSpace драйвера
 // (см. hw_vaddr в spawn_process(), main.cpp). Общие для всех процессов —
 // каждый драйвер видит свое устройство по одному и тому же литералу. ---
 constexpr uintptr_t PLAT_UART_VADDR         = 0x200000000ULL;
 constexpr uintptr_t PLAT_EMMC_VADDR         = 0x200006000ULL;
+// Фаза 4.5/ADMA2 (см. ROADMAP.md) — приватный НЕКЭШИРУЕМЫЙ DMA-буфер
+// blk_driver (одна страница, bounce-буфер для ADMA2-дескрипторов — та же
+// схема, что PLAT_MBOX_BUF_VADDR ниже и SHM net_driver/wifi_driver для
+// GENET). Свободный слот между PLAT_EMMC_VADDR (1 страница) и
+// PLAT_GENET_VADDR — тот же 2MB-регион, drv_pud/pd/pt для is_driver==3 уже
+// создаются в spawn_process(), отдельная иерархия страничных таблиц не нужна.
+constexpr uintptr_t PLAT_BLK_DMA_VADDR      = 0x200007000ULL;
 constexpr uintptr_t PLAT_GENET_VADDR        = 0x200008000ULL;
 constexpr uintptr_t PLAT_AVS_VADDR          = 0x200019000ULL;
 constexpr uintptr_t PLAT_WIFI_SDIO_VADDR    = 0x20001a000ULL;
+constexpr uintptr_t PLAT_MBOX_VADDR         = 0x20001b000ULL;    // регистры mailbox (см. PLAT_MBOX_PADDR)
+constexpr uintptr_t PLAT_MBOX_BUF_VADDR     = 0x20001c000ULL;    // приватный некэшируемый буфер под property-tag запрос (см. main.cpp)
+
+// --- Оффсеты/биты регистров VideoCore mailbox, считаются от MAILBOX_BASE
+// (см. PLAT_MBOX_PADDR — сама страница начинается на 0x880 раньше). ---
+constexpr uintptr_t MBOX_BASE_OFFSET   = 0x880;
+constexpr uintptr_t MBOX_READ_OFFSET   = MBOX_BASE_OFFSET + 0x00;  // VC -> ARM
+constexpr uintptr_t MBOX_STATUS_OFFSET = MBOX_BASE_OFFSET + 0x18;
+constexpr uintptr_t MBOX_WRITE_OFFSET  = MBOX_BASE_OFFSET + 0x20;  // ARM -> VC
+constexpr uint32_t  MBOX_STATUS_FULL   = (1u << 31);               // писать нельзя, входной FIFO VC полон
+constexpr uint32_t  MBOX_STATUS_EMPTY  = (1u << 30);                // читать нечего
+constexpr uint32_t  MBOX_CHANNEL_PROP  = 8;                         // ARM -> VC property tags channel
+
+// Property-tag протокол (https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface).
+constexpr uint32_t MBOX_TAG_GET_FIRMWARE_REVISION = 0x00000001;
+constexpr uint32_t MBOX_TAG_LAST                  = 0x00000000;
+constexpr uint32_t MBOX_CODE_REQUEST              = 0x00000000;
+constexpr uint32_t MBOX_CODE_RESPONSE_SUCCESS     = 0x80000000;
 
 // --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
 // от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
@@ -171,6 +205,8 @@ constexpr uintptr_t EMMC_INTERRUPT_OFFSET  = 0x30;  // write-1-to-clear
 constexpr uintptr_t EMMC_IRPT_MASK_OFFSET  = 0x34;
 constexpr uintptr_t EMMC_IRPT_EN_OFFSET    = 0x38;
 constexpr uintptr_t EMMC_CAP0_OFFSET       = 0x40;  // Capabilities: [13:8] = base clock frequency (МГц)
+constexpr uint32_t EMMC_CAP0_ADMA2_SUPPORT = (1u << 19); // Фаза 4.5/ADMA2 (см. ROADMAP.md) — если этот бит не выставлен, ADMA2 контроллером не поддерживается вообще
+constexpr uintptr_t EMMC_ADMA_SYSADDR_OFFSET = 0x58; // ADMA System Address (32-бит, см. ROADMAP.md 4.5/ADMA2) — физический адрес таблицы дескрипторов
 constexpr uintptr_t EMMC_SLOTISR_VER_OFFSET = 0xFC; // [23:16] = Host Controller Version (0=v1,1=v2,2=v3)
 
 // STATUS (0x24) — биты состояния линий команды/данных
@@ -197,8 +233,9 @@ constexpr uint32_t EMMC_INT_CMD_DONE   = (1u << 0);   // Command Complete
 constexpr uint32_t EMMC_INT_DATA_DONE  = (1u << 1);   // Transfer Complete
 constexpr uint32_t EMMC_INT_WRITE_RDY  = (1u << 4);   // Buffer Write Ready
 constexpr uint32_t EMMC_INT_READ_RDY   = (1u << 5);   // Buffer Read Ready
+constexpr uint32_t EMMC_INT_CARD_INT   = (1u << 8);   // Card Interrupt (SDHCI Simplified Spec, стандартный бит для ЛЮБОГО SDIO-совместимого контроллера) — карта сигналит хосту по DAT1 в-полосе; используется ТОЛЬКО в wifi_driver.cpp (Фаза 4.5, реальный GIC IRQ для sdpcm_wait_and_read_ctrl), EMMC2/blk_driver.cpp его не размаскирует (там нет SDIO-функций, сигналить некому)
 constexpr uint32_t EMMC_INT_ERROR_MASK = 0xFFFF0000u; // Любая ошибка (Command/Data Error Status, верхние 16 бит)
-constexpr uint32_t EMMC_INT_ALL_EN     = 0xFFFFFFFFu; // Маска "разрешить всё" для IRPT_MASK/IRPT_EN (нужна для чтения статусов даже без реальных IRQ)
+constexpr uint32_t EMMC_INT_ALL_EN     = 0xFFFFFFFFu; // Маска "разрешить всё" для IRPT_MASK (статус-биты) и, начиная с Фазы 4.5, для IRPT_EN тоже (реальный GIC IRQ, см. blk_driver.cpp)
 
 // CONTROL0 (0x28) — базовая настройка хоста
 constexpr uint32_t EMMC_C0_USE_4BIT    = (1u << 1);   // Ширина шины 4 бита (не используется в первой версии — см. план)
@@ -208,6 +245,12 @@ constexpr uint32_t EMMC_C0_USE_4BIT    = (1u << 1);   // Ширина шины 4
 // висит вечно и ни одна команда никогда не завершается.
 constexpr uint32_t EMMC_C0_PWR_ON      = (1u << 8);
 constexpr uint32_t EMMC_C0_PWR_3V3     = (0x7u << 9);
+// DMA Select (биты [4:3] Host Control 1, тот же младший байт CONTROL0, что и
+// USE_4BIT выше) — Фаза 4.5/ADMA2 (см. ROADMAP.md): 00=SDMA (не используем),
+// 10=32-битный ADMA2 (наш случай — все физические адреса RPi4 укладываются
+// в 32 бита, см. доступные регионы памяти при загрузке), 11=64-битный ADMA2.
+constexpr uint32_t EMMC_C0_DMA_SEL_MASK      = (0x3u << 3);
+constexpr uint32_t EMMC_C0_DMA_SEL_ADMA2_32  = (0x2u << 3);
 
 // CMDTM (0x0C) — response type (биты [17:16]) и флаги данных
 constexpr uint32_t EMMC_CMD_RSPNS_NONE = (0x0u << 16);
@@ -219,9 +262,29 @@ constexpr uint32_t EMMC_CMD_IXCHK_EN   = (1u << 20);
 constexpr uint32_t EMMC_CMD_ISDATA     = (1u << 21);   // Data Present Select
 constexpr uint32_t EMMC_CMD_INDEX_SHIFT = 24;           // Индекс команды в битах [29:24]
 // Transfer Mode (биты [15:0] того же CMDTM)
+constexpr uint32_t EMMC_TM_DMA_EN      = (1u << 0);     // Фаза 4.5/ADMA2 — БЕЗ этого бита контроллер игнорирует ADMA_SYSADDR и ждёт PIO, даже если DMA Select в CONTROL0 уже выставлен
 constexpr uint32_t EMMC_TM_BLKCNT_EN   = (1u << 1);
 constexpr uint32_t EMMC_TM_MULTI_BLOCK = (1u << 5);
 constexpr uint32_t EMMC_TM_DAT_DIR_READ = (1u << 4);    // 1 = card->host (чтение)
+
+// --- ADMA2 (32-битный) дескриптор, 8 байт (см. SD Host Controller Simplified
+// Specification, "ADMA2 Descriptor Table") — Фаза 4.5 (ROADMAP.md): заменяет
+// PIO-цикл по EMMC_DATA в hardware_emmc_read/write (blk_driver.cpp). Один
+// дескриптор на один сектор (512 байт) — с запасом от лимита Length=65535.
+// Табличка дескрипторов и bounce-буфер данных живут в приватной
+// НЕКЭШИРУЕМОЙ странице blk_driver (см. PLAT_BLK_DMA_VADDR выше) — обычный
+// (кэшируемый) стек/куча процесса для DMA не годится без явного cache
+// maintenance (см. ROADMAP.md 4.5 — разбор, почему решили не рисковать
+// aliasing'ом кэш-линий на произвольных стековых буферах fat32.cpp).
+constexpr uint32_t ADMA2_ATTR_VALID     = (1u << 0);
+constexpr uint32_t ADMA2_ATTR_END       = (1u << 1);
+constexpr uint32_t ADMA2_ATTR_INT       = (1u << 2); // не используем — ждём общий Transfer Complete, не per-descriptor ADMA interrupt
+constexpr uint32_t ADMA2_ATTR_ACT_TRAN  = (0x2u << 4); // Act=Transfer Data
+struct __attribute__((packed)) Adma2Descriptor32 {
+    uint16_t attr;
+    uint16_t length;   // 0 означает 65536, нам не актуально (512 байт/сектор)
+    uint32_t addr;      // физический адрес буфера данных
+};
 
 // Коды SD-команд (используются как (CMDn << EMMC_CMD_INDEX_SHIFT) | response type | флаги)
 constexpr uint32_t EMMC_CMD_GO_IDLE        = 0;   // CMD0,  без ответа
@@ -268,6 +331,25 @@ constexpr uintptr_t GENET_MDIO_CMD_OFFSET           = 0xE14;  // = RPI4_GENET_MD
 // инициализатор GENET (например, U-Boot, настроивший её под свой MAC) —
 // см. /home/nikita/workspace_nofing/common/drivers/net/ethernet/broadcom/genet/bcmgenet.c.
 constexpr uintptr_t GENET_UMAC_MDF_CTRL_OFFSET      = 0xE50;  // 0x800 + 0x650
+
+// Контроллер прерываний GENET (INTRL2_0) — Фаза 4.5 (событийный RX, см.
+// ROADMAP.md). НЕ было в проекте до этого момента (в отличие от остальных
+// GENET-регистров выше, унаследованных от u-boot/bcmgenet.c, который сам
+// прерываниями не пользуется — чисто polling-драйвер загрузчика). Смещения
+// и биты сверены с реальным Linux-драйвером — /home/nikita/kernel_xiaomi_vince/
+// drivers/net/ethernet/broadcom/genet/bcmgenet.h (тот же GENETv5, тот же
+// SoC-блок, просто другая ОС). INTRL2_0 — основной, CPU-обращённый блок
+// (link/DMA done/ошибки); INTRL2_1 (0x0240) — per-ring, не нужен при одной
+// очереди по умолчанию (см. GENET_DEFAULT_Q) — не используем.
+constexpr uintptr_t GENET_INTRL2_0_OFF        = 0x0200;
+constexpr uintptr_t INTRL2_CPU_STAT           = GENET_INTRL2_0_OFF + 0x00; // read-only, сырые pending-биты
+constexpr uintptr_t INTRL2_CPU_CLEAR          = GENET_INTRL2_0_OFF + 0x08; // write-1-to-clear (НЕ то же самое, что STAT!)
+constexpr uintptr_t INTRL2_CPU_MASK_STATUS    = GENET_INTRL2_0_OFF + 0x0C; // read-only, 1 = замаскирован
+constexpr uintptr_t INTRL2_CPU_MASK_SET       = GENET_INTRL2_0_OFF + 0x10; // write 1 = замаскировать (выключить)
+constexpr uintptr_t INTRL2_CPU_MASK_CLEAR     = GENET_INTRL2_0_OFF + 0x14; // write 1 = размаскировать (включить)
+constexpr uint32_t  UMAC_IRQ_LINK_UP          = (1u << 4);
+constexpr uint32_t  UMAC_IRQ_LINK_DOWN        = (1u << 5);
+constexpr uint32_t  UMAC_IRQ_RXDMA_DONE       = (1u << 13); // он же UMAC_IRQ_RXDMA_MBDONE в эталоне
 
 constexpr uint32_t GENET_PORT_MODE_EXT_GPHY = 3;
 constexpr uint32_t GENET_RGMII_LINK      = (1u << 4);
@@ -444,6 +526,34 @@ constexpr uint32_t SDIO_R4_READY = (1u << 31);
 // для SDIO-функций, и без него CMD53 к F1 не проходит.
 constexpr uint32_t SDIO_CCCR_IOEx_OFFSET = 0x02;
 constexpr uint32_t SDIO_CCCR_IORx_OFFSET = 0x03;
+
+// F0 CCCR offset 0x04 — Interrupt Enable (см. SDIO_CCCR_IENx в
+// linux/mmc/sdio.h). Бит 0 — IENM (master interrupt enable), биты 1..7 —
+// per-function enable (бит N разрешает in-band прерывание по DAT1 от
+// функции N). Пока не трогался (Милстоуны 4.1-4.3 — чистый polling,
+// см. ROADMAP.md 4.5) — карта физически МОЖЕТ сигнализировать прерывание
+// (см. I_HMB_FRAME_IND/I_HMB_HOST_INT в SDPCMD_INTSTATUS ниже), просто хост
+// никогда не просил её это делать. Тот же read-modify-write принцип, что и
+// у sdio_enable_func()/IOEx — запись CMD52 перезаписывает байт целиком.
+constexpr uint32_t SDIO_CCCR_IENx_OFFSET = 0x04;
+constexpr uint32_t SDIO_CCCR_IEN_MASTER  = (1u << 0);
+
+// F0 CCCR offset 0x07 — Bus Interface Control (см. SDIO_CCCR_IF в
+// linux/mmc/sdio.h). Биты [1:0] — ширина шины данных (00=1-бит, 10=4-бит).
+// Милстоуны 4.1-4.3 работали в 1-бит режиме (хост НИКОГДА не переводился в
+// 4-бит, см. EMMC_C0_USE_4BIT — константа была объявлена, но нигде не
+// использовалась), потому что весь PIO-транспорт (CMD53 word-by-word через
+// EMMC_DATA) от ширины шины не зависит — работает одинаково что на 1, что
+// на 4 линиях DATA. НО in-band SDIO-прерывание сигналится картой именно по
+// DAT1 — стандартный quirk многих SDHCI-контроллеров: статус Card Interrupt
+// надёжно распознаётся, только когда контроллер реально сконфигурирован на
+// 4-бит (см. ROADMAP.md 4.5 — CARD_INT ни разу не появился за 3с прямого
+// опроса при активной 1-бит шине). Переключение — ДВУСТОРОННЕЕ: сначала
+// карта (этот регистр, CMD52), потом хост (EMMC_C0_USE_4BIT в CONTROL0) —
+// CMD-линия ширины не имеет, поэтому сообщить карте первой безопасно.
+constexpr uint32_t SDIO_CCCR_IF_OFFSET   = 0x07;
+constexpr uint32_t SDIO_BUS_WIDTH_4BIT   = 0x02;
+constexpr uint32_t SDIO_BUS_WIDTH_MASK   = 0x03;
 
 // F0 CCCR offset 0x06 — I/O Abort (см. SDIO_CCCR_ABORT в linux/mmc/sdio.h).
 // Бит 3 (RES) — программный сброс ВСЕХ SDIO-функций карты, определённый
@@ -901,17 +1011,34 @@ constexpr uintptr_t RPI4_UART1_MINIUART_PADDR = 0xfe215040ULL;          // DT se
 constexpr int        RPI4_UART1_MINIUART_IRQ  = 125;                    // DT SPI 0x5d=93 -> GIC 93+32 (общий "aux" IRQ)
 
 // --- ARM Generic Timer — заменяет отсутствующий PL031 (Фаза 3.1, готово).
-// PPI, поэтому номер на всех ядрах одинаковый; GIC_IRQ = 16 + PPI. На
-// практике не используются: CNTVCT_EL0/CNTFRQ_EL0 читаются прямой
-// mrs-инструкцией из EL0 без всякого IRQ/маппинга (см. hw_timer.cpp), а
-// регистры сравнения/управления (которые и генерировали бы эти PPI) с EL0
-// на этой сборке ядра недоступны (EXPORT_PTMR_USER/VTMR_USER=false в
-// gen_config) — оставлены как справочные на случай смены конфигурации ядра
-// (например, MCS + scheduling contexts) в будущем. ---
+// PPI, поэтому номер на всех ядрах одинаковый; GIC_IRQ = 16 + PPI.
+// CNTVCT_EL0/CNTFRQ_EL0 читаются прямой mrs-инструкцией из EL0 без всякого
+// IRQ/маппинга (см. hw_timer.cpp) — это НЕ то же самое, что регистры
+// сравнения/управления (CNTP_CTL/CNTP_CVAL), которые и генерируют PPI.
+// Раньше (до Фазы 4.5) те были недоступны с EL0 (EXPORT_PTMR_USER=false) —
+// с Фазы 4.5 KernelArmExportPTMRUser включён (см. easy-settings.cmake) для
+// НЕ-secure физического таймера (RPI4_TIMER_PPI_NONSECURE ниже), что даёт
+// timer_driver.cpp настоящий событийный sys_sleep() вместо busy-poll (см.
+// PLAT_TIMER_IRQ ниже). ВАЖНО: НЕ VTMR (виртуальный таймер, CNTV_CTL) — тот
+// регистровый блок на этой сборке ядра (MCS выключен, ARM_HYP выключен)
+// использует само ядро для своего тика планировщика (см.
+// kernel/include/arch/arm/arch/64/mode/machine.h, CNT_CTL == CNTV_CTL) —
+// дать userspace писать в него значило бы ломать планировщик ядра.
+// ВАЖНО: константы ниже — это УЖЕ готовые GIC INTID (16 + сырой номер PPI из
+// devicetree, см. комментарий "DT PPI N" у каждой — тот самый сырой номер,
+// а не значение константы). Т.е. RPI4_TIMER_PPI_NONSECURE == 30 — это и есть
+// "GIC_IRQ = 16 + PPI" для DT PPI 14 (16+14=30), UЖЕ посчитано. Раньше здесь
+// ниже было "PLAT_TIMER_IRQ = 16 + RPI4_TIMER_PPI_NONSECURE" = 46 — двойной
+// сдвиг на 16, из-за которого timer_driver.cpp слушал СОВСЕМ ДРУГОЙ (никем
+// не используемый) IRQ и никогда не получал прерывание физического таймера
+// (см. живое зависание sleep(), ROADMAP.md 4.5) — seL4_IRQControl_Get на 46
+// при этом успешно "получалось" (это валидный, просто чужой номер), поэтому
+// ошибка не была видна по check_err().
 constexpr int RPI4_TIMER_PPI_SECURE       = 29;                         // DT PPI 13 (0x0d) — secure phys timer
-constexpr int RPI4_TIMER_PPI_NONSECURE    = 30;                         // DT PPI 14 (0x0e) — non-secure phys timer
-constexpr int RPI4_TIMER_PPI_VIRTUAL      = 27;                         // DT PPI 11 (0x0b)
+constexpr int RPI4_TIMER_PPI_NONSECURE    = 30;                         // DT PPI 14 (0x0e) — non-secure phys timer (используется, см. PLAT_TIMER_IRQ)
+constexpr int RPI4_TIMER_PPI_VIRTUAL      = 27;                         // DT PPI 11 (0x0b) — НЕ трогать, тик планировщика ядра
 constexpr int RPI4_TIMER_PPI_HYP          = 26;                         // DT PPI 10 (0x0a)
+constexpr int PLAT_TIMER_IRQ = RPI4_TIMER_PPI_NONSECURE;                // GIC IRQ = 30 (уже посчитано выше, БЕЗ дополнительного +16)
 
 // --- Термодатчик: AVS RO thermal — единственный сенсор температуры кристалла
 // на BCM2711, доступный без прошивки VideoCore (см. AVS_RO_TEMP_STATUS_OFFSET

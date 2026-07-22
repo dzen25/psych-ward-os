@@ -408,6 +408,16 @@ static bool sys_get_temp_mC(seL4_CPtr timer_ep, int32_t *out_mC) {
     return status == 0;
 }
 
+// Диагностика VideoCore mailbox (Фаза 4.6, расследование DVFS — см.
+// ROADMAP.md/timer_driver.cpp SYS_MBOX_PROBE). Возвращает индекс
+// сработавшего варианта трансляции bus-адреса или -1, если не ответил
+// ни на один.
+static int sys_mbox_probe(seL4_CPtr timer_ep) {
+    seL4_SetMR(0, 7); // 7 = SYS_MBOX_PROBE
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (int)(seL4_Word)seL4_GetMR(0);
+}
+
 // Разбивает число дней с 1970-01-01 на (год, месяц, день) в пролептическом
 // григорианском календаре. Алгоритм Хауарда Хиннанта (chrono-совместимый,
 // не требует libc/времени с плавающей точкой).
@@ -459,9 +469,14 @@ static void print_localtime(seL4_CPtr console_ep, seL4_Word epoch_ms, int tz_off
     sys_puts(console_ep, "\n");
 }
 
+// Фаза 4.5 (см. ROADMAP.md/timer_driver.cpp SYS_SLEEP_MS): раньше это был
+// клиентский busy-poll (sys_get_time() в цикле с seL4_Yield()) — теперь
+// обычный блокирующий IPC-вызов, timer_driver сам спит на реальном IRQ
+// физического таймера и отвечает по дедлайну.
 static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
-    seL4_Word start = sys_get_time(timer_ep);
-    while (sys_get_time(timer_ep) - start < ms) { seL4_Yield(); }
+    seL4_SetMR(0, 8); // 8 = SYS_SLEEP_MS
+    seL4_SetMR(1, ms);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
 static void sys_recover(const char* driver_name) {
@@ -1137,9 +1152,22 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            else if (my_strcmp(cmd_ptr, "mboxprobe") == 0) {
+                // Таймбоксед-расследование из ROADMAP.md 4.6: пробует несколько
+                // вариантов bus-адреса на безобидном теге, печатает подробности
+                // в консоль по ходу (см. timer_driver.cpp mbox_probe()).
+                int variant = sys_mbox_probe(timer_ep);
+                if (variant < 0) {
+                    sys_puts(console_ep, "mboxprobe: mailbox не ответил ни на один вариант — см. ROADMAP.md 4.6\n");
+                } else {
+                    sys_puts(console_ep, "mboxprobe: mailbox ЖИВ (сработавший вариант напечатан выше)\n");
+                }
+            }
+
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
-                sys_puts(console_ep, "Sleeping 3 seconds...\n");
-                sys_sleep(timer_ep, 3000);
+                seL4_Word ms = arg ? (seL4_Word)simple_atoi(arg) : 3000; // без аргумента — 3с по умолчанию
+                sys_puts(console_ep, "Sleeping "); sys_putdec(ms); sys_puts(console_ep, " ms...\n");
+                sys_sleep(timer_ep, ms);
                 sys_puts(console_ep, "Woke up!\n");
             }
 
@@ -1890,7 +1918,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

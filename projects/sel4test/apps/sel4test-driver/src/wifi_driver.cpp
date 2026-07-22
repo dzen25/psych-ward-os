@@ -56,6 +56,17 @@ static inline uint64_t wifi_read_cntfrq() {
     return val;
 }
 
+// Диагностика долгой заливки прошивки (см. ROADMAP.md/память — переключение
+// шины на 4-бит само по себе не помогло) — миллисекунды реального времени
+// между двумя снятыми cntvct-отметками, тем же способом, что уже используется
+// для settle-задержек выше.
+static inline uint32_t wifi_elapsed_ms(uint64_t start) {
+    uint64_t freq = wifi_read_cntfrq();
+    uint64_t now = wifi_read_cntvct();
+    if (freq == 0) return 0;
+    return (uint32_t)(((now - start) * 1000ull) / freq);
+}
+
 static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     int len = 0; while (str[len]) len++;
@@ -128,6 +139,10 @@ static void wifi_vputs(seL4_CPtr console_ep, const char *str) {
 
 static void wifi_vputhex32(seL4_CPtr console_ep, const char* label, uint32_t val) {
     if (g_wifi_verbose) sys_puthex32(console_ep, label, val);
+}
+
+static void wifi_vputdec32(seL4_CPtr console_ep, const char* label, int32_t val) {
+    if (g_wifi_verbose) sys_putdec32(console_ep, label, val);
 }
 
 static void wifi_vputhexbuf(seL4_CPtr console_ep, const char* label, const uint8_t* buf, uint32_t len) {
@@ -500,6 +515,67 @@ static bool sdio_enable_func1(seL4_CPtr console_ep) {
     return sdio_enable_func(SBSDIO_FUNC_1, console_ep);
 }
 
+// --- Переключить шину данных (карта + хост) с 1-бит на 4-бит (CCCR IF,
+// offset 0x07 + EMMC_C0_USE_4BIT) — см. platform.h/SDIO_CCCR_IF_OFFSET,
+// подробный комментарий там про то, зачем это нужно для in-band IRQ.
+// Сначала карта (CMD-линия ширины не имеет, безопасно менять первой),
+// потом хост. ---
+static bool sdio_set_bus_width_4bit(seL4_CPtr console_ep) {
+    uint8_t current_if = 0;
+    {
+        uint32_t rarg = (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) | (SDIO_CCCR_IF_OFFSET << SDIO_ARG_REG_ADDR_SHIFT);
+        if (sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_RW_DIRECT, rarg, console_ep)) {
+            current_if = (uint8_t)(*wifi_reg(EMMC_RESP0_OFFSET) & 0xFFu);
+        }
+    }
+    uint32_t new_if = (((uint32_t)current_if) & ~SDIO_BUS_WIDTH_MASK) | SDIO_BUS_WIDTH_4BIT;
+    // ВРЕМЕННО (диагностика: подозрение, что запись не "держится" — см.
+    // ROADMAP.md 4.5) — RAW (Read After Write, см. SDIO_ARG_RAW_FLAG) отдаёт
+    // значение регистра СРАЗУ ПОСЛЕ записи в том же ответе R5, без отдельной
+    // read-команды — самый прямой способ убедиться, что запись реально
+    // "прилипла" на стороне карты.
+    uint32_t arg = SDIO_ARG_RW_FLAG | SDIO_ARG_RAW_FLAG | (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) |
+                   (SDIO_CCCR_IF_OFFSET << SDIO_ARG_REG_ADDR_SHIFT) | new_if;
+    if (!sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_RW_DIRECT, arg, console_ep)) {
+        sys_puts(console_ep, "[WIFI][IRQ] FAIL: CMD52 CCCR IF (переключение карты на 4-бит) — команда не прошла\n");
+        return false;
+    }
+    uint32_t readback = *wifi_reg(EMMC_RESP0_OFFSET) & 0xFFu;
+    sys_puthex32(console_ep, "[WIFI][IRQ] диагностика: CCCR IF после записи (RAW) = ", readback);
+    *wifi_reg(EMMC_CONTROL0_OFFSET) = *wifi_reg(EMMC_CONTROL0_OFFSET) | EMMC_C0_USE_4BIT;
+    sys_puthex32(console_ep, "[WIFI][IRQ] диагностика: хостовый CONTROL0 после запроса 4-бит = ", *wifi_reg(EMMC_CONTROL0_OFFSET));
+    return (readback & SDIO_BUS_WIDTH_MASK) == SDIO_BUS_WIDTH_4BIT;
+}
+
+// --- Разблокировать in-band SDIO-прерывание (CCCR IENx, offset 0x04) для
+// функции func_num — Фаза 4.5 (см. ROADMAP.md), нужно для реального GIC IRQ
+// вместо busy-poll в sdpcm_wait_and_read_ctrl(). Master enable (бит 0) +
+// бит самой функции — тот же read-modify-write принцип, что и
+// sdio_enable_func()/IOEx выше (CMD52-запись перезаписывает байт целиком,
+// аппаратного OR нет — это и было причиной бага с IOEx в Милстоуне 4.3, не
+// повторяем его здесь). ---
+static bool sdio_enable_card_interrupt(uint32_t func_num, seL4_CPtr console_ep) {
+    uint8_t current_ien = 0;
+    {
+        uint32_t rarg = (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) | (SDIO_CCCR_IENx_OFFSET << SDIO_ARG_REG_ADDR_SHIFT);
+        if (sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_RW_DIRECT, rarg, console_ep)) {
+            current_ien = (uint8_t)(*wifi_reg(EMMC_RESP0_OFFSET) & 0xFFu);
+        }
+    }
+    uint32_t new_ien = ((uint32_t)current_ien) | SDIO_CCCR_IEN_MASTER | (1u << func_num);
+    // ВРЕМЕННО (диагностика, см. sdio_set_bus_width_4bit выше) — RAW,
+    // чтобы сразу увидеть, реально ли записался мастер-бит + бит функции.
+    uint32_t arg = SDIO_ARG_RW_FLAG | SDIO_ARG_RAW_FLAG | (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) |
+                   (SDIO_CCCR_IENx_OFFSET << SDIO_ARG_REG_ADDR_SHIFT) | new_ien;
+    if (!sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_RW_DIRECT, arg, console_ep)) {
+        sys_puts(console_ep, "[WIFI][IRQ] FAIL: CMD52 IENx (enable card interrupt) — команда не прошла\n");
+        return false;
+    }
+    uint32_t readback = *wifi_reg(EMMC_RESP0_OFFSET) & 0xFFu;
+    sys_puthex32(console_ep, "[WIFI][IRQ] диагностика: CCCR IENx после записи (RAW) = ", readback);
+    return (readback & (SDIO_CCCR_IEN_MASTER | (1u << func_num))) == (SDIO_CCCR_IEN_MASTER | (1u << func_num));
+}
+
 // --- SDIO-функция 1: байтовый read/write через CMD52 (для регистров окна
 // SBADDRLOW/MID/HIGH — они всегда однобайтовые, не backplane-данные). ---
 static bool sdio_f1_write_byte(uint32_t reg_addr, uint8_t data, seL4_CPtr console_ep = 0) {
@@ -720,6 +796,20 @@ constexpr uint32_t WIFI_WRITE_CHUNK = WIFI_WRITE_BLOCK_SIZE * WIFI_WRITE_MAX_BLO
 
 // console_ep только для диагностики (см. wifi_backplane_bringup) — на каком
 // именно под-шаге отвалилась заливка, а не просто общий "не получилось".
+//
+// Фаза 4.5/ADMA2 (см. ROADMAP.md) — ПРОБОВАЛИ перевести на ADMA2, ОТКАЧЕНО:
+// на живом железе перенос зависал навсегда (STATUS DAT_INHIBIT|DAT_ACTIVE
+// никогда не снимался, IRPT оставался 0). Причина — этот контроллер
+// (brcm,bcm2835-sdhci, легаси-блок под Wi-Fi-only SDIO, НЕ тот же физический
+// IP, что bcm2711-emmc2 у EMMC2) ADMA2 просто не поддерживает: подтверждено
+// в реальном Linux-драйвере (sdhci-iproc.c) — bcm2835_data не включает
+// SDHCI_CAN_DO_ADMA2 в capabilities, в отличие от iproc_data (общий вариант,
+// где ADMA2 есть). См. также комментарий у CAP0 в wifi_sdio_probe() выше
+// (SDHCI_QUIRK_MISSING_CAPS — сам регистр Capabilities на этом блоке не
+// заслуживает доверия, что независимо намекало на то же самое). Остаётся
+// PIO — как и
+// EMMC2's emmc_wait_cmd_ready/dat_ready, задокументированное аппаратное
+// ограничение, не блокер (см. ROADMAP.md).
 static bool backplane_write_chunk(seL4_CPtr console_ep, uint32_t addr, const uint8_t *data, uint32_t len) {
     if (!backplane_set_window(addr)) {
         sys_puts(console_ep, "[WIFI][FW] FAIL: set_window\n");
@@ -1229,9 +1319,11 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     if (g_wifi_ramsize == 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: ramsize == 0\n"); return false; }
 
     wifi_vputs(console_ep, "[WIFI][BP] step: чтение прошивки с SD...\n");
+    uint64_t t_fw_read_start = wifi_read_cntvct();
     int fw_len = wifi_read_file(PATH_WIFI_FW, g_wifi_fw_buf, WIFI_FW_BUF_CAP);
     if (fw_len <= 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать wifi_fw.bin\n"); return false; }
     wifi_vputhex32(console_ep, "[WIFI][BP] firmware length = ", (uint32_t)fw_len);
+    wifi_vputdec32(console_ep, "[WIFI][BP] timing: чтение прошивки с SD, мс = ", (int32_t)wifi_elapsed_ms(t_fw_read_start));
     // PIO-цикл backplane_write_chunk() пишет данные 32-битными словами — длина
     // файла произвольная (не обязана быть кратна 4), поэтому "хвост" в 1-3
     // байта дополняем нулями до целого слова (лишние нулевые байты в TCM RAM
@@ -1245,11 +1337,13 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     fw_len = (int)fw_len_padded;
 
     wifi_vputs(console_ep, "[WIFI][BP] step: чтение NVRAM с SD...\n");
+    uint64_t t_nvram_read_start = wifi_read_cntvct();
     int nvram_raw_len = wifi_read_file(PATH_WIFI_NVRAM, g_wifi_nvram_raw, WIFI_NVRAM_RAW_CAP);
     if (nvram_raw_len <= 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать wifi_nvram.txt\n"); return false; }
     uint32_t nvram_len = wifi_process_nvram(g_wifi_nvram_raw, (uint32_t)nvram_raw_len, g_wifi_nvram_out, WIFI_NVRAM_OUT_CAP);
     if (nvram_len == 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: обработка NVRAM не удалась (буфер мал?)\n"); return false; }
     wifi_vputhex32(console_ep, "[WIFI][BP] nvram processed length = ", nvram_len);
+    wifi_vputdec32(console_ep, "[WIFI][BP] timing: чтение+обработка NVRAM, мс = ", (int32_t)wifi_elapsed_ms(t_nvram_read_start));
 
     // ВАЖНО: во время заливки прошивки эталонный brcmf_sdio_firmware_callback()
     // явно выставляет bus->alp_only=true перед download_firmware() — то есть
@@ -1258,17 +1352,21 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     // милстоуна) запрашивается эталоном только ПОСЛЕ успешной загрузки,
     // перед включением F2/data-path — там он и нужен по-настоящему.
     wifi_vputs(console_ep, "[WIFI][BP] step: заливка прошивки в TCM RAM...\n");
+    uint64_t t_fw_write_start = wifi_read_cntvct();
     if (!backplane_write_bulk(console_ep, BRCM_4345_RAMBASE, g_wifi_fw_buf, (uint32_t)fw_len)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: заливка прошивки\n");
         return false;
     }
+    wifi_vputdec32(console_ep, "[WIFI][BP] timing: заливка прошивки по SDIO, мс = ", (int32_t)wifi_elapsed_ms(t_fw_write_start));
 
     wifi_vputs(console_ep, "[WIFI][BP] step: заливка NVRAM в верх RAM...\n");
     uint32_t nvram_addr = BRCM_4345_RAMBASE + g_wifi_ramsize - nvram_len;
+    uint64_t t_nvram_write_start = wifi_read_cntvct();
     if (!backplane_write_bulk(console_ep, nvram_addr, g_wifi_nvram_out, nvram_len)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: заливка NVRAM\n");
         return false;
     }
+    wifi_vputdec32(console_ep, "[WIFI][BP] timing: заливка NVRAM по SDIO, мс = ", (int32_t)wifi_elapsed_ms(t_nvram_write_start));
 
     uint32_t rstvec = ((uint32_t)g_wifi_fw_buf[0]) | ((uint32_t)g_wifi_fw_buf[1] << 8) |
                       ((uint32_t)g_wifi_fw_buf[2] << 16) | ((uint32_t)g_wifi_fw_buf[3] << 24);
@@ -1443,6 +1541,25 @@ constexpr uint32_t WIFI_SDPCM_RX_BUF_CAP = 512;
 alignas(4) static uint8_t g_sdpcm_rx_buf[WIFI_SDPCM_RX_BUF_CAP];
 static uint8_t g_sdpcm_tx_seq = 0;
 
+// Фаза 4.5 (см. ROADMAP.md) — капа на нотификацию общего IRQ 158 (EMMC2/
+// Wi-Fi SDIO, см. IRQ_MMC_SHARED_BADGE в main.cpp) и на root_ep для
+// SYS_WIFI_IRQ_ACK. НЕ TCB-bind (тот же довод, что у g_emmc_irq_ntfn в
+// blk_driver.cpp) — ожидание происходит вложенно, посреди одного IOCTL
+// (sdpcm_wait_and_read_ctrl), а не в верхнеуровневом seL4_Recv(my_ep, ...).
+static seL4_CPtr g_wifi_irq_ntfn = 0;
+static seL4_CPtr g_wifi_root_ep = 0;
+// true после того, как CCCR IENx размаскирован И собственный IRPT_EN
+// содержит EMMC_INT_CARD_INT (см. wifi_sdpcm_bringup) — до этого момента
+// карта физически не может ассертнуть DAT1, никакого IRQ не придёт никогда,
+// событийное ожидание там означало бы гарантированный вечный hang.
+static bool g_wifi_irq_ready = false;
+
+static void notify_root_wifi_irq_handled() {
+    if (g_wifi_root_ep == 0) return;
+    seL4_SetMR(0, SYS_WIFI_IRQ_ACK);
+    seL4_Call(g_wifi_root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
 static bool sdpcm_send_ctrl(seL4_CPtr console_ep, const uint8_t *payload, uint32_t payload_len, bool dump_hex = true) {
     uint32_t total_len = SDPCM_HDRLEN + payload_len;
     // Хвост не кратный 4 не пишется word-PIO циклом (та же причина, что
@@ -1522,7 +1639,141 @@ static bool backplane_read32_retry(uint32_t addr, uint32_t *out, seL4_CPtr conso
     return false;
 }
 
+// Пробует прочитать и разобрать ОДИН control-кадр из F2 — общая логика для
+// обоих путей sdpcm_wait_and_read_ctrl() ниже (событийного и busy-poll
+// fallback). Возвращает true и заполняет out_payload/out_len, если это был
+// настоящий ответ на CONTROL-канале; false, если кадра ещё нет/это не наш
+// канал (не фатально, вызывающий код должен просто продолжить ждать) —
+// *out_fatal отличает эту ситуацию от настоящей неисправимой ошибки (кадр
+// не влезает в буфер), после которой вызывающий код обязан сдаться.
+static bool sdpcm_try_read_one_frame(seL4_CPtr console_ep, uint8_t **out_payload, uint32_t *out_len, bool *out_fatal) {
+    *out_fatal = false;
+    if (!sdio_f2_read(0, g_sdpcm_rx_buf, BRCMF_FIRSTREAD)) return false;
+
+    uint16_t len16 = (uint16_t)(g_sdpcm_rx_buf[0] | (g_sdpcm_rx_buf[1] << 8));
+    uint16_t chk16 = (uint16_t)(g_sdpcm_rx_buf[2] | (g_sdpcm_rx_buf[3] << 8));
+    bool checksum_ok = (uint16_t)~(len16 ^ chk16) == 0;
+    // чек-сумма не сошлась/len16==0/короче заголовка — считаем это "кадра ещё нет" (особенно для
+    // спекулятивных попыток), не фатально, просто ждём дальше молча
+    if (!checksum_ok || len16 < SDPCM_HDRLEN) return false;
+
+    uint8_t channel = g_sdpcm_rx_buf[5] & 0x0F;
+    uint8_t dat_offset = g_sdpcm_rx_buf[7];
+    if (channel != SDPCM_CONTROL_CHANNEL || dat_offset < SDPCM_HDRLEN || dat_offset > len16) {
+        return false; // событие/данные, не наш ответ, ждём дальше молча
+    }
+
+    if (len16 > BRCMF_FIRSTREAD) {
+        uint32_t remaining = len16 - BRCMF_FIRSTREAD;
+        uint32_t remaining_padded = (remaining + 3u) & ~3u;
+        if (BRCMF_FIRSTREAD + remaining_padded > WIFI_SDPCM_RX_BUF_CAP) {
+            sys_puts(console_ep, "[WIFI][SDPCM] FAIL: ответ не влезает в RX-буфер\n");
+            *out_fatal = true;
+            return false;
+        }
+        if (!sdio_f2_read(console_ep, g_sdpcm_rx_buf + BRCMF_FIRSTREAD, remaining_padded)) {
+            sys_puts(console_ep, "[WIFI][SDPCM] FAIL: чтение остатка кадра\n");
+            *out_fatal = true;
+            return false;
+        }
+    }
+    *out_payload = g_sdpcm_rx_buf + dat_offset;
+    *out_len = len16 - dat_offset;
+    return true;
+}
+
 static bool sdpcm_wait_and_read_ctrl(seL4_CPtr console_ep, uint8_t **out_payload, uint32_t *out_len) {
+    // Фаза 4.5 (см. ROADMAP.md) — событийный путь, ЧИСТЫЙ IRQ, без
+    // heartbeat-подстраховки (сознательный выбор — если на практике
+    // окажется, что card interrupt так же ненадёжен, как chip-level
+    // intstatus оказался в Милстоуне 4.3 (см. историю ниже), лечится
+    // добавлением периодического тика от timer_driver, тем же приёмом, что
+    // уже сделан для net_driver, — но пока не делаем этого заранее).
+    if (g_wifi_irq_ready) {
+        sys_puts(console_ep, "[WIFI][IRQ] ожидание ответа (событийно, card interrupt)...\n");
+
+        // ВРЕМЕННО (диагностика: первая попытка чистого IRQ-only повисла
+        // навсегда в seL4_Wait — ни разу не проснулась, см. ROADMAP.md 4.5)
+        // — прямой опрос регистра EMMC_INTERRUPT (БЕЗ seL4_Wait, без
+        // нотификации, чистое чтение MMIO раз в yield) в течение честных
+        // ~3с реального времени. Цель — разделить две гипотезы: (а) карта
+        // вообще никогда не ассертит DAT1 (тогда in-band SDIO IRQ на этом
+        // чипе/плате в принципе не взлетит — многие Broadcom-модули на деле
+        // полагаются на отдельный OOB GPIO host_wake, не на in-band), или
+        // (б) бит реально появляется, но GIC/root-демультиплексор его не
+        // доставляет (тогда проблема в другом месте, не в самой карте).
+        {
+            uint64_t freq = wifi_read_cntfrq();
+            uint64_t start = wifi_read_cntvct();
+            uint64_t diag_timeout_ticks = (freq * 3000000ull) / 1000000ull; // 3с
+            bool seen = false;
+            while (wifi_read_cntvct() - start < diag_timeout_ticks) {
+                uint32_t raw = *wifi_reg(EMMC_INTERRUPT_OFFSET);
+                if (raw != 0) {
+                    sys_puthex32(console_ep, "[WIFI][IRQ] диагностика: прямой опрос EMMC_INTERRUPT (ненулевой!) raw = ", raw);
+                    if (raw & EMMC_INT_CARD_INT) { seen = true; break; }
+                }
+                seL4_Yield();
+            }
+            sys_puts(console_ep, seen ? "[WIFI][IRQ] диагностика: CARD_INT бит РЕАЛЬНО появился при прямом опросе\n"
+                                       : "[WIFI][IRQ] диагностика: за ~3с прямого опроса CARD_INT так и не появился ни разу\n");
+        }
+
+        // ИЗВЕСТНОЕ, осознанно принятое ограничение: seL4_Wait() не имеет
+        // таймаута — если карта по-настоящему перестанет прерывать (не
+        // обычное ожидание, а реальный сбой прошивки/шины), эта КОНКРЕТНАЯ
+        // операция зависнет насовсем вместо честной ошибки через
+        // WIFI_SDPCM_TIMEOUT_US, как в busy-poll версии ниже (тот же
+        // принятый компромисс, что и emmc_wait_irpt_bit() в blk_driver.cpp).
+        // Обходится вручную: "wifi restart" зависшего процесса.
+        for (int spurious = 0; spurious < 1000; spurious++) {
+            uint32_t host_irpt = *wifi_reg(EMMC_INTERRUPT_OFFSET);
+            if (host_irpt & EMMC_INT_CARD_INT) {
+                *wifi_reg(EMMC_INTERRUPT_OFFSET) = EMMC_INT_CARD_INT;
+                sys_puts(console_ep, "[WIFI][IRQ] card interrupt получен\n");
+
+                uint32_t intstatus = 0;
+                if (backplane_read32_retry(g_sdio_core.base + SDPCMD_INTSTATUS, &intstatus, 0) &&
+                    (intstatus & (I_HMB_HOST_INT | I_HMB_FRAME_IND))) {
+                    wifi_vputhex32(console_ep, "[WIFI][IRQ] intstatus = ", intstatus);
+                    // Сброс sticky-бита на СТОРОНЕ ЧИПА (заставляет карту
+                    // реально отпустить DAT1) ПЕРЕД тем, как снимать бит и
+                    // Ack'ать на СТОРОНЕ ХОСТА (см. выше) — тот же порядок,
+                    // что и живой урок с EMMC2 (ROADMAP.md 4.5): иначе карта
+                    // могла бы тут же снова поднять DAT1, а host-бит уже
+                    // считался бы "снятым".
+                    backplane_write32_retry(g_sdio_core.base + SDPCMD_INTSTATUS, intstatus & (I_HMB_HOST_INT | I_HMB_FRAME_IND), 0);
+                    if (intstatus & I_HMB_HOST_INT) {
+                        uint32_t mbdata = 0;
+                        backplane_read32_retry(g_sdio_core.base + SDPCMD_TOHOSTMAILBOXDATA, &mbdata, 0);
+                        backplane_write32_retry(g_sdio_core.base + SDPCMD_TOSBMAILBOX, SMB_INT_ACK, 0);
+                        if (mbdata & HMB_DATA_FWHALT) {
+                            sys_puts(console_ep, "[WIFI][SDPCM] FAIL: прошивка сообщила FWHALT\n");
+                            notify_root_wifi_irq_handled();
+                            return false;
+                        }
+                    }
+                }
+                notify_root_wifi_irq_handled(); // девайсные биты сняты — теперь root может снова Ack'нуть общий GIC158
+
+                bool fatal = false;
+                if (sdpcm_try_read_one_frame(console_ep, out_payload, out_len, &fatal)) {
+                    sys_puts(console_ep, "[WIFI][IRQ] ответ получен\n");
+                    return true;
+                }
+                if (fatal) return false;
+                // не наш кадр/событие — продолжаем ждать следующий IRQ
+            }
+            seL4_Word badge = 0;
+            seL4_Wait(g_wifi_irq_ntfn, &badge);
+        }
+        sys_puts(console_ep, "[WIFI][IRQ] FAIL: 1000 чужих/пустых пробуждений подряд без ответа\n");
+        return false;
+    }
+
+    // --- Fallback: busy-poll (как до Фазы 4.5) — используется, только пока
+    // g_wifi_irq_ready==false (CCCR IENx ещё не размаскирован или не прошёл,
+    // см. wifi_sdpcm_bringup()). ---
     uint64_t freq = wifi_read_cntfrq();
     uint64_t start = wifi_read_cntvct();
     uint64_t timeout_ticks = (freq * WIFI_SDPCM_TIMEOUT_US) / 1000000ull;
@@ -1571,35 +1822,9 @@ static bool sdpcm_wait_and_read_ctrl(seL4_CPtr console_ep, uint8_t **out_payload
             }
             if (speculative_turn) next_poll = now + poll_interval_ticks;
 
-            if (sdio_f2_read(0, g_sdpcm_rx_buf, BRCMF_FIRSTREAD)) {
-                uint16_t len16 = (uint16_t)(g_sdpcm_rx_buf[0] | (g_sdpcm_rx_buf[1] << 8));
-                uint16_t chk16 = (uint16_t)(g_sdpcm_rx_buf[2] | (g_sdpcm_rx_buf[3] << 8));
-                bool checksum_ok = (uint16_t)~(len16 ^ chk16) == 0;
-                if (checksum_ok && len16 >= SDPCM_HDRLEN) {
-                    uint8_t channel = g_sdpcm_rx_buf[5] & 0x0F;
-                    uint8_t dat_offset = g_sdpcm_rx_buf[7];
-                    if (channel == SDPCM_CONTROL_CHANNEL && dat_offset >= SDPCM_HDRLEN && dat_offset <= len16) {
-                        if (len16 > BRCMF_FIRSTREAD) {
-                            uint32_t remaining = len16 - BRCMF_FIRSTREAD;
-                            uint32_t remaining_padded = (remaining + 3u) & ~3u;
-                            if (BRCMF_FIRSTREAD + remaining_padded > WIFI_SDPCM_RX_BUF_CAP) {
-                                sys_puts(console_ep, "[WIFI][SDPCM] FAIL: ответ не влезает в RX-буфер\n");
-                                return false;
-                            }
-                            if (!sdio_f2_read(console_ep, g_sdpcm_rx_buf + BRCMF_FIRSTREAD, remaining_padded)) {
-                                sys_puts(console_ep, "[WIFI][SDPCM] FAIL: чтение остатка кадра\n");
-                                return false;
-                            }
-                        }
-                        *out_payload = g_sdpcm_rx_buf + dat_offset;
-                        *out_len = len16 - dat_offset;
-                        return true;
-                    }
-                    // channel != CONTROL или некорректный dat_offset — событие/данные, не наш ответ, ждём дальше молча
-                }
-                // чек-сумма не сошлась/len16==0/короче заголовка — считаем это "кадра ещё нет" (особенно для
-                // спекулятивных попыток без сигнала от intstatus), не фатально, просто ждём дальше молча
-            }
+            bool fatal = false;
+            if (sdpcm_try_read_one_frame(console_ep, out_payload, out_len, &fatal)) return true;
+            if (fatal) return false;
         }
 
         if (wifi_read_cntvct() - start >= timeout_ticks) {
@@ -1768,6 +1993,33 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
 
     wifi_vputs(console_ep, "[WIFI][SDPCM] step: согласование блок-размера func2 (512 байт)...\n");
     if (!wifi_set_func2_blocksize(console_ep)) return;
+
+    // Фаза 4.5 (см. ROADMAP.md) — реальный GIC IRQ на приём sdpcm-кадра
+    // вместо busy-poll в sdpcm_wait_and_read_ctrl(). Переключение шины на 4
+    // бита само по себе сделано раньше — в Milestone 4.1 (main(), сразу после
+    // SDIO probe, до заливки прошивки/NVRAM: заодно ускоряет PIO в Milestone
+    // 4.2, раньше было 1-бит). Изначально оно вводилось ради in-band IRQ
+    // (первая попытка на 1-бит шине зависла НАВСЕГДА, card interrupt ни разу
+    // не появился даже при прямом опросе регистра, см. живой лог, ROADMAP.md
+    // 4.5), но сама смена ширины от места вызова не зависит. Здесь остаются
+    // два шага, специфичных для F2/IRQ: (1) карта должна получить разрешение
+    // сигналить прерывание по DAT1 для функции 2 (CCCR IENx) — раньше
+    // сознательно не трогалось; (2) СВОЙ хост-контроллер (не общий с EMMC2
+    // регистровый блок — другой физический адрес, см. platform.h
+    // PLAT_WIFI_SDIO_PADDR) должен размаскировать этот же бит в IRPT_EN,
+    // иначе GIC никогда не увидит событие, даже если карта его honestly
+    // сигналит.
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: разблокировка CCCR IENx (in-band IRQ для func2)...\n");
+    if (!sdio_enable_card_interrupt(SBSDIO_FUNC_2, console_ep)) {
+        sys_puts(console_ep, "[WIFI][IRQ] WARN: CCCR IENx не прошёл — событийный sdpcm_wait_and_read_ctrl останется без реального IRQ\n");
+    } else if (g_wifi_irq_ntfn != 0) {
+        // Только теперь (не в wifi_sdio_probe(), см. там EMMC_IRPT_EN=0) —
+        // до этого момента карта физически не могла ассертнуть DAT1 (IENx
+        // ещё не был размаскирован), включать приём IRQ раньше не было смысла.
+        *wifi_reg(EMMC_IRPT_EN_OFFSET) = EMMC_INT_CARD_INT;
+        g_wifi_irq_ready = true;
+        wifi_vputs(console_ep, "[WIFI][IRQ] card interrupt разблокирован (IENx + IRPT_EN), событийный sdpcm_wait_and_read_ctrl активен\n");
+    }
 
     // ДИАГНОСТИКА: первая же команда СРАЗУ после enable F2 стабильно ловила
     // Command Timeout Error (карта вообще не отвечает) — не CRC, что похоже
@@ -3148,6 +3400,8 @@ int main(int argc, char *argv[]) {
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr my_ep      = ipc->msg[BOOT_WIFI_EP];
     g_wifi_blk_ep         = ipc->msg[7]; // BOOT_BLK_EP (Милстоун 4.2 — чтение прошивки/NVRAM)
+    g_wifi_irq_ntfn       = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO (см. main.cpp)
+    g_wifi_root_ep        = root_ep; // см. notify_root_wifi_irq_handled()/SYS_WIFI_IRQ_ACK
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -3175,6 +3429,19 @@ int main(int argc, char *argv[]) {
     g_probe_ok = wifi_sdio_probe((void*)PLAT_WIFI_SDIO_VADDR, console_ep);
     if (g_probe_ok) sys_puts(console_ep, "[WIFI] SDIO probe OK.\n");
     else            sys_puts(console_ep, "[WIFI] SDIO probe FAILED (see log above) — wifiprobe will report last state.\n");
+
+    // Переключаем шину на 4-бит СРАЗУ после probe, ДО заливки прошивки/NVRAM
+    // (Milestone 4.2) — та льётся PIO блоками по CMD53 (см. backplane_write_
+    // chunk), и ширина шины напрямую определяет число тактов на байт, т.е.
+    // реальное время заливки ~600КБ прошивки. Раньше эта смена делалась
+    // только в Milestone 4.3 ради in-band IRQ (см. wifi_sdpcm_bringup) — из-за
+    // этого вся прошивка грузилась по 1-битной шине без всякой причины.
+    if (g_probe_ok) {
+        sys_puts(console_ep, "[WIFI] step: переключение шины данных на 4-бит (ускоряет заливку прошивки/NVRAM)...\n");
+        if (!sdio_set_bus_width_4bit(console_ep)) {
+            sys_puts(console_ep, "[WIFI] WARN: переключение на 4-бит не прошло, шина остаётся 1-бит (заливка будет медленнее)\n");
+        }
+    }
 
     if (g_probe_ok && g_wifi_blk_ep != 0 && g_wifi_shm != nullptr) {
         sys_puts(console_ep, "[WIFI] Backplane bring-up + прошивка/NVRAM (Milestone 4.2)...\n");

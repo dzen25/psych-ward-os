@@ -242,6 +242,14 @@ struct ProcessControlBlock {
 #define MAX_PIPES 16
 #define PIPE_BASE_BADGE 1000 // Бейджи от 1000 до 1015 будут пайпами
 
+// Общий IRQ 158 (EMMC2 + Wi-Fi SDIO — одна физическая GIC-линия на обоих
+// контроллерах, см. platform.h/ROADMAP.md 4.5) слушает САМ root, а не
+// какой-то конкретный драйвер — только один процесс вообще может держать
+// IRQHandler-капу на этот номер. Badge заведомо вне диапазонов PID (1-255)
+// и пайпов (1000-1015) выше, чтобы не путаться с обычными сообщениями в
+// главном цикле ядра.
+#define IRQ_MMC_SHARED_BADGE 2000
+
 struct pipe_t {
     bool active;
     char buffer[4096];
@@ -390,7 +398,26 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          seL4_CPtr net_cmd_recv_ep = 0,
                          seL4_CPtr net_cmd_send_ep = 0,
                          seL4_CPtr wifi_cmd_recv_ep = 0,
-                         seL4_CPtr wifi_cmd_send_ep = 0) {
+                         seL4_CPtr wifi_cmd_send_ep = 0,
+                         // Второй/третий MMIO-регион для is_driver == 2 (timer_driver) —
+                         // регистры VideoCore mailbox + приватный буфер под property-tag
+                         // запрос (Фаза 4.6, см. ROADMAP.md). Не обобщаем на другие
+                         // драйверы — это разовая надобность именно timer_driver'а.
+                         seL4_CPtr mbox_regs_frame = 0,
+                         seL4_CPtr mbox_buf_frame_param = 0,
+                         seL4_Word mbox_buf_paddr_param = 0,
+                         // Для is_driver == 2 (timer_driver): капа на нотификацию
+                         // net_driver'а (badged NET_EVENT_HEARTBEAT), которой
+                         // timer_driver периодически будит net_driver (Фаза 4.5,
+                         // см. common.h/BOOT_HEARTBEAT_NTFN_CAP). Обычное копирование
+                         // capability, как и с blk_irq_ntfn — не TCB-bind.
+                         seL4_CPtr extra_ntfn_param = 0,
+                         // Для is_driver == 3 (blk_driver): приватный
+                         // некэшируемый DMA bounce-буфер под ADMA2-дескрипторы
+                         // (Фаза 4.5, см. PLAT_BLK_DMA_VADDR/platform.h) —
+                         // та же схема, что mbox_buf_frame_param выше.
+                         seL4_CPtr blk_dma_frame_param = 0,
+                         seL4_Word blk_dma_paddr_param = 0) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -439,8 +466,20 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_blk_ep      = 7; // VFS/Block Driver Endpoint
     seL4_Word local_wifi_recv_ep = 8; // Wi-Fi (Фаза 4): wifi_driver слушает на этом слоте (см. BOOT_WIFI_EP)
     seL4_Word local_syscall_ep  = 10; // <-- Локальный индекс для Faults и Syscalls
+    seL4_Word local_extra_ntfn  = 13; // Фаза 4.5: капа на heartbeat-нотификацию net_driver'а (только для timer_driver, см. extra_ntfn_param)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
+
+    if (is_driver == 1 || is_driver == 2) {
+        // UART/Timer driver: капа на СОБСТВЕННЫЙ CNode (см. SELF_CNODE_SLOT в
+        // common.h) — нужна для seL4_CNode_SaveCaller() внутри самого
+        // процесса, чтобы откладывать reply вместо немедленного ответа
+        // (UART: SYS_READ, Фаза 4.5; Timer: SYS_SLEEP_MS, тоже Фаза 4.5, см.
+        // timer_driver.cpp). child_cnode здесь — это capability НА ТОТ ЖЕ
+        // CNode-объект в адресном пространстве root_cnode; копия внутрь
+        // себя же — обычный seL4-приём для self-reference.
+        check_err(seL4_CNode_Copy(child_cnode, SELF_CNODE_SLOT, 8, root_cnode, child_cnode, seL4_WordBits, seL4_AllRights), "Copy self-CNode cap");
+    }
 
     // ИСПРАВЛЕНО: Упрощена и исправлена логика копирования. Теперь она зависит от аргументов, а не от PCB.
     if (console_ep != 0) {
@@ -460,6 +499,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (net_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_net_recv_ep, 8, root_cnode, net_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy net recv ep");
     if (wifi_cmd_send_ep != 0) check_err(seL4_CNode_Mint(child_cnode, local_wifi_send_ep, 8, root_cnode, wifi_cmd_send_ep, seL4_WordBits, seL4_AllRights, pid), "Mint wifi send ep");
     if (wifi_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_wifi_recv_ep, 8, root_cnode, wifi_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy wifi recv ep");
+    if (extra_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_extra_ntfn, 8, root_cnode, extra_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy extra ntfn (heartbeat)");
 
     pcb.cspace = child_cnode;
     pcb.badged_ep = badged_ep; // Оставляем глобальный в pcb для нужд ядра
@@ -605,8 +645,38 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             seL4_CPtr frame_child = alloc_and_track_cap(alloc, pcb);
             check_err(seL4_CNode_Copy(root_cnode, frame_child, seL4_WordBits, 
                                       root_cnode, hw_frame + i, seL4_WordBits, seL4_AllRights), "Copy HW Frame Cap");
-            check_err(seL4_ARM_Page_Map(frame_child, child_vspace, hw_vaddr + (i * 4096), 
+            check_err(seL4_ARM_Page_Map(frame_child, child_vspace, hw_vaddr + (i * 4096),
                                         seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map HW to Driver");
+        }
+
+        // PLAT_MBOX_VADDR/PLAT_MBOX_BUF_VADDR лежат в том же 2MB-регионе,
+        // что и PLAT_AVS_VADDR (см. platform.h) — drv_pud/drv_pd/drv_pt выше
+        // уже покрывают весь этот диапазон, отдельная PUD/PD/PT-иерархия для
+        // них не нужна, только дополнительный Page_Map.
+        if (is_driver == 2 && mbox_regs_frame != 0) {
+            seL4_CPtr mbox_regs_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, mbox_regs_child, seL4_WordBits,
+                                      root_cnode, mbox_regs_frame, seL4_WordBits, seL4_AllRights), "Copy Mbox Regs Frame Cap");
+            check_err(seL4_ARM_Page_Map(mbox_regs_child, child_vspace, PLAT_MBOX_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Mbox Regs to Driver");
+        }
+        if (is_driver == 2 && mbox_buf_frame_param != 0) {
+            seL4_CPtr mbox_buf_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, mbox_buf_child, seL4_WordBits,
+                                      root_cnode, mbox_buf_frame_param, seL4_WordBits, seL4_AllRights), "Copy Mbox Buf Frame Cap");
+            check_err(seL4_ARM_Page_Map(mbox_buf_child, child_vspace, PLAT_MBOX_BUF_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Mbox Buf to Driver");
+        }
+        // Фаза 4.5/ADMA2 (см. ROADMAP.md) — приватный некэшируемый DMA
+        // bounce-буфер blk_driver, тот же приём, что mbox_buf выше.
+        // PLAT_BLK_DMA_VADDR лежит в том же 2MB-регионе, что и PLAT_EMMC_VADDR
+        // (drv_pud/pd/pt для is_driver==3 уже созданы в этом же блоке выше).
+        if (is_driver == 3 && blk_dma_frame_param != 0) {
+            seL4_CPtr blk_dma_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, blk_dma_child, seL4_WordBits,
+                                      root_cnode, blk_dma_frame_param, seL4_WordBits, seL4_AllRights), "Copy Blk DMA Frame Cap");
+            check_err(seL4_ARM_Page_Map(blk_dma_child, child_vspace, PLAT_BLK_DMA_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Blk DMA Buf to Driver");
         }
 
         if (is_driver == 1) { // UART
@@ -615,21 +685,41 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
         } else if (is_driver == 2) { // Timer
             // Timer driver является сервером для timer_ep, он на нем слушает.
-            child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep; 
-            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler; 
+            child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
+            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep; // Таймер может логировать в консоль, но не обязан
+            child_ipc_ptr->msg[BOOT_MBOX_BUF_PADDR] = mbox_buf_paddr_param; // Фаза 4.6, см. platform.h
+            child_ipc_ptr->msg[BOOT_HEARTBEAT_NTFN_CAP] = (extra_ntfn_param != 0) ? local_extra_ntfn : 0; // Фаза 4.5, см. common.h
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
+            // Фаза 4.5: капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO —
+            // см. g_emmc_irq_ntfn в blk_driver.cpp, local_irq_handler
+            // используется здесь просто как "ещё один слот с готовой
+            // capability", не как настоящий IRQHandler.
+            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
+            // Фаза 4.5/ADMA2: физический адрес DMA bounce-буфера — см.
+            // blk_dma_paddr_param выше и PLAT_BLK_DMA_VADDR/platform.h.
+            child_ipc_ptr->msg[BOOT_BLK_DMA_PADDR] = blk_dma_paddr_param;
         } else if (is_driver == 4) { // Net driver - клиент консоли, таймера и blk (журнал net_udp.log)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
             child_ipc_ptr->msg[BOOT_NET_EP] = local_net_recv_ep;
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
+            // Фаза 4.5: настоящая IRQHandler-капа GENET RX (RPI4_GENET_IRQ_A) —
+            // собственная линия, ни с кем не разделяемая (в отличие от IRQ 158
+            // EMMC2/Wi-Fi), поэтому net_driver держит её сам и Ack'ает сам,
+            // без root-релея (тот же приём, что у timer_driver).
+            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
         } else if (is_driver == 5) { // Wi-Fi driver (Фаза 4) - сервер для шелла, клиент консоли и blk (Милстоун 4.2: чтение прошивки/NVRAM с SD)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_recv_ep;
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
+            // Фаза 4.5 (продолжение): капа на нотификацию общего IRQ EMMC2/
+            // Wi-Fi SDIO — тот же приём, что у blk_driver (local_irq_handler
+            // здесь тоже просто "слот с готовой capability на нотификацию",
+            // не настоящий IRQHandler, см. wifi_irq_ntfn в main()).
+            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
         }
 
     } else {
@@ -833,9 +923,17 @@ int main(int argc, char *argv[]) {
     // сделан повтор менее агрессивным (см. wifi_driver.cpp).
     constexpr bool RPI4_ENABLE_WIFI  = true;
 
+    // PLAT_MBOX_PADDR (0xfe00b000) физически МЕНЬШЕ mini-UART AUX (0xfe215000)
+    // и лежит в том же untyped-регионе — должен аллоцироваться СТРОГО ДО
+    // uart_frame (тот же приём, что и для PLAT_WIFI_SDIO_PADDR/PLAT_EMMC_PADDR
+    // ниже — см. комментарий там же и проверку "target_paddr BEHIND watermark"
+    // в alloc_device_frame()).
+    seL4_CPtr mbox_regs_frame = alloc_device_frame(info, alloc, PLAT_MBOX_PADDR, root_cnode);
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
     seL4_CPtr emmc_frame = 0;
     seL4_CPtr avs_frame = 0;
+    seL4_CPtr mbox_buf_frame = 0;
+    seL4_Word mbox_buf_paddr = 0;
     seL4_CPtr wifi_sdio_frame = 0;
     // GENET занимает 64KB (0x10000) — 16 страниц, а не один слот, как EMMC2.
     seL4_CPtr genet_frames[16] = {0};
@@ -848,8 +946,20 @@ int main(int argc, char *argv[]) {
     if (RPI4_ENABLE_WIFI) {
         wifi_sdio_frame = alloc_device_frame(info, alloc, PLAT_WIFI_SDIO_PADDR, root_cnode);
     }
+    seL4_CPtr blk_dma_frame = 0;
+    seL4_Word blk_dma_paddr = 0;
     if (RPI4_ENABLE_BLK) {
         emmc_frame = alloc_device_frame(info, alloc, PLAT_EMMC_PADDR, root_cnode);
+
+        // Фаза 4.5/ADMA2 (см. ROADMAP.md) — приватный некэшируемый DMA
+        // bounce-буфер blk_driver, тот же приём, что mbox_buf_frame ниже:
+        // обычная RAM-страница (не device-фрейм с фиксированным адресом),
+        // физический адрес нужен только для программирования
+        // EMMC_ADMA_SYSADDR_OFFSET (см. platform.h/blk_driver.cpp).
+        blk_dma_frame = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, blk_dma_frame, 1);
+        seL4_ARM_Page_GetAddress_t blk_dma_addr_res = seL4_ARM_Page_GetAddress(blk_dma_frame);
+        blk_dma_paddr = (seL4_Word)blk_dma_addr_res.paddr;
     }
     if (RPI4_ENABLE_NET) {
         for (int i = 0; i < 16; i++) {
@@ -860,6 +970,19 @@ int main(int argc, char *argv[]) {
         // AVS RO thermal (0xf00 байт регистров) умещается в одну страницу,
         // как EMMC2 — читается тем же процессом, что и таймер (timer_driver).
         avs_frame = alloc_device_frame(info, alloc, PLAT_AVS_PADDR, root_cnode);
+
+        // Приватный буфер под property-tag запрос VideoCore mailbox (Фаза
+        // 4.6, расследование DVFS, см. ROADMAP.md) — обычная RAM-страница
+        // (не MMIO-device-фрейм с фиксированным физическим адресом, как
+        // остальные выше), физический адрес нужен только затем, чтобы
+        // сообщить его GPU через MAILBOX_WRITE. Маппится некэшируемым (см.
+        // is_driver == 2 ниже) — разовый диагностический запрос не стоит
+        // усложнять cache maintenance (см. flush_rootserver_shm() — тот же
+        // класс проблемы, но там от него отказаться было нельзя).
+        mbox_buf_frame = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, mbox_buf_frame, 1);
+        seL4_ARM_Page_GetAddress_t mbox_buf_addr_res = seL4_ARM_Page_GetAddress(mbox_buf_frame);
+        mbox_buf_paddr = (seL4_Word)mbox_buf_addr_res.paddr;
     }
 
     // ВАЖНО: MMIO должен маппиться некэшируемым (Device memory), иначе CPU
@@ -922,15 +1045,30 @@ int main(int argc, char *argv[]) {
     seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, med_ep, 1);
 
     // --- ПРАВИЛЬНОЕ ВЫДЕЛЕНИЕ SHM (Из обычной ОЗУ, а не из Device Memory) ---
+    // ВАЖНО: retype ВСЕХ 4 страниц идёт ОТДЕЛЬНЫМ, ничем не прерываемым
+    // циклом, ДО какого-либо маппинга — net_driver.cpp (GENET DMA) и
+    // остальные потребители этой SHM считают физический адрес любого
+    // смещения как paddr(shm_frames[0]) + смещение, что верно, ТОЛЬКО если
+    // все 4 страницы физически идут подряд. Раньше retype и map были в
+    // ОДНОМ цикле — маппинг страницы[0] в НИКОГДА не мапленный диапазон
+    // (см. комментарий у rootserver_shm_base ниже) triggers on-demand
+    // создание PUD/PD/PT (ещё 3 объекта из ТОГО ЖЕ normal_untyped) МЕЖДУ
+    // retype'ом страницы[0] и страницы[1] — на живом железе это давало
+    // paddr(frame[0])=0x40005000, paddr(frame[1])=0x40009000 (дыра 0x4000
+    // вместо 0x1000!), из-за чего GENET писал принятые кадры в
+    // "дырочный" (чужой/неинициализированный) физический адрес вместо
+    // настоящей 2-й/3-й страницы SHM — net_driver читал свою страницу и
+    // видел одни нули (см. ROADMAP.md 4.5, живой баг ethertype=0).
     for (int i = 0; i < 4; i++) {
-        shm_frames[i] = alloc.alloc_slot();        
-        // ИСПРАВЛЕНО: Передаем 0, 0 вместо root_cnode для индексов!
+        shm_frames[i] = alloc.alloc_slot();
         seL4_Error err = seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
                                              root_cnode, 0, 0, shm_frames[i], 1);
         if (err != seL4_NoError) {
             uart_puts("[ROOT] FATAL: Failed to allocate normal RAM for SHM!\n");
             while(1);
         }
+    }
+    for (int i = 0; i < 4; i++) {
         // Мапим эти физические фреймы в виртуальную память Rootserver'а —
         // ОБЯЗАТЕЛЬНО кэшируемой (seL4_ARM_Default_VMAttributes), в отличие
         // от map_frame_robust() ниже (та мапит некэшируемо ради когерентности
@@ -1033,25 +1171,116 @@ int main(int argc, char *argv[]) {
         uart_puts("PANIC: UART Driver failed to load!\n"); while(1);
     }
 
+    // GENET RX IRQ + heartbeat-нотификация для net_driver (Фаза 4.5, см.
+    // ROADMAP.md/common.h) — создаём ЗДЕСЬ, ДО спавна timer_driver, потому
+    // что timer_driver'у ниже нужна badged-копия badged_net_heartbeat_ntfn.
+    // Оба badge (NET_EVENT_GENET_RX/NET_EVENT_HEARTBEAT) минтятся из ОДНОГО
+    // net_event_ntfn — seL4 OR'ит непотреблённые бейджи одного объекта,
+    // поэтому net_driver одним Recv видит и кадр, и будильник (см.
+    // net_driver.cpp). GENET_IRQ_A — собственная линия (не общая, в отличие
+    // от IRQ 158 EMMC2/Wi-Fi), поэтому net_driver держит настоящую
+    // IRQHandler-капу сам и Ack'ает сам — root-релей не нужен.
+    seL4_CPtr net_event_ntfn = alloc.alloc_slot();
+    seL4_CPtr badged_genet_rx_ntfn = alloc.alloc_slot();
+    seL4_CPtr badged_net_heartbeat_ntfn = alloc.alloc_slot();
+    seL4_CPtr genet_irq_handler = alloc.alloc_slot();
+    if (RPI4_ENABLE_NET) {
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, net_event_ntfn, 1);
+        seL4_CNode_Mint(root_cnode, badged_genet_rx_ntfn, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_GENET_RX);
+        seL4_CNode_Mint(root_cnode, badged_net_heartbeat_ntfn, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_HEARTBEAT);
+        check_err(seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_GENET_IRQ_A, root_cnode, genet_irq_handler, seL4_WordBits), "IRQControl_Get(GENET_IRQ_A)");
+        check_err(seL4_IRQHandler_SetNotification(genet_irq_handler, badged_genet_rx_ntfn), "IRQHandler_SetNotification(genet)");
+        check_err(seL4_IRQHandler_Ack(genet_irq_handler), "IRQHandler_Ack(genet, initial)");
+    }
+
+    // Физический таймер (PPI 30, non-secure) — Фаза 4.5, событийный sys_sleep
+    // (см. platform.h/PLAT_TIMER_IRQ, easy-settings.cmake/KernelArmExportPTMRUser).
+    // Не общий ни с чем (в отличие от IRQ 158 EMMC2/Wi-Fi) — timer_driver
+    // держит настоящую IRQHandler-капу сам и сам себя Ack'ает, никакого
+    // root-релея не нужно (см. blk_driver.cpp/SYS_MMC_IRQ_ACK для контраста,
+    // где релей был обязателен из-за общей линии и разных priority).
+    seL4_CPtr timer_ntfn = alloc.alloc_slot();
+    seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
+    seL4_CPtr timer_irq_handler = alloc.alloc_slot();
+    if (RPI4_ENABLE_TIMER) {
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
+        seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, 1);
+        // ВРЕМЕННО (отладка живого зависания sleep, см. ROADMAP.md 4.5): эти
+        // три вызова раньше не проверялись (как и у UART) — заворачиваем в
+        // check_err(), чтобы явно увидеть в логе загрузки, если PPI 30
+        // (физический таймер) почему-то не claim'ится как обычный IRQ.
+        check_err(seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_TIMER_IRQ, root_cnode, timer_irq_handler, seL4_WordBits), "IRQControl_Get(PLAT_TIMER_IRQ)");
+        check_err(seL4_IRQHandler_SetNotification(timer_irq_handler, badged_timer_ntfn), "IRQHandler_SetNotification(timer)");
+        check_err(seL4_IRQHandler_Ack(timer_irq_handler), "IRQHandler_Ack(timer, initial)");
+    }
+
     if (RPI4_ENABLE_TIMER) {
     // Запускаем Драйвер Таймера (is_driver = 2)
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, 0, 0, avs_frame) < 0) {
+                      2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, avs_frame,
+                      nullptr, 0, 0, 0, 0, mbox_regs_frame, mbox_buf_frame, mbox_buf_paddr, badged_net_heartbeat_ntfn) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
 
+    // Общий IRQ 158 (Фаза 4.5, см. define IRQ_MMC_SHARED_BADGE выше) — root
+    // держит единственную IRQHandler-капу на эту линию (её физически
+    // делят EMMC2 и Wi-Fi SDIO, см. platform.h), сам ничего не знает про
+    // регистры конкретного контроллера и просто будит ОБА процесса (blk_
+    // driver и wifi_driver) своими нотификациями при срабатывании — каждый
+    // сам проверяет СВОЙ статусный регистр (разные физические контроллеры,
+    // разные MMIO-адреса) и решает, его ли это событие (см.
+    // sdpcm_wait_and_read_ctrl в wifi_driver.cpp / emmc_wait_irpt_bit в
+    // blk_driver.cpp — оба уже толерантны к чужим/спекулятивным пробуждениям
+    // на своей нотификации).
+    seL4_CPtr blk_irq_ntfn = 0;
+    seL4_CPtr wifi_irq_ntfn = 0;
+    seL4_CPtr mmc_shared_irq_handler = 0;
     if (RPI4_ENABLE_BLK) {
-    // Запускаем Драйвер Диска и ФС (is_driver = 3)
+        seL4_CPtr mmc_shared_irq_ntfn = alloc.alloc_slot();
+        seL4_CPtr mmc_shared_irq_badged = alloc.alloc_slot();
+        mmc_shared_irq_handler = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, mmc_shared_irq_ntfn, 1);
+        seL4_CNode_Mint(root_cnode, mmc_shared_irq_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, IRQ_MMC_SHARED_BADGE);
+        seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_WIFI_SDIO_IRQ, root_cnode, mmc_shared_irq_handler, seL4_WordBits);
+        seL4_IRQHandler_SetNotification(mmc_shared_irq_handler, mmc_shared_irq_badged);
+        check_err(seL4_TCB_BindNotification(seL4_CapInitThreadTCB, mmc_shared_irq_ntfn), "Bind shared MMC IRQ to root");
+        seL4_IRQHandler_Ack(mmc_shared_irq_handler);
+
+        // Отдельная нотификация, которой root будит именно blk_driver (см.
+        // seL4_TCB_BindNotification для него внутри spawn_process — тот же
+        // общий механизм, что уже используется для UART, просто источник
+        // сигнала теперь root, а не сам GIC напрямую).
+        blk_irq_ntfn = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, blk_irq_ntfn, 1);
+
+        // Та же идея, но для wifi_driver (Фаза 4.5, продолжение) — отдельный
+        // объект, а не badged-копия blk_irq_ntfn, потому что wifi_driver
+        // спавнится/убивается динамически (SYS_START_WIFI/SYS_STOP_WIFI,
+        // см. ROADMAP.md 4.4.1) — capability передаётся заново при каждом
+        // "wifi start", сам notification-объект переживает рестарты
+        // процесса без пересоздания.
+        wifi_irq_ntfn = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_irq_ntfn, 1);
+    }
+
+    if (RPI4_ENABLE_BLK) {
+    // Запускаем Драйвер Диска и ФС (is_driver = 3). blk_irq_ntfn передаётся
+    // ТРЕТЬИМ параметром из пары irq_ntfn/irq_handler (не первым!) — это
+    // НЕ TCB-bind (blk_driver не читает свой my_ep для IRQ, см. комментарий
+    // у g_emmc_irq_ntfn в blk_driver.cpp), а обычное копирование capability
+    // на нотификацию в cspace процесса (тот же spawn_process-механизм, что
+    // копирует IRQHandler для UART — семантика объекта ему не важна).
     if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, emmc_frame) < 0) {
+                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, blk_irq_ntfn, emmc_frame,
+                      nullptr, 0, 0, 0, 0, 0, 0, 0, 0, blk_dma_frame, blk_dma_paddr) < 0) {
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
     }
 
     if (RPI4_ENABLE_NET) {
     if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      4, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, genet_frames[0], nullptr,
+                      4, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, net_event_ntfn, genet_irq_handler, genet_frames[0], nullptr,
                       net_cmd_recv_ep, 0) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
@@ -1083,6 +1312,24 @@ int main(int argc, char *argv[]) {
         seL4_Word sender_badge = 0;
         // Ожидаем прерывание, сообщение IPC или fault
         seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
+
+        if (sender_badge == IRQ_MMC_SHARED_BADGE) {
+            // Общий IRQ EMMC2/Wi-Fi SDIO (см. define выше) — root не читает
+            // регистры контроллеров сам, просто будит blk_driver; тот
+            // проверяет свой статусный бит и, если это не он, просто снова
+            // засыпает на своей нотификации (см. blk_driver.cpp).
+            //
+            // ВАЖНО: seL4_IRQHandler_Ack() здесь НЕ вызывается (см.
+            // SYS_MMC_IRQ_ACK в common.h) — линия level-triggered, и Ack без
+            // предварительного сброса девайсного статус-бита мгновенно
+            // перезаводит тот же IRQ; root (priority 255) в таком цикле
+            // никогда не отдал бы CPU blk_driver'у (priority 254), который
+            // единственный может реально снять бит. Ack откладывается до
+            // явного запроса от blk_driver, когда бит уже гарантированно снят.
+            if (blk_irq_ntfn != 0) seL4_Signal(blk_irq_ntfn);
+            if (wifi_irq_ntfn != 0) seL4_Signal(wifi_irq_ntfn);
+            continue;
+        }
 
         seL4_Word sender_pid = 0;
 
@@ -1733,7 +1980,7 @@ int main(int argc, char *argv[]) {
                 // wifi всё ещё экспериментальный (см. RPI4_ENABLE_WIFI), и
                 // зависание/провал его пробы не должно блокировать загрузку
                 // остальных модулей и шелла.
-                if (drv >= 1 && drv <= 5) {
+                if (drv >= 1 && drv <= 5 && drv != 3) {
                     uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
                 }
                 if (drv == 5) {
@@ -1874,8 +2121,12 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, (seL4_Word)-1); // не скомпилирован (RPI4_ENABLE_WIFI=false)
                 } else {
                     g_wifi_driver_ready = false;
+                    // wifi_irq_ntfn передаётся ДЕВЯТЫМ параметром (irq_handler
+                    // слот) — тот же приём, что у blk_irq_ntfn: обычная
+                    // capability на нотификацию, не настоящий IRQHandler (см.
+                    // is_driver==5 блок выше и common.h/SYS_WIFI_IRQ_ACK).
                     int new_pid = spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, wifi_sdio_frame, nullptr,
+                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
                                                 0, 0, wifi_cmd_recv_ep, 0);
                     seL4_SetMR(0, new_pid > 0 ? 0 : (seL4_Word)-1);
                 }
@@ -1911,6 +2162,18 @@ int main(int argc, char *argv[]) {
                 else status = 2;                          // готов принимать WIFI_CMD_*
                 seL4_SetMR(0, status);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_MMC_IRQ_ACK: { // Фаза 4.5, см. common.h — blk_driver уже снял девайсный статус-бит
+                if (mmc_shared_irq_handler != 0) seL4_IRQHandler_Ack(mmc_shared_irq_handler);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                break;
+            }
+
+            case SYS_WIFI_IRQ_ACK: { // Фаза 4.5, см. common.h — wifi_driver уже снял I_HMB_*/INTSTATUS на своей стороне
+                if (mmc_shared_irq_handler != 0) seL4_IRQHandler_Ack(mmc_shared_irq_handler);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
                 break;
             }
 

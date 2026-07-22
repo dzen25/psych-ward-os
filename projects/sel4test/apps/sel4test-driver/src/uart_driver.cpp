@@ -158,6 +158,18 @@ int main(int argc, char *argv[]) {
     seL4_SetMR(0, SYS_DRIVER_READY);
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
 
+    // Отложенный reply на SYS_READ (Фаза 4.5, см. ROADMAP.md): вместо
+    // немедленного "-1, данных нет" и busy-poll на СТОРОНЕ ВЫЗЫВАЮЩЕГО
+    // (shell.cpp::sys_read_blocking() крутил seL4_Yield() в цикле), теперь
+    // не отвечаем на SYS_READ, если буфер пуст — сохраняем reply-cap
+    // вызывающего (см. SELF_CNODE_SLOT в common.h) и достаём его из
+    // ветки IRQ ниже, как только реально придёт символ. Только ОДИН
+    // отложенный читатель одновременно — той же однопоточной модели, что и
+    // раньше (kbd_buffer общий на все fd=0, конкурентных читателей не было
+    // и до этой правки).
+    constexpr seL4_Word UART_PENDING_REPLY_SLOT = 12;
+    bool pending_reader = false;
+
     while(1) {
         seL4_Word badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
@@ -176,6 +188,23 @@ int main(int argc, char *argv[]) {
                 kbd_buffer[head] = c; head = next_head;
             }
             seL4_IRQHandler_Ack(irq_ep);
+
+            if (pending_reader && head != tail) {
+                seL4_SetMR(0, kbd_buffer[tail]); tail = (tail + 1) % 128;
+                seL4_Send(UART_PENDING_REPLY_SLOT, seL4_MessageInfo_new(0, 0, 0, 1));
+                // depth=8, не seL4_WordBits: SELF_CNODE_SLOT резолвится через
+                // ГВАРДИРОВАННЫЙ корень треда (это отдельный механизм для
+                // самого аргумента _service), а вот ВНУТРИ найденного CNode
+                // (голый объект, скопированный как есть в main.cpp — без
+                // гварда) слот 12 адресуется его РЕАЛЬНЫМ радиксом, 8 бит —
+                // ровно как ROOT-задача всегда адресует child_cnode напрямую
+                // (см. все seL4_CNode_Copy(child_cnode, ..., 8, ...) в
+                // main.cpp). seL4_WordBits здесь резолвил не тот слот и ронял
+                // "CNode operation: Target slot invalid" / "null cap #12" на
+                // живом железе.
+                seL4_CNode_Delete(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8);
+                pending_reader = false;
+            }
             // Не делаем 'continue', чтобы после IRQ тоже можно было сбросить буфер на печать
         } else {
             // Сообщение IPC от клиента. Badge - это PID отправителя.
@@ -229,9 +258,20 @@ int main(int argc, char *argv[]) {
                 line_buffer_pos[sender_pid] = 0;
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             } else if (sys == 6) { // SYS_READ
-                if (head != tail) { seL4_SetMR(0, kbd_buffer[tail]); tail = (tail + 1) % 128; }
-                else { seL4_SetMR(0, (seL4_Word)-1); }
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                if (head != tail) {
+                    seL4_SetMR(0, kbd_buffer[tail]); tail = (tail + 1) % 128;
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                } else if (!pending_reader) {
+                    // Нет данных — откладываем reply вместо "-1" (см. пометку
+                    // про UART_PENDING_REPLY_SLOT выше по функции).
+                    seL4_CNode_SaveCaller(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8); // depth=8, см. комментарий у seL4_CNode_Delete ниже
+                    pending_reader = true;
+                } else {
+                    // Уже есть отложенный читатель (см. комментарий выше про
+                    // единственность) — не зависаем, отвечаем сразу "нет данных".
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                }
             } else {
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             }

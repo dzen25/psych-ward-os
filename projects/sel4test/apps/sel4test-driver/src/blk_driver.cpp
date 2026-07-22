@@ -14,6 +14,28 @@ static FAT32_Instance g_file_system;
 static volatile uint32_t* g_emmc_base = nullptr;
 static uint32_t g_emmc_rca = 0; // Relative Card Address, получаем в emmc_init()
 
+// Фаза 4.5/ADMA2 (см. ROADMAP.md) — приватный НЕКЭШИРУЕМЫЙ DMA bounce-буфер
+// (одна страница, PLAT_BLK_DMA_VADDR/platform.h, физический адрес приходит
+// через BOOT_BLK_DMA_PADDR при спавне — см. main.cpp). Некэшируемый, а не
+// стек/куча процесса — стандартный паттерн non-coherent DMA (см. подробный
+// разбор в ROADMAP.md 4.5: DMA напрямую в кэшируемый стек потребовал бы
+// явного cache maintenance + alignas(64) на каждом буфере в fat32.cpp, риск
+// aliasing'а кэш-линий с соседними живыми локальными переменными — решили не
+// рисковать, тот же приём, что уже проверен для GENET/net_driver/SHM).
+// Первые 512 байт страницы — буфер данных сектора, следующие 8 — ADMA2-
+// дескриптор (см. Adma2Descriptor32/platform.h) — обе части используются
+// синхронно, одна операция за раз, отдельно выделять под дескриптор ничего
+// не нужно.
+static uint32_t g_blk_dma_paddr = 0;
+constexpr uintptr_t BLK_DMA_BUF_OFFSET  = 0;
+constexpr uintptr_t BLK_DMA_DESC_OFFSET = 512;
+static inline volatile uint8_t* blk_dma_buf() {
+    return (volatile uint8_t*)(PLAT_BLK_DMA_VADDR + BLK_DMA_BUF_OFFSET);
+}
+static inline volatile Adma2Descriptor32* blk_dma_desc() {
+    return (volatile Adma2Descriptor32*)(PLAT_BLK_DMA_VADDR + BLK_DMA_DESC_OFFSET);
+}
+
 // Смещение (в секторах) начала FAT32-раздела на физической карте — см.
 // find_fat32_partition() ниже. На стандартно размеченной SD-карте (с MBR)
 // сектор 0 диска — это НЕ BPB, а таблица разделов; реальный BPB лежит по
@@ -107,6 +129,60 @@ static inline volatile uint32_t* emmc_reg(uintptr_t offset) {
     return (volatile uint32_t*)((uintptr_t)g_emmc_base + offset);
 }
 
+// Капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO (см. IRQ_MMC_SHARED_BADGE
+// и настройку в main.cpp) — сюда root будит нас, когда линия сработала.
+// НЕ TCB-bind (как у UART) — та схема годится, только когда IRQ и клиентские
+// сообщения делят один and тот же верхнеуровневый seL4_Recv(my_ep, ...); здесь
+// ожидание IRQ происходит ВЛОЖЕННО, посреди обработки одной команды клиента
+// (см. emmc_wait_irpt_bit ниже) — если бы это шло через my_ep, случайно
+// пришедшее сообщение от ДРУГОГО клиента было бы ошибочно съедено вместо
+// настоящего события железа. Поэтому это отдельная капа, отдельный
+// seL4_Wait(), никак не пересекающийся с главным циклом диспетчеризации.
+static seL4_CPtr g_emmc_irq_ntfn = 0;
+
+// true после успешной инициализации (см. main(), ниже emmc_init()) — только
+// тогда включаем событийное ожидание вместо busy-yield. См. ROADMAP.md 4.5:
+// на этапе инициализации карта может вообще не отвечать (нет карты и т.п.),
+// и там честный отказ по счётчику итераций важнее — иначе весь boot
+// (SYS_WAIT_ALL_DRIVERS_READY) зависнет навсегда вместо чистой ошибки "EMMC2
+// init failed" (см. память проекта: driver обязан просигналить готовность,
+// иначе шелл висит вечно).
+static bool g_emmc_irq_ready = false;
+
+// Капа на root_ep (см. main(), ниже) — нужна только затем, чтобы после
+// event-driven снятия статус-бита попросить root сделать
+// seL4_IRQHandler_Ack() (см. SYS_MMC_IRQ_ACK в common.h и подробный
+// комментарий там же про то, почему root не Ack'ает сам сразу).
+static seL4_CPtr g_root_ep = 0;
+
+static void notify_root_irq_handled() {
+    if (g_root_ep == 0) return;
+    seL4_SetMR(0, SYS_MMC_IRQ_ACK);
+    seL4_Call(g_root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
+// СОЗНАТЕЛЬНО НЕ переведены на событийное ожидание (Фаза 4.5, см.
+// ROADMAP.md) — в отличие от emmc_wait_irpt_bit() ниже, это принципиально
+// другой случай:
+// 1. CMD_INHIBIT/DAT_INHIBIT — биты регистра STATUS (busy-флаги
+//    контроллера), а не EMMC_INTERRUPT — по спеке SDHCI у них НЕТ
+//    собственного прерывания, в отличие от CMD_DONE/DATA_DONE/READ_RDY/
+//    WRITE_RDY.
+// 2. Если бы всё равно завести для них ожидание на той же g_emmc_irq_ntfn,
+//    возник бы риск дедлока по ответственности за SYS_MMC_IRQ_ACK: root не
+//    Ack'ает GIC, пока blk_driver явно не подтвердит, что снял бит в
+//    EMMC_INTERRUPT (см. emmc_wait_irpt_bit) — а эти две функции тот
+//    регистр не трогают вообще, им нечего "снимать" и не о чем уведомлять
+//    root. Проснуться по чужому сигналу и уйти в повторный Wait(), так и не
+//    вызвав notify_root_irq_handled(), значит НАВСЕГДА заблокировать
+//    переармирование GIC — заденет и уже рабочий emmc_wait_irpt_bit().
+// 3. Реальный поток команд — cmd_ready() -> issue cmd -> irpt_bit(CMD_DONE)
+//    -> (следующая команда) cmd_ready() — к моменту повторного вызова
+//    cmd_ready() предыдущая команда уже полностью дождана через IRQ, т.е.
+//    CMD_INHIBIT/DAT_INHIBIT на практике почти всегда УЖЕ сняты — цикл
+//    ниже в норме проходит на первой же проверке, без единой реальной
+//    итерации seL4_Yield(). Выигрыш от событийной версии здесь околонулевой
+//    при не-нулевом риске — решили не трогать.
 static bool emmc_wait_cmd_ready() {
     uint32_t timeout = 1000000;
     while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_CMD_INHIBIT) {
@@ -127,15 +203,52 @@ static bool emmc_wait_dat_ready() {
 
 // Ждет конкретный бит в INTERRUPT (READ_RDY/WRITE_RDY/DATA_DONE/CMD_DONE),
 // сбрасывает его по получении. Любая ошибка (верхние 16 бит) — немедленный отказ.
+//
+// До успешной инициализации (g_emmc_irq_ready == false) — старый busy-yield
+// с честным счётчиком итераций, без изменений (см. комментарий у флага выше).
+//
+// После неё — событийный путь (Фаза 4.5, см. ROADMAP.md): читаем регистр
+// один раз (могли уже опоздать — бит мог встать до входа в этот вызов),
+// иначе блокируемся на g_emmc_irq_ntfn до реального IRQ. ИЗВЕСТНОЕ,
+// осознанно принятое ограничение: если карта по-настоящему перестанет
+// отвечать посреди обычной работы (не при инициализации — там таймаут
+// прежний), эта КОНКРЕТНАЯ операция зависнет насовсем вместо честной
+// ошибки — настоящий bounded timeout поверх блокирующего seL4_Wait() нужен
+// heartbeat от таймерного IRQ, а тот пока не сделан (см. ROADMAP.md 4.5/4.6
+// про EXPORT_PTMR_USER). Обходится вручную: kill+respawn зависшего
+// blk_driver (см. SYS_KILL/SYS_RECOVER), как и любой другой зависший
+// процесс в этой системе.
 static bool emmc_wait_irpt_bit(uint32_t bit) {
-    uint32_t timeout = 1000000;
-    while (true) {
-        uint32_t irpt = *emmc_reg(EMMC_INTERRUPT_OFFSET);
-        if (irpt & EMMC_INT_ERROR_MASK) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = irpt; return false; }
-        if (irpt & bit) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = bit; return true; }
-        if (--timeout == 0) return false;
-        seL4_Yield();
+    if (!g_emmc_irq_ready) {
+        uint32_t timeout = 1000000;
+        while (true) {
+            uint32_t irpt = *emmc_reg(EMMC_INTERRUPT_OFFSET);
+            if (irpt & EMMC_INT_ERROR_MASK) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = irpt; return false; }
+            if (irpt & bit) { *emmc_reg(EMMC_INTERRUPT_OFFSET) = bit; return true; }
+            if (--timeout == 0) return false;
+            seL4_Yield();
+        }
     }
+
+    // 1000 ложных пробуждений подряд без нашего бита — не настоящий таймаут
+    // (см. комментарий выше), но хотя бы не бесконечный цикл на всякий
+    // случайный чужой сигнал по той же нотификации.
+    for (int spurious = 0; spurious < 1000; spurious++) {
+        uint32_t irpt = *emmc_reg(EMMC_INTERRUPT_OFFSET);
+        if (irpt & EMMC_INT_ERROR_MASK) {
+            *emmc_reg(EMMC_INTERRUPT_OFFSET) = irpt;
+            notify_root_irq_handled(); // бит реально снят — теперь root может снова Ack'нуть GIC
+            return false;
+        }
+        if (irpt & bit) {
+            *emmc_reg(EMMC_INTERRUPT_OFFSET) = bit;
+            notify_root_irq_handled();
+            return true;
+        }
+        seL4_Word badge = 0;
+        seL4_Wait(g_emmc_irq_ntfn, &badge);
+    }
+    return false;
 }
 
 static bool emmc_send_cmd(uint32_t cmd_flags, uint32_t index, uint32_t arg) {
@@ -212,7 +325,21 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     if (LOG_BLK) sys_puthex32(console_ep, "[BLK][EMMC] CONTROL0 after power-on = ", *emmc_reg(EMMC_CONTROL0_OFFSET));
 
     *emmc_reg(EMMC_IRPT_MASK_OFFSET) = EMMC_INT_ALL_EN;
-    *emmc_reg(EMMC_IRPT_EN_OFFSET)   = 0; // сигнальные IRQ не используем, только статус-биты (polling)
+    // ВАЖНО (см. живой баг, найденный на этом самом шаге, ROADMAP.md 4.5):
+    // сигнальные IRQ (IRPT_EN) НЕЛЬЗЯ включать здесь. GIC-линия общая с
+    // Wi-Fi SDIO (см. IRQ_MMC_SHARED_BADGE в main.cpp), root её только
+    // Ack'ает и сигналит нотификацию — САМ статусный бит в EMMC_INTERRUPT
+    // при этом НЕ сбрасывается (это делает только код ниже, в
+    // emmc_wait_irpt_bit). Поскольку линия level-triggered, а во время
+    // ЭТОЙ функции blk_driver ещё не читает нотификацию (сидит в старом
+    // busy-yield на статус-регистре), GIC переретриггерит тот же IRQ на
+    // КАЖДОЙ итерации root'а мгновенно после Ack — реальный IRQ-шторм в
+    // процессе root, который вообще не даёт scheduler'у дойти до
+    // blk_driver, чтобы тот наконец сбросил бит. Ровно так и подвис boot
+    // сразу после первой же команды EMMC во время написания этого кода.
+    // IRPT_EN включается только ПОСЛЕ успешной инициализации (см. main(),
+    // g_emmc_irq_ready) — до этого статус-биты доступны только опросом.
+    *emmc_reg(EMMC_IRPT_EN_OFFSET)   = 0;
     *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF;
 
     // Базовая частота EMMC2 на BCM2711 — фиксированные 100MHz (DT clocks =
@@ -308,6 +435,14 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     // 0x02 -> 100MHz/(2*2) = 25MHz (рабочая стадия, standard speed).
     emmc_set_clock_divider(0x02);
 
+    // Фаза 4.5/ADMA2 (см. ROADMAP.md) — режим DMA-select персистентный (не
+    // per-команда, как EMMC_TM_DMA_EN), поэтому включаем один раз здесь, до
+    // ЛЮБОГО реального чтения/записи сектора (find_fat32_partition() дёргает
+    // hardware_emmc_read() сразу после emmc_init(), см. main()). На обычные
+    // безданные команды (CMD0/CMD2/CMD3/CMD7 выше) DMA Select не влияет —
+    // учитывается контроллером только вместе с EMMC_CMD_ISDATA+DMA_EN.
+    *emmc_reg(EMMC_CONTROL0_OFFSET) = (*emmc_reg(EMMC_CONTROL0_OFFSET) & ~EMMC_C0_DMA_SEL_MASK) | EMMC_C0_DMA_SEL_ADMA2_32;
+
     return true;
 }
 
@@ -315,21 +450,37 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
 // (CMD18/CMD25), чтобы не связываться с auto-CMD12/CMD23 на первом проходе.
 // FAT32-слой запрашивает не больше 8 секторов (1 страница SHM) за вызов, так
 // что цикл по count здесь совсем короткий.
+//
+// Фаза 4.5/ADMA2 (см. ROADMAP.md): вместо цикла на 128 MMIO-слов через
+// EMMC_DATA — один ADMA2-дескриптор на сектор в некэшируемом bounce-буфере
+// (см. blk_dma_buf()/blk_dma_desc() выше). Один memcpy на сектор между
+// bounce-буфером и buffer вызывающего (может быть на стеке fat32.cpp) —
+// дёшево по сравнению с самим SD-обменом.
 bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
     if (count == 0 || count > 8) return false;
-    uint32_t* out = (uint32_t*)buffer;
+    if (g_blk_dma_paddr == 0) return false;
+    uint8_t* out = (uint8_t*)buffer;
 
     for (uint32_t i = 0; i < count; i++) {
+        volatile Adma2Descriptor32* desc = blk_dma_desc();
+        desc->attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN);
+        desc->length = 512;
+        desc->addr = g_blk_dma_paddr + BLK_DMA_BUF_OFFSET;
+
         if (!emmc_wait_dat_ready()) return false;
+        *emmc_reg(EMMC_ADMA_SYSADDR_OFFSET) = g_blk_dma_paddr + BLK_DMA_DESC_OFFSET;
         *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (1u << 16) | 512;
 
         uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
-                            | EMMC_CMD_ISDATA | EMMC_TM_DAT_DIR_READ;
+                            | EMMC_CMD_ISDATA | EMMC_TM_DAT_DIR_READ | EMMC_TM_DMA_EN;
         if (!emmc_send_cmd(cmd_flags, EMMC_CMD_READ_SINGLE, g_partition_start_sector + sector + i)) return false;
 
-        if (!emmc_wait_irpt_bit(EMMC_INT_READ_RDY)) return false;
-        for (int w = 0; w < 128; w++) out[i * 128 + w] = *emmc_reg(EMMC_DATA_OFFSET);
+        // ADMA2 сам гоняет данные между картой и памятью — READ_RDY (чисто
+        // PIO-семантика "слово готово в FIFO") здесь не ждём, только конец
+        // всего переноса.
         if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+
+        my_memcpy(out + i * 512, (const void*)blk_dma_buf(), 512);
     }
     return true;
 }
@@ -337,17 +488,25 @@ bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
 bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
     if (!RPI4_EMMC_ALLOW_WRITE) return false;
     if (count == 0 || count > 8) return false;
-    const uint32_t* in = (const uint32_t*)buffer;
+    if (g_blk_dma_paddr == 0) return false;
+    const uint8_t* in = (const uint8_t*)buffer;
 
     for (uint32_t i = 0; i < count; i++) {
+        my_memcpy((void*)blk_dma_buf(), in + i * 512, 512);
+
+        volatile Adma2Descriptor32* desc = blk_dma_desc();
+        desc->attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN);
+        desc->length = 512;
+        desc->addr = g_blk_dma_paddr + BLK_DMA_BUF_OFFSET;
+
         if (!emmc_wait_dat_ready()) return false;
+        *emmc_reg(EMMC_ADMA_SYSADDR_OFFSET) = g_blk_dma_paddr + BLK_DMA_DESC_OFFSET;
         *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (1u << 16) | 512;
 
-        uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN | EMMC_CMD_ISDATA;
+        uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
+                            | EMMC_CMD_ISDATA | EMMC_TM_DMA_EN;
         if (!emmc_send_cmd(cmd_flags, EMMC_CMD_WRITE_SINGLE, g_partition_start_sector + sector + i)) return false;
 
-        if (!emmc_wait_irpt_bit(EMMC_INT_WRITE_RDY)) return false;
-        for (int w = 0; w < 128; w++) *emmc_reg(EMMC_DATA_OFFSET) = in[i * 128 + w];
         if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
     }
     return true;
@@ -418,6 +577,9 @@ int main(int argc, char *argv[]) {
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr my_ep   = ipc->msg[7]; // BOOT_BLK_EP
+    g_emmc_irq_ntfn = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO (см. main.cpp)
+    g_root_ep = root_ep; // см. notify_root_irq_handled()/SYS_MMC_IRQ_ACK
+    g_blk_dma_paddr = ipc->msg[BOOT_BLK_DMA_PADDR]; // Фаза 4.5/ADMA2, см. blk_dma_buf()/blk_dma_desc() выше
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -493,6 +655,20 @@ int main(int argc, char *argv[]) {
         }
     } else {
         sys_puts(console_ep, "[BLK] FAT32 mount failed.\n");
+    }
+
+    // Только теперь безопасно включать реальный сигнальный IRQ (см. живой
+    // баг и подробный комментарий в emmc_init() у EMMC_IRPT_EN_OFFSET) — ВСЯ
+    // наша собственная инициализация (emmc_init + поиск раздела + монтирование
+    // FAT32 + cd в рабочую директорию, все они тоже гоняют EMMC-команды через
+    // emmc_send_cmd/emmc_wait_irpt_bit) уже прошла на старом проверенном
+    // busy-yield. Раньше эта строка стояла СРАЗУ после emmc_init() — из-за
+    // этого поиск раздела/монтирование FAT32 (которые тоже дергают железо)
+    // первыми же попадали под совершенно новый, ещё не обкатанный
+    // событийный путь ещё до готовности драйвера, и именно там подвисало.
+    if (g_emmc_irq_ntfn != 0) {
+        *emmc_reg(EMMC_IRPT_EN_OFFSET) = EMMC_INT_ALL_EN;
+        g_emmc_irq_ready = true;
     }
 
     seL4_SetMR(0, SYS_DRIVER_READY);
