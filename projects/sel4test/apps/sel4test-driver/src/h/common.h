@@ -41,5 +41,16 @@ constexpr seL4_Word SYS_DRIVER_READY = 109;
 // синхронизации порядка где-либо еще.
 constexpr seL4_Word SYS_WAIT_ALL_DRIVERS_READY = 110;
 
+// wifi_driver больше не запускается при загрузке (см. ROADMAP.md/main.cpp —
+// подозрение на гонку мапинга/таймингов при одновременном спавне с
+// остальными драйверами, из-за которой изредка не успевал возникать
+// готовый sdpcm-канал). Теперь его жизненным циклом управляет шелл через
+// команду "wifi start/stop/restart" — три новых сисколла ниже, по образцу
+// SYS_EXEC/SYS_KILL/SYS_RECOVER, но специфичные для wifi_driver (не требуют
+// передачи имени процесса, рутсервер и так знает, кого спавнить/убивать).
+constexpr seL4_Word SYS_START_WIFI  = 130; // спавнит wifi_driver, если ещё не запущен
+constexpr seL4_Word SYS_STOP_WIFI   = 131; // убивает wifi_driver БЕЗ автореспавна
+constexpr seL4_Word SYS_WIFI_STATUS = 132; // MR0: 0=не запущен, 1=запущен но не готов, 2=готов принимать команды
+
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/platform.h"
 #include <stdint.h>
 
 // Адреса для синхронизации доступа к VFS и TTY
@@ -9,18 +10,24 @@
 // Системные часы (SYS_GET_TIME) всегда хранятся в UTC — здесь только отображение.
 static const int TZ_OFFSET_HOURS = 3;
 
-// Ширина терминала для автоматического переноса длинных строк (см. sys_puts
-// ниже) — большинство serial-консолей (minicom/screen/QEMU chardev), которыми
-// реально подключаются к этой ОС, сами не переносят строки по словам, а
-// просто обрезают/наезжают текст при достижении края экрана.
-static const int SHELL_TERM_WIDTH = 80;
-
 // Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
 static char ls_thread_stack[16384] __attribute__((aligned(16)));
 static char grep_thread_stack[16384] __attribute__((aligned(16)));
 
 static char* shm_base = nullptr;
 static volatile int* vfs_spinlock_ptr = nullptr;
+
+// Милстоун 4.4 (см. wifi_driver.cpp) — "знакомые сети" (PATH_WIFI_PQW,
+// строки "имясети|пароль"). Буферы для чтения/перезаписи файла целиком
+// (у blk_driver нет append, см. net_driver.cpp/platform.h) — статические
+// (не в стеке main()), по тому же принципу, что ls_thread_stack/cmd_history
+// выше: единственный поток шелла обрабатывает одну команду за раз, повторный
+// вход невозможен, а 2x4000 байт на стеке main() было бы неоправданным риском.
+static char g_pqw_old[4000];
+static char g_pqw_new[4000];
+// SSID сети, к которой шелл последний раз успешно подключился этой сессией
+// (используется командой "wifi clean" без явного имени сети — см. ниже).
+static char g_wifi_current_ssid[33] = {0};
 
 // ВАЖНО: обычные volatile чтение/запись, БЕЗ __sync_lock_test_and_set/
 // __sync_lock_release. Разделяемая SHM (см. vfs_spinlock_ptr ниже) мапится
@@ -60,86 +67,17 @@ static seL4_Word my_strlen(const char *s);
 static void sys_write(int fd, const char* str);
 static char sys_read_fd(int fd);
 
-// Текущая колонка курсора на терминале и флаг "внутри ANSI CSI-
-// последовательности" — оба персистентны МЕЖДУ вызовами sys_puts, т.к. одна
-// логическая строка вывода в этом файле почти всегда строится несколькими
-// последовательными вызовами sys_puts (см. print_ip/print_localtime/
-// sys_putdec и т.п. ниже), а одна ANSI-последовательность (курсор/очистка
-// строки в редакторе командной строки, см. цикл ввода в main()) может быть
-// точно так же разбита по кусочкам, например "\x1b[" + sys_putdec(N) + "D".
-static int  g_console_col       = 0;
-static bool g_console_in_escape = false;
-
-// Допечатывает накопленное слово с учетом переноса на SHELL_TERM_WIDTH и
-// сбрасывает буфер слова. Вынесено отдельно, т.к. нужно вызывать из
-// нескольких точек sys_puts (пробел/перевод строки/ESC/конец вызова).
-static void sys_puts_flush_word(char *word, int *word_len) {
-    if (*word_len == 0) return;
-    if (g_console_col > 0 && g_console_col + *word_len > SHELL_TERM_WIDTH) {
-        sys_write(1, "\n");
-        g_console_col = 0;
-    }
-    word[*word_len] = '\0';
-    sys_write(1, word);
-    g_console_col += *word_len;
-    *word_len = 0;
-}
-
-// Единая защищенная функция вывода. Помимо самой записи в stdout, переносит
-// длинные строки по границам слов на ширину SHELL_TERM_WIDTH — большинство
-// serial-консолей, которыми реально пользуются с этой ОС (minicom/screen/
-// QEMU chardev), сами не переносят строки, а обрезают/наезжают текст при
-// достижении края экрана. ANSI CSI-последовательности (используются для
-// курсора/очистки строки в редакторе командной строки) проходят насквозь,
-// не считаются в колонку и никогда не разрываются переносом.
+// Перенос длинных строк по словам теперь делает uart_driver.cpp (единственный
+// процесс, через который реально проходит SYS_PUTS от ЛЮБОГО клиента —
+// shell/wifi_driver/net_driver/blk_driver и т.д.) — раньше это делалось
+// только здесь и только для того, что печатает сам шелл, из-за чего
+// диагностические строки других драйверов вообще не переносились, а
+// собственный перенос шелла к тому же считал длину строки в БАЙТАХ UTF-8
+// вместо видимых символов (кириллица преждевременно вызывала перенос).
+// Здесь остаётся простая пересылка — вся логика переноса теперь в одном
+// месте, см. uart_putc_wrapped()/uart_flush_word() в uart_driver.cpp.
 static void sys_puts(seL4_CPtr _ignored, const char *str) {
-    char word[SHELL_TERM_WIDTH + 1];
-    int word_len = 0;
-
-    for (const char *p = str; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-
-        if (g_console_in_escape) {
-            char buf[2] = {(char)c, 0};
-            sys_write(1, buf);
-            if (c >= 0x40 && c <= 0x7E) g_console_in_escape = false;
-            continue;
-        }
-
-        if (c == 27) { // ESC — начало ANSI CSI-последовательности
-            sys_puts_flush_word(word, &word_len);
-            g_console_in_escape = true;
-            char buf[2] = {(char)c, 0};
-            sys_write(1, buf);
-            continue;
-        }
-
-        if (c == '\n' || c == '\r') {
-            sys_puts_flush_word(word, &word_len);
-            char buf[2] = {(char)c, 0};
-            sys_write(1, buf);
-            g_console_col = 0;
-            continue;
-        }
-
-        if (c == ' ') {
-            sys_puts_flush_word(word, &word_len);
-            if (g_console_col >= SHELL_TERM_WIDTH) {
-                sys_write(1, "\n");
-                g_console_col = 0;
-            } else {
-                sys_write(1, " ");
-                g_console_col++;
-            }
-            continue;
-        }
-
-        if (word_len >= SHELL_TERM_WIDTH) {
-            sys_puts_flush_word(word, &word_len); // Само слово длиннее ширины терминала — форсируем разрыв
-        }
-        word[word_len++] = (char)c;
-    }
-    sys_puts_flush_word(word, &word_len);
+    sys_write(1, str);
 }
 
 // Helper to print a 64-bit value in hex via IPC.
@@ -542,6 +480,42 @@ static void sys_recover(const char* driver_name) {
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 5));
 }
 
+// Ручной жизненный цикл Wi-Fi (см. common.h SYS_START_WIFI/SYS_STOP_WIFI/
+// SYS_WIFI_STATUS — wifi_driver больше не спавнится при загрузке, подозрение
+// на гонку мапинга/таймингов при одновременном спавне с остальными
+// драйверами, см. ROADMAP.md/память проекта). В отличие от sys_recover()
+// выше, имя процесса передавать не нужно — рутсервер сам ищет "wifi_driver".
+static int sys_start_wifi() {
+    seL4_CPtr root_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
+    seL4_SetMR(0, SYS_START_WIFI);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (int)seL4_GetMR(0);
+}
+
+static int sys_stop_wifi() {
+    seL4_CPtr root_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
+    seL4_SetMR(0, SYS_STOP_WIFI);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (int)seL4_GetMR(0);
+}
+
+// Возвращает 0 (не запущен) / 1 (запущен, ещё не готов) / 2 (готов принимать
+// WIFI_CMD_*). Любой seL4_Call(wifi_ep, ...) ДО статуса 2 рискует зависнуть
+// навсегда — до Милстоуна с ручным стартом wifi_driver всегда был жив к
+// моменту, когда шелл печатал приглашение, так что этой проверки нигде не
+// требовалось; теперь любая команда, зовущая wifi_ep, обязана проверять это.
+static int sys_wifi_status() {
+    seL4_CPtr root_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
+    seL4_SetMR(0, SYS_WIFI_STATUS);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    return (int)seL4_GetMR(0);
+}
+
+static void wifi_print_not_ready(seL4_CPtr console_ep, int status) {
+    if (status == 0) sys_puts(console_ep, "wifi_driver is not running — run 'wifi start' first.\n");
+    else sys_puts(console_ep, "wifi_driver is still starting up (SDIO/firmware bring-up) — try again shortly.\n");
+}
+
 // Возвращает true, если mailbox разблокировался сам (операция реально
 // завершилась), false — если пришлось снимать блокировку по таймауту (см.
 // использование в "ping": печатать статистику серии имеет смысл только в
@@ -659,6 +633,127 @@ static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
     int ret_val = seL4_GetMR(0);
     vfs_unlock();
     return ret_val;
+}
+
+// --- "Знакомые сети" Wi-Fi (Милстоун 4.4, см. wifi_driver.cpp) ---
+// Формат PATH_WIFI_PQW: одна сеть на строку, "имясети|пароль". Всё через
+// тот же синхронный blk_ep-протокол (SYS_TOUCH=112/SYS_READ_TEXT_FILE=114/
+// SYS_WRITE_FILE=113), что уже используют "touch"/"cat"/"echo >" — блокирует
+// только сам обработчик команды "wifi ..." в шелле (однопоточном, обрабатывает
+// одну команду за раз в любом случае), а не фоновый цикл какого-то ДРУГОГО
+// процесса — это другой класс проблемы, чем тот, что решался mailbox-паттерном
+// в net_driver.cpp (там блокировался чужой поллинг-цикл). Поэтому здесь
+// достаточно обычного vfs_syscall()/vfs_lock(), без seL4_Send+mailbox.
+
+// Создаёт PATH_WIFI_PQW, если файла ещё нет. Возвращает false только при
+// ошибке самого создания (SYS_TOUCH), не при "файл уже существует".
+static bool wifi_pqw_ensure_file(seL4_CPtr console_ep, seL4_CPtr blk_ep, bool verbose) {
+    build_absolute_path(shm_base, PATH_WIFI_PQW, SHM_TOTAL_SIZE);
+    if (vfs_syscall(114, blk_ep) == 0) { // SYS_READ_TEXT_FILE — уже существует
+        if (verbose) sys_puts(console_ep, "[WIFI][PQW] файл знакомых сетей уже существует.\n");
+        return true;
+    }
+    build_absolute_path(shm_base, PATH_WIFI_PQW, SHM_TOTAL_SIZE);
+    bool ok = vfs_syscall(112, blk_ep) == 0; // SYS_TOUCH
+    if (verbose) {
+        sys_puts(console_ep, ok ? "[WIFI][PQW] файл отсутствовал, создан пустым.\n"
+                                : "[WIFI][PQW] файл отсутствовал, ОШИБКА создания.\n");
+    }
+    return ok;
+}
+
+// Читает PATH_WIFI_PQW целиком в out_buf. false, если файла нет/пуст на чтение.
+static bool wifi_pqw_read_all(seL4_CPtr blk_ep, char* out_buf, int out_cap) {
+    build_absolute_path(shm_base, PATH_WIFI_PQW, SHM_TOTAL_SIZE);
+    if (vfs_syscall(114, blk_ep) != 0) { out_buf[0] = '\0'; return false; }
+    my_strlcpy(out_buf, shm_base, out_cap);
+    return true;
+}
+
+// Ищет строку вида "ssid|пароль" в filedata; при находке копирует пароль в
+// pass_out. Строки разделены '\n' (как их пишет wifi_pqw_rewrite() ниже).
+static bool wifi_pqw_find(const char* filedata, const char* ssid, char* pass_out, int pass_cap) {
+    int ssid_len = (int)my_strlen(ssid);
+    const char* line = filedata;
+    while (*line) {
+        const char* line_end = line;
+        while (*line_end && *line_end != '\n') line_end++;
+
+        bool match = (int)(line_end - line) > ssid_len && line[ssid_len] == '|';
+        for (int i = 0; match && i < ssid_len; i++) if (line[i] != ssid[i]) match = false;
+
+        if (match) {
+            const char* pass_start = line + ssid_len + 1;
+            int i = 0;
+            while (pass_start + i < line_end && i < pass_cap - 1) { pass_out[i] = pass_start[i]; i++; }
+            pass_out[i] = '\0';
+            return true;
+        }
+        line = (*line_end == '\n') ? line_end + 1 : line_end;
+    }
+    return false;
+}
+
+// Перезаписывает PATH_WIFI_PQW целиком (у blk_driver нет append — см.
+// net_driver.cpp/platform.h). mode: 0=upsert(ssid,pass) — обновляет пароль,
+// если сеть уже известна, иначе добавляет новую строку; 1=remove(ssid) —
+// убирает строку сети; 2=очистить всё (ssid/pass игнорируются).
+static bool wifi_pqw_rewrite(seL4_CPtr console_ep, seL4_CPtr blk_ep, const char* old_data,
+                              int mode, const char* ssid, const char* pass, bool verbose) {
+    int out_len = 0;
+    bool found = false;
+    int ssid_len = ssid ? (int)my_strlen(ssid) : 0;
+    int pass_len = pass ? (int)my_strlen(pass) : 0;
+
+    if (mode != 2) {
+        const char* line = old_data;
+        while (*line) {
+            const char* line_end = line;
+            while (*line_end && *line_end != '\n') line_end++;
+            int line_len = (int)(line_end - line);
+
+            bool match = line_len > ssid_len && line[ssid_len] == '|';
+            for (int i = 0; match && i < ssid_len; i++) if (line[i] != ssid[i]) match = false;
+
+            if (match) {
+                found = true;
+                if (mode == 0 && out_len + ssid_len + 1 + pass_len + 1 < (int)sizeof(g_pqw_new)) {
+                    for (int i = 0; i < ssid_len; i++) g_pqw_new[out_len++] = ssid[i];
+                    g_pqw_new[out_len++] = '|';
+                    for (int i = 0; i < pass_len; i++) g_pqw_new[out_len++] = pass[i];
+                    g_pqw_new[out_len++] = '\n';
+                } // mode==1 (remove) — просто не копируем эту строку дальше
+            } else if (line_len > 0 && out_len + line_len + 1 < (int)sizeof(g_pqw_new)) {
+                for (int i = 0; i < line_len; i++) g_pqw_new[out_len++] = line[i];
+                g_pqw_new[out_len++] = '\n';
+            }
+
+            line = (*line_end == '\n') ? line_end + 1 : line_end;
+        }
+        if (mode == 0 && !found && out_len + ssid_len + 1 + pass_len + 1 < (int)sizeof(g_pqw_new)) {
+            for (int i = 0; i < ssid_len; i++) g_pqw_new[out_len++] = ssid[i];
+            g_pqw_new[out_len++] = '|';
+            for (int i = 0; i < pass_len; i++) g_pqw_new[out_len++] = pass[i];
+            g_pqw_new[out_len++] = '\n';
+        }
+    }
+    g_pqw_new[out_len] = '\0';
+
+    build_absolute_path(shm_base, PATH_WIFI_PQW, 128);
+    my_strlcpy(shm_base + 128, g_pqw_new, SHM_TOTAL_SIZE - 128);
+
+    vfs_lock();
+    seL4_SetMR(0, 113); // SYS_WRITE_FILE
+    seL4_SetMR(1, (seL4_Word)out_len);
+    seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    int ret_val = (int)seL4_GetMR(0);
+    vfs_unlock();
+
+    if (verbose) {
+        sys_puts(console_ep, ret_val == 0 ? "[WIFI][PQW] файл знакомых сетей обновлён.\n"
+                                           : "[WIFI][PQW] ОШИБКА записи файла знакомых сетей.\n");
+    }
+    return ret_val == 0;
 }
 
 static void sys_pipe_wr_close(int fd) {
@@ -1216,11 +1311,16 @@ int main(int argc, char *argv[]) {
                 // SDIO-хост-бринг-апа. В отличие от net-команд выше, это
                 // мгновенный синхронный запрос (просто отдаёт последние
                 // сохранённые значения CMD5/CMD52), поэтому seL4_Call вместо
-                // seL4_Send+mailbox-poll.
+                // seL4_Send+mailbox-poll. wifi_driver теперь стартует вручную
+                // ("wifi start") — без проверки статуса этот seL4_Call
+                // повис бы навсегда, если никто не слушает wifi_ep.
                 if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+                int probe_status = sys_wifi_status();
+                if (probe_status != 2) { wifi_print_not_ready(console_ep, probe_status); continue; }
 
                 seL4_SetMR(0, 1); // WIFI_CMD_PROBE_STATUS
-                seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_SetMR(1, 0); // "-l" не поддерживается этой командой (нет протокольной активности, нечего скрывать/показывать) — но MR1 обязателен: wifi_driver безусловно читает его как бит подробности для ЛЮБОЙ команды.
+                seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 seL4_Word status   = seL4_GetMR(0);
                 seL4_Word ocr      = seL4_GetMR(1);
                 seL4_Word cccr     = seL4_GetMR(2);
@@ -1239,52 +1339,225 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "wifi") == 0) {
-                // Милстоун 4.4 (см. wifi_driver.cpp: wifi_connect()) —
-                // SSID/пароль не влезают в message registers, передаём через
-                // разделяемую SHM (те же смещения, что WIFI_SHM_*_OFFSET в
-                // wifi_driver.cpp — область 8192+ ничем больше не занята,
-                // см. vfs_spinlock_ptr на 4096 выше). seL4_Call, как
-                // wifiprobe, но может занять до ~15с (см. wifi_driver.cpp
-                // wifi_wait_for_join_result) — шелл будет заблокирован,
-                // пока прошивка не завершит (или не провалит) handshake.
-                if (!arg) { sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n"); continue; }
+                static const char *WIFI_USAGE =
+                    "Usage: wifi start|stop|restart [-l]\n"
+                    "       wifi scan [-l]\n"
+                    "       wifi connect <ssid> [password] [-l] [&&save]\n"
+                    "       wifi clean [all] [-l]\n";
+                if (!arg) { sys_puts(console_ep, WIFI_USAGE); continue; }
                 char *cursor = arg;
                 char *subcmd = next_token(&cursor);
-                if (!subcmd || my_strcmp(subcmd, "connect") != 0) {
-                    sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n");
-                    continue;
+                if (!subcmd) { sys_puts(console_ep, WIFI_USAGE); continue; }
+
+                // --- start/stop/restart: жизненный цикл процесса wifi_driver
+                // (см. common.h SYS_START_WIFI/SYS_STOP_WIFI). Не трогают
+                // wifi_ep вообще — идут на root_ep, поэтому безопасны, даже
+                // если wifi_driver сейчас не запущен. "-l" — подождать и
+                // напечатать финальный статус (до ~20с); без него команда
+                // возвращается сразу же, не блокируя шелл (собственные логи
+                // бринг-апа wifi_driver и так печатаются в ту же консоль по
+                // мере готовности, независимо от -l).
+                if (my_strcmp(subcmd, "start") == 0 || my_strcmp(subcmd, "restart") == 0) {
+                    bool verbose = false;
+                    char *tok;
+                    while ((tok = next_token(&cursor)) != nullptr) if (my_strcmp(tok, "-l") == 0) verbose = true;
+
+                    if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+
+                    if (my_strcmp(subcmd, "restart") == 0) {
+                        sys_stop_wifi(); // без эффекта, если уже не запущен
+                    }
+                    // Бит подробности для ФОНОВОГО bring-up — должен лежать в SHM
+                    // ДО спавна процесса (см. WIFI_SHM_VERBOSE_OFFSET в
+                    // wifi_driver.cpp: main() читает его один раз в самом начале,
+                    // до отправки WIFI_CMD_* тут вообще возможно).
+                    shm[8296] = verbose ? 1 : 0;
+                    int r = sys_start_wifi();
+                    if (r == 0) sys_puts(console_ep, "wifi_driver starting (SDIO/firmware bring-up in background)...\n");
+                    else if (r == 1) sys_puts(console_ep, "wifi_driver is already running.\n");
+                    else sys_puts(console_ep, "Failed to start wifi_driver.\n");
+
+                    // ВАЖНО: НЕ трогаем /wifi/pqw.txt сразу после свежего "start"
+                    // (r==0) — wifi_driver в этот момент ещё вовсю печатает свой
+                    // собственный лог бринг-апа в тот же console_ep, и blk_ep-вызов
+                    // отсюда (тоже пишущий в console_ep через wifi_pqw_ensure_file)
+                    // гонится с ним и рвёт строки друг друга (подтверждено на
+                    // живом железе — см. память проекта). Если driver уже был
+                    // запущен (r==1), бринг-ап давно закончился — трогать файл
+                    // сразу безопасно. Если r==0 и указан -l, ждём готовности
+                    // (бринг-ап гарантированно завершён к этому моменту) и только
+                    // тогда трогаем файл; без -l полагаемся на то, что "wifi connect"
+                    // сделает ту же проверку позже (она уже ждёт status==2 первой).
+                    if (r == 1) wifi_pqw_ensure_file(console_ep, blk_ep, verbose);
+
+                    if (verbose && r == 0) {
+                        int st = sys_wifi_status();
+                        for (int i = 0; i < 100 && st == 1; i++) { sys_sleep(timer_ep, 200); st = sys_wifi_status(); }
+                        sys_puts(console_ep, st == 2 ? "wifi_driver ready.\n" : "wifi_driver still not ready (see boot log above).\n");
+                        if (st == 2) wifi_pqw_ensure_file(console_ep, blk_ep, verbose);
+                    }
                 }
-                char *ssid = next_token(&cursor);
-                char *pass = cursor;
-                while (pass && *pass == ' ') pass++;
-                if (!ssid || !pass || pass[0] == '\0') {
-                    sys_puts(console_ep, "Usage: wifi connect <ssid> <password>\n");
-                    continue;
+
+                else if (my_strcmp(subcmd, "stop") == 0) {
+                    bool verbose = false;
+                    char *tok;
+                    while ((tok = next_token(&cursor)) != nullptr) if (my_strcmp(tok, "-l") == 0) verbose = true;
+                    (void)verbose;
+
+                    int r = sys_stop_wifi();
+                    sys_puts(console_ep, r == 0 ? "wifi_driver stopped.\n" : "wifi_driver was not running.\n");
+                    g_wifi_current_ssid[0] = '\0';
                 }
-                if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
 
-                uint32_t ssid_len = 0; while (ssid[ssid_len] && ssid_len < 32) ssid_len++;
-                uint32_t pass_len = 0; while (pass[pass_len] && pass_len < 63) pass_len++;
+                // --- scan: переиспользует диагностический слепой escan из
+                // wifi_driver.cpp (Милстоун 4.4) — печатает сырые
+                // event_type/status, БЕЗ декодирования списка SSID/BSS (это
+                // отдельная, более крупная задача).
+                else if (my_strcmp(subcmd, "scan") == 0) {
+                    bool verbose = false;
+                    uint32_t timeout_s = 30; // по умолчанию — прежнее поведение (полный проход 2.4+5ГГц)
+                    uint32_t band = 0;       // 0 = оба диапазона (слепой скан, как раньше)
+                    char *tok;
+                    while ((tok = next_token(&cursor)) != nullptr) {
+                        if (my_strcmp(tok, "-l") == 0) {
+                            verbose = true;
+                        } else if (my_strcmp(tok, "-t") == 0) {
+                            char *val = next_token(&cursor);
+                            if (val) timeout_s = (uint32_t)simple_atoi(val);
+                        } else if (my_strcmp(tok, "-f") == 0) {
+                            char *val = next_token(&cursor);
+                            if (val) band = (uint32_t)simple_atoi(val);
+                        }
+                    }
+                    if (timeout_s == 0) timeout_s = 30;
+                    if (band != 2 && band != 5) band = 0;
 
-                *(uint32_t*)(shm + 8192) = ssid_len;
-                for (uint32_t i = 0; i < 32; i++) (shm + 8196)[i] = (i < ssid_len) ? ssid[i] : '\0';
-                *(uint32_t*)(shm + 8228) = pass_len;
-                for (uint32_t i = 0; i < 64; i++) (shm + 8232)[i] = (i < pass_len) ? pass[i] : '\0';
+                    if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+                    int st = sys_wifi_status();
+                    if (st != 2) { wifi_print_not_ready(console_ep, st); continue; }
 
-                sys_puts(console_ep, "Connecting to \""); sys_puts(console_ep, ssid);
-                sys_puts(console_ep, "\" (WPA2-PSK) — this can take up to ~15s while firmware completes the 4-way handshake...\n");
+                    sys_puts(console_ep, "Scanning (");
+                    sys_puts(console_ep, band == 0 ? "2.4+5GHz" : (band == 2 ? "2.4GHz only" : "5GHz only"));
+                    sys_puts(console_ep, ", up to ~"); sys_putdec(timeout_s); sys_puts(console_ep, "s)...\n");
+                    seL4_SetMR(0, 3); // WIFI_CMD_SCAN (см. wifi_driver.cpp)
+                    seL4_SetMR(1, verbose ? 1 : 0); // "-l" — подробный лог самого драйвера на время этой команды
+                    seL4_SetMR(2, timeout_s);       // "-t" — сколько секунд слушать результаты
+                    seL4_SetMR(3, band);             // "-f" — 0=оба диапазона, 2=только 2.4ГГц, 5=только 5ГГц
+                    seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 4));
+                    seL4_Word scan_status = seL4_GetMR(0);
+                    seL4_Word events_seen = seL4_GetMR(1);
+                    if (scan_status == 0) {
+                        sys_puts(console_ep, "Scan done. Events seen: "); sys_putdec(events_seen); sys_puts(console_ep, "\n");
+                    } else {
+                        sys_puts(console_ep, "Scan failed (see driver log above).\n");
+                    }
+                }
 
-                seL4_SetMR(0, 2); // WIFI_CMD_CONNECT
-                seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-                seL4_Word result = seL4_GetMR(0);
-                seL4_Word reason = seL4_GetMR(1);
+                // --- connect <ssid> [password] [-l] [&&save]: как раньше,
+                // плюс необязательный пароль (если сеть уже "знакома" — см.
+                // /wifi/pqw.txt) и необязательное сохранение в знакомые.
+                else if (my_strcmp(subcmd, "connect") == 0) {
+                    char *ssid = next_token(&cursor);
+                    if (!ssid) { sys_puts(console_ep, WIFI_USAGE); continue; }
+                    char *pass = nullptr;
+                    bool verbose = false;
+                    bool do_save = false;
+                    char *tok;
+                    while ((tok = next_token(&cursor)) != nullptr) {
+                        if (my_strcmp(tok, "-l") == 0) verbose = true;
+                        else if (my_strcmp(tok, "&&save") == 0) do_save = true;
+                        else if (!pass) pass = tok;
+                    }
 
-                if (result == 0) {
-                    sys_puts(console_ep, "Connected!\n");
-                } else {
-                    sys_puts(console_ep, "Connect FAILED (code "); sys_putdec(result);
-                    sys_puts(console_ep, ", reason "); sys_putdec(reason);
-                    sys_puts(console_ep, ") — see driver log above for details.\n");
+                    if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+                    int st = sys_wifi_status();
+                    if (st != 2) { wifi_print_not_ready(console_ep, st); continue; }
+
+                    wifi_pqw_ensure_file(console_ep, blk_ep, verbose);
+
+                    char known_pass[64];
+                    if (!pass) {
+                        if (!wifi_pqw_read_all(blk_ep, g_pqw_old, sizeof(g_pqw_old)) ||
+                            !wifi_pqw_find(g_pqw_old, ssid, known_pass, sizeof(known_pass))) {
+                            sys_puts(console_ep, "Unknown network — provide a password: wifi connect <ssid> <password>\n");
+                            continue;
+                        }
+                        pass = known_pass;
+                        if (verbose) sys_puts(console_ep, "[WIFI][PQW] using saved password for known network.\n");
+                    }
+
+                    // Сохраняем В ФАЙЛ СРАЗУ по факту запроса "&&save", не
+                    // дожидаясь результата подключения — пароль, который ввёл
+                    // пользователь, стоит запомнить независимо от того, окажется
+                    // ли ТЕКУЩАЯ попытка join неудачной по другой причине (AP
+                    // временно недоступна и т.п.), иначе "&&save" пришлось бы
+                    // повторять при каждой попытке до первого успеха.
+                    if (do_save) {
+                        if (wifi_pqw_read_all(blk_ep, g_pqw_old, sizeof(g_pqw_old))) {
+                            wifi_pqw_rewrite(console_ep, blk_ep, g_pqw_old, /*mode=*/0, ssid, pass, verbose);
+                        }
+                    }
+
+                    uint32_t ssid_len = 0; while (ssid[ssid_len] && ssid_len < 32) ssid_len++;
+                    uint32_t pass_len = 0; while (pass[pass_len] && pass_len < 63) pass_len++;
+
+                    *(uint32_t*)(shm + 8192) = ssid_len;
+                    for (uint32_t i = 0; i < 32; i++) (shm + 8196)[i] = (i < ssid_len) ? ssid[i] : '\0';
+                    *(uint32_t*)(shm + 8228) = pass_len;
+                    for (uint32_t i = 0; i < 64; i++) (shm + 8232)[i] = (i < pass_len) ? pass[i] : '\0';
+
+                    sys_puts(console_ep, "Connecting to \""); sys_puts(console_ep, ssid);
+                    sys_puts(console_ep, "\" (WPA2-PSK) — this can take up to ~15s while firmware completes the 4-way handshake...\n");
+
+                    seL4_SetMR(0, 2); // WIFI_CMD_CONNECT
+                    seL4_SetMR(1, verbose ? 1 : 0); // "-l" — подробный лог самого драйвера на время этой команды
+                    seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                    seL4_Word result = seL4_GetMR(0);
+                    seL4_Word reason = seL4_GetMR(1);
+
+                    if (result == 0) {
+                        sys_puts(console_ep, "Connected!\n");
+                        my_strlcpy(g_wifi_current_ssid, ssid, sizeof(g_wifi_current_ssid));
+                    } else {
+                        sys_puts(console_ep, "Connect FAILED (code "); sys_putdec(result);
+                        sys_puts(console_ep, ", reason "); sys_putdec(reason);
+                        sys_puts(console_ep, ") — see driver log above for details.\n");
+                    }
+                }
+
+                // --- clean [all] [-l]: убрать сохранённый пароль сети, к
+                // которой сейчас подключены ("текущее подключение"), либо
+                // все знакомые сети разом ("all").
+                else if (my_strcmp(subcmd, "clean") == 0) {
+                    bool verbose = false;
+                    bool clean_all = false;
+                    char *tok;
+                    while ((tok = next_token(&cursor)) != nullptr) {
+                        if (my_strcmp(tok, "-l") == 0) verbose = true;
+                        else if (my_strcmp(tok, "all") == 0) clean_all = true;
+                    }
+
+                    if (clean_all) {
+                        if (wifi_pqw_rewrite(console_ep, blk_ep, "", /*mode=*/2, nullptr, nullptr, verbose)) {
+                            sys_puts(console_ep, "Removed all known networks.\n");
+                            g_wifi_current_ssid[0] = '\0';
+                        } else {
+                            sys_puts(console_ep, "Failed to clear known networks file.\n");
+                        }
+                    } else if (g_wifi_current_ssid[0] == '\0') {
+                        sys_puts(console_ep, "No active connection to clean.\n");
+                    } else if (wifi_pqw_read_all(blk_ep, g_pqw_old, sizeof(g_pqw_old)) &&
+                               wifi_pqw_rewrite(console_ep, blk_ep, g_pqw_old, /*mode=*/1, g_wifi_current_ssid, nullptr, verbose)) {
+                        sys_puts(console_ep, "Removed \""); sys_puts(console_ep, g_wifi_current_ssid);
+                        sys_puts(console_ep, "\" from known networks.\n");
+                        g_wifi_current_ssid[0] = '\0';
+                    } else {
+                        sys_puts(console_ep, "Failed to update known networks file.\n");
+                    }
+                }
+
+                else {
+                    sys_puts(console_ep, WIFI_USAGE);
                 }
             }
 
@@ -1617,7 +1890,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi, touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

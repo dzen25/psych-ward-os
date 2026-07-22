@@ -85,7 +85,21 @@ static void debug_puthex32(const char *label, uint32_t val) {
 static uintptr_t global_elf_temp_vaddr = 0x200100000ULL;
 static uintptr_t global_ipc_temp_vaddr = 0x200800000ULL;
 
-static char* rootserver_shm_base = (char*)0x502000ULL; // Адрес SHM внутри Rootserver-а
+// ИСПРАВЛЕНО (см. память проекта — краш на "wifi restart", 2026-07-20):
+// адрес 0x502000 попадал ВНУТРЬ статического массива pcbs[256] (реальный
+// адрес которого определяет линкер, не мы) — sizeof(ProcessControlBlock)
+// выросло настолько (крипто/join-код Милстоуна 4.4), что диапазон SHM
+// (0x502000..0x506000, те же 4 страницы, что мапятся ниже) целиком
+// перекрывал pcbs[3..9], и запись SSID/пароля в SHM (см. WIFI_SHM_*_OFFSET
+// в wifi_driver.cpp) физически совпадала с pcbs[6].cap_tracker.caps[54..66]
+// — отсюда "капабилити" со значением байт пароля/SSID и краш рутсервера при
+// попытке их Revoke/Delete. Перенесено в тот же "высокий" диапазон адресов
+// (0x2000000000+), что уже используют global_elf_temp_vaddr/
+// global_ipc_temp_vaddr ниже — эти адреса заведомо вне статического образа
+// rootserver'а (vaddr=[400000..7b8fff] по логу загрузки), так что коллизия
+// с pcbs[]/любыми другими статическими данными невозможна в принципе, а не
+// просто "пока не встретилась".
+static char* rootserver_shm_base = (char*)0x200A00000ULL;
 static seL4_CPtr shm_frames[4]; // Массив Capability для 4-х страниц SHM
 
 // rootserver_shm_base мапится КЭШИРУЕМО (см. цикл маппинга в main()), а все
@@ -279,6 +293,15 @@ static seL4_CPtr driver_ready_wait_reply = 0;
 static bool all_drivers_ready() {
     return driver_ready[1] && driver_ready[2] && driver_ready[3] && driver_ready[4];
 }
+
+// Wi-Fi (index 5) сознательно НЕ входит в driver_ready[]/all_drivers_ready()
+// выше (см. их комментарий) — он больше не автоспавнится при загрузке и
+// живёт своим отдельным жизненным циклом (SYS_START_WIFI/SYS_STOP_WIFI/
+// SYS_WIFI_STATUS). true означает "wifi_driver дошёл до своего SYS_DRIVER_READY",
+// т.е. гарантированно уже висит в блокирующем seL4_Recv и готов принимать
+// любые WIFI_CMD_* — даже если сама проба SDIO/прошивки внутри провалилась
+// (в этом случае команды просто вернут код ошибки, а не зависнут).
+static bool g_wifi_driver_ready = false;
 
 static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
     uint32_t total_read = 0;
@@ -672,9 +695,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     return pid;
 }
 
-static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc, 
-                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped, 
-                                    seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep) {
+static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc,
+                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                                    seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
+                                    bool respawn = true) {
     if (pid <= 0 || pid >= 256 || !pcbs[pid].active)
         return;
 
@@ -705,15 +729,15 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     for (int i = 0; i < pcbs[pid].cap_tracker.count; i++) {
         bool is_thread = (strncmp(pcbs[pid].name, "shell_thread", 12) == 0);
         if (is_thread && pcbs[pid].cap_tracker.caps[i] == pcbs[pid].vspace) continue;
-        
+
         seL4_CPtr cap_to_free = pcbs[pid].cap_tracker.caps[i];
 
         // 1. Сначала ОТЗЫВАЕМ (Revoke) все дочерние объекты в ядре, чтобы освободить RAM
         seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
-        
+
         // 2. Затем УДАЛЯЕМ (Delete) сам слот в CNode
         seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
-        
+
         // ДОБАВЛЕНО: Возвращаем слот обратно в пул свободных слотов!
         alloc.free(cap_to_free);
     }
@@ -731,20 +755,24 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         }
     }
 
-    if (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0) {
+    if (respawn && (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0)) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
-        
+
         int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                                     meta.is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                     meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep,
                                     meta.wifi_cmd_recv_ep, meta.wifi_cmd_send_ep);
-        
+
         if (new_pid > 0) {
             uart_puts("[WATCHDOG] Service restored successfully. New PID: "); uart_putdec(new_pid); uart_puts("\n");
         } else {
             uart_puts("[WATCHDOG] CRITICAL ERROR: Failed to respawn component!\n");
         }
+    } else if (!respawn) {
+        // Явная ручная остановка (см. SYS_STOP_WIFI) — в отличие от аварийного
+        // восстановления (SYS_KILL/SYS_RECOVER/watchdog), респавн НЕ нужен.
+        uart_puts("[ROOT] Process stopped (manual, no respawn): "); uart_puts(meta.name); uart_puts("\n");
     } else {
         uart_puts("[WATCHDOG] Non-critical user process terminated permanently.\n");
     }
@@ -875,8 +903,17 @@ int main(int argc, char *argv[]) {
         if (!RPI4_ENABLE_NET)   uart_puts(" net DISABLED (ping/send/... will hang);");
         uart_puts("\n");
     } else {
-        uart_puts(RPI4_ENABLE_WIFI ? "[ROOT] Booting UART / Timer / Block / Net / Wifi / Shell...\n"
-                                    : "[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
+        // Wi-Fi больше НЕ в этом списке — wifi_driver больше не спавнится при
+        // загрузке (см. SYS_START_WIFI ниже/ROADMAP.md): подозрение, что
+        // одновременный спавн вместе с остальными драйверами вызывал гонку
+        // мапинга/таймингов, изредка ломавшую готовность sdpcm-канала (см.
+        // память проекта — интермиттентный краш на настройке CR4). Теперь
+        // это отдельный, изолированный от общего бута шаг — команда шелла
+        // "wifi start".
+        uart_puts("[ROOT] Booting UART / Timer / Block / Net / Shell...\n");
+        if (RPI4_ENABLE_WIFI) {
+            uart_puts("[ROOT] Wi-Fi driver compiled in — run 'wifi start' to enable.\n");
+        }
     }
 
     seL4_CPtr ep = alloc.alloc_slot();
@@ -910,8 +947,35 @@ int main(int argc, char *argv[]) {
         // для чужого некэшируемого чтения (SYS_PS и т.п.), а также перед
         // рутсерверным чтением того, что кто-то другой записал некэшируемо
         // (load_elf_from_disk — ответ blk_driver).
-        seL4_ARM_Page_Map(shm_frames[i], root_vspace, (uintptr_t)rootserver_shm_base + (i * 4096),
-                          seL4_AllRights, seL4_ARM_Default_VMAttributes);
+        // Новый адрес (см. комментарий у rootserver_shm_base) лежит в ранее
+        // никогда не мапленном для root_vspace диапазоне — в отличие от
+        // старого 0x502000, который "бесплатно" попадал в уже замапленный
+        // элфлоадером образ rootserver'а, здесь нужно создать промежуточные
+        // PUD/PD/PT сами (тот же приём отказоустойчивого создания, что и в
+        // map_frame_robust() ниже, но с КЭШИРУЕМЫМИ атрибутами — см. комментарий
+        // выше про то, почему rootserver_shm_base обязан остаться кэшируемым).
+        uintptr_t shm_vaddr = (uintptr_t)rootserver_shm_base + (i * 4096);
+        seL4_Error shm_map_err = seL4_ARM_Page_Map(shm_frames[i], root_vspace, shm_vaddr,
+                                                    seL4_AllRights, seL4_ARM_Default_VMAttributes);
+        if (shm_map_err == seL4_FailedLookup) {
+            seL4_CPtr shm_pud = alloc.alloc_slot();
+            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, shm_pud, 1) == seL4_NoError) {
+                seL4_ARM_PageUpperDirectory_Map(shm_pud, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
+            }
+            seL4_CPtr shm_pd = alloc.alloc_slot();
+            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, shm_pd, 1) == seL4_NoError) {
+                seL4_ARM_PageDirectory_Map(shm_pd, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
+            }
+            seL4_CPtr shm_pt = alloc.alloc_slot();
+            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, shm_pt, 1) == seL4_NoError) {
+                seL4_ARM_PageTable_Map(shm_pt, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
+            }
+            shm_map_err = seL4_ARM_Page_Map(shm_frames[i], root_vspace, shm_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+        }
+        if (shm_map_err != seL4_NoError) {
+            uart_puts("[ROOT] FATAL: Failed to map rootserver SHM window!\n");
+            while(1);
+        }
     }
 
     seL4_CPtr console_ep = alloc.alloc_slot();
@@ -993,17 +1057,12 @@ int main(int argc, char *argv[]) {
     }
     }
 
-    if (RPI4_ENABLE_WIFI) {
-    // Запускаем Wi-Fi драйвер (is_driver = 5, Фаза 4, Милстоун 4.1). Не
-    // критичный для загрузки — SYS_DRIVER_READY для is_driver вне 1..4
-    // игнорируется рутсервером (см. case SYS_DRIVER_READY ниже), так что
-    // зависание/провал пробы SDIO не блокирует остальные драйверы/шелл.
-    if (spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, wifi_sdio_frame, nullptr,
-                      0, 0, wifi_cmd_recv_ep, 0) < 0) {
-        uart_puts("PANIC: Wi-Fi Driver failed to load!\n"); while(1);
-    }
-    }
+    // Wi-Fi (is_driver = 5, Фаза 4) БОЛЬШЕ НЕ спавнится здесь при загрузке —
+    // только по требованию, через "wifi start" в шелле (см. case
+    // SYS_START_WIFI ниже). Ресурсы (wifi_cmd_ep/wifi_sdio_frame) уже
+    // выделены выше под RPI4_ENABLE_WIFI — spawn_process() с ТЕМИ ЖЕ
+    // аргументами, что были здесь раньше, просто перенесён в обработчик
+    // SYS_START_WIFI.
 
     // Запускаем Оболочку (is_driver = 0). Сама оболочка при старте блокируется
     // на SYS_WAIT_ALL_DRIVERS_READY (см. главный цикл ниже и shell.cpp) —
@@ -1677,6 +1736,9 @@ int main(int argc, char *argv[]) {
                 if (drv >= 1 && drv <= 5) {
                     uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
                 }
+                if (drv == 5) {
+                    g_wifi_driver_ready = true;
+                }
                 if (drv >= 1 && drv <= 4) {
                     driver_ready[drv] = true;
 
@@ -1793,6 +1855,61 @@ int main(int argc, char *argv[]) {
                 } else {
                     seL4_SetMR(0, (seL4_Word)-1);
                 }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // Ручной жизненный цикл Wi-Fi (см. common.h — почему wifi_driver
+            // больше не спавнится при загрузке). Все три сисколла ниже не
+            // принимают имя процесса — рутсервер и так знает, что речь про
+            // "wifi_driver" (единственный процесс с этим именем).
+            case SYS_START_WIFI: {
+                int existing_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { existing_pid = i; break; }
+                }
+                if (existing_pid != -1) {
+                    seL4_SetMR(0, 1); // уже запущен
+                } else if (wifi_cmd_recv_ep == 0) {
+                    seL4_SetMR(0, (seL4_Word)-1); // не скомпилирован (RPI4_ENABLE_WIFI=false)
+                } else {
+                    g_wifi_driver_ready = false;
+                    int new_pid = spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, wifi_sdio_frame, nullptr,
+                                                0, 0, wifi_cmd_recv_ep, 0);
+                    seL4_SetMR(0, new_pid > 0 ? 0 : (seL4_Word)-1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_STOP_WIFI: {
+                int target_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { target_pid = i; break; }
+                }
+                if (target_pid == -1) {
+                    seL4_SetMR(0, (seL4_Word)-1); // не запущен
+                } else {
+                    generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                            shm_frames[0], console_ep, timer_ep, blk_ep, /*respawn=*/false);
+                    g_wifi_driver_ready = false;
+                    seL4_SetMR(0, 0);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_WIFI_STATUS: {
+                int target_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { target_pid = i; break; }
+                }
+                seL4_Word status;
+                if (target_pid == -1) status = 0;       // не запущен
+                else if (!g_wifi_driver_ready) status = 1; // запущен, ещё не дошёл до SYS_DRIVER_READY
+                else status = 2;                          // готов принимать WIFI_CMD_*
+                seL4_SetMR(0, status);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }

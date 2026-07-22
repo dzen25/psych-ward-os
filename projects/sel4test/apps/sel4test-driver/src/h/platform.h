@@ -11,6 +11,7 @@ constexpr bool LOG_UART    = false;
 constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
 constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежий/менее обкатанный компонент
+constexpr bool LOG_WIFI    = true;  // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
 // абсолютные (с ведущего '/'), чтобы не зависеть от current_dir_cluster —
@@ -27,6 +28,28 @@ constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежи
 constexpr const char* PATH_NET_UDP_LOG   = "/root/net_udp.log";
 constexpr const char* PATH_WIFI_FW       = "/wifi/wifi_fw.bin";
 constexpr const char* PATH_WIFI_NVRAM    = "/wifi/wifi_nvram.txt";
+constexpr const char* PATH_WIFI_CLM      = "/wifi/wifi_clm.bin"; // regulatory/channel-таблица, см. brcmf_c_process_clm_blob()
+constexpr const char* PATH_WIFI_PQW      = "/wifi/pqw.txt"; // знакомые сети: строки "имясети|пароль"
+
+// CLM blob download ("clmload" iovar, см. brcmf_c_download()/brcmf_c_process_clm_blob()
+// в эталоне) — без него регуляторная таблица прошивки пуста, и даже валидный
+// ccode вроде "US" в iovar "country" отвергается (BCME_BADARG), а escan без
+// country вовсе падает с BCME_NOTUP (подтверждено на живом железе).
+// ИСПРАВЛЕНО: эталонное значение MAX_CHUNK_LEN=1400 приводит к TX-кадру
+// >512 байт, что на нашей SDIO-реализации требует block-mode CMD53 (F2)
+// — путь, который до сих пор нигде в этом коде не использовался и не
+// проверен (на живом железе первый же такой чанк вызвал "ответ не влезает
+// в RX-буфер", похоже на эхо собственного TX-кадра, а не реальный ответ
+// прошивки — вероятно, баг в обработке multi-block записи на этом
+// SDIO-контроллере). Пока не разобрались, режем чанки заведомо мельче
+// 512 байт целиком (кадр = 12 sdpcm + 8 имя "clmload\0" + 12 dload-hdr +
+// чанк), чтобы гарантированно оставаться в уже проверенном byte-mode.
+constexpr uint32_t MAX_CLM_CHUNK_LEN    = 256;
+constexpr uint16_t DLOAD_HANDLER_VER    = 1;
+constexpr uint16_t DLOAD_FLAG_VER_SHIFT = 12;
+constexpr uint16_t DL_BEGIN             = 0x0002;
+constexpr uint16_t DL_END               = 0x0004;
+constexpr uint16_t DL_TYPE_CLM          = 2;
 
 // =====================================================================
 // Платформенно-зависимый слой.
@@ -422,6 +445,19 @@ constexpr uint32_t SDIO_R4_READY = (1u << 31);
 constexpr uint32_t SDIO_CCCR_IOEx_OFFSET = 0x02;
 constexpr uint32_t SDIO_CCCR_IORx_OFFSET = 0x03;
 
+// F0 CCCR offset 0x06 — I/O Abort (см. SDIO_CCCR_ABORT в linux/mmc/sdio.h).
+// Бит 3 (RES) — программный сброс ВСЕХ SDIO-функций карты, определённый
+// самой SDIO-спекой: "the card returns to its power-up default state, before
+// card identification" — то же самое, что физический power-cycle, но без
+// участия внешнего GPIO/regulator'а. Используется в wifi_sdio_probe() ПЕРЕД
+// CMD5 при повторном "wifi start" после "wifi stop" — см. ROADMAP.md/память
+// проекта: без физического power-cycle чип помнит состояние card-selected
+// из прошлой сессии и не отвечает на CMD5 (валиден только в idle), а
+// оказавшийся неэффективным CMD0 (GO_IDLE_STATE) SDIO-only картам не
+// обязателен по спеке и на этом чипе, похоже, ничего не делает.
+constexpr uint32_t SDIO_CCCR_ABORT_OFFSET = 0x06;
+constexpr uint32_t SDIO_CCCR_ABORT_RES    = (1u << 3);
+
 // --- Wi-Fi (BCM43455) Милстоун 4.2 — backplane (внутренняя шина чипа):
 // enumeration ядер, сброс ARM-ядра, заливка прошивки/NVRAM. Все константы
 // сверены построчно с эталонным
@@ -642,6 +678,39 @@ constexpr uint32_t BRCMF_WSEC_MAX_PSK_LEN = 32;
 constexpr uint32_t BRCMF_WSEC_PMK_KEY_BUF_LEN = 2 * BRCMF_WSEC_MAX_PSK_LEN + 1; // 65
 constexpr uint32_t BRCMF_WSEC_PMK_LE_LEN = 4 + BRCMF_WSEC_PMK_KEY_BUF_LEN; // 2+2+65 = 69
 
+// --- Милстоун 4.4, раунд 3: полный brcmf_config_dongle() ---
+// Найдено расхождение с эталоном: BRCMF_C_UP отправлялся у нас ПОСЛЕДНИМ (по
+// итогам расследования предыдущего раунда, где казалось, что SET_INFRA
+// сбрасывает интерфейс обратно в down) — но в эталоне (cfg80211.c,
+// brcmf_config_dongle(), вызывается ОДИН РАЗ при открытии интерфейса, до
+// вообще какой-либо попытки join) порядок ровно обратный: UP отправляется
+// ПЕРВЫМ, а SET_INFRA — куда позже, через brcmf_cfg80211_change_iface(),
+// вместе с ещё несколькими шагами, которые мы раньше не отправляли вовсе
+// (scantime/roam/ARP-ND offload/FAKEFRAG). Раз простой перенос UP в конец
+// не решил NOTUP на escan (см. память проекта) — реплицируем всю
+// последовательность brcmf_config_dongle() как есть, а не только его
+// часть.
+constexpr uint32_t BRCMF_C_SET_ROAM_TRIGGER       = 55;  // fwil.h
+constexpr uint32_t BRCMF_C_SET_ROAM_DELTA         = 57;  // fwil.h
+constexpr uint32_t BRCMF_C_SET_SCAN_CHANNEL_TIME  = 185; // fwil.h
+constexpr uint32_t BRCMF_C_SET_SCAN_UNASSOC_TIME  = 187; // fwil.h
+constexpr uint32_t BRCMF_C_SET_FAKEFRAG           = 219; // fwil.h
+constexpr uint32_t BRCMF_C_SET_SCAN_PASSIVE_TIME  = 258; // fwil.h
+
+constexpr int32_t  WL_ROAM_TRIGGER_LEVEL = -75; // cfg80211.c, dBm
+constexpr uint32_t WL_ROAM_DELTA         = 20;  // cfg80211.c
+constexpr uint32_t BRCM_BAND_ALL         = 3;   // defs.h — оба параметра выше применяются сразу ко всем диапазонам
+constexpr uint32_t BRCMF_DEFAULT_BCN_TIMEOUT_ROAM_ON = 2; // cfg80211.h — используем ROAM_ON-вариант: внутренний роуминг прошивки НЕ отключаем (roam_off=0), т.к. в этом порте нет wpa_supplicant, который взял бы это на себя
+constexpr uint32_t BRCMF_SCAN_CHANNEL_TIME  = 40;  // cfg80211.c, мс
+constexpr uint32_t BRCMF_SCAN_UNASSOC_TIME  = 40;  // cfg80211.c, мс
+constexpr uint32_t BRCMF_SCAN_PASSIVE_TIME  = 120; // cfg80211.c, мс
+
+// ARP/ND offload (core.c: brcmf_configure_arp_nd_offload()) — все шаги
+// best-effort, ошибки в эталоне тоже не считаются фатальными ("may fail,
+// then it is simply not supported").
+constexpr uint32_t BRCMF_ARP_OL_AGENT           = 0x00000001u; // fwil_types.h
+constexpr uint32_t BRCMF_ARP_OL_PEER_AUTO_REPLY = 0x00000008u; // fwil_types.h
+
 // struct brcmf_ssid_le: SSID_len(le32) + SSID[32] (IEEE80211_MAX_SSID_LEN).
 constexpr uint32_t IEEE80211_MAX_SSID_LEN = 32;
 constexpr uint32_t BRCMF_SSID_LE_LEN = 4 + IEEE80211_MAX_SSID_LEN; // 36
@@ -695,6 +764,26 @@ constexpr uint32_t BRCMF_E_DISASSOC_IND = 12;
 constexpr uint32_t BRCMF_E_LINK         = 16;
 constexpr uint32_t BRCMF_E_PSK_SUP      = 46;
 constexpr uint32_t BRCMF_E_ESCAN_RESULT = 69; // диагностика: "видит ли прошивка вообще что-то в эфире" независимо от join
+constexpr uint32_t BRCMF_E_IF           = 54; // fweh.h — единственный бит, который эталон явно включает в event_msgs в brcmf_c_preinit_dcmds()
+
+// event_msgs (см. brcmf_c_preinit_dcmds(), common.c) — битовая маска
+// разрешённых событий, BRCMF_EVENTING_MASK_LEN = ceil(BRCMF_E_LAST(139)/8) = 18
+// байт. Мы никогда её не трогали (полагались на дефолт прошивки) — эталон
+// явно читает-модифицирует-пишет её на самом раннем этапе, до всего
+// остального (даже до brcmf_config_dongle()).
+constexpr uint32_t BRCMF_EVENTING_MASK_LEN = 18;
+
+// Прочие шаги из brcmf_c_preinit_dcmds() (common.c) — самая ранняя стадия
+// инициализации в эталоне, ДО brcmf_config_dongle(). Мы её вообще не
+// реализовывали (см. память проекта/ROADMAP.md — MAC-адрес/revinfo/
+// event_msgs/mpc никогда не устанавливались).
+constexpr uint32_t BRCMF_C_GET_REVINFO = 98; // fwil.h, raw dcmd (не iovar)
+
+// Принудительная остановка скана в прошивке (brcmf_notify_escan_complete(),
+// fw_abort=true в эталоне) — raw dcmd BRCMF_C_SCAN, а не iovar "escan".
+// Абортится специальным сигнальным значением channel_list[0]=-1, а не
+// вызовом "escan" с action=ABORT (см. wifi_escan_abort() в wifi_driver.cpp).
+constexpr uint32_t BRCMF_C_SCAN = 50;
 
 constexpr uint32_t BRCMF_E_STATUS_SUCCESS         = 0;
 constexpr uint32_t BRCMF_E_STATUS_NO_NETWORKS     = 3;
@@ -713,9 +802,43 @@ constexpr uint32_t BRCMF_ESCAN_REQ_VERSION   = 1;
 constexpr uint16_t WL_ESCAN_ACTION_START     = 1;
 constexpr uint32_t DOT11_BSSTYPE_ANY         = 2;
 constexpr uint32_t BRCMF_SCANTYPE_ACTIVE     = 0;
+constexpr uint32_t BRCMF_SCANTYPE_PASSIVE    = 1;
 constexpr uint32_t BRCMF_SCAN_PARAMS_FIXED_SIZE = 64; // brcmf_scan_params_le до channel_num включительно, без channel_list
 constexpr uint32_t BRCMF_ESCAN_PARAMS_HDR_LEN   = 8;  // version(4)+action(2)+sync_id(2)
 constexpr uint32_t BRCMF_ESCAN_BLIND_LEN = BRCMF_ESCAN_PARAMS_HDR_LEN + BRCMF_SCAN_PARAMS_FIXED_SIZE; // 72
+
+// Разбор результата escan — struct brcmf_escan_result_le (fwil_types.h),
+// приходит как ДАННЫЕ события BRCMF_E_ESCAN_RESULT (сразу после 48-байтного
+// brcmf_event_msg_be, см. BRCMF_EVENT_MSG_BE_LEN выше), все поля LITTLE-endian
+// (в отличие от самого event_msg_be, который big-endian):
+//   buflen(le32) + version(le32) + sync_id(le16) + bss_count(le16) = 12 байт
+// фиксированной части, затем один struct brcmf_bss_info_le (при bss_count>=1
+// — на практике прошивка шлёт ровно один BSS на PARTIAL-событие).
+constexpr uint32_t BRCMF_ESCAN_RESULT_FIXED_LEN  = 12;
+constexpr uint32_t BRCMF_ESCAN_RESULT_BSSCOUNT_OFF = 10; // le16, смещение от начала brcmf_escan_result_le
+
+// struct brcmf_bss_info_le — смещения нужных полей ОТ начала самой структуры
+// (т.е. от escan_result_off + BRCMF_ESCAN_RESULT_FIXED_LEN). Полный список
+// полей см. fwil_types.h — берём только то, что показываем пользователю.
+// ИСПРАВЛЕНО: структура в эталоне НЕ помечена __packed — компилятор вставляет
+// выравнивающие байты перед каждым полем, размер которого >1 байт, если
+// текущее смещение не кратно его размеру. Наивный расчёт "по сумме размеров
+// полей" (chanspec=71/RSSI=76) давал channel=0/RSSI=0 на живом железе —
+// сверено побайтово с реальным дампом bss_info (version=109 совпал,
+// BSSID/SSID совпали до offset 51, но rateset.count оказался на offset 52,
+// не 51 — то есть после SSID[32] вставлен 1 паддинг-байт для 4-байтного
+// выравнивания вложенной rateset-структуры; аналогично после dtim_period
+// перед RSSI). Реальные смещения (подтверждены: channel=42, RSSI=-84 —
+// правдоподобные значения для настоящей эфирной сети):
+//   ...SSID[32](19..50) + 1 паддинг -> rateset.count(52) + rates[16](56) ->
+//   chanspec(72) + atim_window(74) + dtim_period(76) + 1 паддинг -> RSSI(78)
+constexpr uint32_t BRCMF_BSS_INFO_BSSID_OFF      = 8;  // u8[6]
+constexpr uint32_t BRCMF_BSS_INFO_SSID_LEN_OFF   = 18; // u8
+constexpr uint32_t BRCMF_BSS_INFO_SSID_OFF       = 19; // u8[32]
+constexpr uint32_t BRCMF_BSS_INFO_CHANSPEC_OFF   = 72; // le16
+constexpr uint32_t BRCMF_BSS_INFO_RSSI_OFF       = 78; // le16 (интерпретируется как s16, дБм)
+constexpr uint32_t BRCMF_BSS_INFO_FIXED_LEN      = 128; // с учётом выравнивания, до конца SNR-поля, без переменных IE
+constexpr uint32_t BRCMF_CHANSPEC_CH_MASK        = 0x00FF; // brcmu_d11.h — номер канала, одинаково в D11N и D11AC форматах chanspec
 
 // =====================================================================
 // Raspberry Pi 4 (BCM2711) — реальные физические адреса.

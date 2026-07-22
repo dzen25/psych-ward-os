@@ -98,6 +98,42 @@ static void sys_puthexbuf(seL4_CPtr console_ep, const char* label, const uint8_t
     sys_puts(console_ep, "\n");
 }
 
+// Десятичная печать (channel/RSSI читаются человеком куда легче в десятичном
+// виде, чем в hex) — знаковая, нужна для RSSI (отрицательные дБм).
+static void sys_putdec32(seL4_CPtr console_ep, const char *label, int32_t val) {
+    sys_puts(console_ep, label);
+    char buf[12];
+    int pos = 11;
+    buf[pos] = 0;
+    bool neg = val < 0;
+    uint32_t uval = neg ? (uint32_t)(-(int64_t)val) : (uint32_t)val;
+    if (uval == 0) buf[--pos] = '0';
+    while (uval > 0) { buf[--pos] = (char)('0' + (uval % 10)); uval /= 10; }
+    if (neg) buf[--pos] = '-';
+    sys_puts(console_ep, &buf[pos]);
+}
+
+// Управление подробностью лога — по умолчанию ВЫКЛЮЧЕНО (тихо), включается
+// за один запуск/команду через "-l" в шелле (см. WIFI_SHM_VERBOSE_OFFSET/
+// WIFI_CMD_* ниже — шелл передаёт этот бит либо через SHM перед "wifi start"
+// (для фонового bring-up, у которого нет своего WIFI_CMD_*), либо в MR
+// самой команды CONNECT/SCAN/PROBE_STATUS). FAIL/WARN/ТАЙМАУТ/ОШИБКА/УСПЕХ
+// и итоговые Milestone-сообщения НЕ гасятся — печатаются всегда, чтобы
+// реальная проблема не потерялась в тишине по умолчанию.
+static bool g_wifi_verbose = false;
+
+static void wifi_vputs(seL4_CPtr console_ep, const char *str) {
+    if (g_wifi_verbose) sys_puts(console_ep, str);
+}
+
+static void wifi_vputhex32(seL4_CPtr console_ep, const char* label, uint32_t val) {
+    if (g_wifi_verbose) sys_puthex32(console_ep, label, val);
+}
+
+static void wifi_vputhexbuf(seL4_CPtr console_ep, const char* label, const uint8_t* buf, uint32_t len) {
+    if (g_wifi_verbose) sys_puthexbuf(console_ep, label, buf, len);
+}
+
 // ========================================================
 // АППАРАТНЫЙ УРОВЕНЬ: SDIO-хост (brcm,bcm2835-sdhci), PIO/polling.
 // Регистровая карта — h/platform.h (EMMC_* переиспользуются, см. шапку файла).
@@ -180,7 +216,7 @@ static bool wifi_wait_irpt_bit(uint32_t bit, seL4_CPtr console_ep = 0) {
             *wifi_reg(EMMC_INTERRUPT_OFFSET) = irpt;
             if (console_ep) {
                 sys_puthex32(console_ep, "[WIFI][FW] ОШИБКА — IRPT raw = ", irpt);
-                sys_puthex32(console_ep, "[WIFI][FW] STATUS raw        = ", *wifi_reg(EMMC_STATUS_OFFSET));
+                wifi_vputhex32(console_ep, "[WIFI][FW] STATUS raw        = ", *wifi_reg(EMMC_STATUS_OFFSET));
             }
             // Настоящая ошибка (не обычный таймаут) оставляет командную/DAT-
             // линию заклиненной для СЛЕДУЮЩЕЙ команды — сбрасываем сразу,
@@ -194,7 +230,7 @@ static bool wifi_wait_irpt_bit(uint32_t bit, seL4_CPtr console_ep = 0) {
         if (--timeout == 0) {
             if (console_ep) {
                 sys_puthex32(console_ep, "[WIFI][FW] ТАЙМАУТ — последний IRPT raw = ", irpt);
-                sys_puthex32(console_ep, "[WIFI][FW] STATUS raw                    = ", *wifi_reg(EMMC_STATUS_OFFSET));
+                wifi_vputhex32(console_ep, "[WIFI][FW] STATUS raw                    = ", *wifi_reg(EMMC_STATUS_OFFSET));
             }
             return false;
         }
@@ -254,7 +290,7 @@ static uint32_t g_cccr_rev = 0;      // F0 CCCR offset 0x00, прочитан ч
 static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     g_wifi_base = (volatile uint32_t*)vaddr;
 
-    sys_puts(console_ep, "[WIFI][SDIO] step: SRST_HC...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: SRST_HC...\n");
     *wifi_reg(EMMC_CONTROL1_OFFSET) = EMMC_C1_SRST_HC;
     uint32_t timeout = 1000000;
     while (*wifi_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_SRST_HC) {
@@ -264,7 +300,7 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
         }
         seL4_Yield();
     }
-    sys_puts(console_ep, "[WIFI][SDIO] step: SRST_HC cleared, CONTROL0 restore...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: SRST_HC cleared, CONTROL0 restore...\n");
 
     // Как и у EMMC2 (blk_driver.cpp), SRST_HC может гасить биты питания шины
     // в CONTROL0 — восстанавливаем защитно, даже если на этом контроллере
@@ -275,7 +311,7 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     *wifi_reg(EMMC_IRPT_EN_OFFSET)   = 0; // polling, без IRQ — как и все остальные драйверы этой ОС
     *wifi_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF;
 
-    sys_puts(console_ep, "[WIFI][SDIO] step: clock init...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: clock init...\n");
     // CAP0 на этом контроллере помечен квirком SDHCI_QUIRK_MISSING_CAPS в
     // эталонном Linux-драйвере (sdhci-iproc.c) — не заслуживает доверия,
     // поэтому делитель для идентификационной стадии берём тем же, что и у
@@ -285,7 +321,43 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     *wifi_reg(EMMC_CONTROL1_OFFSET) = EMMC_C1_CLK_INTLEN | EMMC_C1_TOUNIT_MAX;
     sdio_set_clock_divider(0x80);
     for (int i = 0; i < 100000; i++) seL4_Yield(); // см. blk_driver.cpp — CLK_STABLE иногда врёт раньше времени
-    sys_puts(console_ep, "[WIFI][SDIO] step: clock done, starting CMD5...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: clock done, starting CMD5...\n");
+
+    // ИСПРАВЛЕНО #2 (CMD0 из первой попытки не помог — см. память проекта):
+    // CMD0 (GO_IDLE_STATE) для SDIO-only карт по спеке НЕОБЯЗАТЕЛЕН, и этот
+    // чип его, похоже, просто игнорирует. Правильный, определённый самой
+    // SDIO-спекой программный сброс — бит RES в CCCR offset 0x06 (I/O Abort,
+    // см. SDIO_CCCR_ABORT_* в platform.h): "the card returns to its power-up
+    // default state" — то же самое, что физический power-cycle через
+    // WL_REG_ON, но БЕЗ него (на этой плате WL_REG_ON вообще недоступен без
+    // VideoCore mailbox, а mailbox на этой прошивке не отвечает — см.
+    // PLAT_UART_PADDR комментарий выше про ту же проблему с PL011).
+    // Проблема курицы-и-яйца: CMD52 (которым пишется этот бит) сам работает
+    // только с УЖЕ ВЫБРАННОЙ картой (после CMD3/CMD7) — но если чип НЕ
+    // ресетился с прошлой сессии (наш случай на "wifi start" после "wifi
+    // stop"), он по-прежнему СЧИТАЕТ себя выбранным под старым RCA и ответит
+    // на CMD52 без повторных CMD3/CMD7. При самой первой загрузке платы чип
+    // ещё не выбран вообще — CMD52 тут просто не получит ответа, это
+    // ожидаемо и не ошибка: sdio_send_cmd() тут best-effort, результат
+    // игнорируем.
+    {
+        uint32_t reset_arg = SDIO_ARG_RW_FLAG | (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) |
+                             (SDIO_CCCR_ABORT_OFFSET << SDIO_ARG_REG_ADDR_SHIFT) | SDIO_CCCR_ABORT_RES;
+        wifi_vputs(console_ep, "[WIFI][SDIO] step: best-effort CCCR RES (программный сброс, на случай, если чип уже выбран с прошлой сессии)...\n");
+        sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_RW_DIRECT, reset_arg);
+        for (int i = 0; i < 100000; i++) seL4_Yield(); // settle после ресета, как и после SRST_HC/clock
+    }
+
+    // CMD0 (GO_IDLE_STATE) — не обязателен для SDIO-only карт по спеке и,
+    // судя по всему, ничего не меняет на этом чипе (проверено), но
+    // безопасен и дёшев, оставляем как дополнительный стандартный шаг
+    // (см. blk_driver.cpp, который его тоже шлёт первым для настоящей
+    // SD-карты).
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD0 (GO_IDLE_STATE)...\n");
+    if (!sdio_send_cmd(EMMC_CMD_RSPNS_NONE, EMMC_CMD_GO_IDLE, 0)) {
+        sys_puts(console_ep, "[WIFI][SDIO] FAIL: CMD0 (GO_IDLE_STATE)\n");
+        return false;
+    }
 
     // CMD5 (SDIO_SEND_OP_COND), arg=0: узнать OCR/число функций. R4 —
     // 48-битный ответ без CRC-проверки (см. SDIO_CMD_SEND_OP_COND в
@@ -301,7 +373,7 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     // повторять предыдущий, судя по всему, фатальный для шины сценарий.
     bool sdio_ready = false;
     for (int i = 0; i < 20 && !sdio_ready; i++) {
-        sys_puts(console_ep, "[WIFI][SDIO] step: CMD5 attempt "); sys_puthex32(console_ep, "#", (uint32_t)i);
+        wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD5 attempt "); wifi_vputhex32(console_ep, "#", (uint32_t)i);
         if (!sdio_send_cmd(EMMC_CMD_RSPNS_48, SDIO_CMD_SEND_OP_COND, 0)) {
             sys_puts(console_ep, "[WIFI][SDIO] FAIL: CMD5 (SDIO_SEND_OP_COND) — карта не отвечает\n");
             return false;
@@ -310,8 +382,8 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
         if (g_sdio_ocr & SDIO_R4_READY) sdio_ready = true;
         else for (int y = 0; y < 50000; y++) seL4_Yield(); // реальная пауза, не мгновенный повтор
     }
-    sys_puts(console_ep, "[WIFI][SDIO] step: CMD5 loop done\n");
-    sys_puthex32(console_ep, "[WIFI][SDIO] CMD5 OCR = ", g_sdio_ocr);
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD5 loop done\n");
+    wifi_vputhex32(console_ep, "[WIFI][SDIO] CMD5 OCR = ", g_sdio_ocr);
     if (!sdio_ready) {
         sys_puts(console_ep, "[WIFI][SDIO] FAIL: CMD5 never set ready bit (карта не готова за 20 попыток)\n");
         return false;
@@ -326,21 +398,21 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     // transfer). CMD3/CMD7 — те же номера команд, что и у SD-memory карт в
     // blk_driver.cpp (EMMC_CMD_SEND_REL_ADDR/EMMC_CMD_SELECT_CARD), формат
     // ответа тоже совпадает (R6: RCA в старших 16 битах RESP0; R1b/48bit+busy).
-    sys_puts(console_ep, "[WIFI][SDIO] step: CMD3 (get RCA)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD3 (get RCA)...\n");
     if (!sdio_send_cmd(EMMC_CMD_RSPNS_48, EMMC_CMD_SEND_REL_ADDR, 0)) {
         sys_puts(console_ep, "[WIFI][SDIO] FAIL: CMD3 (SEND_RELATIVE_ADDR)\n");
         return false;
     }
     g_sdio_rca = *wifi_reg(EMMC_RESP0_OFFSET) & 0xFFFF0000u;
-    sys_puthex32(console_ep, "[WIFI][SDIO] CMD3 RCA = ", g_sdio_rca);
+    wifi_vputhex32(console_ep, "[WIFI][SDIO] CMD3 RCA = ", g_sdio_rca);
 
-    sys_puts(console_ep, "[WIFI][SDIO] step: CMD7 (select card)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD7 (select card)...\n");
     if (!sdio_send_cmd(EMMC_CMD_RSPNS_48B, EMMC_CMD_SELECT_CARD, g_sdio_rca)) {
         sys_puts(console_ep, "[WIFI][SDIO] FAIL: CMD7 (SELECT_CARD)\n");
         return false;
     }
 
-    sys_puts(console_ep, "[WIFI][SDIO] step: CMD52...\n");
+    wifi_vputs(console_ep, "[WIFI][SDIO] step: CMD52...\n");
     // CMD52 (SDIO_RW_DIRECT) чтение F0 CCCR offset 0x00 (версия CCCR/FBR).
     // R/W=0 (чтение), функция 0, RAW=0, адрес=SDIO_CCCR_CCCR_OFFSET, данные=0.
     uint32_t cmd52_arg = (SDIO_FUNC_0 << SDIO_ARG_FUNC_SHIFT) |
@@ -353,8 +425,8 @@ static bool wifi_sdio_probe(void *vaddr, seL4_CPtr console_ep) {
     // platform.h — комментарий у SDIO_ARG_* про формат R5).
     uint32_t cmd52_resp = *wifi_reg(EMMC_RESP0_OFFSET);
     g_cccr_rev = cmd52_resp & 0xFFu;
-    sys_puthex32(console_ep, "[WIFI][SDIO] CMD52 F0 CCCR raw resp = ", cmd52_resp);
-    sys_puthex32(console_ep, "[WIFI][SDIO] CMD52 F0 CCCR value    = ", g_cccr_rev);
+    wifi_vputhex32(console_ep, "[WIFI][SDIO] CMD52 F0 CCCR raw resp = ", cmd52_resp);
+    wifi_vputhex32(console_ep, "[WIFI][SDIO] CMD52 F0 CCCR value    = ", g_cccr_rev);
 
     return true;
 }
@@ -731,7 +803,7 @@ static bool backplane_write_bulk(seL4_CPtr console_ep, uint32_t addr, const uint
         }
         if (!backplane_write_chunk(console_ep, cur_addr, data + written, chunk)) {
             sys_puthex32(console_ep, "[WIFI][FW] FAIL: не удалось записать чанк по адресу ", cur_addr);
-            sys_puthex32(console_ep, "[WIFI][FW]   written so far = ", written);
+            wifi_vputhex32(console_ep, "[WIFI][FW]   written so far = ", written);
             return false;
         }
         written += chunk;
@@ -818,14 +890,14 @@ static bool wifi_erom_scan(seL4_CPtr console_ep) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать chipid с backplane\n");
         return false;
     }
-    sys_puthex32(console_ep, "[WIFI][BP] chipid raw = ", chipid);
+    wifi_vputhex32(console_ep, "[WIFI][BP] chipid raw = ", chipid);
 
     uint32_t eromaddr = 0;
     if (!backplane_read32(SI_ENUM_BASE + CHIPCOMMON_EROMPTR_OFFSET, &eromaddr)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать eromptr\n");
         return false;
     }
-    sys_puthex32(console_ep, "[WIFI][BP] eromptr = ", eromaddr);
+    wifi_vputhex32(console_ep, "[WIFI][BP] eromptr = ", eromaddr);
 
     uint8_t desc_type = 0;
     int guard = 0;
@@ -860,12 +932,12 @@ static bool wifi_erom_scan(seL4_CPtr console_ep) {
         if (id == BCMA_CORE_SDIO_DEV)  { g_sdio_core.base = base; g_sdio_core.wrap = wrap; }
     }
 
-    sys_puthex32(console_ep, "[WIFI][BP] CR4 core.base = ", g_cr4_core.base);
-    sys_puthex32(console_ep, "[WIFI][BP] CR4 core.wrap = ", g_cr4_core.wrap);
-    sys_puthex32(console_ep, "[WIFI][BP] D11 core.base = ", g_d11_core.base);
-    sys_puthex32(console_ep, "[WIFI][BP] D11 core.wrap = ", g_d11_core.wrap);
-    sys_puthex32(console_ep, "[WIFI][BP] SDIO core.base = ", g_sdio_core.base);
-    sys_puthex32(console_ep, "[WIFI][BP] SDIO core.wrap = ", g_sdio_core.wrap);
+    wifi_vputhex32(console_ep, "[WIFI][BP] CR4 core.base = ", g_cr4_core.base);
+    wifi_vputhex32(console_ep, "[WIFI][BP] CR4 core.wrap = ", g_cr4_core.wrap);
+    wifi_vputhex32(console_ep, "[WIFI][BP] D11 core.base = ", g_d11_core.base);
+    wifi_vputhex32(console_ep, "[WIFI][BP] D11 core.wrap = ", g_d11_core.wrap);
+    wifi_vputhex32(console_ep, "[WIFI][BP] SDIO core.base = ", g_sdio_core.base);
+    wifi_vputhex32(console_ep, "[WIFI][BP] SDIO core.wrap = ", g_sdio_core.wrap);
 
     return (g_cr4_core.wrap != 0 && g_d11_core.wrap != 0 && g_sdio_core.base != 0);
 }
@@ -937,7 +1009,7 @@ static uint32_t wifi_calc_ramsize(seL4_CPtr console_ep) {
         if (!backplane_read32(g_cr4_core.base + ARMCR4_BANKINFO, &bxinfo)) return 0;
         memsize += ((bxinfo & ARMCR4_BSZ_MASK) + 1) * ARMCR4_BSZ_MULT;
     }
-    sys_puthex32(console_ep, "[WIFI][BP] ramsize = ", memsize);
+    wifi_vputhex32(console_ep, "[WIFI][BP] ramsize = ", memsize);
     return memsize;
 }
 
@@ -1066,16 +1138,16 @@ static void wifi_try_read_console(seL4_CPtr console_ep, uint32_t console_addr) {
     if (!backplane_read32(console_addr + RTE_CONSOLE_LOG_BUF_OFFSET, &log_buf)) return;
     if (!backplane_read32(console_addr + RTE_CONSOLE_LOG_BUF_SIZE_OFFSET, &log_size)) return;
     if (!backplane_read32(console_addr + RTE_CONSOLE_LOG_IDX_OFFSET, &log_idx)) return;
-    sys_puthex32(console_ep, "[WIFI][FW] console log_buf  = ", log_buf);
-    sys_puthex32(console_ep, "[WIFI][FW] console log_size = ", log_size);
-    sys_puthex32(console_ep, "[WIFI][FW] console log_idx  = ", log_idx);
+    wifi_vputhex32(console_ep, "[WIFI][FW] console log_buf  = ", log_buf);
+    wifi_vputhex32(console_ep, "[WIFI][FW] console log_size = ", log_size);
+    wifi_vputhex32(console_ep, "[WIFI][FW] console log_idx  = ", log_idx);
     if (log_buf == 0 || log_size == 0) return;
 
     // Дамп первых ~128 байт лога прошивки как есть (диагностика, не парсим
     // кольцевой буфер по-настоящему — если видно что-то похожее на текст,
     // этого достаточно, чтобы доказать, что прошивка реально исполняется).
     uint32_t dump_len = log_size < 128 ? log_size : 128;
-    sys_puts(console_ep, "[WIFI][FW] console dump: \"");
+    wifi_vputs(console_ep, "[WIFI][FW] console dump: \"");
     for (uint32_t off = 0; off < dump_len; off += 4) {
         uint32_t word = 0;
         if (!backplane_read32(log_buf + off, &word)) break;
@@ -1084,10 +1156,10 @@ static void wifi_try_read_console(seL4_CPtr console_ep, uint32_t console_addr) {
             if (c == 0) continue;
             if (c < 0x20 || c > 0x7E) c = '.'; // непечатное -> точка, не мусорить консоль
             char s[2] = {c, 0};
-            sys_puts(console_ep, s);
+            wifi_vputs(console_ep, s);
         }
     }
-    sys_puts(console_ep, "\"\n");
+    wifi_vputs(console_ep, "\"\n");
 }
 
 static void wifi_check_alive(seL4_CPtr console_ep) {
@@ -1097,20 +1169,20 @@ static void wifi_check_alive(seL4_CPtr console_ep) {
         sys_puts(console_ep, "[WIFI][FW] FAIL: не удалось прочитать shaddr\n");
         return;
     }
-    sys_puthex32(console_ep, "[WIFI][FW] shaddr = ", shaddr);
+    wifi_vputhex32(console_ep, "[WIFI][FW] shaddr = ", shaddr);
     // Простая проверка на валидность (см. brcmf_sdio_valid_shared_address):
     // не 0, не 0xFFFFFFFF, в разумных пределах RAM самого чипа.
     if (shaddr == 0 || shaddr == 0xFFFFFFFFu || shaddr < BRCM_4345_RAMBASE || shaddr >= top) {
-        sys_puts(console_ep, "[WIFI][FW] shaddr невалиден — прошивка, похоже, ещё не стартовала (или стартовала не так, как ожидалось)\n");
+        wifi_vputs(console_ep, "[WIFI][FW] shaddr невалиден — прошивка, похоже, ещё не стартовала (или стартовала не так, как ожидалось)\n");
         return;
     }
     g_wifi_shaddr = shaddr;
     g_wifi_fw_alive = true;
-    sys_puts(console_ep, "[WIFI][FW] shaddr валиден — прошивка похожа на живую!\n");
+    wifi_vputs(console_ep, "[WIFI][FW] shaddr валиден — прошивка похожа на живую!\n");
 
     uint32_t console_addr = 0;
     if (!backplane_read32(shaddr + SDPCM_SHARED_CONSOLE_ADDR_OFFSET, &console_addr)) return;
-    sys_puthex32(console_ep, "[WIFI][FW] console_addr = ", console_addr);
+    wifi_vputhex32(console_ep, "[WIFI][FW] console_addr = ", console_addr);
     if (console_addr != 0 && console_addr != 0xFFFFFFFFu) {
         wifi_try_read_console(console_ep, console_addr);
     }
@@ -1128,38 +1200,38 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     // медленно. Карта уже выбрана (CMD7 в wifi_sdio_probe завершился успешно
     // до входа сюда), поэтому, как и blk_driver.cpp после его CMD7 ("рабочая
     // стадия, standard speed"), поднимаем клок до 0x02 (100МГц/(2*2)=25МГц).
-    sys_puts(console_ep, "[WIFI][BP] step: переключение SDIO-клока на рабочую скорость (25МГц)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: переключение SDIO-клока на рабочую скорость (25МГц)...\n");
     sdio_set_clock_divider(0x02);
 
-    sys_puts(console_ep, "[WIFI][BP] step: enable SDIO func1 (IOEx/IORx)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: enable SDIO func1 (IOEx/IORx)...\n");
     if (!sdio_enable_func1(console_ep)) return false;
 
-    sys_puts(console_ep, "[WIFI][BP] step: согласование блок-размера func1 (64 байта)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: согласование блок-размера func1 (64 байта)...\n");
     if (!wifi_set_func1_blocksize(console_ep)) return false;
 
-    sys_puts(console_ep, "[WIFI][BP] step: запрос тактовой частоты чипа (ALP)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: запрос тактовой частоты чипа (ALP)...\n");
     if (!wifi_request_alp_clock(console_ep)) return false;
 
-    sys_puts(console_ep, "[WIFI][BP] step: EROM scan (искать CR4/D11 ядра)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: EROM scan (искать CR4/D11 ядра)...\n");
     if (!wifi_erom_scan(console_ep)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: EROM scan не нашёл оба нужных ядра\n");
         return false;
     }
 
-    sys_puts(console_ep, "[WIFI][BP] step: halt CR4...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: halt CR4...\n");
     if (!wifi_halt_cr4()) { sys_puts(console_ep, "[WIFI][BP] FAIL: halt CR4\n"); return false; }
 
-    sys_puts(console_ep, "[WIFI][BP] step: reset D11...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: reset D11...\n");
     if (!wifi_reset_d11()) { sys_puts(console_ep, "[WIFI][BP] FAIL: reset D11\n"); return false; }
 
-    sys_puts(console_ep, "[WIFI][BP] step: ramsize...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: ramsize...\n");
     g_wifi_ramsize = wifi_calc_ramsize(console_ep);
     if (g_wifi_ramsize == 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: ramsize == 0\n"); return false; }
 
-    sys_puts(console_ep, "[WIFI][BP] step: чтение прошивки с SD...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: чтение прошивки с SD...\n");
     int fw_len = wifi_read_file(PATH_WIFI_FW, g_wifi_fw_buf, WIFI_FW_BUF_CAP);
     if (fw_len <= 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать wifi_fw.bin\n"); return false; }
-    sys_puthex32(console_ep, "[WIFI][BP] firmware length = ", (uint32_t)fw_len);
+    wifi_vputhex32(console_ep, "[WIFI][BP] firmware length = ", (uint32_t)fw_len);
     // PIO-цикл backplane_write_chunk() пишет данные 32-битными словами — длина
     // файла произвольная (не обязана быть кратна 4), поэтому "хвост" в 1-3
     // байта дополняем нулями до целого слова (лишние нулевые байты в TCM RAM
@@ -1172,12 +1244,12 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     for (uint32_t i = (uint32_t)fw_len; i < fw_len_padded; i++) g_wifi_fw_buf[i] = 0;
     fw_len = (int)fw_len_padded;
 
-    sys_puts(console_ep, "[WIFI][BP] step: чтение NVRAM с SD...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: чтение NVRAM с SD...\n");
     int nvram_raw_len = wifi_read_file(PATH_WIFI_NVRAM, g_wifi_nvram_raw, WIFI_NVRAM_RAW_CAP);
     if (nvram_raw_len <= 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: не удалось прочитать wifi_nvram.txt\n"); return false; }
     uint32_t nvram_len = wifi_process_nvram(g_wifi_nvram_raw, (uint32_t)nvram_raw_len, g_wifi_nvram_out, WIFI_NVRAM_OUT_CAP);
     if (nvram_len == 0) { sys_puts(console_ep, "[WIFI][BP] FAIL: обработка NVRAM не удалась (буфер мал?)\n"); return false; }
-    sys_puthex32(console_ep, "[WIFI][BP] nvram processed length = ", nvram_len);
+    wifi_vputhex32(console_ep, "[WIFI][BP] nvram processed length = ", nvram_len);
 
     // ВАЖНО: во время заливки прошивки эталонный brcmf_sdio_firmware_callback()
     // явно выставляет bus->alp_only=true перед download_firmware() — то есть
@@ -1185,13 +1257,13 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
     // HT (wifi_request_ht_clock — см. функцию выше, оставлена для будущего
     // милстоуна) запрашивается эталоном только ПОСЛЕ успешной загрузки,
     // перед включением F2/data-path — там он и нужен по-настоящему.
-    sys_puts(console_ep, "[WIFI][BP] step: заливка прошивки в TCM RAM...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: заливка прошивки в TCM RAM...\n");
     if (!backplane_write_bulk(console_ep, BRCM_4345_RAMBASE, g_wifi_fw_buf, (uint32_t)fw_len)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: заливка прошивки\n");
         return false;
     }
 
-    sys_puts(console_ep, "[WIFI][BP] step: заливка NVRAM в верх RAM...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: заливка NVRAM в верх RAM...\n");
     uint32_t nvram_addr = BRCM_4345_RAMBASE + g_wifi_ramsize - nvram_len;
     if (!backplane_write_bulk(console_ep, nvram_addr, g_wifi_nvram_out, nvram_len)) {
         sys_puts(console_ep, "[WIFI][BP] FAIL: заливка NVRAM\n");
@@ -1200,9 +1272,9 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
 
     uint32_t rstvec = ((uint32_t)g_wifi_fw_buf[0]) | ((uint32_t)g_wifi_fw_buf[1] << 8) |
                       ((uint32_t)g_wifi_fw_buf[2] << 16) | ((uint32_t)g_wifi_fw_buf[3] << 24);
-    sys_puthex32(console_ep, "[WIFI][BP] rstvec = ", rstvec);
+    wifi_vputhex32(console_ep, "[WIFI][BP] rstvec = ", rstvec);
 
-    sys_puts(console_ep, "[WIFI][BP] step: запуск CR4 (un-halt)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: запуск CR4 (un-halt)...\n");
     if (!wifi_start_cr4(rstvec)) { sys_puts(console_ep, "[WIFI][BP] FAIL: старт CR4\n"); return false; }
 
     // Дать прошивке время на собственную инициализацию перед первым чтением.
@@ -1229,7 +1301,7 @@ static bool wifi_backplane_bringup(seL4_CPtr console_ep) {
         while (wifi_read_cntvct() - start < settle_ticks) seL4_Yield();
     }
 
-    sys_puts(console_ep, "[WIFI][BP] step: проверка, жива ли прошивка (sdpcm_shared)...\n");
+    wifi_vputs(console_ep, "[WIFI][BP] step: проверка, жива ли прошивка (sdpcm_shared)...\n");
     wifi_check_alive(console_ep);
 
     return g_wifi_fw_alive;
@@ -1361,17 +1433,30 @@ static bool sdio_f2_read(seL4_CPtr console_ep, uint8_t *out, uint32_t len) {
 //   8: fcmask (TX=0)      9: tx_seq_max/window (TX=0)   10-11: 0
 // Статические буферы (не стек — тот же принцип, что и большие буферы
 // прошивки/NVRAM в Милстоуне 4.2). ---
-constexpr uint32_t WIFI_SDPCM_TX_BUF_CAP = 512;
+// Ёмкость поднята с 512 до 1536 байт для CLM blob download (clmload iovar,
+// см. wifi_clm_download() ниже) — чанки там до MAX_CLM_CHUNK_LEN=1400 байт
+// данных + 12 байт dload-заголовка + 8 байт имени iovar + 16 байт dcmd-
+// заголовка + 12 байт sdpcm-заголовка = максимум 1448 байт на кадр.
+constexpr uint32_t WIFI_SDPCM_TX_BUF_CAP = 1536;
 alignas(4) static uint8_t g_sdpcm_tx_buf[WIFI_SDPCM_TX_BUF_CAP];
 constexpr uint32_t WIFI_SDPCM_RX_BUF_CAP = 512;
 alignas(4) static uint8_t g_sdpcm_rx_buf[WIFI_SDPCM_RX_BUF_CAP];
 static uint8_t g_sdpcm_tx_seq = 0;
 
-static bool sdpcm_send_ctrl(seL4_CPtr console_ep, const uint8_t *payload, uint32_t payload_len) {
+static bool sdpcm_send_ctrl(seL4_CPtr console_ep, const uint8_t *payload, uint32_t payload_len, bool dump_hex = true) {
     uint32_t total_len = SDPCM_HDRLEN + payload_len;
     // Хвост не кратный 4 не пишется word-PIO циклом (та же причина, что
     // сломала последние 3 байта прошивки в Милстоуне 4.2) — дополняем нулями.
     uint32_t padded_len = (total_len + 3u) & ~3u;
+    // ИСПРАВЛЕНО (для CLM-чанков): sdio_f2_write() включает block-mode ТОЛЬКО
+    // когда len кратен SDIO_FUNC2_BLOCKSIZE(512) — иначе уходит в byte-mode,
+    // где count-поле CMD53 всего 9 бит (макс. 511), и любая длина >=512, не
+    // кратная 512, тихо обрежется/исказится на шине. Пока кадры были <512
+    // (обычные IOCTL) это было не важно — для CLM (кадры ~1400+ байт) нужно
+    // округлять ВВЕРХ до кратности 512, а не только до кратности 4.
+    if (padded_len >= SDIO_FUNC2_BLOCKSIZE) {
+        padded_len = (padded_len + (SDIO_FUNC2_BLOCKSIZE - 1)) & ~(SDIO_FUNC2_BLOCKSIZE - 1);
+    }
     if (padded_len > WIFI_SDPCM_TX_BUF_CAP) {
         sys_puts(console_ep, "[WIFI][SDPCM] FAIL: TX-кадр не влезает в буфер\n");
         return false;
@@ -1391,7 +1476,9 @@ static bool sdpcm_send_ctrl(seL4_CPtr console_ep, const uint8_t *payload, uint32
     g_sdpcm_tx_buf[7] = (uint8_t)SDPCM_HDRLEN;
     g_sdpcm_tx_buf[8] = 0; g_sdpcm_tx_buf[9] = 0; g_sdpcm_tx_buf[10] = 0; g_sdpcm_tx_buf[11] = 0;
 
-    sys_puthexbuf(console_ep, "[WIFI][SDPCM] диагностика: полный TX-кадр (hdr+dcmd) = ", g_sdpcm_tx_buf, padded_len);
+    if (dump_hex) {
+        wifi_vputhexbuf(console_ep, "[WIFI][SDPCM] диагностика: полный TX-кадр (hdr+dcmd) = ", g_sdpcm_tx_buf, padded_len);
+    }
 
     return sdio_f2_write(console_ep, g_sdpcm_tx_buf, padded_len);
 }
@@ -1461,7 +1548,7 @@ static bool sdpcm_wait_and_read_ctrl(seL4_CPtr console_ep, uint8_t **out_payload
         bool have_intstatus = backplane_read32_retry(g_sdio_core.base + SDPCMD_INTSTATUS, &intstatus, 0);
         uint64_t now = wifi_read_cntvct();
         if (have_intstatus && (intstatus != last_intstatus_seen || now >= next_diag)) {
-            sys_puthex32(console_ep, "[WIFI][SDPCM] диагностика: intstatus = ", intstatus);
+            wifi_vputhex32(console_ep, "[WIFI][SDPCM] диагностика: intstatus = ", intstatus);
             last_intstatus_seen = intstatus;
             next_diag = now + diag_interval_ticks;
         }
@@ -1530,12 +1617,15 @@ static bool sdpcm_wait_and_read_ctrl(seL4_CPtr console_ep, uint8_t **out_payload
 // (именно столько байт реально едет по проводу и указывается в dcmd.len —
 // прошивка использует dcmd.len, чтобы знать, сколько места у неё есть под
 // ответ). ---
-constexpr uint32_t WIFI_IOCTL_FRAME_CAP = 400; // 16(dcmd) + payload/ответ (BRCMF_DCMD_SMLEN=256 с запасом)
+// Поднято с 400 до 1536 байт для CLM blob download (16 dcmd + 8 имя "clmload\0"
+// + 12 dload-заголовок + до 1400 байт данных чанка, см. wifi_clm_download()).
+constexpr uint32_t WIFI_IOCTL_FRAME_CAP = 1536;
 alignas(4) static uint8_t g_ioctl_frame[WIFI_IOCTL_FRAME_CAP];
 static uint16_t g_bcdc_reqid = 0;
 
 static bool wifi_ioctl(seL4_CPtr console_ep, uint32_t cmd, bool is_set,
-                        uint8_t *inout_buf, uint32_t inout_cap, uint32_t req_len, uint32_t *out_len) {
+                        uint8_t *inout_buf, uint32_t inout_cap, uint32_t req_len, uint32_t *out_len,
+                        bool dump_hex = true) {
     uint32_t frame_len = 16 + req_len;
     if (frame_len > WIFI_IOCTL_FRAME_CAP || req_len > inout_cap) {
         sys_puts(console_ep, "[WIFI][IOCTL] FAIL: запрос не влезает в буфер\n");
@@ -1559,9 +1649,11 @@ static bool wifi_ioctl(seL4_CPtr console_ep, uint32_t cmd, bool is_set,
 
     for (uint32_t i = 0; i < req_len; i++) g_ioctl_frame[16 + i] = inout_buf[i];
 
-    sys_puthexbuf(console_ep, "[WIFI][IOCTL] диагностика: dcmd+payload = ", g_ioctl_frame, frame_len);
+    if (dump_hex) {
+        wifi_vputhexbuf(console_ep, "[WIFI][IOCTL] диагностика: dcmd+payload = ", g_ioctl_frame, frame_len);
+    }
 
-    if (!sdpcm_send_ctrl(console_ep, g_ioctl_frame, frame_len)) return false;
+    if (!sdpcm_send_ctrl(console_ep, g_ioctl_frame, frame_len, dump_hex)) return false;
 
     // Ответ на ПРЕДЫДУЩИЙ запрос (протухший по таймауту раньше) может всё
     // ещё сидеть в очереди F2 и прийти раньше ответа на текущий — подтверждено
@@ -1585,7 +1677,7 @@ static bool wifi_ioctl(seL4_CPtr console_ep, uint32_t cmd, bool is_set,
         resp_id = (resp_flags >> BCDC_DCMD_ID_SHIFT) & 0xFFFFu;
         if (resp_id == reqid) break;
         sys_puthex32(console_ep, "[WIFI][IOCTL] WARN: reqid не совпал (устаревший ответ), ожидали ", reqid);
-        sys_puthex32(console_ep, "[WIFI][IOCTL]   получили ", resp_id);
+        wifi_vputhex32(console_ep, "[WIFI][IOCTL]   получили ", resp_id);
         if (attempt == 2) {
             sys_puts(console_ep, "[WIFI][IOCTL] FAIL: не дождались ответа с нужным reqid\n");
             return false;
@@ -1605,7 +1697,8 @@ static bool wifi_ioctl(seL4_CPtr console_ep, uint32_t cmd, bool is_set,
 
 // Ответ на IOCTL перезаписывает тот же буфер, что и запрос — общий, статика
 // (не стек), с запасом под "ver"-строку (BRCMF_DCMD_SMLEN=256 в эталоне).
-alignas(4) static uint8_t g_ioctl_iobuf[256];
+// Поднято до 1536 байт для CLM blob download (см. WIFI_IOCTL_FRAME_CAP выше).
+alignas(4) static uint8_t g_ioctl_iobuf[1536];
 static bool g_wifi_sdpcm_ok = false;
 
 // Полная оркестровка Милстоуна 4.3 — вызывается из main() ПОСЛЕ успешного
@@ -1624,7 +1717,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // восстановления линии (wifi_reset_cmd_data_lines() при любой реальной
     // ошибке/застревании, см. wifi_wait_status_clear/wifi_wait_irpt_bit) —
     // пробуем снова, уже с этой защитой.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: запрос тактовой частоты чипа (HT, нужен backplane'у F2)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: запрос тактовой частоты чипа (HT, нужен backplane'у F2)...\n");
     uint8_t saveclk = 0;
     bool have_saveclk = wifi_request_ht_clock(console_ep, &saveclk);
     if (!have_saveclk) {
@@ -1653,7 +1746,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // на уровне SDIO, но прошивка не увидит кадр, если FIFO не настроен
     // правильно. Пробуем настроить его здесь, пока прямые F1-записи ещё
     // работают, вместо того чтобы пропускать целиком.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: watermark/MES (до enable F2)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: watermark/MES (до enable F2)...\n");
     if (!sdio_f1_write_byte(SBSDIO_WATERMARK, CY_43455_F2_WATERMARK, console_ep)) {
         sys_puts(console_ep, "[WIFI][SDPCM] WARN: watermark не прошёл, продолжаем best-effort\n");
     } else {
@@ -1664,16 +1757,16 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
         sdio_f1_write_byte(SBSDIO_FUNC1_MESBUSYCTRL, CY_43455_MESBUSYCTRL, console_ep);
     }
 
-    sys_puts(console_ep, "[WIFI][SDPCM] step: tosbmailboxdata (версия sdpcm, до enable F2)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: tosbmailboxdata (версия sdpcm, до enable F2)...\n");
     if (!backplane_write32_retry(g_sdio_core.base + SDPCMD_TOSBMAILBOXDATA, SDPCM_PROT_VERSION << SMB_DATA_VERSION_SHIFT, console_ep)) {
         sys_puts(console_ep, "[WIFI][SDPCM] FAIL: запись tosbmailboxdata\n");
         return;
     }
 
-    sys_puts(console_ep, "[WIFI][SDPCM] step: enable SDIO func2...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: enable SDIO func2...\n");
     if (!sdio_enable_func(SBSDIO_FUNC_2, console_ep)) return;
 
-    sys_puts(console_ep, "[WIFI][SDPCM] step: согласование блок-размера func2 (512 байт)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: согласование блок-размера func2 (512 байт)...\n");
     if (!wifi_set_func2_blocksize(console_ep)) return;
 
     // ДИАГНОСТИКА: первая же команда СРАЗУ после enable F2 стабильно ловила
@@ -1681,7 +1774,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // на "чип занят" на короткое время сразу после включения функции, а не
     // структурную ошибку протокола. Даём честную реальную паузу перед тем,
     // как трогать что-либо ещё.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: пауза после enable F2 (settle)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: пауза после enable F2 (settle)...\n");
     {
         uint64_t freq = wifi_read_cntfrq();
         uint64_t start = wifi_read_cntvct();
@@ -1699,12 +1792,12 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
             sys_puts(console_ep, "[WIFI][SDPCM] FAIL: контрольное чтение F0 CCCR после enable F2 НЕ ПРОШЛО — шина сломана целиком\n");
         } else {
             uint32_t cccr_resp = *wifi_reg(EMMC_RESP0_OFFSET) & 0xFFu;
-            sys_puthex32(console_ep, "[WIFI][SDPCM] контрольное чтение F0 CCCR после enable F2 = ", cccr_resp);
+            wifi_vputhex32(console_ep, "[WIFI][SDPCM] контрольное чтение F0 CCCR после enable F2 = ", cccr_resp);
         }
     }
 
     // hostintmask (CMD53 через backplane-окно) — стабильно проходит, оставляем.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: hostintmask...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: hostintmask...\n");
     if (!backplane_write32_retry(g_sdio_core.base + SDPCMD_HOSTINTMASK, HOSTINTMASK, console_ep)) {
         sys_puts(console_ep, "[WIFI][SDPCM] WARN: hostintmask не прошёл, продолжаем best-effort\n");
     }
@@ -1728,7 +1821,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // (PMU/clock state machine прошивки могла быть в замешательстве).
     // Best-effort, как и остальные шаги здесь.
     if (have_saveclk) {
-        sys_puts(console_ep, "[WIFI][SDPCM] step: восстановление CHIPCLKCSR=saveclk...\n");
+        wifi_vputs(console_ep, "[WIFI][SDPCM] step: восстановление CHIPCLKCSR=saveclk...\n");
         if (!sdio_f1_write_byte(SBSDIO_FUNC1_CHIPCLKCSR, saveclk, console_ep)) {
             sys_puts(console_ep, "[WIFI][SDPCM] WARN: восстановление CHIPCLKCSR не прошло, продолжаем best-effort\n");
         }
@@ -1743,7 +1836,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // прошивке действительно нужно было чуть больше времени на собственную
     // sdpcm-инициализацию, чем на то, чтобы просто напечатать что-то в
     // консоль (см. Милстоун 4.2), это должно проявиться здесь.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: ожидание готовности прошивки (tohostmailboxdata)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: ожидание готовности прошивки (tohostmailboxdata)...\n");
     {
         // ДИАГНОСТИКА: первое чтение — С console_ep, чтобы отличить "реально
         // 0" от "тихо падает" (весь остальной цикл ниже читает молча,
@@ -1753,9 +1846,9 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
         // чтения стабильно ловили Data Timeout Error).
         uint32_t probe_mbdata = 0;
         if (!backplane_read32_retry(g_sdio_core.base + SDPCMD_TOHOSTMAILBOXDATA, &probe_mbdata, console_ep)) {
-            sys_puts(console_ep, "[WIFI][SDPCM] диагностика: первое чтение tohostmailboxdata НЕ ПРОШЛО\n");
+            wifi_vputs(console_ep, "[WIFI][SDPCM] диагностика: первое чтение tohostmailboxdata НЕ ПРОШЛО\n");
         } else {
-            sys_puthex32(console_ep, "[WIFI][SDPCM] диагностика: первое чтение tohostmailboxdata = ", probe_mbdata);
+            wifi_vputhex32(console_ep, "[WIFI][SDPCM] диагностика: первое чтение tohostmailboxdata = ", probe_mbdata);
         }
 
         uint64_t freq = wifi_read_cntfrq();
@@ -1765,7 +1858,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
         while (wifi_read_cntvct() - start < timeout_ticks) {
             uint32_t mbdata = 0;
             if (backplane_read32_retry(g_sdio_core.base + SDPCMD_TOHOSTMAILBOXDATA, &mbdata, 0) && mbdata != 0) {
-                sys_puthex32(console_ep, "[WIFI][SDPCM] tohostmailboxdata = ", mbdata);
+                wifi_vputhex32(console_ep, "[WIFI][SDPCM] tohostmailboxdata = ", mbdata);
                 if (mbdata & (HMB_DATA_DEVREADY | HMB_DATA_FWREADY)) { seen_ready = true; break; }
             }
             seL4_Yield();
@@ -1780,7 +1873,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // Не является предпосылкой готовности прошивки к остальным dcmd'ам (per
     // research), но раз это буквально первый запрос эталона — отправляем и
     // мы первым, для полного соответствия порядку.
-    sys_puts(console_ep, "[WIFI][SDPCM] step: iovar \"bus:txglom\"=0 (первый control-запрос, как в эталоне)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: iovar \"bus:txglom\"=0 (первый control-запрос, как в эталоне)...\n");
     {
         const char *name = "bus:txglom";
         uint32_t ni = 0;
@@ -1790,7 +1883,7 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
         uint32_t txglom_len = ni + 4;
         uint32_t txglom_out_len = 0;
         if (wifi_ioctl(console_ep, BRCMF_C_SET_VAR, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), txglom_len, &txglom_out_len)) {
-            sys_puts(console_ep, "[WIFI][SDPCM] \"bus:txglom\" SET OK\n");
+            wifi_vputs(console_ep, "[WIFI][SDPCM] \"bus:txglom\" SET OK\n");
         } else {
             sys_puts(console_ep, "[WIFI][SDPCM] WARN: \"bus:txglom\" SET не прошёл, продолжаем best-effort\n");
         }
@@ -1803,35 +1896,42 @@ static void wifi_sdpcm_bringup(seL4_CPtr console_ep) {
     // payload'а запроса (у GET_VERSION запрос вообще без параметров) — как и
     // "ver" ниже, должны честно объявить место под ответ (4 байта — размер
     // uint32-версии).
-    sys_puts(console_ep, "[WIFI][SDPCM] step: IOCTL GET_VERSION (смок-тест #1)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: IOCTL GET_VERSION (смок-тест #1)...\n");
     for (uint32_t i = 0; i < sizeof(g_ioctl_iobuf); i++) g_ioctl_iobuf[i] = 0;
     uint32_t out_len = 0;
     if (wifi_ioctl(console_ep, BRCMF_C_GET_VERSION, false, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), 4, &out_len)) {
-        sys_puts(console_ep, "[WIFI][SDPCM] GET_VERSION OK\n");
+        wifi_vputs(console_ep, "[WIFI][SDPCM] GET_VERSION OK\n");
         if (out_len >= 4) {
             uint32_t ver = (uint32_t)g_ioctl_iobuf[0] | ((uint32_t)g_ioctl_iobuf[1] << 8) |
                            ((uint32_t)g_ioctl_iobuf[2] << 16) | ((uint32_t)g_ioctl_iobuf[3] << 24);
-            sys_puthex32(console_ep, "[WIFI][SDPCM] GET_VERSION value = ", ver);
+            wifi_vputhex32(console_ep, "[WIFI][SDPCM] GET_VERSION value = ", ver);
         }
         g_wifi_sdpcm_ok = true;
     } else {
         sys_puts(console_ep, "[WIFI][SDPCM] GET_VERSION FAILED\n");
     }
 
-    sys_puts(console_ep, "[WIFI][SDPCM] step: IOCTL GET_VAR \"ver\" (смок-тест #2)...\n");
+    wifi_vputs(console_ep, "[WIFI][SDPCM] step: IOCTL GET_VAR \"ver\" (смок-тест #2)...\n");
     for (uint32_t i = 0; i < sizeof(g_ioctl_iobuf); i++) g_ioctl_iobuf[i] = 0;
     const char *name = "ver";
     uint32_t ni = 0;
     while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
     g_ioctl_iobuf[ni] = 0; // NUL-терминатор имени iovar'а
     out_len = 0;
-    // req_len = ВЕСЬ буфер (не только "ver\0") — прошивка использует dcmd.len,
-    // чтобы знать, сколько места у неё есть под ответ (см. план, п.4/6).
-    if (wifi_ioctl(console_ep, BRCMF_C_GET_VAR, false, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), (uint32_t)sizeof(g_ioctl_iobuf), &out_len)) {
+    // req_len = буфер под ответ (BRCMF_DCMD_SMLEN=256 в эталоне) — прошивка
+    // использует dcmd.len, чтобы знать, сколько места у неё есть под ответ
+    // (см. план, п.4/6). ИСПРАВЛЕНО: раньше здесь стоял sizeof(g_ioctl_iobuf)
+    // целиком — это было безопасно, пока буфер был 256 байт, но после его
+    // роста до 1536 (ради CLM blob, см. WIFI_IOCTL_FRAME_CAP) это стало
+    // 16+1536=1552 > WIFI_IOCTL_FRAME_CAP(1536), и "ver" стабильно падал с
+    // "запрос не влезает в буфер". Фиксированный небольшой запас достаточен —
+    // строка версии всегда укладывается в 256 байт.
+    constexpr uint32_t VER_RESP_CAP = 256;
+    if (wifi_ioctl(console_ep, BRCMF_C_GET_VAR, false, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), VER_RESP_CAP, &out_len)) {
         g_ioctl_iobuf[sizeof(g_ioctl_iobuf) - 1] = 0; // защититься от неNUL-терминированного ответа
-        sys_puts(console_ep, "[WIFI][SDPCM] \"ver\" = \"");
-        sys_puts(console_ep, (const char*)g_ioctl_iobuf);
-        sys_puts(console_ep, "\"\n");
+        wifi_vputs(console_ep, "[WIFI][SDPCM] \"ver\" = \"");
+        wifi_vputs(console_ep, (const char*)g_ioctl_iobuf);
+        wifi_vputs(console_ep, "\"\n");
         g_wifi_sdpcm_ok = true;
     } else {
         sys_puts(console_ep, "[WIFI][SDPCM] \"ver\" iovar FAILED\n");
@@ -1970,7 +2070,7 @@ static void sys_puthexbyte(seL4_CPtr console_ep, uint8_t v) {
     hex[0] = "0123456789abcdef"[(v >> 4) & 0xF];
     hex[1] = "0123456789abcdef"[v & 0xF];
     hex[2] = 0;
-    sys_puts(console_ep, hex);
+    wifi_vputs(console_ep, hex);
 }
 
 // Самотест PBKDF2 по общеизвестному тестовому вектору 802.11i/WPA2
@@ -2009,63 +2109,384 @@ static bool wifi_dcmd_set_int(seL4_CPtr console_ep, uint32_t cmd, uint32_t value
     return wifi_ioctl(console_ep, cmd, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), 4u, &out_len);
 }
 
+// Прямой dcmd с ДВУМЯ le32 (BRCMF_C_SET_ROAM_TRIGGER/DELTA — эталон шлёт
+// __le32[2]{значение, BRCM_BAND_ALL}, см. brcmf_dongle_roam() в cfg80211.c).
+static bool wifi_dcmd_set_int_pair(seL4_CPtr console_ep, uint32_t cmd, int32_t v0, uint32_t v1) {
+    uint32_t u0 = (uint32_t)v0;
+    for (int i = 0; i < 4; i++) g_ioctl_iobuf[i]     = (uint8_t)((u0 >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 4; i++) g_ioctl_iobuf[4 + i] = (uint8_t)((v1 >> (i * 8)) & 0xFF);
+    uint32_t out_len = 0;
+    return wifi_ioctl(console_ep, cmd, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), 8u, &out_len);
+}
+
 // Буфер под приём кадров EVENT-канала — общий для escan-диагностики и
 // ожидания результата join (ниже).
 constexpr uint32_t WIFI_EVENT_RX_BUF_CAP = 512;
 alignas(4) static uint8_t g_event_rx_buf[WIFI_EVENT_RX_BUF_CAP];
 
-// ДИАГНОСТИКА: слепой escan (все каналы, все SSID) — не зависит от
-// правильности SSID/PSK/join вообще, только от того, включено ли радио и
-// делает ли прошивка ХОТЬ ЧТО-ТО в эфире. Если это тоже не даёт ни одного
-// события — проблема выше join, в самом базовом bring-up радио/интерфейса.
-static bool wifi_escan_start(seL4_CPtr console_ep) {
+// Списки каналов для "wifi scan -f 2/5" — при явном выборе диапазона
+// сканируются ТОЛЬКО эти каналы (быстрее, чем слепой проход по всем),
+// вместо диапазона фильтруется уже готовый результат (обсуждали и сознательно
+// выбрали именно ограничение на уровне запроса, а не фильтр вывода).
+static const uint8_t WIFI_CHANNELS_24GHZ[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+static const uint8_t WIFI_CHANNELS_5GHZ[]  = {36,40,44,48,52,56,60,64,
+                                               100,104,108,112,116,120,124,128,132,136,140,144,
+                                               149,153,157,161,165};
+
+// chanspec одного 20МГц-канала для СПИСКА КАНАЛОВ escan-запроса (не путать с
+// chanspec ИЗ РЕЗУЛЬТАТА скана в wifi_print_escan_bss() — та описывает
+// реальную ширину/полосу НАЙДЕННОЙ точки доступа, а эта — просто "настройся
+// на этот канал и слушай"). Сверено с эталоном (channel_to_chanspec() в
+// cfg80211.c: chnum + BW_20 + encchspec()) и с brcmu_d11ac_encchspec()
+// (d11.c): для BW_20 sideband всегда "L"=0x0000; диапазон определяется по
+// самому номеру канала (<=14 -> 2.4ГГц) прошивкой/эталоном одинаково, а не
+// нашим выбором — воспроизводим ту же границу. Подтверждено эмпирически:
+// реальный формат этой прошивки — именно D11AC chanspec (не D11N, как
+// предполагалось раньше) — байты найденной "TP-Link_..._5G" сети содержали
+// BW=80MHz/BND=5G ровно в D11AC-битах (0xe02a), а не D11N.
+static uint16_t wifi_chanspec_for_channel(uint8_t channel) {
+    constexpr uint16_t BW_20 = 0x1000;   // BRCMU_CHSPEC_D11AC_BW_20
+    constexpr uint16_t BND_5G = 0xc000;  // BRCMU_CHSPEC_D11AC_BND_5G (2G = 0x0000)
+    uint16_t chanspec = (uint16_t)channel | BW_20;
+    if (channel > 14) chanspec |= BND_5G;
+    return chanspec;
+}
+
+// ИСПРАВЛЕНО: с фильтром по диапазону скан стал заметно быстрее (несколько
+// секунд вместо ~30) — и на живом железе тут же вылезла проблема, которая
+// раньше маскировалась долгими сканами: если запустить НОВЫЙ "wifi scan"
+// сразу же (буквально в ту же секунду) после того как предыдущий вернул
+// результат, escan SET нового запроса иногда СОВСЕМ не получает ответ
+// (полный таймаут 15с, см. лог/память проекта — "reqid не совпал" один раз
+// проскакивает, а затем настоящий ack так и не приходит). Прошивке, похоже,
+// нужно немного реального времени после завершения предыдущего скана, прежде
+// чем она готова принять следующий. Даём небольшой обязательный "остыв" —
+// если с момента, когда МЫ сами посчитали предыдущий скан завершённым,
+// прошло меньше COOLDOWN, просто ждём остаток перед отправкой нового escan.
+static uint64_t g_last_scan_end_tick = 0;
+static bool g_last_scan_end_valid = false;
+static uint32_t g_last_scan_band_filter = 0;
+constexpr uint64_t WIFI_SCAN_COOLDOWN_US = 1500000;          // 1.5с — после слепого скана этого достаточно
+// ИСПРАВЛЕНО: A/B-тест на живом железе (три слепых "wifi scan" подряд без
+// пауз — все ОК; два "-f 2" подряд — второй стабильно вообще не получает
+// ответа, даже не "устаревший") показал, что проблема НЕ в повторных сканах
+// вообще, а конкретно в повторении запроса с явным channel_list (см. память
+// проекта). channel_num=0 (слепой) — прошивка, видимо, игнорирует любое
+// состояние итератора списка каналов; channel_num>0 — нет. Раз точная
+// причина на стороне прошивки не видна (закрытый блоб), даём заведомо
+// больший запас именно после канало-ограниченного скана, а не гадаем
+// дальше с протоколом.
+constexpr uint64_t WIFI_SCAN_COOLDOWN_FILTERED_US = 4000000; // 4с — после "-f 2/5"
+
+static void wifi_scan_cooldown_wait(seL4_CPtr console_ep) {
+    if (!g_last_scan_end_valid) return;
+    uint64_t cooldown_us = (g_last_scan_band_filter != 0) ? WIFI_SCAN_COOLDOWN_FILTERED_US : WIFI_SCAN_COOLDOWN_US;
+    uint64_t freq = wifi_read_cntfrq();
+    uint64_t cooldown_ticks = (freq * cooldown_us) / 1000000ull;
+    uint64_t elapsed = wifi_read_cntvct() - g_last_scan_end_tick;
+    if (elapsed >= cooldown_ticks) return;
+    uint64_t remaining_ticks = cooldown_ticks - elapsed;
+    wifi_vputs(console_ep, "[WIFI][SCAN] step: остываем после предыдущего скана...\n");
+    uint64_t wait_until = wifi_read_cntvct() + remaining_ticks;
+    while (wifi_read_cntvct() < wait_until) seL4_Yield();
+}
+
+// band_filter: 0 = слепой скан всех каналов (как раньше), 2/5 = явный список
+// каналов только этого диапазона (см. WIFI_CHANNELS_24GHZ/5GHZ выше).
+// iovar SET БЕЗ ожидания ack — тот же приём, что и в wifi_escan_abort() выше:
+// ack на служебные "туда-обратно" вызовы вокруг скана (mpc=0/mpc=1) на живом
+// железе ненадёжен/запаздывает не хуже, чем на abort, и попытка его дождаться
+// добавляла собственный таймаут ПОВЕРХ уже успешно отработавшего скана (см.
+// память проекта — "Scan done" после "FAIL: таймаут ожидания ответа"). Если
+// ack всё же придёт позже, его молча пропустит reqid-mismatch-толерантная
+// логика в следующем wifi_ioctl().
+static bool wifi_iovar_set_int_noack(seL4_CPtr console_ep, const char *name, uint32_t value) {
+    uint32_t ni = 0;
+    while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
+    g_ioctl_iobuf[ni] = 0; ni++;
+    g_ioctl_iobuf[ni + 0] = (uint8_t)(value & 0xFF);
+    g_ioctl_iobuf[ni + 1] = (uint8_t)((value >> 8) & 0xFF);
+    g_ioctl_iobuf[ni + 2] = (uint8_t)((value >> 16) & 0xFF);
+    g_ioctl_iobuf[ni + 3] = (uint8_t)((value >> 24) & 0xFF);
+    uint32_t req_len = ni + 4u;
+    uint32_t frame_len = 16 + req_len;
+    uint32_t reqid = (uint32_t)(++g_bcdc_reqid);
+    uint32_t flags = (reqid << BCDC_DCMD_ID_SHIFT) | BCDC_DCMD_SET;
+    g_ioctl_frame[0] = (uint8_t)(BRCMF_C_SET_VAR & 0xFF);
+    g_ioctl_frame[1] = (uint8_t)((BRCMF_C_SET_VAR >> 8) & 0xFF);
+    g_ioctl_frame[2] = (uint8_t)((BRCMF_C_SET_VAR >> 16) & 0xFF);
+    g_ioctl_frame[3] = (uint8_t)((BRCMF_C_SET_VAR >> 24) & 0xFF);
+    g_ioctl_frame[4] = (uint8_t)(req_len & 0xFF);
+    g_ioctl_frame[5] = (uint8_t)((req_len >> 8) & 0xFF);
+    g_ioctl_frame[6] = 0; g_ioctl_frame[7] = 0;
+    g_ioctl_frame[8]  = (uint8_t)(flags & 0xFF);
+    g_ioctl_frame[9]  = (uint8_t)((flags >> 8) & 0xFF);
+    g_ioctl_frame[10] = (uint8_t)((flags >> 16) & 0xFF);
+    g_ioctl_frame[11] = (uint8_t)((flags >> 24) & 0xFF);
+    g_ioctl_frame[12] = 0; g_ioctl_frame[13] = 0; g_ioctl_frame[14] = 0; g_ioctl_frame[15] = 0;
+    for (uint32_t i = 0; i < req_len; i++) g_ioctl_frame[16 + i] = g_ioctl_iobuf[i];
+    return sdpcm_send_ctrl(console_ep, g_ioctl_frame, frame_len, false);
+}
+
+static bool wifi_escan_start(seL4_CPtr console_ep, uint32_t band_filter = 0) {
+    wifi_scan_cooldown_wait(console_ep); // использует band_filter ПРЕДЫДУЩЕГО скана
+    g_last_scan_band_filter = band_filter;
+    // ИСПРАВЛЕНО: реальный физический замер тока показал, что при повторном
+    // "-f 2/5" радио вообще не активируется (потребление остаётся на уровне
+    // покоя ~950мА весь "скан", хотя в первый раз честно росло до ~997мА и
+    // держалось до конца) — чип, похоже, действительно засыпает между
+    // сканами. Эталон (brcmf_cfg80211_escan(), cfg80211.c) ПЕРЕД каждым
+    // сканом явно шлёт "mpc"=0 (выключить энергосбережение радио на время
+    // скана) и включает обратно после (brcmf_notify_escan_complete()) — мы
+    // ставили "mpc"=1 один раз в preinit и никогда не трогали снова.
+    // В эталоне этот вызов гейтится квиркой, применимой только к чипу 4329
+    // (не нашему 4345/43455) — но раз у нас нет остальной инфраструктуры
+    // энергоуправления Linux, делаем это явно и безусловно: дёшево и прямо
+    // подсказано измерением тока, а не догадкой по протоколу.
+    wifi_iovar_set_int_noack(console_ep, "mpc", 0);
+    const uint8_t *channels = nullptr;
+    uint32_t n_channels = 0;
+    if (band_filter == 2) { channels = WIFI_CHANNELS_24GHZ; n_channels = sizeof(WIFI_CHANNELS_24GHZ); }
+    else if (band_filter == 5) { channels = WIFI_CHANNELS_5GHZ; n_channels = sizeof(WIFI_CHANNELS_5GHZ); }
+
     const char *name = "escan";
     uint32_t ni = 0;
     while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
     g_ioctl_iobuf[ni] = 0; ni++;
     uint32_t base = ni;
-    for (uint32_t i = 0; i < BRCMF_ESCAN_BLIND_LEN; i++) g_ioctl_iobuf[base + i] = 0;
+    uint32_t params_len = BRCMF_ESCAN_PARAMS_HDR_LEN + BRCMF_SCAN_PARAMS_FIXED_SIZE + n_channels * 2u;
+    for (uint32_t i = 0; i < params_len; i++) g_ioctl_iobuf[base + i] = 0;
 
     // brcmf_escan_params_le: version(le32) + action(le16) + sync_id(le16)
+    // ИСПРАВЛЕНО: sync_id раньше был жёстко захардкожен как 0x1234 на КАЖДЫЙ
+    // вызов — cooldown до 4с не помог повторному "-f 2/5" ни капли (полная
+    // тишина что через 1.5с, что через 4с), значит дело не во времени. Один
+    // из немногих оставшихся кандидатов — прошивка может игнорировать escan
+    // с уже виденным sync_id как дубликат. Делаем sync_id уникальным на
+    // каждый запрос (просто инкрементируем).
+    static uint16_t g_escan_sync_id = 0x1234;
+    g_escan_sync_id++;
     g_ioctl_iobuf[base + 0] = (uint8_t)(BRCMF_ESCAN_REQ_VERSION & 0xFF);
     g_ioctl_iobuf[base + 4] = (uint8_t)(WL_ESCAN_ACTION_START & 0xFF);
-    g_ioctl_iobuf[base + 6] = 0x34; g_ioctl_iobuf[base + 7] = 0x12; // sync_id = 0x1234, произвольно
+    g_ioctl_iobuf[base + 6] = (uint8_t)(g_escan_sync_id & 0xFF);
+    g_ioctl_iobuf[base + 7] = (uint8_t)((g_escan_sync_id >> 8) & 0xFF);
 
-    // brcmf_scan_params_le (offset base+8): ssid_le=0 (все SSID, т.к. n_ssids=0
-    // в этом упрощённом слепом варианте), bssid=broadcast, bss_type=ANY,
-    // scan_type=ACTIVE, nprobes/active/passive/home=-1, channel_num=0 (все
-    // каналы, без отдельного channel_list — n_channels=0 в этом варианте).
+    // brcmf_scan_params_le (offset base+8): ssid_le=0 (все SSID — n_ssids
+    // остаётся 0 независимо от фильтра диапазона, фильтруем только каналы),
+    // bssid=broadcast, bss_type=ANY, nprobes/active/passive/home=-1.
+    // scan_type — эталон (brcmf_escan_prep(), cfg80211.c) ставит ACTIVE по
+    // умолчанию, но переключает на PASSIVE именно когда n_ssids==0 (наш
+    // случай всегда, с фильтром каналов или без).
     uint32_t p = base + BRCMF_ESCAN_PARAMS_HDR_LEN;
     // ssid_le (36 байт) — уже занулено (означает "любой SSID")
     for (int i = 0; i < 6; i++) g_ioctl_iobuf[p + 36 + i] = 0xFF; // bssid broadcast
     g_ioctl_iobuf[p + 42] = (uint8_t)DOT11_BSSTYPE_ANY;   // bss_type (s8)
-    g_ioctl_iobuf[p + 43] = (uint8_t)BRCMF_SCANTYPE_ACTIVE; // scan_type
+    g_ioctl_iobuf[p + 43] = (uint8_t)BRCMF_SCANTYPE_PASSIVE; // scan_type (n_ssids==0 -> PASSIVE)
     for (int f = 0; f < 4; f++) { // nprobes/active_time/passive_time/home_time = -1
         uint32_t off = p + 44 + (uint32_t)f * 4u;
         g_ioctl_iobuf[off+0]=0xFF; g_ioctl_iobuf[off+1]=0xFF; g_ioctl_iobuf[off+2]=0xFF; g_ioctl_iobuf[off+3]=0xFF;
     }
-    // channel_num (offset p+60) = 0 — уже занулено (все каналы)
+    // channel_num (offset p+60, le32) = n_channels в младших 16 битах
+    // (n_ssids=0 в старших — уже занулено). n_channels=0 -> "все каналы"
+    // (прежнее слепое поведение), как и в эталоне.
+    g_ioctl_iobuf[p + 60] = (uint8_t)(n_channels & 0xFF);
+    g_ioctl_iobuf[p + 61] = (uint8_t)((n_channels >> 8) & 0xFF);
+    // channel_list (offset p+64) — только если задан явный диапазон
+    for (uint32_t i = 0; i < n_channels; i++) {
+        uint16_t cs = wifi_chanspec_for_channel(channels[i]);
+        g_ioctl_iobuf[p + 64 + i * 2 + 0] = (uint8_t)(cs & 0xFF);
+        g_ioctl_iobuf[p + 64 + i * 2 + 1] = (uint8_t)((cs >> 8) & 0xFF);
+    }
 
-    uint32_t req_len = ni + BRCMF_ESCAN_BLIND_LEN;
+    uint32_t req_len = ni + params_len;
     uint32_t out_len = 0;
     return wifi_ioctl(console_ep, BRCMF_C_SET_VAR, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), req_len, &out_len);
 }
 
-// ДИАГНОСТИКА: печатает ЛЮБОЕ событие (не фильтруя по типу), которое видит
+// Принудительная остановка скана в прошивке (см. brcmf_notify_escan_complete(),
+// fw_abort=true, cfg80211.c) — вызывается, когда наше время ожидания ("-t")
+// истекло, а финальный маркер (status != PARTIAL) так и не пришёл: раньше мы
+// просто переставали слушать, а скан в прошивке продолжал идти в фоне — это
+// и было причиной того, что следующий "wifi scan" иногда не получал ответа
+// вовсе (см. память проекта). Это RAW dcmd BRCMF_C_SCAN (НЕ iovar "escan"!),
+// с обычным brcmf_scan_params_le, где channel_list[0] = -1 (0xFFFF) —
+// специальное сигнальное значение, которым эталон останавливает ЛЮБОЙ активный
+// скан (обычный или escan) на уровне самого сканирующего движка прошивки.
+static bool wifi_escan_abort(seL4_CPtr console_ep) {
+    constexpr uint32_t ABORT_LEN = 66; // brcmf_scan_params_le: 64 байта фикс. часть + channel_list[1](2 байта)
+    for (uint32_t i = 0; i < ABORT_LEN; i++) g_ioctl_iobuf[i] = 0;
+    for (int i = 0; i < 6; i++) g_ioctl_iobuf[36 + i] = 0xFF; // bssid broadcast
+    g_ioctl_iobuf[42] = (uint8_t)DOT11_BSSTYPE_ANY;           // bss_type
+    g_ioctl_iobuf[43] = 0;                                     // scan_type — не важно для abort
+    g_ioctl_iobuf[44] = 1;                                     // nprobes = 1
+    for (int i = 0; i < 4; i++) g_ioctl_iobuf[48 + i] = 0xFF;  // active_time = -1
+    for (int i = 0; i < 4; i++) g_ioctl_iobuf[52 + i] = 0xFF;  // passive_time = -1
+    for (int i = 0; i < 4; i++) g_ioctl_iobuf[56 + i] = 0xFF;  // home_time = -1
+    g_ioctl_iobuf[60] = 1;                                     // channel_num низкие 16 бит = 1 (высокие/n_ssids=0)
+    g_ioctl_iobuf[64] = 0xFF; g_ioctl_iobuf[65] = 0xFF;         // channel_list[0] = -1 — сигнал ABORT
+
+    // ИСПРАВЛЕНО: изначально ждали ack через wifi_ioctl() как на любой другой
+    // dcmd — на живом железе это регулярно само утыкалось в полный 15-секундный
+    // таймаут (см. память проекта — "зависло на ~15с хотя скан отработал
+    // штатно"), сводя на нет весь смысл настраиваемого "-t". Эталон на ошибку
+    // abort'а тоже не блокируется (только логирует, если err != 0) — здесь же
+    // проблема глубже: сам ack на abort ненадёжно доходит вовремя. Просто
+    // отправляем dcmd-кадр БЕЗ ожидания ответа; если ack всё же придёт позже,
+    // его молча пропустит уже существующая reqid-mismatch-толерантная логика
+    // в следующем wifi_ioctl() (см. "WARN: reqid не совпал").
+    uint32_t frame_len = 16 + ABORT_LEN;
+    uint32_t reqid = (uint32_t)(++g_bcdc_reqid);
+    uint32_t flags = (reqid << BCDC_DCMD_ID_SHIFT) | BCDC_DCMD_SET;
+    g_ioctl_frame[0] = (uint8_t)(BRCMF_C_SCAN & 0xFF);
+    g_ioctl_frame[1] = (uint8_t)((BRCMF_C_SCAN >> 8) & 0xFF);
+    g_ioctl_frame[2] = (uint8_t)((BRCMF_C_SCAN >> 16) & 0xFF);
+    g_ioctl_frame[3] = (uint8_t)((BRCMF_C_SCAN >> 24) & 0xFF);
+    g_ioctl_frame[4] = (uint8_t)(ABORT_LEN & 0xFF);
+    g_ioctl_frame[5] = (uint8_t)((ABORT_LEN >> 8) & 0xFF);
+    g_ioctl_frame[6] = 0; g_ioctl_frame[7] = 0;
+    g_ioctl_frame[8]  = (uint8_t)(flags & 0xFF);
+    g_ioctl_frame[9]  = (uint8_t)((flags >> 8) & 0xFF);
+    g_ioctl_frame[10] = (uint8_t)((flags >> 16) & 0xFF);
+    g_ioctl_frame[11] = (uint8_t)((flags >> 24) & 0xFF);
+    g_ioctl_frame[12] = 0; g_ioctl_frame[13] = 0; g_ioctl_frame[14] = 0; g_ioctl_frame[15] = 0;
+    for (uint32_t i = 0; i < ABORT_LEN; i++) g_ioctl_frame[16 + i] = g_ioctl_iobuf[i];
+    return sdpcm_send_ctrl(console_ep, g_ioctl_frame, frame_len, false);
+}
+
+// Разбор одной записи struct brcmf_bss_info_le (см. константы BRCMF_BSS_INFO_*
+// в platform.h) из тела события BRCMF_E_ESCAN_RESULT и печать человекочитаемой
+// строки — SSID, BSSID, канал, RSSI. Печатается ВСЕГДА (не гасится "-l") —
+// это и есть смысл команды "wifi scan", а не диагностика.
+// Канал читается как младший байт chanspec (BRCMF_CHANSPEC_CH_MASK) — это
+// поле одинаково по смыслу что в D11N, что в D11AC формате chanspec, так что
+// для одного только отображения номера канала формат не важен. Подтверждено
+// эмпирически: у этого чипа (BCM4345/43455, поддерживает 802.11AC) реальный
+// формат — именно D11AC (найденный 0xe02a для 5ГГц-сети decode'ится как
+// BW=80МГц/BND=5G ровно в D11AC-битах), см. wifi_chanspec_for_channel() ниже,
+// где формат учтён явно при СБОРКЕ (а не только чтении) chanspec.
+static void wifi_print_escan_bss(seL4_CPtr console_ep, const uint8_t *buf, uint32_t bss_off) {
+    uint8_t ssid_len = buf[bss_off + BRCMF_BSS_INFO_SSID_LEN_OFF];
+    if (ssid_len > 32) ssid_len = 32;
+    char ssid[33];
+    for (uint32_t i = 0; i < ssid_len; i++) {
+        uint8_t c = buf[bss_off + BRCMF_BSS_INFO_SSID_OFF + i];
+        // Непечатаемые байты (в редких скрытых/нестандартных SSID) заменяем,
+        // а не печатаем как есть — это просто консоль UART, не терминал с
+        // полноценной обработкой произвольных байт.
+        ssid[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+    }
+    ssid[ssid_len] = 0;
+
+    const uint8_t *bssid = buf + bss_off + BRCMF_BSS_INFO_BSSID_OFF;
+    uint16_t chanspec = (uint16_t)(buf[bss_off + BRCMF_BSS_INFO_CHANSPEC_OFF] |
+                                    ((uint16_t)buf[bss_off + BRCMF_BSS_INFO_CHANSPEC_OFF + 1] << 8));
+    int32_t channel = (int32_t)(chanspec & BRCMF_CHANSPEC_CH_MASK);
+    int16_t rssi = (int16_t)(buf[bss_off + BRCMF_BSS_INFO_RSSI_OFF] |
+                              ((uint16_t)buf[bss_off + BRCMF_BSS_INFO_RSSI_OFF + 1] << 8));
+
+    sys_puts(console_ep, "[WIFI][SCAN] сеть: SSID=\"");
+    sys_puts(console_ep, ssid_len > 0 ? ssid : "(скрыт)");
+    sys_puts(console_ep, "\" BSSID=");
+    char hex[18];
+    const char *hexd = "0123456789abcdef";
+    for (int i = 0; i < 6; i++) {
+        hex[i * 3 + 0] = hexd[(bssid[i] >> 4) & 0xF];
+        hex[i * 3 + 1] = hexd[bssid[i] & 0xF];
+        hex[i * 3 + 2] = (i < 5) ? ':' : 0;
+    }
+    sys_puts(console_ep, hex);
+    sys_putdec32(console_ep, " канал=", channel);
+    sys_putdec32(console_ep, " RSSI=", (int32_t)rssi);
+    sys_puts(console_ep, "\n");
+}
+
+// Дедупликация по BSSID — за время полного passive-скана (теперь до 30с,
+// см. вызовы wifi_wait_and_dump_any_events() ниже) одна и та же точка
+// доступа слышна МНОГОКРАТНО (маячок повторяется каждые ~100мс, и/или
+// прошивка повторно проходит канал) — реальные драйверы у себя это молча
+// склеивают в один результат на BSSID (cfg80211_inform_bss в Linux), мы
+// печатали каждое сырое событие как отдельную строку. Простая таблица
+// "уже видели этот BSSID в ЭТОМ скане" — не самый свежий/сильный сигнал,
+// просто первое попадание, этого достаточно для списка сетей.
+constexpr uint32_t WIFI_SCAN_SEEN_BSS_CAP = 64;
+alignas(4) static uint8_t g_scan_seen_bssid[WIFI_SCAN_SEEN_BSS_CAP][6];
+static uint32_t g_scan_seen_bss_count = 0;
+
+static bool wifi_scan_bss_already_seen(const uint8_t *bssid) {
+    for (uint32_t i = 0; i < g_scan_seen_bss_count; i++) {
+        bool same = true;
+        for (int j = 0; j < 6; j++) if (g_scan_seen_bssid[i][j] != bssid[j]) { same = false; break; }
+        if (same) return true;
+    }
+    if (g_scan_seen_bss_count < WIFI_SCAN_SEEN_BSS_CAP) {
+        for (int j = 0; j < 6; j++) g_scan_seen_bssid[g_scan_seen_bss_count][j] = bssid[j];
+        g_scan_seen_bss_count++;
+    }
+    return false;
+}
+
+// Вычерпывает всё, что осело в очереди F2 (событийные ИЛИ контрольные кадры —
+// не разбираем, просто читаем и выбрасываем), пока не увидим ~3 подряд
+// "пустых" попытки (невалидная чек-сумма/нет данных). Вызывается в КОНЦЕ
+// wifi_wait_and_dump_any_events() — идея пользователя: если после abort'а
+// (fire-and-forget, см. wifi_escan_abort()) в очереди остаются "хвостовые"
+// кадры текущего скана (или его же запоздавший ack), они иначе всплывают
+// ПОЗЖЕ, во время ожидания ack на СЛЕДУЮЩИЙ "wifi scan" — именно так себя
+// вели повторные сканы, даже после того как abort стал fire-and-forget и
+// перестал сам добавлять 15-секундную задержку. Явно опустошаем очередь
+// здесь же, а не полагаемся на то, что следующий вызов сам разберётся.
+static void wifi_scan_drain_stale_frames(seL4_CPtr console_ep) {
+    int consecutive_empty = 0;
+    for (int iter = 0; iter < 40 && consecutive_empty < 3; iter++) {
+        if (!sdio_f2_read(0, g_event_rx_buf, BRCMF_FIRSTREAD)) { consecutive_empty++; continue; }
+        uint16_t len16 = (uint16_t)(g_event_rx_buf[0] | (g_event_rx_buf[1] << 8));
+        uint16_t chk16 = (uint16_t)(g_event_rx_buf[2] | (g_event_rx_buf[3] << 8));
+        if ((uint16_t)~(len16 ^ chk16) != 0 || len16 < SDPCM_HDRLEN) { consecutive_empty++; continue; }
+        if (len16 > BRCMF_FIRSTREAD) {
+            uint32_t remaining = len16 - BRCMF_FIRSTREAD;
+            uint32_t remaining_padded = (remaining + 3u) & ~3u;
+            if (BRCMF_FIRSTREAD + remaining_padded <= WIFI_EVENT_RX_BUF_CAP) {
+                sdio_f2_read(0, g_event_rx_buf + BRCMF_FIRSTREAD, remaining_padded);
+            }
+        }
+        consecutive_empty = 0; // нашли настоящий кадр — очередь ещё не точно пуста
+    }
+    wifi_vputs(console_ep, "[WIFI][SCAN] step: очередь F2 вычерпана перед завершением скана.\n");
+}
+
+// печатает ЛЮБОЕ событие (не фильтруя по типу), которое видит
 // за timeout_us — чтобы понять, делает ли прошивка вообще хоть что-то в
 // эфире (при escan) независимо от корректности join-последовательности.
 // Не завершает работу при первом событии — копит все события до таймаута,
 // чтобы увидеть полную картину (escan обычно шлёт много PARTIAL + один
-// финальный).
-static void wifi_wait_and_dump_any_events(seL4_CPtr console_ep, uint32_t timeout_us) {
+// финальный). BRCMF_E_ESCAN_RESULT дополнительно разбирается через
+// wifi_print_escan_bss() выше — это и есть основной результат "wifi scan".
+//
+// ИСПРАВЛЕНО: раньше функция ВСЕГДА ждала полный timeout_us (фиксированные
+// 5с), даже если прошивка уже закончила скан раньше — из-за этого 2-й/3-й
+// подряд "wifi scan" стабильно падали таймаутом ответа на сам escan-dcmd.
+// Причина: если сканирование реально завершается ПОЗЖЕ, чем мы перестали
+// слушать (наш polling — раз в 200мс, не настоящее прерывание), финальные
+// PARTIAL/COMPLETE-события остаются недочитанными в очереди F2 — и на
+// следующий "wifi scan" наш sdpcm_wait_and_read_ctrl() выгребает эти старые
+// "хвостовые" кадры вместо ack на НОВЫЙ запрос, и не успевает добраться до
+// настоящего ответа за общий таймаут. Эталон (brcmf_notify_escan_complete())
+// завершает скан по ЯВНОМУ финальному событию (BRCMF_E_ESCAN_RESULT со
+// status != PARTIAL — SUCCESS/ABORT/иное), а не по времени — делаем так же:
+// timeout_us остаётся как аварийный потолок (на случай, если финальное
+// событие вообще не придёт), но обычный выход — по факту увиденного
+// завершения, гарантированно вычерпывая очередь до конца.
+static uint32_t wifi_wait_and_dump_any_events(seL4_CPtr console_ep, uint32_t timeout_us) {
     uint64_t freq = wifi_read_cntfrq();
     uint64_t start = wifi_read_cntvct();
     uint64_t timeout_ticks = (freq * (uint64_t)timeout_us) / 1000000ull;
     uint64_t poll_interval_ticks = (freq * 200000ull) / 1000000ull; // 200мс
     uint64_t next_poll = start;
     uint32_t events_seen = 0;
+    bool scan_done = false;
+    g_scan_seen_bss_count = 0; // новый скан — своя дедупликация, не смешиваем с прошлой
 
-    while (wifi_read_cntvct() - start < timeout_ticks) {
+    while (!scan_done && wifi_read_cntvct() - start < timeout_ticks) {
         uint64_t now = wifi_read_cntvct();
         if (now < next_poll) { seL4_Yield(); continue; }
         next_poll = now + poll_interval_ticks;
@@ -2097,10 +2518,48 @@ static void wifi_wait_and_dump_any_events(seL4_CPtr console_ep, uint32_t timeout
         uint32_t event_type = ((uint32_t)g_event_rx_buf[msg_off+4]<<24)|((uint32_t)g_event_rx_buf[msg_off+5]<<16)|((uint32_t)g_event_rx_buf[msg_off+6]<<8)|(uint32_t)g_event_rx_buf[msg_off+7];
         uint32_t status = ((uint32_t)g_event_rx_buf[msg_off+8]<<24)|((uint32_t)g_event_rx_buf[msg_off+9]<<16)|((uint32_t)g_event_rx_buf[msg_off+10]<<8)|(uint32_t)g_event_rx_buf[msg_off+11];
         events_seen++;
-        sys_puthex32(console_ep, "[WIFI][SCAN] событие: event_type = ", event_type);
-        sys_puthex32(console_ep, "[WIFI][SCAN]           status     = ", status);
+        wifi_vputhex32(console_ep, "[WIFI][SCAN] событие: event_type = ", event_type);
+        wifi_vputhex32(console_ep, "[WIFI][SCAN]           status     = ", status);
+
+        // status != PARTIAL на ESCAN_RESULT — финальный маркер (SUCCESS/ABORT/
+        // иное), сканирование реально завершено (см. комментарий выше функции).
+        if (event_type == BRCMF_E_ESCAN_RESULT && status != BRCMF_E_STATUS_PARTIAL) {
+            scan_done = true;
+        }
+
+        if (event_type == BRCMF_E_ESCAN_RESULT) {
+            uint32_t escan_off = msg_off + BRCMF_EVENT_MSG_BE_LEN;
+            if (escan_off + BRCMF_ESCAN_RESULT_FIXED_LEN <= len16) {
+                uint16_t bss_count = (uint16_t)(g_event_rx_buf[escan_off + BRCMF_ESCAN_RESULT_BSSCOUNT_OFF] |
+                                                 ((uint16_t)g_event_rx_buf[escan_off + BRCMF_ESCAN_RESULT_BSSCOUNT_OFF + 1] << 8));
+                uint32_t bss_off = escan_off + BRCMF_ESCAN_RESULT_FIXED_LEN;
+                if (bss_count >= 1 && bss_off + BRCMF_BSS_INFO_FIXED_LEN <= len16) {
+                    const uint8_t *bssid = g_event_rx_buf + bss_off + BRCMF_BSS_INFO_BSSID_OFF;
+                    if (!wifi_scan_bss_already_seen(bssid)) {
+                        wifi_print_escan_bss(console_ep, g_event_rx_buf, bss_off);
+                    }
+                }
+            }
+        }
     }
-    sys_puthex32(console_ep, "[WIFI][SCAN] всего событий увидено: ", events_seen);
+    wifi_vputhex32(console_ep, "[WIFI][SCAN] всего событий увидено: ", events_seen);
+    if (!scan_done) {
+        // Время ("-t") вышло, а финальный маркер так и не пришёл — прошивка,
+        // насколько мы знаем, ВСЁ ЕЩЁ сканирует в фоне. Принудительно
+        // останавливаем (см. wifi_escan_abort() выше), а не просто перестаём
+        // слушать — именно фоновое продолжение скана было причиной, что
+        // следующий "wifi scan" иногда вообще не получал ответа.
+        wifi_vputs(console_ep, "[WIFI][SCAN] step: время вышло — принудительно останавливаем скан...\n");
+        wifi_escan_abort(console_ep);
+    }
+    wifi_scan_drain_stale_frames(console_ep);
+    // Возвращаем "mpc"=1 обратно (см. симметричный "mpc"=0 в начале
+    // wifi_escan_start() — эталон делает то же самое в
+    // brcmf_notify_escan_complete()/на ошибке запуска скана).
+    wifi_iovar_set_int_noack(console_ep, "mpc", 1);
+    g_last_scan_end_tick = wifi_read_cntvct();
+    g_last_scan_end_valid = true;
+    return events_seen;
 }
 
 // --- iovar-хелперы для join: обычный SET-iovar с 4-байтным целым значением
@@ -2120,6 +2579,200 @@ static bool wifi_iovar_set_int(seL4_CPtr console_ep, const char *name, uint32_t 
     uint32_t req_len = ni + 4u;
     uint32_t out_len = 0;
     return wifi_ioctl(console_ep, BRCMF_C_SET_VAR, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), req_len, &out_len);
+}
+
+// GET/SET iovar с произвольным буфером данных (не просто 4-байтный int) —
+// нужно для event_msgs (18 байт)/cur_etheraddr (6 байт) в wifi_preinit_dcmds()
+// ниже. wifi_ioctl() для GET перезаписывает g_ioctl_iobuf ответом с offset 0
+// (см. её реализацию) — поэтому здесь копируем результат в out_buf уже ПОСЛЕ
+// вызова, а не только строим запрос.
+static bool wifi_iovar_get_data(seL4_CPtr console_ep, const char *name, uint8_t *out_buf, uint32_t out_cap) {
+    uint32_t ni = 0;
+    while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
+    g_ioctl_iobuf[ni] = 0; ni++;
+    // ИСПРАВЛЕНО (раунд 2): req_len — это не просто длина имени+NUL, а
+    // размер РАЗДЕЛЯЕМОГО буфера запрос/ответ, который прошивка использует,
+    // чтобы понять, сколько байт она МОЖЕТ записать назад в ответе — именно
+    // так это делает эталон (brcmf_fil_iovar_data_get: передаёт cmd_data
+    // buflen = max(strlen(name)+1, желаемый размер ответа), а не просто
+    // длину имени). Если out_cap (напр. 18 для event_msgs) больше длины
+    // имени (11 для "event_msgs\0"), req_len=ni давал прошивке буфер
+    // размером всего 11 байт — недостаточно для 18-байтного ответа, отсюда
+    // BUFTOOSHORT. Для cur_etheraddr это случайно не проявлялось (имя длиннее
+    // 6-байтного ответа). Хвост буфера после имени зануляем.
+    uint32_t req_len = ni;
+    if (out_cap > req_len) {
+        for (uint32_t i = req_len; i < out_cap; i++) g_ioctl_iobuf[i] = 0;
+        req_len = out_cap;
+    }
+    uint32_t actual_len = 0;
+    if (!wifi_ioctl(console_ep, BRCMF_C_GET_VAR, false, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), req_len, &actual_len)) return false;
+    for (uint32_t i = 0; i < out_cap && i < actual_len; i++) out_buf[i] = g_ioctl_iobuf[i];
+    return true;
+}
+
+static bool wifi_iovar_set_data(seL4_CPtr console_ep, const char *name, const uint8_t *data, uint32_t data_len) {
+    uint32_t ni = 0;
+    while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
+    g_ioctl_iobuf[ni] = 0; ni++;
+    for (uint32_t i = 0; i < data_len; i++) g_ioctl_iobuf[ni + i] = data[i];
+    uint32_t req_len = ni + data_len;
+    uint32_t out_len = 0;
+    return wifi_ioctl(console_ep, BRCMF_C_SET_VAR, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), req_len, &out_len);
+}
+
+// Раздельный маленький буфер под dcmd БЕЗ имени iovar (GET_REVINFO — raw
+// dcmd, не "SET_VAR") — не переиспользуем g_ioctl_iobuf с уже записанным
+// именем предыдущего вызова, чтобы не запутаться; wifi_ioctl() пишет ответ
+// начиная с offset 0 переданного буфера в любом случае.
+alignas(4) static uint8_t g_revinfo_buf[80];
+
+// CLM blob download ("clmload" iovar) — см. brcmf_c_download()/
+// brcmf_c_process_clm_blob() в эталоне. Без него регуляторная таблица
+// прошивки пуста: даже валидный ccode вроде "US" в iovar "country"
+// отвергается (BCME_BADARG), а escan без country вовсе падает с
+// BCME_NOTUP — подтверждено на живом железе (сначала пробовали пропустить
+// CLM как "нефатальное" по комментарию эталона — не помогло, см. память
+// проекта). Блоб (4733 байта, ровно тот, что идёт в паре с нашим
+// wifi_fw.bin — сверено по md5) шлётся чанками по MAX_CLM_CHUNK_LEN=1400
+// байт через тот же dcmd/sdpcm-канал, что и обычные iovar SET, только с
+// доп. 12-байтным dload-заголовком (flag/dload_type/len/crc) перед данными.
+constexpr uint32_t WIFI_CLM_BUF_CAP = 8 * 1024;
+alignas(4) static uint8_t g_wifi_clm_buf[WIFI_CLM_BUF_CAP];
+
+static bool wifi_clmload_chunk(seL4_CPtr console_ep, uint16_t dl_flag, const uint8_t *chunk, uint32_t chunk_len) {
+    uint32_t ni = 0;
+    const char *name = "clmload";
+    while (name[ni]) { g_ioctl_iobuf[ni] = (uint8_t)name[ni]; ni++; }
+    g_ioctl_iobuf[ni] = 0; ni++;
+    uint32_t hdr_off = ni;
+
+    uint16_t full_flag = dl_flag | (uint16_t)(DLOAD_HANDLER_VER << DLOAD_FLAG_VER_SHIFT);
+    g_ioctl_iobuf[hdr_off + 0] = (uint8_t)(full_flag & 0xFF);
+    g_ioctl_iobuf[hdr_off + 1] = (uint8_t)(full_flag >> 8);
+    g_ioctl_iobuf[hdr_off + 2] = (uint8_t)(DL_TYPE_CLM & 0xFF);
+    g_ioctl_iobuf[hdr_off + 3] = (uint8_t)(DL_TYPE_CLM >> 8);
+    g_ioctl_iobuf[hdr_off + 4] = (uint8_t)(chunk_len & 0xFF);
+    g_ioctl_iobuf[hdr_off + 5] = (uint8_t)((chunk_len >> 8) & 0xFF);
+    g_ioctl_iobuf[hdr_off + 6] = (uint8_t)((chunk_len >> 16) & 0xFF);
+    g_ioctl_iobuf[hdr_off + 7] = (uint8_t)((chunk_len >> 24) & 0xFF);
+    g_ioctl_iobuf[hdr_off + 8] = 0; g_ioctl_iobuf[hdr_off + 9] = 0;
+    g_ioctl_iobuf[hdr_off + 10] = 0; g_ioctl_iobuf[hdr_off + 11] = 0; // crc = 0
+
+    for (uint32_t i = 0; i < chunk_len; i++) g_ioctl_iobuf[hdr_off + 12 + i] = chunk[i];
+
+    uint32_t req_len = hdr_off + 12 + chunk_len;
+    uint32_t out_len = 0;
+    // dump_hex=false — блоб уже проверен побайтово на живом железе (см.
+    // память проекта), ~19 чанков x 2 полных hex-дампа на каждый ощутимо
+    // раздували out.log без реальной пользы; отдельная короткая строка
+    // прогресса даётся в wifi_clm_download() ниже.
+    return wifi_ioctl(console_ep, BRCMF_C_SET_VAR, true, g_ioctl_iobuf, sizeof(g_ioctl_iobuf), req_len, &out_len, false);
+}
+
+static bool wifi_clm_download(seL4_CPtr console_ep, const uint8_t *clm_data, uint32_t clm_len) {
+    uint32_t cumulative = 0;
+    uint16_t dl_flag = DL_BEGIN;
+    uint32_t chunk_no = 0;
+    uint32_t total_chunks = (clm_len + MAX_CLM_CHUNK_LEN - 1) / MAX_CLM_CHUNK_LEN;
+    while (true) {
+        uint32_t remaining = clm_len - cumulative;
+        uint32_t chunk_len = remaining > MAX_CLM_CHUNK_LEN ? MAX_CLM_CHUNK_LEN : remaining;
+        if (chunk_len == remaining) dl_flag |= DL_END;
+        chunk_no++;
+        if (g_wifi_verbose) {
+            sys_putdec32(console_ep, "[WIFI][PREINIT] CLM чанк ", (int32_t)chunk_no);
+            sys_putdec32(console_ep, "/", (int32_t)total_chunks);
+            sys_puts(console_ep, "\n");
+        }
+        if (!wifi_clmload_chunk(console_ep, dl_flag, clm_data + cumulative, chunk_len)) return false;
+        dl_flag &= ~DL_BEGIN;
+        cumulative += chunk_len;
+        if (cumulative >= clm_len) break;
+    }
+    return true;
+}
+
+// "Стадия 0" эталонного brcmf_c_preinit_dcmds() (common.c) — САМАЯ ранняя
+// инициализация, выполняется в реальном драйвере ДО brcmf_config_dongle()
+// (даже до регистрации сетевого интерфейса). Мы её никогда не делали вообще
+// (см. ROADMAP.md/память проекта — заметили это только при разборе того,
+// почему escan/join получают NOTUP уже после полной brcmf_config_dongle()).
+// Все шаги best-effort — ошибка одного не останавливает остальные,
+// поведение зеркалит то, что реальный драйвер делает для необязательных
+// частей preinit (revinfo/mac/mpc можно потерять и продолжить, event_msgs
+// эталон всё же считает обязательным, но мы не абортируем, чтобы не
+// потерять уже работающий bring-up при ошибке этого шага на нашей прошивке).
+static bool g_preinit_done = false;
+
+static bool wifi_preinit_dcmds(seL4_CPtr console_ep) {
+    if (g_preinit_done) return true;
+
+    // MAC-адрес: у нас нет своего постоянного адреса для установки (в
+    // отличие от эталона, который либо ставит заранее известный, либо, как
+    // и мы, просто читает тот, что уже в NVRAM/прошивке) — делаем только GET,
+    // как ELSE-ветка эталона, чтобы хотя бы проверить связь по этому iovar.
+    {
+        uint8_t mac[6] = {0};
+        wifi_vputs(console_ep, "[WIFI][PREINIT] step: cur_etheraddr (GET)...\n");
+        if (!wifi_iovar_get_data(console_ep, "cur_etheraddr", mac, sizeof(mac))) {
+            wifi_vputs(console_ep, "[WIFI][PREINIT] WARN: cur_etheraddr не прошёл, продолжаем best-effort\n");
+        }
+    }
+
+    // GET_REVINFO — raw dcmd (не iovar), чисто диагностический, как в эталоне.
+    {
+        wifi_vputs(console_ep, "[WIFI][PREINIT] step: GET_REVINFO...\n");
+        uint32_t out_len = 0;
+        if (!wifi_ioctl(console_ep, BRCMF_C_GET_REVINFO, false, g_revinfo_buf, sizeof(g_revinfo_buf), sizeof(g_revinfo_buf), &out_len)) {
+            wifi_vputs(console_ep, "[WIFI][PREINIT] WARN: GET_REVINFO не прошёл, продолжаем best-effort\n");
+        }
+    }
+
+    // CLM blob — см. wifi_clm_download() выше. Порядок как в эталоне: сразу
+    // после GET_REVINFO, до iovar "ver"/"mpc"/event_msgs.
+    {
+        wifi_vputs(console_ep, "[WIFI][PREINIT] step: CLM blob (clmload)...\n");
+        int clm_len = wifi_read_file(PATH_WIFI_CLM, g_wifi_clm_buf, WIFI_CLM_BUF_CAP);
+        if (clm_len <= 0) {
+            sys_puts(console_ep, "[WIFI][PREINIT] WARN: не удалось прочитать wifi_clm.bin, каналы могут быть недоступны\n");
+        } else if (!wifi_clm_download(console_ep, g_wifi_clm_buf, (uint32_t)clm_len)) {
+            sys_puts(console_ep, "[WIFI][PREINIT] WARN: clmload не прошёл, каналы могут быть недоступны\n");
+        } else {
+            wifi_vputs(console_ep, "[WIFI][PREINIT] CLM blob загружен успешно.\n");
+        }
+    }
+
+    // "mpc" = 1 — безусловно ставится в preinit эталона (это ДРУГОЙ, более
+    // ранний вызов, чем quirk-gated brcmf_scan_config_mpc() вокруг самого
+    // скана — тот на нашем чипе неприменим, см. предыдущее расследование).
+    wifi_vputs(console_ep, "[WIFI][PREINIT] step: iovar \"mpc\" = 1...\n");
+    wifi_iovar_set_int(console_ep, "mpc", 1);
+
+    // event_msgs: get-modify-set, включаем биты событий, которые реально
+    // проверяет наш собственный код (SET_SSID/LINK/PSK_SUP/ESCAN_RESULT) +
+    // BRCMF_E_IF (единственный бит, который явно включает сам эталон в
+    // preinit) — читаем текущую маску, а не пишем с нуля, чтобы случайно не
+    // выключить то, что прошивка, возможно, уже включила по умолчанию.
+    {
+        wifi_vputs(console_ep, "[WIFI][PREINIT] step: event_msgs (GET-modify-SET)...\n");
+        uint8_t mask[BRCMF_EVENTING_MASK_LEN] = {0};
+        if (!wifi_iovar_get_data(console_ep, "event_msgs", mask, sizeof(mask))) {
+            wifi_vputs(console_ep, "[WIFI][PREINIT] WARN: event_msgs GET не прошёл, пишем с нуля\n");
+        }
+        auto setbit = [&](uint32_t bit) { mask[bit / 8] |= (uint8_t)(1u << (bit % 8)); };
+        setbit(BRCMF_E_IF);
+        setbit(BRCMF_E_SET_SSID);
+        setbit(BRCMF_E_LINK);
+        setbit(BRCMF_E_PSK_SUP);
+        setbit(BRCMF_E_ESCAN_RESULT);
+        if (!wifi_iovar_set_data(console_ep, "event_msgs", mask, sizeof(mask))) {
+            wifi_vputs(console_ep, "[WIFI][PREINIT] WARN: event_msgs SET не прошёл, продолжаем best-effort\n");
+        }
+    }
+
+    g_preinit_done = true;
+    return true;
 }
 
 // SET_WSEC_PMK (raw dcmd 268) — struct brcmf_wsec_pmk_le: key_len(le16) +
@@ -2247,8 +2900,8 @@ static WifiJoinResult wifi_wait_for_join_result(seL4_CPtr console_ep, uint32_t t
                                         ((uint32_t)g_event_rx_buf[msg_off + 12] << 24) | ((uint32_t)g_event_rx_buf[msg_off + 13] << 16) |
                                         ((uint32_t)g_event_rx_buf[msg_off + 14] << 8)  |  (uint32_t)g_event_rx_buf[msg_off + 15];
 
-                                    sys_puthex32(console_ep, "[WIFI][JOIN] событие: event_type = ", event_type);
-                                    sys_puthex32(console_ep, "[WIFI][JOIN]           status     = ", status);
+                                    wifi_vputhex32(console_ep, "[WIFI][JOIN] событие: event_type = ", event_type);
+                                    wifi_vputhex32(console_ep, "[WIFI][JOIN]           status     = ", status);
 
                                     if (event_type == BRCMF_E_SET_SSID) {
                                         if (status == BRCMF_E_STATUS_SUCCESS) seen_set_ssid_ok = true;
@@ -2290,71 +2943,161 @@ enum WifiConnectResult {
     WIFI_CONNECT_ERR_EVENT_TIMEOUT = 5,
 };
 
+// "Стадия 1" эталонного brcmf_config_dongle() (cfg80211.c) — bring-up
+// интерфейса, в эталоне выполняется РОВНО ОДИН РАЗ при открытии интерфейса
+// (netdev open), а не на каждую операцию — g_dongle_up ниже воспроизводит
+// именно это (`if (cfg->dongle_up) return err;` в эталоне), а не только
+// экономии ради: escan/join оба одинаково требуют этот bring-up (см.
+// wifi scan — раньше падал с NOTUP, потому что шёл прямо к escan без него).
+// ИСПРАВЛЕНО, раунд 3 (переносить один только BRCMF_C_UP в конец не помогло
+// — escan/join после этого ВСЁ РАВНО получали NOTUP). Причина была глубже:
+// мы реализовывали только ЧАСТЬ эталонного brcmf_config_dongle()
+// (UP/SET_INFRA/PM), а он делает заметно больше, и что ГЛАВНОЕ — в
+// ПРОТИВОПОЛОЖНОМ порядке: UP отправляется ПЕРВЫМ (буквальный комментарий в
+// эталоне: "make sure RF is ready for work"), а SET_INFRA — куда позже,
+// вместе с scan-time/roam/ARP-ND offload/FAKEFRAG. Реплицируем всю
+// последовательность как есть (см. platform.h константы и комментарий там же).
+static bool g_dongle_up = false;
+
+static bool wifi_dongle_bringup(seL4_CPtr console_ep) {
+    if (g_dongle_up) return true;
+
+    // "Стадия 0" (см. wifi_preinit_dcmds() выше) — в эталоне выполняется ещё
+    // раньше config_dongle(), при самом первом bus attach.
+    wifi_preinit_dcmds(console_ep);
+
+    // ИСПРАВЛЕНО, раунд 4: brcmf_config_dongle() (Linux) НИКОГДА явно не
+    // устанавливает "country" — это отдано userspace-регуляторному стеку
+    // (crda/wpa_supplicant, вызывается через brcmf_cfg80211_reg_notifier(),
+    // только по внешнему запросу типа "iw reg set XX"). У нас такого стека
+    // нет и не будет, а наш NVRAM (стоковый от Raspberry Pi Foundation)
+    // сознательно НЕ содержит ключей ccode/regrev — сверено built-in
+    // ISO3166-фоллбэком в самом brcmfmac (brmcf_use_iso3166_ccode_fallback):
+    // без явного "country" прошивка держит регуляторную таблицу пустой,
+    // отсюда, по гипотезе, BCME_NOTUP на escan (свободных каналов для
+    // сканирования просто нет, хотя WLC_UP формально подтверждается).
+    // Сверено с Infineon WHD (whd_management.c: whd_wifi_on()) — это
+    // bare-metal драйвер ИМЕННО для этой (CY-брендированной) прошивки,
+    // без Linux-обвязки, и там "country" — ОБЯЗАТЕЛЬНЫЙ шаг ДО WLC_UP
+    // (default = WHD_COUNTRY_UNITED_STATES, т.е. ccode="US"), payload —
+    // тот же wl_country_t/brcmf_fil_country_le (12 байт: country_abbrev[4]
+    // + rev(le32) + ccode[4]), rev=-1 означает "прошивка сама выберет
+    // последнюю известную ревизию для этого ccode".
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"country\" = US (обязательно для непустого списка каналов)...\n");
+    {
+        uint8_t cc[12] = {0};
+        cc[0] = 'U'; cc[1] = 'S'; cc[2] = 0; cc[3] = 0;             // country_abbrev
+        cc[4] = 0xFF; cc[5] = 0xFF; cc[6] = 0xFF; cc[7] = 0xFF;     // rev = -1 (unspecified)
+        cc[8] = 'U'; cc[9] = 'S'; cc[10] = 0; cc[11] = 0;           // ccode
+        if (!wifi_iovar_set_data(console_ep, "country", cc, sizeof(cc))) {
+            wifi_vputs(console_ep, "[WIFI][JOIN] WARN: country iovar не прошёл (best-effort)\n");
+        }
+    }
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: BRCMF_C_UP (включить радио, ПЕРВЫМ, как в эталоне)...\n");
+    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_UP, 0)) return false;
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: scan-time (channel/unassoc/passive)...\n");
+    wifi_dcmd_set_int(console_ep, BRCMF_C_SET_SCAN_CHANNEL_TIME, BRCMF_SCAN_CHANNEL_TIME);
+    wifi_dcmd_set_int(console_ep, BRCMF_C_SET_SCAN_UNASSOC_TIME, BRCMF_SCAN_UNASSOC_TIME);
+    wifi_dcmd_set_int(console_ep, BRCMF_C_SET_SCAN_PASSIVE_TIME, BRCMF_SCAN_PASSIVE_TIME);
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: BRCMF_C_SET_PM = PM_OFF (отключить power-save)...\n");
+    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_SET_PM, 0)) return false;
+
+    // Роуминг (best-effort, как и в эталоне — ошибки тут не абортят весь
+    // bring-up). roam_off=0 — оставляем встроенный роуминг прошивки
+    // включённым (в этом порте нет wpa_supplicant, которому иначе нужно
+    // было бы это отдать).
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: roam config (bcn_timeout/roam_off/trigger/delta)...\n");
+    wifi_iovar_set_int(console_ep, "bcn_timeout", BRCMF_DEFAULT_BCN_TIMEOUT_ROAM_ON);
+    wifi_iovar_set_int(console_ep, "roam_off", 0);
+    wifi_dcmd_set_int_pair(console_ep, BRCMF_C_SET_ROAM_TRIGGER, WL_ROAM_TRIGGER_LEVEL, BRCM_BAND_ALL);
+    wifi_dcmd_set_int_pair(console_ep, BRCMF_C_SET_ROAM_DELTA, WL_ROAM_DELTA, BRCM_BAND_ALL);
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: BRCMF_C_SET_INFRA = 1 (режим станции)...\n");
+    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_SET_INFRA, 1)) return false;
+
+    // ARP/ND offload — best-effort (эталон: "may fail, then it is simply
+    // not supported", ошибки только логируются, не абортят).
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: ARP/ND offload (best-effort)...\n");
+    wifi_iovar_set_int(console_ep, "arp_ol", BRCMF_ARP_OL_AGENT | BRCMF_ARP_OL_PEER_AUTO_REPLY);
+    wifi_iovar_set_int(console_ep, "arpoe", 1);
+    wifi_iovar_set_int(console_ep, "ndoe", 1);
+
+    // "fakefrag" сознательно НЕ отправляем — эта прошивка на живом железе
+    // подтверждённо всегда отвечает BCME_UNSUPPORTED (0xffffffe9) на этот
+    // iovar, никакой пользы от вызова нет, только лишний FAIL в логе.
+
+    // ДИАГНОСТИКА/гипотеза (эталон весь этот bring-up делает синхронно и
+    // без задержек, но у него за плечами реальный RF, которому, возможно,
+    // физически нужно время на калибровку PHY после BRCMF_C_UP — а у нас
+    // между UP и первой попыткой escan/join проходят доли секунды). Тот же
+    // урок, что уже был с CR4-settle в Милстоуне 4.2: если недокументированная
+    // задержка отсутствует — единственный способ проверить, нужна ли она,
+    // это реальный wall-clock delay и тест на живом железе.
+    {
+        uint64_t freq = wifi_read_cntfrq();
+        uint64_t start = wifi_read_cntvct();
+        uint64_t settle_ticks = (freq * 500000ull) / 1000000ull; // 500мс
+        while (wifi_read_cntvct() - start < settle_ticks) seL4_Yield();
+    }
+
+    g_dongle_up = true;
+    return true;
+}
+
 // Полная оркестровка Милстоуна 4.4 — вызывается из main() по IPC-команде
 // от шелла (см. WIFI_CMD_CONNECT ниже). Крипто (PBKDF2) — на хосте (см.
 // заголовок секции выше про то, почему прошивка не делает это сама),
 // 802.11 MLME/4-way handshake — прошивкой.
 static WifiConnectResult wifi_connect(seL4_CPtr console_ep, const char *ssid, uint32_t ssid_len,
                                        const char *pass, uint32_t pass_len, uint32_t *out_reason) {
-    // ИСПРАВЛЕНО (после первого неудачного теста на живом железе — join/
-    // iovar-последовательность вся прошла с ack, но за 15с не пришло НИ
-    // ОДНОГО события): эталон (brcmf_config_dongle(), cfg80211.c) шлёт
-    // BRCMF_C_UP=0 ("make sure RF is ready for work") ПЕРЕД любым join —
-    // мы этот шаг вообще пропускали, из-за чего прошивка, похоже, никогда
-    // не запускала сам скан/ассоциацию. BRCMF_C_SET_PM=PM_OFF(0) — отключить
-    // power-save, чтобы прошивка не проспала окно скана/ответа AP.
-    sys_puts(console_ep, "[WIFI][JOIN] step: BRCMF_C_UP (включить радио)...\n");
-    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_UP, 0)) return WIFI_CONNECT_ERR_IOVAR;
+    if (!wifi_dongle_bringup(console_ep)) return WIFI_CONNECT_ERR_IOVAR;
 
-    // ИСПРАВЛЕНО (после второго неудачного теста — весь iovar/join-обмен
-    // снова с ack, снова 0 событий за 15с): brcmf_config_dongle() ТАКЖЕ
-    // вызывает brcmf_cfg80211_change_iface(..., NL80211_IFTYPE_STATION,...),
-    // которая шлёт BRCMF_C_SET_INFRA=1 ("infrastructure", т.е. "я станция,
-    // подключаюсь к AP", в отличие от 0 = IBSS/ad-hoc) — мы этот шаг тоже
-    // пропускали. Без него прошивка, видимо, не понимает свою роль и join
-    // молча не запускает настоящую 802.11-ассоциацию.
-    sys_puts(console_ep, "[WIFI][JOIN] step: BRCMF_C_SET_INFRA = 1 (режим станции)...\n");
-    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_SET_INFRA, 1)) return WIFI_CONNECT_ERR_IOVAR;
-
-    sys_puts(console_ep, "[WIFI][JOIN] step: BRCMF_C_SET_PM = PM_OFF (отключить power-save)...\n");
-    if (!wifi_dcmd_set_int(console_ep, BRCMF_C_SET_PM, 0)) return WIFI_CONNECT_ERR_IOVAR;
-
-    // ДИАГНОСТИКА (временно, перед основной WPA2/join-последовательностью):
-    // слепой escan — не зависит от корректности SSID/PSK вообще, только от
-    // того, включено ли радио и делает ли прошивка ХОТЬ ЧТО-ТО в эфире.
-    // Прошлые попытки join (всё ack'ается, 0 событий за 15с) не дают понять,
-    // ломается ли сам join, или прошивка вообще ничего не делает после
-    // UP/INFRA/PM — это разделит две гипотезы.
-    sys_puts(console_ep, "[WIFI][JOIN] step: ДИАГНОСТИКА — слепой escan (все каналы/SSID)...\n");
-    if (!wifi_escan_start(console_ep)) {
-        sys_puts(console_ep, "[WIFI][JOIN] WARN: escan iovar не прошёл, продолжаем join всё равно\n");
-    } else {
-        wifi_wait_and_dump_any_events(console_ep, 5000000); // 5с
-    }
-
-    sys_puts(console_ep, "[WIFI][JOIN] step: PBKDF2(passphrase, SSID, 4096 итераций) -> PMK...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: PBKDF2(passphrase, SSID, 4096 итераций) -> PMK...\n");
     uint8_t pmk[32];
     pbkdf2_hmac_sha1((const uint8_t*)pass, pass_len, (const uint8_t*)ssid, ssid_len, 4096, pmk, 32);
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: iovar \"wsec\" = AES...\n");
-    if (!wifi_iovar_set_int(console_ep, "wsec", WSEC_AES_ENABLED)) return WIFI_CONNECT_ERR_IOVAR;
-
-    sys_puts(console_ep, "[WIFI][JOIN] step: iovar \"auth\" = 0 (open system)...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"auth\" = 0 (open system)...\n");
     if (!wifi_iovar_set_int(console_ep, "auth", 0)) return WIFI_CONNECT_ERR_IOVAR;
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: iovar \"wpa_auth\" = WPA2_AUTH_PSK...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"wpa_auth\" = WPA2_AUTH_PSK...\n");
     if (!wifi_iovar_set_int(console_ep, "wpa_auth", WPA2_AUTH_PSK)) return WIFI_CONNECT_ERR_IOVAR;
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: iovar \"sup_wpa\" = 1 (внутренний supplicant прошивки)...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"wsec\" = AES...\n");
+    if (!wifi_iovar_set_int(console_ep, "wsec", WSEC_AES_ENABLED)) return WIFI_CONNECT_ERR_IOVAR;
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"sup_wpa\" = 1 (внутренний supplicant прошивки)...\n");
     if (!wifi_iovar_set_int(console_ep, "sup_wpa", 1)) return WIFI_CONNECT_ERR_IOVAR;
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: SET_WSEC_PMK...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: SET_WSEC_PMK...\n");
     if (!wifi_set_wsec_pmk(console_ep, pmk)) return WIFI_CONNECT_ERR_PMK;
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: iovar \"join\"...\n");
+    // ДИАГНОСТИКА (временно, перед join): слепой escan — не зависит от
+    // корректности SSID/PSK, только от того, включено ли радио и делает ли
+    // прошивка ХОТЬ ЧТО-ТО в эфире. Теперь UP идёт ПОСЛЕДНИМ перед этим
+    // шагом, так что если и сейчас NOTUP — проблема не в порядке.
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: ДИАГНОСТИКА — слепой escan (все каналы/SSID)...\n");
+    if (!wifi_escan_start(console_ep)) {
+        sys_puts(console_ep, "[WIFI][JOIN] WARN: escan iovar не прошёл, продолжаем join всё равно\n");
+    } else {
+        // ИСПРАВЛЕНО: 5с хватало, пока CLM не был загружен и сканировать было
+        // фактически нечего (пустой список каналов) — реальный полный проход
+        // по 2.4+5ГГц (который CLM теперь и правда открывает) на живом железе
+        // подтверждённо идёт заметно дольше 5с, и firmware всё это время шлёт
+        // PARTIAL-события без единого финального маркера (см. память проекта/
+        // out.log — второй "wifi scan" подряд стабильно уходил в таймаут,
+        // потому что первый скан ещё не завершился в прошивке). 30с — запас
+        // с той же ранней остановкой по терминальному статусу, если он придёт
+        // раньше (см. scan_done в wifi_wait_and_dump_any_events()).
+        wifi_wait_and_dump_any_events(console_ep, 30000000); // 30с
+    }
+
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: iovar \"join\"...\n");
     if (!wifi_join(console_ep, ssid, ssid_len)) return WIFI_CONNECT_ERR_JOIN;
 
-    sys_puts(console_ep, "[WIFI][JOIN] step: ожидание событий (SET_SSID + PSK_SUP)...\n");
+    wifi_vputs(console_ep, "[WIFI][JOIN] step: ожидание событий (SET_SSID + PSK_SUP)...\n");
     uint32_t reason = 0;
     WifiJoinResult r = wifi_wait_for_join_result(console_ep, 15000000, &reason); // 15с
     if (out_reason) *out_reason = reason;
@@ -2383,6 +3126,19 @@ constexpr uint32_t WIFI_SHM_SSID_LEN_OFFSET = 8192;
 constexpr uint32_t WIFI_SHM_SSID_OFFSET     = 8196; // 32 байта
 constexpr uint32_t WIFI_SHM_PASS_LEN_OFFSET = 8228;
 constexpr uint32_t WIFI_SHM_PASS_OFFSET     = 8232; // 64 байта
+// Команда IPC от шелла ("wifi scan") — переиспользует диагностический
+// слепой escan, уже built и проверенный внутри wifi_connect() (Милстоун 4.4):
+// не декодирует список SSID/BSS из BRCMF_E_ESCAN_RESULT (это отдельная,
+// более крупная задача — парсинг wl_escan_result_t/bss_info), только
+// сообщает, сколько событий вообще пришло за окно ожидания — этого хватает,
+// чтобы отличить "радио работает" от "радио молчит".
+constexpr seL4_Word WIFI_CMD_SCAN = 3;
+// "-l" для "wifi start"/"wifi restart" (см. shell.cpp) — фоновый bring-up
+// (Милстоуны 4.1-4.3) запускается прямо в main(), ДО того как шелл вообще
+// может послать какую-либо WIFI_CMD_* команду, поэтому бит подробности для
+// НЕГО передаётся через SHM (тот же байт диапазон, что SSID/пароль —
+// 8232+64=8296, ничем не занято), а не через IPC-команду.
+constexpr uint32_t WIFI_SHM_VERBOSE_OFFSET = 8296;
 
 int main(int argc, char *argv[]) {
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -2402,6 +3158,13 @@ int main(int argc, char *argv[]) {
     seL4_SetMR(0, 107); // SYS_SHM_GET
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     g_wifi_shm = (char*)seL4_GetMR(0);
+
+    // "-l" на "wifi start"/"wifi restart" — см. WIFI_SHM_VERBOSE_OFFSET выше.
+    // Байт пишется шеллом ДО SYS_START_WIFI, поэтому уже на месте к этому
+    // моменту.
+    if (g_wifi_shm != nullptr) {
+        g_wifi_verbose = (g_wifi_shm[WIFI_SHM_VERBOSE_OFFSET] != 0);
+    }
 
     // Крипто-самотест (Милстоун 4.4) — не зависит от состояния железа,
     // прогоняем всегда, чтобы сразу отличить баг в PBKDF2/SHA1/HMAC от бага
@@ -2438,6 +3201,10 @@ int main(int argc, char *argv[]) {
         seL4_Recv(my_ep, &badge);
 
         seL4_Word cmd = seL4_GetMR(0);
+        // "-l" для команд, отправляемых уже запущенному драйверу (в отличие
+        // от WIFI_SHM_VERBOSE_OFFSET выше — тот только для фонового
+        // bring-up при самом "wifi start"): шелл кладёт бит в MR1.
+        g_wifi_verbose = (seL4_GetMR(1) != 0);
         if (cmd == WIFI_CMD_PROBE_STATUS) {
             seL4_SetMR(0, g_probe_ok ? 0 : 1);
             seL4_SetMR(1, g_sdio_ocr);
@@ -2465,6 +3232,33 @@ int main(int argc, char *argv[]) {
             }
             seL4_SetMR(0, result);
             seL4_SetMR(1, reason);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+        } else if (cmd == WIFI_CMD_SCAN) {
+            uint32_t status = 1; // по умолчанию: не готово
+            uint32_t events_seen = 0;
+            // "-t"/"-f" из шелла (см. shell.cpp) — сколько секунд слушать
+            // результаты и ограничить ли скан одним диапазоном (0=оба,
+            // как раньше; 2/5 = явный список каналов, см. wifi_escan_start()).
+            uint32_t timeout_s = seL4_GetMR(2);
+            uint32_t band_filter = seL4_GetMR(3);
+            if (timeout_s == 0) timeout_s = 30;
+            uint32_t timeout_us = timeout_s * 1000000u;
+            if (!g_wifi_sdpcm_ok) {
+                if (LOG_WIFI) sys_puts(console_ep, "[WIFI][SCAN] FAIL: sdpcm/IOCTL (Милстоун 4.3) не готов\n");
+            } else if (!wifi_dongle_bringup(console_ep)) {
+                if (LOG_WIFI) sys_puts(console_ep, "[WIFI][SCAN] FAIL: не удалось включить радио (bring-up)\n");
+            } else if (!wifi_escan_start(console_ep, band_filter)) {
+                if (LOG_WIFI) sys_puts(console_ep, "[WIFI][SCAN] FAIL: escan iovar не прошёл\n");
+            } else {
+                // ИСПРАВЛЕНО: раньше было жёстко 5с, потом жёстко 30с — теперь
+                // управляется "-t" из шелла (см. комментарий у аналогичного
+                // вызова в wifi_connect() про то, почему фиксированного
+                // короткого окна недостаточно для честного прохода по каналам).
+                events_seen = wifi_wait_and_dump_any_events(console_ep, timeout_us);
+                status = 0;
+            }
+            seL4_SetMR(0, status);
+            seL4_SetMR(1, events_seen);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));

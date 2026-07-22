@@ -39,6 +39,85 @@ static void uart_putc(char c) {
     *uart_io = c;
 }
 
+// Перенос длинных строк по границам слов — раньше жил в shell.cpp и
+// применялся только к тому, что печатает сам шелл (у wifi_driver.cpp/
+// net_driver.cpp/blk_driver.cpp свои собственные простые sys_puts без
+// переноса вообще — их длинные диагностические строки никогда не
+// переносились). Перенесено сюда, в единственный процесс, через который
+// реально проходит SYS_PUTS от ЛЮБОГО клиента — перенос теперь работает
+// одинаково для всех, а не только для шелла.
+//
+// ИСПРАВЛЕНО: старая версия в shell.cpp считала ширину строки в БАЙТАХ
+// (`word_len` рос на 1 за каждый байт), а не в отображаемых символах —
+// для ASCII это одно и то же, но кириллица в UTF-8 — 2 байта на символ, а
+// "—" (длинное тире) — 3, так что строка вроде "версия прошивки" (52
+// видимых символа) байтово оказывалась ~81 байт и переносилась
+// преждевременно ещё до реальной границы в 80 колонок. Здесь длина слова
+// считается в КОЛОНКАХ — продолжающие UTF-8-байты (10xxxxxx) не увеличивают
+// счётчик колонок, хотя сами байты всё равно копируются и печатаются.
+constexpr int UART_TERM_WIDTH = 110;
+constexpr int UART_WORD_BUF_CAP = 512; // байтовая ёмкость — с учётом многобайтных символов больше, чем ширина в колонках
+static int  g_console_col = 0;
+static bool g_console_in_escape = false;
+static char g_word_buf[UART_WORD_BUF_CAP];
+static int  g_word_len = 0;  // байт накоплено в g_word_buf
+static int  g_word_cols = 0; // видимых колонок в накопленном слове
+
+static void uart_flush_word() {
+    if (g_word_len == 0) return;
+    if (g_console_col > 0 && g_console_col + g_word_cols > UART_TERM_WIDTH) {
+        uart_putc('\n');
+        g_console_col = 0;
+    }
+    for (int i = 0; i < g_word_len; i++) uart_putc(g_word_buf[i]);
+    g_console_col += g_word_cols;
+    g_word_len = 0;
+    g_word_cols = 0;
+}
+
+static void uart_putc_wrapped(char ch) {
+    unsigned char c = (unsigned char)ch;
+
+    if (g_console_in_escape) {
+        uart_putc(ch);
+        if (c >= 0x40 && c <= 0x7E) g_console_in_escape = false;
+        return;
+    }
+    if (c == 27) { // ESC — начало ANSI CSI-последовательности (курсор/очистка строки в редакторе шелла)
+        uart_flush_word();
+        g_console_in_escape = true;
+        uart_putc(ch);
+        return;
+    }
+    if (c == '\n' || c == '\r') {
+        uart_flush_word();
+        uart_putc(ch);
+        g_console_col = 0;
+        return;
+    }
+    if (c == ' ') {
+        uart_flush_word();
+        if (g_console_col >= UART_TERM_WIDTH) {
+            uart_putc('\n');
+            g_console_col = 0;
+        } else {
+            uart_putc(' ');
+            g_console_col++;
+        }
+        return;
+    }
+
+    bool is_continuation = (c & 0xC0) == 0x80; // продолжающий байт UTF-8 — не новый видимый символ
+    if (!is_continuation && g_word_cols >= UART_TERM_WIDTH) {
+        uart_flush_word(); // само "слово" длиннее ширины терминала — форсируем разрыв на границе символа
+    }
+    if (g_word_len >= UART_WORD_BUF_CAP - 1) {
+        uart_flush_word(); // защита от переполнения буфера на аномально длинном "слове" без пробелов
+    }
+    g_word_buf[g_word_len++] = ch;
+    if (!is_continuation) g_word_cols++;
+}
+
 static void flush_buffer() {
     // Записываем столько, сколько влезает в FIFO прямо сейчас.
     // Эта операция неблокирующая: если FIFO полон, цикл немедленно
@@ -114,8 +193,7 @@ int main(int argc, char *argv[]) {
                 if (len > 0) {
                     // НОВЫЙ UNIX-WAY: Строка пришла в регистрах (от sys_write)
                     for (int i = 0; i < len; i++) {
-                        // Выводим каждый символ напрямую в физический UART
-                        uart_putc((char)seL4_GetMR(i + 1));
+                        uart_putc_wrapped((char)seL4_GetMR(i + 1));
                     }
                 } else {
                     // СТАРЫЙ WAY: Строка лежит в разделяемой памяти (SHM)
@@ -123,11 +201,23 @@ int main(int argc, char *argv[]) {
                     if (shm_vaddr) {
                         char* str = (char*)shm_vaddr;
                         while (*str) {
-                            uart_putc(*str++);
+                            uart_putc_wrapped(*str++);
                         }
                     }
                 }
-                
+                // ВАЖНО: принудительно допечатываем накопленное "слово" в конце
+                // КАЖДОГО отдельного SYS_PUTS-вызова, не дожидаясь пробела/новой
+                // строки. Интерактивный ввод с клавиатуры шлёт по одному символу
+                // за вызов (см. shell.cpp: эхо при наборе) — без этого сброса
+                // символ молча оседал бы в буфере слова и не появлялся на экране,
+                // пока не придёт пробел (именно так и было, когда этот сброс
+                // отсутствовал — g_console_col/g_word_buf теперь ПЕРСИСТЕНТНЫ
+                // между вызовами ради переноса многословных строк, но сам
+                // буфер слова обязан опустошаться к концу каждого вызова,
+                // как раньше он гарантированно опустошался в конце каждого
+                // отдельного sys_puts() в shell.cpp).
+                uart_flush_word();
+
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             } else if (sys == 9) { // SYS_FLUSH 
                 for (int i = 0; i < line_buffer_pos[sender_pid]; i++) {
