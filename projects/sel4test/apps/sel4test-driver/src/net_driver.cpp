@@ -205,47 +205,162 @@ struct __attribute__((packed)) dhcp_packet {
     uint8_t  options[312];
 };
 
-// Глобальные переменные для DNS-сессии
-static char g_dns_pending_domain[64];
-static bool g_dns_outstanding = false;
-static uint16_t g_dns_id = 0xDEAF;
-
-static uint8_t my_mac[6] = {0};
-static uint8_t router_mac[6] = {0};
-static bool have_router_mac = false;
-
-// Кэш MAC соседа по локальной подсети — на один слот (последний резолвленный
-// адресат), по аналогии с router_mac. Раньше ВЕСЬ трафик слался на MAC
-// шлюза как next-hop, даже адресатам внутри своей же подсети — рабочий вариант
-// для внешних хостов (обычная маршрутизация), но для соседей по LAN многие
-// роутеры/свитчи не отражают такой кадр обратно (anti-spoofing/split-horizon),
-// и пакет просто терялся, хотя адресат отвечает живым хостам напрямую. См.
-// ip_is_onlink()/resolve_dest_mac() ниже.
-static uint8_t g_onlink_ip[4] = {0, 0, 0, 0};
-static uint8_t g_onlink_mac[6] = {0};
-static bool g_have_onlink_mac = false;
-
-// --- IP-конфигурация: раньше была захардкожена под QEMU user-mode networking
-// (10.0.2.15/10.0.2.2 — гость/SLIRP-гейтвей), на реальном железе такого хоста
-// физически нет, поэтому ARP на 10.0.2.2 никогда не отвечал. Теперь всё это
-// получаем по DHCP (см. блок "DHCP-клиент" ниже) — до получения адреса
-// my_ip/g_gateway_ip остаются 0.0.0.0, а сетевые команды (ping/send/resolve/
-// ntp) ждут g_dhcp_bound, а не шлют ARP в пустоту.
-static uint8_t my_ip[4] = {0, 0, 0, 0};
-static uint8_t g_gateway_ip[4] = {0, 0, 0, 0};
-static uint8_t g_subnet_mask[4] = {255, 255, 255, 0};
-// Публичный DNS как запасной вариант, пока DHCP не пришлёт свой (опция 6).
-static uint8_t g_dns_ip[4] = {8, 8, 8, 8};
-
-static bool ip_is_onlink(const uint8_t ip[4]) {
-    for (int i = 0; i < 4; i++) {
-        if ((ip[i] & g_subnet_mask[i]) != (my_ip[i] & g_subnet_mask[i])) return false;
-    }
+static bool ip_eq(const uint8_t a[4], const uint8_t b[4]) {
+    for (int i = 0; i < 4; i++) if (a[i] != b[i]) return false;
     return true;
 }
 
-static bool ip_eq(const uint8_t a[4], const uint8_t b[4]) {
-    for (int i = 0; i < 4; i++) if (a[i] != b[i]) return false;
+// --- DHCP-состояние (см. блок "DHCP-КЛИЕНТ" ниже за константами) ---
+// DHCP_RENEWING — RFC 2131 RENEWING: на дедлайне T1 (половина lease) шлём
+// UNICAST DHCPREQUEST напрямую серверу с ciaddr=текущий IP, НЕ бросая уже
+// рабочий адрес сразу же (см. net_check_dhcp()/net_send_dhcp_packet()).
+enum DhcpState { DHCP_IDLE = 0, DHCP_DISCOVERING, DHCP_REQUESTING, DHCP_BOUND, DHCP_RENEWING };
+
+// Фаза 4.5 (Wi-Fi data-plane, см. situation.txt/план) — GENET и Wi-Fi работают
+// ОДНОВРЕМЕННО, каждый со своим IP/шлюзом/маской/DNS/DHCP-арендой/ARP-кэшем/
+// ping-DNS-NTP-состоянием. Раньше ВСЁ это (my_ip, g_gateway_ip, g_dhcp_state,
+// router_mac, g_ping_*, g_dns_*, g_ntp_*, pending_cmd и т.д.) было плоскими
+// глобалами на единственный (GENET) интерфейс — теперь это поля одной
+// структуры, по экземпляру на интерфейс, и почти каждая функция протокольного
+// слоя ниже получает параметр NetIface, говорящий, чей это вызов.
+//
+// НЕ входит сюда (остаётся аппаратно-специфичным, вне протокольного слоя):
+// GENET-регистры/DMA-кольца/PHY (g_genet_base, g_net_up, rx_buffer_offsets,
+// g_rx_c_index/g_rx_index/g_tx_index) и Wi-Fi SHM-мейлбокс (см. дальше по
+// файлу, Фаза 4.5.3+) — это детали конкретного net_hw_*-бэкенда, видны
+// только изнутри net_hw_send/poll_rx/rx_done.
+enum NetIface { IFACE_GENET = 0, IFACE_WIFI = 1, IFACE_COUNT = 2 };
+
+struct NetIfaceState {
+    // --- Линк/адресация ---
+    bool link_up;
+    uint8_t mac[6];
+    uint8_t ip[4];
+    uint8_t gateway_ip[4];
+    uint8_t subnet_mask[4];
+    uint8_t dns_ip[4]; // публичный DNS как запасной вариант, пока DHCP не пришлёт свой (опция 6)
+
+    // --- ARP ---
+    uint8_t router_mac[6];
+    bool have_router_mac;
+    // Кэш MAC соседа по локальной подсети — на один слот (последний
+    // резолвленный адресат), по аналогии с router_mac (см. ip_is_onlink()/
+    // resolve_dest_mac() ниже — многие роутеры не отражают unicast-кадр
+    // соседу по LAN обратно без этого, anti-spoofing/split-horizon).
+    uint8_t onlink_ip[4];
+    uint8_t onlink_mac[6];
+    bool have_onlink_mac;
+
+    // --- DHCP-клиент (RFC 2131) ---
+    DhcpState dhcp_state;
+    bool dhcp_bound;
+    uint32_t dhcp_xid;
+    uint8_t dhcp_offered_ip[4];
+    uint8_t dhcp_server_ip[4];
+    uint64_t dhcp_retry_uptime_ms;
+    uint64_t dhcp_lease_deadline_uptime_ms; // 0 = не планировать перезапрос
+    // Счётчик подряд неудачных попыток — растягивает интервал повтора (см.
+    // net_check_dhcp), чтобы при отсутствии DHCP-сервера в сети не заваливать
+    // консоль строкой каждые 4с вечно. Сбрасывается при ACK и новом линке.
+    uint32_t dhcp_attempt;
+
+    // --- Ping: накопительная статистика (для netstat) ---
+    uint32_t ping_sent_count, ping_reply_count, ping_timeout_count;
+    uint64_t ping_last_rtt_us, ping_min_rtt_us, ping_max_rtt_us, ping_total_rtt_us;
+    // --- Ping: состояние ТЕКУЩЕГО одиночного echo request ---
+    uint16_t ping_next_seq, ping_outstanding_seq;
+    bool ping_outstanding;
+    uint64_t ping_next_send_ms, ping_sent_ms, ping_sent_cyc;
+    uint8_t ping_target_ip[4];
+    // --- Ping: статистика ТЕКУЩЕЙ серии (для "--- ... ping statistics ---") ---
+    uint32_t ping_series_remaining;
+    uint32_t ping_series_sent, ping_series_reply;
+    uint64_t ping_series_min_rtt_us, ping_series_max_rtt_us;
+    uint64_t ping_series_total_rtt_us, ping_series_total_rtt_sq_us; // для mdev
+    uint64_t ping_series_start_ms;
+
+    // --- DNS ---
+    char dns_pending_domain[64];
+    bool dns_outstanding;
+    uint16_t dns_id;
+
+    // --- NTP ---
+    bool ntp_outstanding;
+    uint64_t ntp_t1_epoch_s; // T1: наши часы в момент отправки запроса, сек. с эпохи Unix
+    uint32_t ntp_last_offset_s; // для диагностики (netstat) — знак отдельно
+    bool ntp_last_offset_negative;
+    bool ntp_synced;
+    uint64_t ntp_next_resync_uptime_ms;
+
+    // --- Однослотовый мейлбокс произвольных входящих UDP-датаграмм (`recv`) ---
+    bool udp_rx_ready;
+    uint8_t udp_rx_src_ip[4];
+    uint16_t udp_rx_src_port;
+    char udp_rx_data[256];
+    int udp_rx_len;
+
+    // --- "Ожидающая резолва ARP" команда (см. net_handle_command/net_poll) ---
+    int pending_cmd;
+    uint8_t pending_ip[4];
+    uint32_t pending_ping_count;
+    uint8_t pending_udp_ip[4];
+    uint16_t pending_udp_port;
+    char pending_udp[64];
+
+    // --- Диагностика (netstat) ---
+    uint32_t rx_irq_wakeups;
+};
+
+static NetIfaceState g_iface[IFACE_COUNT];
+
+// Провязка "начальных" значений, которые у голых глобалов раньше были
+// нетривиальными дефолтами (не просто 0) — вызывается один раз из main()
+// для каждого элемента g_iface[] до первого реального использования.
+static void net_iface_init_defaults(NetIface iface) {
+    NetIfaceState &s = g_iface[iface];
+    s.subnet_mask[0] = 255; s.subnet_mask[1] = 255; s.subnet_mask[2] = 255; s.subnet_mask[3] = 0;
+    s.dns_ip[0] = 8; s.dns_ip[1] = 8; s.dns_ip[2] = 8; s.dns_ip[3] = 8;
+    s.dhcp_state = DHCP_IDLE;
+    s.dns_id = 0xDEAF;
+}
+
+// Фаза 4.5.6: per-iface копии readiness-флага/DNS-IP/ping-статистики в общей
+// SHM — GENET остаётся на историческом месте (4060-4095, обратная
+// совместимость), Wi-Fi получает отдельный диапазон дальше (4100-8191 между
+// net_vfs_lock на 4096 и WIFI_SHM_* на 8192 — свободно, с большим запасом).
+// Числа ДОЛЖНЫ совпадать с одноимёнными функциями в shell.cpp.
+// ВАЖНО: SHM в дочерних процессах (net_driver, shell, wifi_driver) мапится
+// через map_frame_robust() с VMAttributes=0 — Device-память (некэшируемая,
+// ради когерентности с GENET DMA; см. main.cpp), а НЕ Normal cacheable, как
+// у самого rootserver'а. На Device-памяти ARM требует строгого выравнивания
+// ЛЮБОГО доступа — 8-байтовая запись (dns-ip хранится как seL4_Word,
+// 8 байт на aarch64!) по невыровненному на 8 байт адресу ловит Alignment
+// Fault (живой краш на железе: 4204 % 8 == 4, а не 0 — FATAL FAULT PID 4,
+// PC внутри net_poll(), Mem Addr ровно g_shm_vaddr+4204). GENET-диапазон
+// (4064) исторически выровнен по 8 случайно — Wi-Fi-диапазон исправлен явно.
+static inline uint32_t net_mailbox_ready_offset(NetIface iface) { return (iface == IFACE_WIFI) ? 4200 : 4060; }
+static inline uint32_t net_mailbox_dns_ip_offset(NetIface iface) { return (iface == IFACE_WIFI) ? 4208 : 4064; } // 8-byte aligned — обязательно (seL4_Word*)
+static inline uint32_t net_mailbox_ping_stats_offset(NetIface iface) { return (iface == IFACE_WIFI) ? 4216 : 4068; }
+
+// По просьбе пользователя: shell должен сам выбирать интерфейс по умолчанию
+// (GENET, если у него реально есть IP; иначе Wi-Fi, если есть у него; иначе
+// сразу ошибка "нет сети", без обращения к net_driver вообще) — без флага
+// `-W` дожидаться таймаута DHCP на мёртвом интерфейсе не нужно. shell не
+// может сам знать dhcp_bound (это внутреннее состояние net_driver), поэтому
+// net_driver публикует его в SHM каждый тик — обычный uint32_t (4-byte
+// aligned офсеты, никакого seL4_Word — см. предупреждение выше про
+// Device-память). Числа ДОЛЖНЫ совпадать с shell.cpp.
+static inline uint32_t net_ready_flag_offset(NetIface iface) { return (iface == IFACE_WIFI) ? 4248 : 4244; }
+static void net_publish_iface_ready(NetIface iface) {
+    if (g_shm_vaddr == nullptr) return;
+    *(volatile uint32_t*)(g_shm_vaddr + net_ready_flag_offset(iface)) = g_iface[iface].dhcp_bound ? 1u : 0u;
+}
+
+static bool ip_is_onlink(NetIface iface, const uint8_t ip[4]) {
+    const NetIfaceState &s = g_iface[iface];
+    for (int i = 0; i < 4; i++) {
+        if ((ip[i] & s.subnet_mask[i]) != (s.ip[i] & s.subnet_mask[i])) return false;
+    }
     return true;
 }
 
@@ -254,27 +369,28 @@ static bool ip_eq(const uint8_t a[4], const uint8_t b[4]) {
 // g_onlink_ip/g_onlink_mac), иначе — MAC шлюза как next-hop (обычная
 // маршрутизация). false — нужного MAC ещё нет, кто-то должен инициировать
 // его резолв (см. net_send_arp_request/net_poll ниже).
-static bool resolve_dest_mac(const uint8_t dst_ip[4], uint8_t out_mac[6]) {
+static bool resolve_dest_mac(NetIface iface, const uint8_t dst_ip[4], uint8_t out_mac[6]) {
+    NetIfaceState &s = g_iface[iface];
     // Сам шлюз — ВСЕГДА через router_mac, даже если его адрес физически
     // попадает в нашу подсеть (стандартная ситуация: gateway почти всегда
     // внутри собственной объявленной подсети). Проверяем это раньше общего
     // ip_is_onlink(), иначе резолвился бы MAC шлюза, а искали бы его потом в
-    // g_onlink_mac — рассинхрон, из-за которого `resolve` на DNS-сервер,
+    // onlink_mac — рассинхрон, из-за которого `resolve` на DNS-сервер,
     // совпадающий с шлюзом (частый случай), никогда не находил уже
     // резолвленный MAC и вис навсегда (см. отчёт tcpdump — ARP на шлюз
     // получал ответ мгновенно, а DNS-запрос после этого так и не уходил).
-    if (ip_eq(dst_ip, g_gateway_ip)) {
-        if (!have_router_mac) return false;
-        for (int i = 0; i < 6; i++) out_mac[i] = router_mac[i];
+    if (ip_eq(dst_ip, s.gateway_ip)) {
+        if (!s.have_router_mac) return false;
+        for (int i = 0; i < 6; i++) out_mac[i] = s.router_mac[i];
         return true;
     }
-    if (ip_is_onlink(dst_ip)) {
-        if (!g_have_onlink_mac || !ip_eq(dst_ip, g_onlink_ip)) return false;
-        for (int i = 0; i < 6; i++) out_mac[i] = g_onlink_mac[i];
+    if (ip_is_onlink(iface, dst_ip)) {
+        if (!s.have_onlink_mac || !ip_eq(dst_ip, s.onlink_ip)) return false;
+        for (int i = 0; i < 6; i++) out_mac[i] = s.onlink_mac[i];
         return true;
     }
-    if (!have_router_mac) return false;
-    for (int i = 0; i < 6; i++) out_mac[i] = router_mac[i];
+    if (!s.have_router_mac) return false;
+    for (int i = 0; i < 6; i++) out_mac[i] = s.router_mac[i];
     return true;
 }
 
@@ -282,11 +398,12 @@ static bool resolve_dest_mac(const uint8_t dst_ip[4], uint8_t out_mac[6]) {
 // dst_ip, если он в нашей подсети (кроме самого шлюза — см. resolve_dest_mac
 // выше, для него отдельная ветка не нужна: gateway_ip и так возвращается),
 // иначе — шлюз.
-static void arp_target_for(const uint8_t dst_ip[4], uint8_t out_target[4]) {
+static void arp_target_for(NetIface iface, const uint8_t dst_ip[4], uint8_t out_target[4]) {
+    const NetIfaceState &s = g_iface[iface];
     const uint8_t* src;
-    if (ip_eq(dst_ip, g_gateway_ip)) src = g_gateway_ip;
-    else if (ip_is_onlink(dst_ip)) src = dst_ip;
-    else src = g_gateway_ip;
+    if (ip_eq(dst_ip, s.gateway_ip)) src = s.gateway_ip;
+    else if (ip_is_onlink(iface, dst_ip)) src = dst_ip;
+    else src = s.gateway_ip;
     for (int i = 0; i < 4; i++) out_target[i] = src[i];
 }
 
@@ -300,14 +417,15 @@ static uint32_t g_rx_c_index = 0;   // наш локальный "consumer index
 static uint32_t g_rx_index = 0;     // индекс текущего RX-дескриптора (wrap по GENET_RX_DESCS)
 static uint32_t g_tx_index = 0;     // индекс текущего TX-дескриптора (wrap по GENET_TX_DESCS)
 
-// Счётчики пробуждений главного цикла (см. main()) — по бейджу
-// NET_EVENT_GENET_RX (реальный GIC IRQ приёма) отдельно от NET_EVENT_HEARTBEAT
-// (периодический 100мс тик, см. timer_driver.cpp). Единственный практический
-// способ подтвердить на живом железе, что RX действительно приходит по
-// прерыванию, а не только "кажется рабочим" из-за heartbeat, который тоже
-// дренирует кольцо (см. ROADMAP.md 4.5, живой баг ethertype=0/разрыв SHM) —
-// печатаются в `netstat`.
-static uint32_t g_genet_irq_wakeups = 0;
+// Счётчик пробуждений главного цикла по НЕ привязанному к интерфейсу биту
+// NET_EVENT_HEARTBEAT (периодический 100мс тик, см. timer_driver.cpp) —
+// печатается в `netstat`. Аналогичный счётчик ПО ИНТЕРФЕЙСУ (реальный IRQ/
+// сигнал приёма — NET_EVENT_GENET_RX для GENET, NET_EVENT_WIFI_RX для
+// Wi-Fi) — g_iface[iface].rx_irq_wakeups (см. NetIfaceState выше).
+// Единственный практический способ подтвердить на живом железе, что RX
+// действительно приходит по прерыванию, а не только "кажется рабочим" из-за
+// heartbeat, который тоже дренирует кольцо (см. ROADMAP.md 4.5, живой баг
+// ethertype=0/разрыв SHM).
 static uint32_t g_heartbeat_wakeups = 0;
 
 enum NetCommand {
@@ -331,15 +449,6 @@ static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800u;
 // по аптайму (не по показаниям часов), поэтому не зависит от самой коррекции.
 static const uint64_t NTP_RESYNC_INTERVAL_MS = 30ull * 60 * 1000; // 30 минут
 
-// Последняя принятая произвольная UDP-датаграмма (не DNS-ответ), ждущая
-// команды `recv` из shell. Однослотовый почтовый ящик: новый пакет
-// перезаписывает непрочитанный.
-static bool g_udp_rx_ready = false;
-static uint8_t g_udp_rx_src_ip[4] = {0, 0, 0, 0};
-static uint16_t g_udp_rx_src_port = 0;
-static char g_udp_rx_data[256];
-static int g_udp_rx_len = 0;
-
 // Capability до blk_driver (см. main.cpp: local_blk_ep=7, ipc->msg[7]) —
 // раньше net_driver им не пользовался вообще, нужен только для журнала
 // произвольных UDP-датаграмм ниже (net_log_udp) — LAN оказалась крайне
@@ -359,26 +468,7 @@ static uint32_t g_udp_log_len = 0;
 // использованием (конкретным IP из команды shell либо DHCP-адресами).
 static uint8_t default_udp_ip[4] = {0, 0, 0, 0};
 static uint16_t default_udp_port = 8080;
-static uint8_t pending_ip[4] = {0, 0, 0, 0};
-static uint8_t pending_udp_ip[4] = {0, 0, 0, 0};
-static uint16_t pending_udp_port = 8080;
-static char pending_udp[64];
-static int pending_cmd = NET_CMD_NONE;
-static uint32_t pending_ping_count = 1;
 
-static uint8_t g_ping_target_ip[4] = {0, 0, 0, 0};
-static uint16_t g_ping_next_seq = 0;
-static uint16_t g_ping_outstanding_seq = 0;
-static bool g_ping_outstanding = false;
-static uint32_t g_ping_series_remaining = 0;
-static uint32_t g_ping_sent_count = 0;
-static uint32_t g_ping_reply_count = 0;
-static uint32_t g_ping_timeout_count = 0;
-static uint64_t g_ping_last_rtt_us = 0;
-static uint64_t g_ping_min_rtt_us = 0;
-static uint64_t g_ping_max_rtt_us = 0;
-static uint64_t g_ping_total_rtt_us = 0;
-static uint64_t g_ping_next_send_ms = 0;
 // Реальное время (мс, через timer_ep) отправки текущего echo request — раньше
 // таймаут и RTT считались по числу итераций главного цикла ("~2 секунды =
 // 100 000 циклов"), что было чистой оценкой на глаз и совершенно не отражало
@@ -387,32 +477,13 @@ static uint64_t g_ping_next_send_ms = 0;
 // таймаут на ping к хостам с честным ~65мс RTT (140.82.121.3) при том, что
 // ~21мс (8.8.8.8) укладывался. Показанные раньше "21.195 ms" были не
 // измерением, а произвольным loops*15 — теперь берём настоящее время.
-static uint64_t g_ping_sent_ms = 0;
 static const uint64_t PING_TIMEOUT_MS = 2000;
-// Для RTT (не таймаута) — метка по аппаратному счётчику, см. read_cntvct()
-// выше. g_ping_sent_ms остаётся для грубой проверки "не прошло ли 2 секунды" —
-// там миллисекундного разрешения более чем достаточно.
-static uint64_t g_ping_sent_cyc = 0;
 
 // Стандартный размер полезной нагрузки ICMP echo (как у обычного unix ping) —
 // 8 (заголовок ICMP) + 56 = 64 байта самого ICMP-сообщения, что и печатается
 // в "64 bytes from ..." — раньше было 4 байта ("PONG"), что честно работало,
 // но выглядело не как настоящий ping.
 static const int PING_PAYLOAD_LEN = 56;
-
-// --- Статистика ТЕКУЩЕЙ серии ping (в отличие от g_ping_*_count/rtt_us выше,
-// которые накапливаются за всё время жизни процесса, для netstat) — нужна,
-// чтобы shell мог напечатать "--- ... ping statistics ---" в конце команды
-// `ping`, как обычный unix ping. Сбрасывается в net_start_ping_series(),
-// публикуется в SHM (+4068..+4092) при завершении серии — см.
-// net_schedule_next_ping() и shell.cpp.
-static uint32_t g_ping_series_sent = 0;
-static uint32_t g_ping_series_reply = 0;
-static uint64_t g_ping_series_min_rtt_us = 0;
-static uint64_t g_ping_series_max_rtt_us = 0;
-static uint64_t g_ping_series_total_rtt_us = 0;
-static uint64_t g_ping_series_total_rtt_sq_us = 0; // для mdev (среднеквадратичное отклонение)
-static uint64_t g_ping_series_start_ms = 0;
 
 // Целочисленный квадратный корень (метод Ньютона) — нужен только для mdev,
 // плавающая точка/printf с дробными числами в этом окружении не заведены.
@@ -423,30 +494,8 @@ static uint64_t isqrt64(uint64_t n) {
     return x;
 }
 
-// --- Состояние NTP-клиента ---
-static bool g_ntp_outstanding = false;
-// T1: наши (возможно, неточные) часы в момент отправки запроса, сек. с эпохи Unix.
-static uint64_t g_ntp_t1_epoch_s = 0;
-static uint32_t g_ntp_last_offset_s = 0; // Для диагностики (netstat/логов), знак хранится отдельно.
-static bool g_ntp_last_offset_negative = false;
-static bool g_ntp_synced = false;
-// Аптайм (мс) следующей плановой автоматической ресинхронизации.
-static uint64_t g_ntp_next_resync_uptime_ms = 0;
-
-// --- Состояние DHCP-клиента ---
-enum DhcpState { DHCP_IDLE = 0, DHCP_DISCOVERING, DHCP_REQUESTING, DHCP_BOUND };
-static DhcpState g_dhcp_state = DHCP_IDLE;
-static bool g_dhcp_bound = false;
-static uint32_t g_dhcp_xid = 0;
-static uint8_t g_dhcp_offered_ip[4] = {0, 0, 0, 0};
-static uint8_t g_dhcp_server_ip[4] = {0, 0, 0, 0};
-static uint64_t g_dhcp_retry_uptime_ms = 0;
-static uint64_t g_dhcp_lease_deadline_uptime_ms = 0; // 0 = не планировать перезапрос
-// Счётчик подряд неудачных попыток — растягивает интервал повтора (см.
-// net_check_dhcp), чтобы при отсутствии DHCP-сервера в сети не заваливать
-// консоль строкой каждые 4с вечно (мешает вводу команд в shell). Сбрасывается
-// при получении ACK и при новом подключении кабеля (net_check_link_status).
-static uint32_t g_dhcp_attempt = 0;
+// --- Константы DHCP-клиента (сами по себе не per-interface — состояние
+// DHCP теперь в NetIfaceState/g_iface[], см. выше) ---
 static const uint16_t DHCP_CLIENT_PORT = 68;
 static const uint16_t DHCP_SERVER_PORT = 67;
 static const uint32_t DHCP_MAGIC_COOKIE = 0x63825363u;
@@ -501,9 +550,9 @@ static bool genet_mdio_read(uint32_t reg, uint16_t* out_value) {
     return true;
 }
 
-// Текущее состояние линка (для динамического обнаружения подключения/
-// отключения кабеля после старта — см. net_check_link_status() ниже).
-static bool g_phy_link_up = false;
+// Текущее состояние линка живёт в g_iface[IFACE_GENET].link_up (см.
+// NetIfaceState выше) — для динамического обнаружения подключения/
+// отключения кабеля после старта, см. net_check_link_status() ниже.
 // Throttle для net_check_link_status(), чтобы не долбить MDIO на каждой
 // итерации главного цикла — не имеет смысла опрашивать чаще, чем реально
 // нужно для "быстро заметить, что кабель воткнули/выдернули".
@@ -598,7 +647,7 @@ static void genet_phy_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
         if (bmsr & MII_BMSR_LINK_UP) { link_up = true; break; }
         seL4_Yield();
     }
-    g_phy_link_up = link_up;
+    g_iface[IFACE_GENET].link_up = link_up;
     g_link_next_check_uptime_ms = sys_get_uptime_ms(timer_ep) + LINK_CHECK_INTERVAL_MS;
     if (link_up) sys_puts(console_ep, "[NET] PHY link up.\n");
 }
@@ -607,7 +656,11 @@ static void genet_phy_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
 // динамическое обнаружение подключения/отключения кабеля после старта, а не
 // только один раз при инициализации. Дёшево (один MDIO read раз в секунду),
 // вызывается из главного цикла net_driver'а наравне с другими net_check_*.
+// GENET-специфична (реальный MDIO read) — аналог для Wi-Fi это отдельная
+// net_check_wifi_link() (см. Фазу 4.5.3), т.к. там источник состояния линка
+// совсем другой (SHM-флаг от wifi_driver, не MDIO-регистр).
 static void net_check_link_status(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[IFACE_GENET];
     if (!g_net_up) return;
     uint64_t now = sys_get_uptime_ms(timer_ep);
     if (now < g_link_next_check_uptime_ms) return;
@@ -617,29 +670,116 @@ static void net_check_link_status(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     if (!genet_mdio_read(MII_BMSR, &bmsr)) return;
     bool link_up = (bmsr & MII_BMSR_LINK_UP) != 0;
 
-    if (link_up && !g_phy_link_up) {
+    if (link_up && !s.link_up) {
         sys_puts(console_ep, "[NET] PHY link up (cable connected).\n");
         genet_apply_link(console_ep);
         // Старый MAC гейтвея мог устареть (другая сеть/роутер) — просим
         // разрешить заново при следующей реальной отправке. Новая сеть — новый
         // DHCP: net_check_dhcp() подхватит DHCP_IDLE на следующей итерации.
-        have_router_mac = false;
-        g_have_onlink_mac = false;
-        g_dhcp_state = DHCP_IDLE;
-        g_dhcp_bound = false;
-        g_dhcp_attempt = 0; // новая сеть — обратный отсчёт backoff'а начинаем с нуля
-    } else if (!link_up && g_phy_link_up) {
+        s.have_router_mac = false;
+        s.have_onlink_mac = false;
+        s.dhcp_state = DHCP_IDLE;
+        s.dhcp_bound = false;
+        s.dhcp_attempt = 0; // новая сеть — обратный отсчёт backoff'а начинаем с нуля
+    } else if (!link_up && s.link_up) {
         sys_puts(console_ep, "[NET] PHY link down (cable disconnected).\n");
-        have_router_mac = false;
-        g_have_onlink_mac = false;
-        g_dhcp_state = DHCP_IDLE;
-        g_dhcp_bound = false;
-        g_dhcp_attempt = 0;
+        s.have_router_mac = false;
+        s.have_onlink_mac = false;
+        s.dhcp_state = DHCP_IDLE;
+        s.dhcp_bound = false;
+        s.dhcp_attempt = 0;
         // Адрес был выдан для уже отключённой сети — не используем его дальше.
-        for (int i = 0; i < 4; i++) my_ip[i] = 0;
-        for (int i = 0; i < 4; i++) g_gateway_ip[i] = 0;
+        for (int i = 0; i < 4; i++) s.ip[i] = 0;
+        for (int i = 0; i < 4; i++) s.gateway_ip[i] = 0;
     }
-    g_phy_link_up = link_up;
+    s.link_up = link_up;
+}
+
+// Фаза 4.5.3: Wi-Fi-аналог net_check_link_status() выше — но источник
+// состояния линка не MDIO-регистр, а SHM-мейлбокс, который пишет
+// wifi_driver (успешный WIFI_CMD_CONNECT) или root (SYS_STOP_WIFI, гасит
+// на случай ручной остановки/краша wifi_driver). Дёшево читать каждый тик
+// (один volatile load), поэтому throttle как у GENET-варианта не нужен.
+//
+// НАЙДЕН И ПОЧИНЕН живой баг (см. situation.txt): LINK_STATE_OFFSET читался
+// как противоположное значение без единого известного писателя — оказалось,
+// весь Wi-Fi control-plane (SSID/пароль/verbose) исторически жил на
+// 8192-8296, ровно ВНУТРИ зарезервированного staging-буфера blk_driver'а
+// (SYS_WRITE_FILE зануляет 8192-12287 при КАЖДОЙ записи файла, включая
+// автоматический net_log_udp() на любую входящую non-DNS/NTP/DHCP UDP-
+// датаграмму — mDNS/SSDP/NetBIOS-шум от соседей по LAN, отсюда
+// непериодичность). Весь Wi-Fi SHM (control+data-plane) перенесён на
+// отдельную 5-ю страницу (h/platform.h) — GENET/VFS/blk_driver туда не
+// дотягиваются. Дебаунс и канарейка ниже добавлены во время поиска этого
+// бага — оставлены как дешёвая регресс-защита на случай повторения
+// подобного столкновения в будущем.
+static bool g_wifi_link_canary_init = false;
+static bool g_wifi_link_pending_value = false;
+static int  g_wifi_link_pending_ticks = 0;
+
+static void net_check_wifi_link(seL4_CPtr console_ep) {
+    if (g_shm_vaddr == nullptr) return;
+    NetIfaceState &s = g_iface[IFACE_WIFI];
+
+    if (!g_wifi_link_canary_init) {
+        *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_CANARY_OFFSET) = WIFI_SHM_CANARY_MAGIC;
+        g_wifi_link_canary_init = true;
+    } else {
+        uint32_t canary = *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_CANARY_OFFSET);
+        if (canary != WIFI_SHM_CANARY_MAGIC) {
+            sys_puts(console_ep, "[NET] ДИАГНОСТИКА: канарейка на 5-й странице изменилась! значение=");
+            put_dec(console_ep, canary);
+            sys_puts(console_ep, " — что-то ещё пишет в зону, зарезервированную под Wi-Fi.\n");
+            *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_CANARY_OFFSET) = WIFI_SHM_CANARY_MAGIC;
+        }
+    }
+
+    bool link_up = (*(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_LINK_STATE_OFFSET)) != 0;
+
+    if (link_up != s.link_up) {
+        if (g_wifi_link_pending_ticks > 0 && g_wifi_link_pending_value == link_up) {
+            g_wifi_link_pending_ticks++;
+        } else {
+            g_wifi_link_pending_value = link_up;
+            g_wifi_link_pending_ticks = 1;
+        }
+        if (g_wifi_link_pending_ticks < 2) {
+            sys_puts(console_ep, link_up ? "[NET] ДИАГНОСТИКА: Wi-Fi link=up на один тик, жду подтверждения...\n"
+                                          : "[NET] ДИАГНОСТИКА: Wi-Fi link=down на один тик, жду подтверждения...\n");
+            return; // не действуем, пока не подтвердится на следующем тике
+        }
+    } else {
+        g_wifi_link_pending_ticks = 0;
+    }
+
+    if (link_up && !s.link_up) {
+        sys_puts(console_ep, "[NET] Wi-Fi link up (associated), reason=");
+        put_dec(console_ep, *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_LINK_STATE_REASON_OFFSET));
+        sys_puts(console_ep, ".\n");
+        for (int i = 0; i < 6; i++) s.mac[i] = (uint8_t)g_shm_vaddr[WIFI_SHM_MAC_OFFSET + i];
+        s.have_router_mac = false;
+        s.have_onlink_mac = false;
+        s.dhcp_state = DHCP_IDLE;
+        s.dhcp_bound = false;
+        s.dhcp_attempt = 0;
+    } else if (!link_up && s.link_up) {
+        // Диагностика живого бага (см. platform.h/situation.txt): reason
+        // должен быть один из WIFI_LINK_REASON_* (STARTUP_RESET/CONNECT_FAIL/
+        // SYS_STOP_WIFI), СВЕЖЕ записанный ИМЕННО этим переходом. Если тут
+        // окажется 0 (WIFI_LINK_REASON_NONE) или явно устаревшее значение —
+        // это прямое доказательство, что пишет НЕ один из 4 известных сайтов.
+        sys_puts(console_ep, "[NET] Wi-Fi link down (disconnected), reason=");
+        put_dec(console_ep, *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_LINK_STATE_REASON_OFFSET));
+        sys_puts(console_ep, ".\n");
+        s.have_router_mac = false;
+        s.have_onlink_mac = false;
+        s.dhcp_state = DHCP_IDLE;
+        s.dhcp_bound = false;
+        s.dhcp_attempt = 0;
+        for (int i = 0; i < 4; i++) s.ip[i] = 0;
+        for (int i = 0; i < 4; i++) s.gateway_ip[i] = 0;
+    }
+    s.link_up = link_up;
 }
 
 static void genet_rx_ring_init() {
@@ -739,11 +879,12 @@ bool net_hw_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     // 0x02) — GENET не хранит заводской MAC сам по себе, реальный MAC платы
     // доступен только через VideoCore mailbox, который в этой же сессии уже
     // не отвечал на попытке с PL011 — не рискуем повторно (см. план Фазы 3.2).
-    my_mac[0] = 0x02; my_mac[1] = 0x50; my_mac[2] = 0x57;
-    my_mac[3] = 0x4F; my_mac[4] = 0x53; my_mac[5] = 0x01;
-    uint32_t mac0 = ((uint32_t)my_mac[0] << 24) | ((uint32_t)my_mac[1] << 16) |
-                    ((uint32_t)my_mac[2] << 8) | my_mac[3];
-    uint32_t mac1 = ((uint32_t)my_mac[4] << 8) | my_mac[5];
+    uint8_t *genet_mac = g_iface[IFACE_GENET].mac;
+    genet_mac[0] = 0x02; genet_mac[1] = 0x50; genet_mac[2] = 0x57;
+    genet_mac[3] = 0x4F; genet_mac[4] = 0x53; genet_mac[5] = 0x01;
+    uint32_t mac0 = ((uint32_t)genet_mac[0] << 24) | ((uint32_t)genet_mac[1] << 16) |
+                    ((uint32_t)genet_mac[2] << 8) | genet_mac[3];
+    uint32_t mac1 = ((uint32_t)genet_mac[4] << 8) | genet_mac[5];
     genet_write32(GENET_UMAC_MAC0_OFFSET, mac0);
     genet_write32(GENET_UMAC_MAC1_OFFSET, mac1);
 
@@ -779,7 +920,7 @@ bool net_hw_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     // genet_apply_link() тут дал бы только гадательное "1000 (ANEG не
     // разрешился, догадка)". net_check_link_status() вызовет её по-настоящему,
     // когда линк реально появится (см. там же).
-    if (g_phy_link_up) genet_apply_link(console_ep); // RGMII OOB control + скорость + TX/RX enable (см. genet_apply_link())
+    if (g_iface[IFACE_GENET].link_up) genet_apply_link(console_ep); // RGMII OOB control + скорость + TX/RX enable (см. genet_apply_link())
 
     // Фаза 4.5 (см. ROADMAP.md) — реальный GIC IRQ на приём кадра вместо
     // безусловного опроса net_hw_poll_rx() на каждой итерации главного
@@ -796,7 +937,7 @@ bool net_hw_init(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
 }
 
 // Синхронная отправка одного кадра (без virtio_net_hdr — чистый Ethernet-кадр).
-bool net_hw_send(const void* frame, uint32_t len) {
+static bool genet_hw_send(const void* frame, uint32_t len) {
     uintptr_t desc = GENET_TX_OFF + (g_tx_index % GENET_TX_DESCS) * GENET_DMA_DESC_SIZE;
     uint32_t buf_paddr = g_shm_paddr + (uint32_t)((const char*)frame - g_shm_vaddr);
     uint32_t len_stat = (len << GENET_DMA_BUFLENGTH_SHIFT) | (0x3Fu << GENET_DMA_TX_QTAG_SHIFT) |
@@ -826,7 +967,7 @@ bool net_hw_send(const void* frame, uint32_t len) {
 // и засчитывает их в LENGTH_STATUS — пропускаем их здесь же, один раз, чтобы
 // вся протокольная логика выше видела кадр как есть, без этой аппаратной
 // специфики.
-bool net_hw_poll_rx(uint8_t** out_frame, uint32_t* out_len) {
+static bool genet_hw_poll_rx(uint8_t** out_frame, uint32_t* out_len) {
     uint32_t prod_index = genet_read32(GENET_RDMA_RING_REG_BASE + GENET_RDMA_PROD_INDEX_OFF);
     if ((prod_index & 0xFFFFu) == (g_rx_c_index & 0xFFFFu)) return false;
 
@@ -839,14 +980,71 @@ bool net_hw_poll_rx(uint8_t** out_frame, uint32_t* out_len) {
     return true;
 }
 
-void net_hw_rx_done() {
+static void genet_hw_rx_done() {
     g_rx_c_index = (g_rx_c_index + 1) & 0xFFFFu;
     genet_write32(GENET_RDMA_RING_REG_BASE + GENET_RDMA_CONS_INDEX_OFF, g_rx_c_index);
     g_rx_index = (g_rx_index + 1) % GENET_RX_DESCS;
 }
 
-static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
-    net_hw_send(g_shm_vaddr + tx_offset, total_len);
+// --- Wi-Fi backend (Фаза 4.5.3+, см. situation.txt/план). RX (4.5.5) пока
+// заглушка. Капа сигнала TX (см. BOOT_WIFI_TX_WAKE_CAP/main.cpp) читается
+// один раз в main() ниже и живёт тут же — используется только внутри
+// wifi_hw_send().
+static seL4_CPtr g_wifi_tx_wake_ntfn = 0;
+
+// Фаза 4.5.4 (TX-путь): single-producer(net_driver)/single-consumer
+// (wifi_driver) mailbox в ТОЙ ЖЕ физической SHM, что и control-plane
+// (WIFI_SHM_SSID_OFFSET и т.д.) — просто более высокие офсеты (см.
+// platform.h). Блокировка не нужна (тот же довод, что у lock-free GENET
+// RX-кольца): длина — последнее, что пишет producer, и первое, что читает
+// consumer, поэтому используется как flag "занято/свободно". Если mailbox
+// ещё не опустел (wifi_driver не успел забрать предыдущий кадр) — кадр
+// дропается, не блокируем net_driver (та же семантика, что genet_hw_send()
+// имел бы при переполнении TX-кольца, только тут кольцо глубиной 1).
+static bool wifi_hw_send(const void* frame, uint32_t len) {
+    if (g_shm_vaddr == nullptr || len == 0 || len > WIFI_SHM_FRAME_CAP) return false;
+    if (*(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_TX_LEN_OFFSET) != 0) return false; // mailbox занят
+    for (uint32_t i = 0; i < len; i++) g_shm_vaddr[WIFI_SHM_TX_DATA_OFFSET + i] = ((const char*)frame)[i];
+    *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_TX_LEN_OFFSET) = len;
+    if (g_wifi_tx_wake_ntfn != 0) seL4_Signal(g_wifi_tx_wake_ntfn);
+    return true;
+}
+// Фаза 4.5.5 (RX-путь): зеркало wifi_hw_send() выше — тот же mailbox
+// глубиной 1, но в обратную сторону (пишет wifi_driver, читает net_driver).
+// *out_frame указывает ПРЯМО в SHM (WIFI_SHM_RX_DATA_OFFSET) — протокольный
+// слой (net_poll) обрабатывает кадр НА МЕСТЕ, как и с GENET RX-кольцом, без
+// лишнего копирования; mailbox освобождается для wifi_driver только в
+// wifi_hw_rx_done() (см. ниже), после того как net_poll закончил с кадром.
+static bool wifi_hw_poll_rx(uint8_t** out_frame, uint32_t* out_len) {
+    if (g_shm_vaddr == nullptr) return false;
+    uint32_t len = *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_RX_LEN_OFFSET);
+    if (len == 0 || len > WIFI_SHM_FRAME_CAP) return false;
+    *out_frame = (uint8_t*)(g_shm_vaddr + WIFI_SHM_RX_DATA_OFFSET);
+    *out_len = len;
+    return true;
+}
+static void wifi_hw_rx_done() {
+    *(volatile uint32_t*)(g_shm_vaddr + WIFI_SHM_RX_LEN_OFFSET) = 0;
+}
+
+// --- Диспетчер аппаратного уровня по интерфейсу (Фаза 4.5, см. NetIfaceState
+// выше) — единственное место, где протокольный слой (ARP/DHCP/ping/DNS/NTP/
+// net_poll) соприкасается с конкретным железом. GENET и Wi-Fi ниже этой
+// границы совершенно не похожи друг на друга (DMA-кольца регистров против
+// SHM-мейлбокса до отдельного процесса) — протокольный слой видит только
+// (iface, frame, len), как и раньше видел только (frame, len) для GENET.
+static bool net_hw_send(NetIface iface, const void* frame, uint32_t len) {
+    return (iface == IFACE_GENET) ? genet_hw_send(frame, len) : wifi_hw_send(frame, len);
+}
+static bool net_hw_poll_rx(NetIface iface, uint8_t** out_frame, uint32_t* out_len) {
+    return (iface == IFACE_GENET) ? genet_hw_poll_rx(out_frame, out_len) : wifi_hw_poll_rx(out_frame, out_len);
+}
+static void net_hw_rx_done(NetIface iface) {
+    if (iface == IFACE_GENET) genet_hw_rx_done(); else wifi_hw_rx_done();
+}
+
+static void net_send_packet(NetIface iface, uint32_t total_len, uint32_t tx_offset = 0x280) {
+    net_hw_send(iface, g_shm_vaddr + tx_offset, total_len);
 }
 
 // Резолвит MAC для произвольного target_ip — это либо шлюз (адресат вне
@@ -856,24 +1054,25 @@ static void net_send_packet(uint32_t total_len, uint32_t tx_offset = 0x280) {
 // split-horizon), и пакет до соседа по сети просто не доходил. До получения
 // адреса по DHCP вызывающий код обязан сперва дождаться g_dhcp_bound (см.
 // net_require_ip), иначе это ARP в никуда.
-static void net_send_arp_request(seL4_CPtr root_ep, const uint8_t target_ip[4]) {
+static void net_send_arp_request(NetIface iface, seL4_CPtr root_ep, const uint8_t target_ip[4]) {
+    NetIfaceState &s = g_iface[iface];
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280);
 
     for(int i=0; i<6; i++) eth->dest_mac[i] = 0xFF;
-    for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
+    for(int i=0; i<6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0806);
 
     volatile arp_ipv4* arp = (volatile arp_ipv4*)eth->payload;
     arp->htype = htons(1); arp->ptype = htons(0x0800); arp->hlen = 6; arp->plen = 4; arp->oper = htons(1);
-    for(int i=0; i<6; i++) arp->sha[i] = my_mac[i];
-    for(int i=0; i<4; i++) arp->spa[i] = my_ip[i];
+    for(int i=0; i<6; i++) arp->sha[i] = s.mac[i];
+    for(int i=0; i<4; i++) arp->spa[i] = s.ip[i];
     for(int i=0; i<6; i++) arp->tha[i] = 0;
     for(int i=0; i<4; i++) arp->tpa[i] = target_ip[i];
 
     sys_puts(root_ep, "\n[NET] Broadcasting ARP Request for ");
     put_ip(root_ep, target_ip);
     sys_puts(root_ep, "...\n");
-    net_send_packet(14 + 28, 0x280);
+    net_send_packet(iface, 14 + 28, 0x280);
 }
 
 // Отвечает на входящий ARP-запрос "who-has my_ip" — БЕЗ этого любой сосед
@@ -884,21 +1083,22 @@ static void net_send_arp_request(seL4_CPtr root_ep, const uint8_t target_ip[4]) 
 // наблюдавшийся паттерн "первые пинги проходят, потом внезапно перестают" —
 // подтверждено tcpdump'ом на роутере: он трижды спрашивал наш MAC, мы молчали,
 // и следующий же ICMP-ответ от 8.8.8.8 роутеру уже некуда было доставить.
-static void net_send_arp_reply(seL4_CPtr console_ep, const uint8_t target_ip[4], const uint8_t target_mac[6]) {
+static void net_send_arp_reply(NetIface iface, seL4_CPtr console_ep, const uint8_t target_ip[4], const uint8_t target_mac[6]) {
+    NetIfaceState &s = g_iface[iface];
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280);
 
     for(int i=0; i<6; i++) eth->dest_mac[i] = target_mac[i];
-    for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
+    for(int i=0; i<6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0806);
 
     volatile arp_ipv4* arp = (volatile arp_ipv4*)eth->payload;
     arp->htype = htons(1); arp->ptype = htons(0x0800); arp->hlen = 6; arp->plen = 4; arp->oper = htons(2);
-    for(int i=0; i<6; i++) arp->sha[i] = my_mac[i];
-    for(int i=0; i<4; i++) arp->spa[i] = my_ip[i];
+    for(int i=0; i<6; i++) arp->sha[i] = s.mac[i];
+    for(int i=0; i<4; i++) arp->spa[i] = s.ip[i];
     for(int i=0; i<6; i++) arp->tha[i] = target_mac[i];
     for(int i=0; i<4; i++) arp->tpa[i] = target_ip[i];
 
-    net_send_packet(14 + 28, 0x280);
+    net_send_packet(iface, 14 + 28, 0x280);
 }
 
 // ========================================================
@@ -917,14 +1117,37 @@ static int dhcp_put_option(uint8_t* opt, uint8_t code, uint8_t len, const uint8_
     return 2 + len;
 }
 
-// msg_type: 1=DHCPDISCOVER, 3=DHCPREQUEST. Для REQUEST использует
-// g_dhcp_offered_ip/g_dhcp_server_ip, заполненные при разборе DHCPOFFER.
-static void net_send_dhcp_packet(seL4_CPtr console_ep, uint8_t msg_type) {
+// msg_type: 1=DHCPDISCOVER, 3=DHCPREQUEST. Для обычного REQUEST (SELECTING,
+// после OFFER) использует dhcp_offered_ip/dhcp_server_ip + широковещательно,
+// ciaddr=0 — как раньше. renew=true — RFC 2131 RENEWING: UNICAST прямо на
+// dhcp_server_ip, ciaddr=текущий s.ip (это САМ по себе несёт "какой адрес
+// продлеваем", поэтому БЕЗ option 50/54 — see RFC 2131 table 5), flags=0
+// (unicast-ответ нам уже доступен, IP-то рабочий). Раньше net_check_dhcp()
+// на дедлайне T1 просто бросал рабочий IP и слал DISCOVER с нуля — часть
+// DHCP-серверов (включая dnsmasq/OpenWrt) не всегда охотно переотвечают на
+// повторный DISCOVER от MAC, для которого у них уже есть активная аренда,
+// из-за чего клиент завис в вечном "no response, retrying" (живой баг,
+// см. situation.txt) — настоящий unicast-RENEW почти всегда чинит это.
+static void net_send_dhcp_packet(NetIface iface, seL4_CPtr console_ep, uint8_t msg_type, bool renew = false) {
+    NetIfaceState &s = g_iface[iface];
     uint32_t tx_offset = 0x280;
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + tx_offset);
 
-    for (int i = 0; i < 6; i++) eth->dest_mac[i] = 0xFF; // DHCP всегда широковещательно, MAC шлюза ещё не резолвим
-    for (int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
+    if (renew) {
+        uint8_t dest_mac[6];
+        if (!resolve_dest_mac(iface, s.dhcp_server_ip, dest_mac)) {
+            // MAC сервера не резолвлен (нетипичный случай — обычно он же
+            // гейтвей, уже резолвленный) — не ждать ARP ради необязательного
+            // renew, вызывающий код (net_check_dhcp) сам скатится к полному
+            // re-discover по таймауту, как и раньше.
+            sys_puts(console_ep, "[NET] DHCP: renew skipped (server MAC unknown), will fall back to discovery.\n");
+            return;
+        }
+        for (int i = 0; i < 6; i++) eth->dest_mac[i] = dest_mac[i];
+    } else {
+        for (int i = 0; i < 6; i++) eth->dest_mac[i] = 0xFF; // DHCP широковещательно, MAC сервера ещё не резолвим
+    }
+    for (int i = 0; i < 6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0800);
 
     volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
@@ -933,19 +1156,21 @@ static void net_send_dhcp_packet(seL4_CPtr console_ep, uint8_t msg_type) {
 
     for (uint32_t i = 0; i < sizeof(dhcp_packet); i++) ((volatile uint8_t*)dhcp)[i] = 0;
     dhcp->op = 1; dhcp->htype = 1; dhcp->hlen = 6; dhcp->hops = 0;
-    dhcp->xid = bswap32(g_dhcp_xid);
+    dhcp->xid = bswap32(s.dhcp_xid);
     dhcp->secs = 0;
-    dhcp->flags = htons(0x8000); // просим сервер отвечать broadcast'ом — unicast-приём нам ещё недоступен (нет IP)
-    for (int i = 0; i < 6; i++) dhcp->chaddr[i] = my_mac[i];
+    dhcp->flags = renew ? 0 : htons(0x8000); // RENEWING шлёт unicast и ждёт unicast-ответ — broadcast-бит не нужен
+    if (renew) for (int i = 0; i < 4; i++) dhcp->ciaddr[i] = s.ip[i]; // RFC 2131: адрес, который продлеваем
+    for (int i = 0; i < 6; i++) dhcp->chaddr[i] = s.mac[i];
     dhcp->magic_cookie = bswap32(DHCP_MAGIC_COOKIE);
 
     uint8_t* opt = (uint8_t*)dhcp->options;
     int pos = 0;
     uint8_t type_byte = msg_type;
     pos += dhcp_put_option(opt + pos, 53, 1, &type_byte); // DHCP Message Type
-    if (msg_type == 3) { // DHCPREQUEST — подтверждаем конкретное предложение
-        pos += dhcp_put_option(opt + pos, 50, 4, g_dhcp_offered_ip); // Requested IP Address
-        pos += dhcp_put_option(opt + pos, 54, 4, g_dhcp_server_ip);  // Server Identifier
+    pos += dhcp_put_option(opt + pos, 12, sizeof(DHCP_HOSTNAME) - 1, (const uint8_t*)DHCP_HOSTNAME); // Host Name
+    if (msg_type == 3 && !renew) { // DHCPREQUEST (SELECTING) — подтверждаем конкретное предложение
+        pos += dhcp_put_option(opt + pos, 50, 4, s.dhcp_offered_ip); // Requested IP Address
+        pos += dhcp_put_option(opt + pos, 54, 4, s.dhcp_server_ip);  // Server Identifier
     }
     uint8_t params[3] = {1, 3, 6}; // Subnet Mask, Router, Domain Name Server
     pos += dhcp_put_option(opt + pos, 55, 3, params); // Parameter Request List
@@ -962,65 +1187,90 @@ static void net_send_dhcp_packet(seL4_CPtr console_ep, uint8_t msg_type) {
     ip->ihl_version = 0x45; ip->tos = 0;
     ip->tot_len = htons(sizeof(ipv4_header) + sizeof(udp_header) + dhcp_len);
     ip->id = htons(0xD4C7); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 17;
-    ip->saddr[0] = 0; ip->saddr[1] = 0; ip->saddr[2] = 0; ip->saddr[3] = 0; // RFC 2131: до ACK клиент использует 0.0.0.0
-    ip->daddr[0] = 255; ip->daddr[1] = 255; ip->daddr[2] = 255; ip->daddr[3] = 255;
+    if (renew) {
+        for (int i = 0; i < 4; i++) ip->saddr[i] = s.ip[i];
+        for (int i = 0; i < 4; i++) ip->daddr[i] = s.dhcp_server_ip[i];
+    } else {
+        ip->saddr[0] = 0; ip->saddr[1] = 0; ip->saddr[2] = 0; ip->saddr[3] = 0; // RFC 2131: до ACK клиент использует 0.0.0.0
+        ip->daddr[0] = 255; ip->daddr[1] = 255; ip->daddr[2] = 255; ip->daddr[3] = 255;
+    }
     ip->check = 0;
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
-    sys_puts(console_ep, msg_type == 1 ? "[NET] DHCP: sending DISCOVER...\n" : "[NET] DHCP: sending REQUEST...\n");
-    net_send_packet(14 + sizeof(ipv4_header) + sizeof(udp_header) + dhcp_len, tx_offset);
+    sys_puts(console_ep, renew ? "[NET] DHCP: sending unicast RENEW...\n" :
+                          msg_type == 1 ? "[NET] DHCP: sending DISCOVER...\n" : "[NET] DHCP: sending REQUEST...\n");
+    net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(udp_header) + dhcp_len, tx_offset);
 }
 
 // Запускает/повторяет получение адреса — вызывается раз за итерацию главного
 // цикла (см. main()), сама решает, нужно ли что-то слать. Не делает ничего,
-// пока нет линка (net_check_link_status сбрасывает состояние в DHCP_IDLE при
-// отключении кабеля — см. там же).
-static void net_check_dhcp(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    if (!g_phy_link_up) return;
+// пока нет линка (net_check_link_status/net_check_wifi_link сбрасывают
+// состояние в DHCP_IDLE при отключении — см. там же).
+static void net_check_dhcp(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (!s.link_up) return;
     uint64_t now = sys_get_uptime_ms(timer_ep);
 
-    if (g_dhcp_state == DHCP_IDLE) {
-        g_dhcp_xid = (uint32_t)now ^ 0xA5A5A5A5u; // без аппаратного RNG — сойдёт и так, лишь бы не 0
+    if (s.dhcp_state == DHCP_IDLE) {
+        s.dhcp_xid = (uint32_t)now ^ 0xA5A5A5A5u; // без аппаратного RNG — сойдёт и так, лишь бы не 0
         sys_puts(console_ep, "[NET] Starting DHCP discovery...\n");
-        net_send_dhcp_packet(console_ep, 1 /* DHCPDISCOVER */);
-        g_dhcp_state = DHCP_DISCOVERING;
+        net_send_dhcp_packet(iface, console_ep, 1 /* DHCPDISCOVER */);
+        s.dhcp_state = DHCP_DISCOVERING;
         // Backoff: 4с, 8с, 16с, 32с, дальше потолок 60с — если сервера в сети
         // просто нет, не заваливаем консоль строкой каждые 4 секунды вечно
         // (мешает вводу команд в shell).
-        uint32_t shift = (g_dhcp_attempt < 5) ? g_dhcp_attempt : 5;
+        uint32_t shift = (s.dhcp_attempt < 5) ? s.dhcp_attempt : 5;
         uint64_t interval = DHCP_RETRY_MS << shift;
         if (interval > DHCP_RETRY_MAX_MS) interval = DHCP_RETRY_MAX_MS;
-        g_dhcp_retry_uptime_ms = now + interval;
-        g_dhcp_attempt++;
-    } else if (g_dhcp_state == DHCP_DISCOVERING || g_dhcp_state == DHCP_REQUESTING) {
-        if (now >= g_dhcp_retry_uptime_ms) {
+        s.dhcp_retry_uptime_ms = now + interval;
+        s.dhcp_attempt++;
+    } else if (s.dhcp_state == DHCP_DISCOVERING || s.dhcp_state == DHCP_REQUESTING) {
+        if (now >= s.dhcp_retry_uptime_ms) {
             sys_puts(console_ep, "[NET] DHCP: no response, retrying...\n");
-            g_dhcp_state = DHCP_IDLE; // следующая итерация начнёт DISCOVER заново
+            s.dhcp_state = DHCP_IDLE; // следующая итерация начнёт DISCOVER заново
         }
-    } else if (g_dhcp_state == DHCP_BOUND) {
-        if (g_dhcp_lease_deadline_uptime_ms != 0 && now >= g_dhcp_lease_deadline_uptime_ms) {
-            sys_puts(console_ep, "[NET] DHCP: lease renewal due, restarting discovery...\n");
-            g_dhcp_state = DHCP_IDLE;
-            g_dhcp_bound = false;
+    } else if (s.dhcp_state == DHCP_RENEWING) {
+        // Unicast RENEW не ответил вовремя — сервер мог быть недоступен
+        // (не только истинный отказ, за который отвечал бы явный DHCPNAK,
+        // см. net_poll()). Не держимся за renew бесконечно — один короткий
+        // повтор, потом честный полный re-discover (см. DHCP_IDLE выше).
+        // IP уже брошен здесь же (см. переход в DHCP_BOUND-ветке ниже) —
+        // именно поэтому это НЕ регрессия к старому "мгновенно теряем IP"
+        // поведению: renew либо тихо продлевает адрес без единой потери
+        // связности, либо (редко) откатывается на полный re-discover ровно
+        // так же, как раньше.
+        if (now >= s.dhcp_retry_uptime_ms) {
+            sys_puts(console_ep, "[NET] DHCP: renew got no response, falling back to full discovery.\n");
+            s.dhcp_state = DHCP_IDLE;
+            s.dhcp_bound = false;
+        }
+    } else if (s.dhcp_state == DHCP_BOUND) {
+        if (s.dhcp_lease_deadline_uptime_ms != 0 && now >= s.dhcp_lease_deadline_uptime_ms) {
+            sys_puts(console_ep, "[NET] DHCP: lease renewal due, sending unicast renew...\n");
+            s.dhcp_xid = (uint32_t)now ^ 0x5A5A5A5Au; // свежий xid — иначе сервер может принять его за ретрансмит старого REQUEST
+            net_send_dhcp_packet(iface, console_ep, 3 /* DHCPREQUEST */, true /* renew */);
+            s.dhcp_state = DHCP_RENEWING;
+            s.dhcp_retry_uptime_ms = now + DHCP_RETRY_MS; // один короткий таймаут на unicast-ответ, см. ветку выше
         }
     }
 }
 
-static void net_send_ping(seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_t dst_ip[4]) {
-    uint16_t seq = ++g_ping_next_seq;
-    if (seq == 0) seq = ++g_ping_next_seq;
+static void net_send_ping(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_t dst_ip[4]) {
+    NetIfaceState &s = g_iface[iface];
+    uint16_t seq = ++s.ping_next_seq;
+    if (seq == 0) seq = ++s.ping_next_seq;
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280);
 
     uint8_t dest_mac[6];
-    resolve_dest_mac(dst_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
+    resolve_dest_mac(iface, dst_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
     for(int i=0; i<6; i++) eth->dest_mac[i] = dest_mac[i];
-    for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
-    eth->ethertype = htons(0x0800); 
-    
+    for(int i=0; i<6; i++) eth->src_mac[i] = s.mac[i];
+    eth->ethertype = htons(0x0800);
+
     volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
     ip->ihl_version = 0x45; ip->tos = 0; ip->tot_len = htons(sizeof(ipv4_header) + sizeof(icmp_header) + PING_PAYLOAD_LEN);
     ip->id = htons(0x1234); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 1; ip->check = 0;
-    for (int i = 0; i < 4; i++) ip->saddr[i] = my_ip[i];
+    for (int i = 0; i < 4; i++) ip->saddr[i] = s.ip[i];
     for (int i = 0; i < 4; i++) ip->daddr[i] = dst_ip[i];
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
@@ -1034,15 +1284,15 @@ static void net_send_ping(seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_
     // ответа (или таймаута/потери, о которых он тоже не печатает построчно,
     // только в итоговой статистике, см. net_schedule_next_ping).
 
-    g_ping_sent_ms = sys_get_uptime_ms(timer_ep); // грубый таймаут (2с) — этого разрешения достаточно
+    s.ping_sent_ms = sys_get_uptime_ms(timer_ep); // грубый таймаут (2с) — этого разрешения достаточно
     if (g_cntfrq == 0) g_cntfrq = read_cntfrq();
-    g_ping_sent_cyc = read_cntvct(); // точный RTT — см. read_cntvct() выше
-    g_ping_outstanding_seq = seq;
-    g_ping_outstanding = true;
-    g_ping_sent_count++;
-    g_ping_series_sent++;
+    s.ping_sent_cyc = read_cntvct(); // точный RTT — см. read_cntvct() выше
+    s.ping_outstanding_seq = seq;
+    s.ping_outstanding = true;
+    s.ping_sent_count++;
+    s.ping_series_sent++;
 
-    net_send_packet(14 + sizeof(ipv4_header) + sizeof(icmp_header) + PING_PAYLOAD_LEN, 0x280);
+    net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(icmp_header) + PING_PAYLOAD_LEN, 0x280);
 }
 
 // Смещения в SHM для передачи shell'у статистики завершённой серии ping —
@@ -1050,104 +1300,116 @@ static void net_send_ping(seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_
 // пишем перед тем, как разблокировать mailbox, shell читает сразу после и
 // печатает "--- ... ping statistics ---" в стиле обычного unix ping.
 // Каждое поле — uint32, все 7 умещаются перед концом первой страницы SHM.
-static void net_publish_ping_stats(seL4_CPtr timer_ep) {
-    uint32_t avg_us = g_ping_series_reply > 0 ? (uint32_t)(g_ping_series_total_rtt_us / g_ping_series_reply) : 0;
+static void net_publish_ping_stats(NetIface iface, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    uint32_t avg_us = s.ping_series_reply > 0 ? (uint32_t)(s.ping_series_total_rtt_us / s.ping_series_reply) : 0;
     uint64_t variance = 0;
-    if (g_ping_series_reply > 0) {
+    if (s.ping_series_reply > 0) {
         uint64_t mean_sq = (uint64_t)avg_us * (uint64_t)avg_us;
-        uint64_t sq_avg = g_ping_series_total_rtt_sq_us / g_ping_series_reply;
+        uint64_t sq_avg = s.ping_series_total_rtt_sq_us / s.ping_series_reply;
         variance = (sq_avg > mean_sq) ? (sq_avg - mean_sq) : 0; // integer truncation могла бы дать чуть отрицательное
     }
     uint32_t mdev_us = (uint32_t)isqrt64(variance);
-    uint32_t elapsed_ms = (uint32_t)(sys_get_uptime_ms(timer_ep) - g_ping_series_start_ms);
+    uint32_t elapsed_ms = (uint32_t)(sys_get_uptime_ms(timer_ep) - s.ping_series_start_ms);
 
-    *(uint32_t*)(g_shm_vaddr + 4068) = g_ping_series_sent;
-    *(uint32_t*)(g_shm_vaddr + 4072) = g_ping_series_reply;
-    *(uint32_t*)(g_shm_vaddr + 4076) = (uint32_t)g_ping_series_min_rtt_us;
-    *(uint32_t*)(g_shm_vaddr + 4080) = (uint32_t)g_ping_series_max_rtt_us;
-    *(uint32_t*)(g_shm_vaddr + 4084) = avg_us;
-    *(uint32_t*)(g_shm_vaddr + 4088) = mdev_us;
-    *(uint32_t*)(g_shm_vaddr + 4092) = elapsed_ms;
+    // Фаза 4.5.6: отдельный диапазон офсетов на интерфейс (см.
+    // net_mailbox_ping_stats_offset()) — GENET и Wi-Fi больше не делят один
+    // и тот же блок статистики.
+    uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
+    *(uint32_t*)(g_shm_vaddr + stats_off + 0)  = s.ping_series_sent;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 4)  = s.ping_series_reply;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 8)  = (uint32_t)s.ping_series_min_rtt_us;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 12) = (uint32_t)s.ping_series_max_rtt_us;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 16) = avg_us;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 20) = mdev_us;
+    *(uint32_t*)(g_shm_vaddr + stats_off + 24) = elapsed_ms;
 }
 
-static void net_schedule_next_ping(seL4_CPtr timer_ep) {
-    if (g_ping_series_remaining > 0) {
-        g_ping_next_send_ms = sys_get_time_ms(timer_ep) + 1000; // Пауза ровно 1 секунда через RTC!
+static void net_schedule_next_ping(NetIface iface, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (s.ping_series_remaining > 0) {
+        s.ping_next_send_ms = sys_get_time_ms(timer_ep) + 1000; // Пауза ровно 1 секунда через RTC!
     } else {
-        net_publish_ping_stats(timer_ep);
-        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+        net_publish_ping_stats(iface, timer_ep);
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
         net_mailbox[0] = 0; // Готово, разблокируем Shell
     }
 }
 
-static void net_send_next_ping(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    if (g_ping_outstanding || g_ping_series_remaining == 0) return;
-    g_ping_series_remaining--;
-    net_send_ping(console_ep, timer_ep, g_ping_target_ip);
+static void net_send_next_ping(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (s.ping_outstanding || s.ping_series_remaining == 0) return;
+    s.ping_series_remaining--;
+    net_send_ping(iface, console_ep, timer_ep, s.ping_target_ip);
 }
 
-static void net_check_ping_send(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    if (g_ping_outstanding || g_ping_series_remaining == 0) return;
-    if (g_ping_next_send_ms == 0 || sys_get_time_ms(timer_ep) >= g_ping_next_send_ms) {
-        g_ping_next_send_ms = 0;
-        net_send_next_ping(console_ep, timer_ep);
+static void net_check_ping_send(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (s.ping_outstanding || s.ping_series_remaining == 0) return;
+    if (s.ping_next_send_ms == 0 || sys_get_time_ms(timer_ep) >= s.ping_next_send_ms) {
+        s.ping_next_send_ms = 0;
+        net_send_next_ping(iface, console_ep, timer_ep);
     }
 }
 
-static void net_start_ping_series(seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_t dst_ip[4], uint32_t count) {
+static void net_start_ping_series(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, const uint8_t dst_ip[4], uint32_t count) {
+    NetIfaceState &s = g_iface[iface];
     if (count == 0) count = 1; if (count > 16) count = 16;
-    for (int i = 0; i < 4; i++) g_ping_target_ip[i] = dst_ip[i];
-    g_ping_series_remaining = count; g_ping_outstanding = false; g_ping_next_send_ms = 0;
-    g_ping_series_sent = 0; g_ping_series_reply = 0;
-    g_ping_series_min_rtt_us = 0; g_ping_series_max_rtt_us = 0;
-    g_ping_series_total_rtt_us = 0; g_ping_series_total_rtt_sq_us = 0;
-    g_ping_series_start_ms = sys_get_uptime_ms(timer_ep);
-    net_check_ping_send(console_ep, timer_ep); // Шлем первый пакет сразу
+    for (int i = 0; i < 4; i++) s.ping_target_ip[i] = dst_ip[i];
+    s.ping_series_remaining = count; s.ping_outstanding = false; s.ping_next_send_ms = 0;
+    s.ping_series_sent = 0; s.ping_series_reply = 0;
+    s.ping_series_min_rtt_us = 0; s.ping_series_max_rtt_us = 0;
+    s.ping_series_total_rtt_us = 0; s.ping_series_total_rtt_sq_us = 0;
+    s.ping_series_start_ms = sys_get_uptime_ms(timer_ep);
+    net_check_ping_send(iface, console_ep, timer_ep); // Шлем первый пакет сразу
 }
 
-static void net_record_ping_rtt(uint64_t rtt_us) {
-    g_ping_reply_count++; g_ping_last_rtt_us = rtt_us; g_ping_total_rtt_us += rtt_us;
-    if (g_ping_min_rtt_us == 0 || rtt_us < g_ping_min_rtt_us) g_ping_min_rtt_us = rtt_us;
-    if (rtt_us > g_ping_max_rtt_us) g_ping_max_rtt_us = rtt_us;
+static void net_record_ping_rtt(NetIface iface, uint64_t rtt_us) {
+    NetIfaceState &s = g_iface[iface];
+    s.ping_reply_count++; s.ping_last_rtt_us = rtt_us; s.ping_total_rtt_us += rtt_us;
+    if (s.ping_min_rtt_us == 0 || rtt_us < s.ping_min_rtt_us) s.ping_min_rtt_us = rtt_us;
+    if (rtt_us > s.ping_max_rtt_us) s.ping_max_rtt_us = rtt_us;
 
-    g_ping_series_reply++;
-    g_ping_series_total_rtt_us += rtt_us;
-    g_ping_series_total_rtt_sq_us += rtt_us * rtt_us;
-    if (g_ping_series_min_rtt_us == 0 || rtt_us < g_ping_series_min_rtt_us) g_ping_series_min_rtt_us = rtt_us;
-    if (rtt_us > g_ping_series_max_rtt_us) g_ping_series_max_rtt_us = rtt_us;
+    s.ping_series_reply++;
+    s.ping_series_total_rtt_us += rtt_us;
+    s.ping_series_total_rtt_sq_us += rtt_us * rtt_us;
+    if (s.ping_series_min_rtt_us == 0 || rtt_us < s.ping_series_min_rtt_us) s.ping_series_min_rtt_us = rtt_us;
+    if (rtt_us > s.ping_series_max_rtt_us) s.ping_series_max_rtt_us = rtt_us;
 }
 
-static void net_check_ping_timeout(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    if (!g_ping_outstanding) return;
+static void net_check_ping_timeout(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (!s.ping_outstanding) return;
 
-    if (sys_get_uptime_ms(timer_ep) - g_ping_sent_ms < PING_TIMEOUT_MS) return;
+    if (sys_get_uptime_ms(timer_ep) - s.ping_sent_ms < PING_TIMEOUT_MS) return;
 
     // Молчим по каждому потерянному пакету — как обычный unix ping, который
     // тоже ничего не печатает построчно на таймаут, только в итоговом
-    // packet loss% (см. net_publish_ping_stats). g_ping_timeout_count всё
+    // packet loss% (см. net_publish_ping_stats). ping_timeout_count всё
     // равно считается — используется в netstat.
-    g_ping_outstanding = false; g_ping_timeout_count++;
-    net_schedule_next_ping(timer_ep);
+    s.ping_outstanding = false; s.ping_timeout_count++;
+    net_schedule_next_ping(iface, timer_ep);
 }
 
-static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
+static void net_send_udp(NetIface iface, seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
+    NetIfaceState &s = g_iface[iface];
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + 0x280);
     uint8_t dest_mac[6];
-    resolve_dest_mac(dst_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
+    resolve_dest_mac(iface, dst_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
     for(int i=0; i<6; i++) eth->dest_mac[i] = dest_mac[i];
-    for(int i=0; i<6; i++) eth->src_mac[i] = my_mac[i];
+    for(int i=0; i<6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0800);
 
     int msg_len = my_strlen(message);
-    
+
     // IP Заголовок (Протокол 17 = UDP)
     volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
-    ip->ihl_version = 0x45; ip->tos = 0; 
-    ip->tot_len = htons(sizeof(ipv4_header) + sizeof(udp_header) + msg_len); 
-    ip->id = htons(0x7777); ip->frag_off = 0; ip->ttl = 64; 
+    ip->ihl_version = 0x45; ip->tos = 0;
+    ip->tot_len = htons(sizeof(ipv4_header) + sizeof(udp_header) + msg_len);
+    ip->id = htons(0x7777); ip->frag_off = 0; ip->ttl = 64;
     ip->protocol = 17; // 17 = UDP
     ip->check = 0;
-    for (int i = 0; i < 4; i++) ip->saddr[i] = my_ip[i];
+    for (int i = 0; i < 4; i++) ip->saddr[i] = s.ip[i];
     for (int i = 0; i < 4; i++) ip->daddr[i] = dst_ip[i];
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
@@ -1167,22 +1429,23 @@ static void net_send_udp(seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t
     sys_puts(console_ep, ":");
     put_dec(console_ep, dst_port);
     sys_puts(console_ep, "...\n");
-    net_send_packet(14 + sizeof(ipv4_header) + sizeof(udp_header) + my_strlen(message), 0x280);
-    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+    net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(udp_header) + my_strlen(message), 0x280);
+    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
     net_mailbox[0] = 0;
 }
 
 // Отправляет SNTP client-запрос (mode=3) напрямую на g_ntp_server_ip:123,
 // маршрутизируя через уже разрешенный router_mac (тот же прием, что и DNS-запрос
 // на 8.8.8.8 выше — адресат вне локальной подсети, но канальный уровень идет на гейтвей).
-static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+static void net_send_ntp_request(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
     uint32_t tx_offset = 0x280;
 
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + tx_offset);
     uint8_t dest_mac[6];
-    resolve_dest_mac(g_ntp_server_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
+    resolve_dest_mac(iface, g_ntp_server_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
     for (int i = 0; i < 6; i++) eth->dest_mac[i] = dest_mac[i];
-    for (int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
+    for (int i = 0; i < 6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0800);
 
     volatile udp_header* udp = (volatile udp_header*)(eth->payload + sizeof(ipv4_header));
@@ -1198,7 +1461,7 @@ static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     // T1: наш "текущий" момент отправки — используется вместе с T2..T4 в формуле
     // офсета ((T2-T1)+(T3-T4))/2 ниже, при получении ответа.
     uint64_t our_epoch_s = sys_get_time_ms(timer_ep) / 1000ULL;
-    g_ntp_t1_epoch_s = our_epoch_s;
+    s.ntp_t1_epoch_s = our_epoch_s;
     ntp->tx_ts_sec = bswap32((uint32_t)(our_epoch_s + NTP_UNIX_EPOCH_DELTA));
     ntp->tx_ts_frac = 0;
 
@@ -1206,7 +1469,7 @@ static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     ip->ihl_version = 0x45; ip->tos = 0;
     ip->tot_len = htons(sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet));
     ip->id = htons(0x4E54); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 17;
-    for (int i = 0; i < 4; i++) ip->saddr[i] = my_ip[i];
+    for (int i = 0; i < 4; i++) ip->saddr[i] = s.ip[i];
     for (int i = 0; i < 4; i++) ip->daddr[i] = g_ntp_server_ip[i];
     ip->check = 0;
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
@@ -1215,14 +1478,14 @@ static void net_send_ntp_request(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
     put_ip(console_ep, g_ntp_server_ip);
     sys_puts(console_ep, ":123...\n");
 
-    net_send_packet(14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
-    g_ntp_outstanding = true;
+    net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
+    s.ntp_outstanding = true;
 }
 
 // Ставит в план следующую автоматическую ресинхронизацию через NTP_RESYNC_INTERVAL_MS
 // от текущего аптайма (не от показаний часов — не зависит от самой коррекции).
-static void net_schedule_next_ntp_resync(seL4_CPtr timer_ep) {
-    g_ntp_next_resync_uptime_ms = sys_get_uptime_ms(timer_ep) + NTP_RESYNC_INTERVAL_MS;
+static void net_schedule_next_ntp_resync(NetIface iface, seL4_CPtr timer_ep) {
+    g_iface[iface].ntp_next_resync_uptime_ms = sys_get_uptime_ms(timer_ep) + NTP_RESYNC_INTERVAL_MS;
 }
 
 // Сигналит rootserver'у готовность net_driver. Вызывается один раз сразу
@@ -1237,22 +1500,23 @@ static void signal_net_driver_ready(seL4_CPtr root_ep) {
 
 // Периодически перезапускает NTP-синхронизацию, не дожидаясь команды `ntp` из shell.
 // Не мешает уже идущему запросу (ручному, загрузочному или предыдущему плановому).
-static void net_check_ntp_resync(seL4_CPtr console_ep, seL4_CPtr timer_ep) {
-    if (g_ntp_outstanding || pending_cmd == NET_CMD_NTP) return;
-    if (sys_get_uptime_ms(timer_ep) < g_ntp_next_resync_uptime_ms) return;
-    if (!g_dhcp_bound) { net_schedule_next_ntp_resync(timer_ep); return; } // нет IP — нечего слать, пробуем позже
+static void net_check_ntp_resync(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (s.ntp_outstanding || s.pending_cmd == NET_CMD_NTP) return;
+    if (sys_get_uptime_ms(timer_ep) < s.ntp_next_resync_uptime_ms) return;
+    if (!s.dhcp_bound) { net_schedule_next_ntp_resync(iface, timer_ep); return; } // нет IP — нечего слать, пробуем позже
 
     sys_puts(console_ep, "[NET] Periodic NTP resync...\n");
     uint8_t dummy_mac[6];
-    if (resolve_dest_mac(g_ntp_server_ip, dummy_mac)) {
-        net_send_ntp_request(console_ep, timer_ep);
+    if (resolve_dest_mac(iface, g_ntp_server_ip, dummy_mac)) {
+        net_send_ntp_request(iface, console_ep, timer_ep);
     } else {
-        pending_cmd = NET_CMD_NTP;
+        s.pending_cmd = NET_CMD_NTP;
         uint8_t arp_target[4];
-        arp_target_for(g_ntp_server_ip, arp_target);
-        net_send_arp_request(console_ep, arp_target);
+        arp_target_for(iface, g_ntp_server_ip, arp_target);
+        net_send_arp_request(iface, console_ep, arp_target);
     }
-    net_schedule_next_ntp_resync(timer_ep);
+    net_schedule_next_ntp_resync(iface, timer_ep);
 }
 
 static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
@@ -1262,15 +1526,17 @@ static void unpack_ipv4(seL4_Word packed, uint8_t out[4]) {
     out[3] = (uint8_t)(packed & 0xFF);
 }
 
+// Фаза 4.5.6: заголовок команды вырос с 4 слов (cmd/ip/port/text_len) до 5
+// (добавился iface в MR4, см. net_handle_command) — текст теперь с MR5, не MR4.
 static void copy_text_from_mrs(char *dst, int max_len, int text_len, int msg_words) {
     const int word_bytes = sizeof(seL4_Word);
-    int available = (msg_words - 4) * word_bytes;
+    int available = (msg_words - 5) * word_bytes;
     if (text_len > available) text_len = available;
     if (text_len < 0) text_len = 0;
     if (text_len >= max_len) text_len = max_len - 1;
 
     for (int i = 0; i < text_len; i++) {
-        seL4_Word word = seL4_GetMR(4 + (i / word_bytes));
+        seL4_Word word = seL4_GetMR(5 + (i / word_bytes));
         dst[i] = (char)((word >> ((i % word_bytes) * 8)) & 0xFF);
     }
     dst[text_len] = '\0';
@@ -1313,15 +1579,16 @@ static uint8_t* dns_skip_name(uint8_t* reader, uint8_t* buffer_end) {
     return reader;
 }
 
-static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
+static void net_send_dns_query(NetIface iface, seL4_CPtr console_ep, const char* domain) {
+    NetIfaceState &s = g_iface[iface];
     uint32_t tx_offset = 0x280;  // Возвращаем проверенное смещение
 
     volatile ethernet_frame* eth = (volatile ethernet_frame*)(g_shm_vaddr + tx_offset);
 
     uint8_t dest_mac[6];
-    resolve_dest_mac(g_dns_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
+    resolve_dest_mac(iface, s.dns_ip, dest_mac); // вызывающий код уже убедился, что резолв готов
     for(int i = 0; i < 6; i++) eth->dest_mac[i] = dest_mac[i];
-    for(int i = 0; i < 6; i++) eth->src_mac[i] = my_mac[i];
+    for(int i = 0; i < 6; i++) eth->src_mac[i] = s.mac[i];
     eth->ethertype = htons(0x0800);
 
     char* qname = (char*)eth->payload + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(dns_header);
@@ -1333,24 +1600,24 @@ static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
     udp->src_port = htons(50053);
     udp->dst_port = htons(53);
     udp->len = htons(total_udp_len);
-    udp->checksum = 0; 
+    udp->checksum = 0;
 
     volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
     ip->ihl_version = 0x45; ip->tos = 0;
     ip->tot_len = htons(sizeof(ipv4_header) + total_udp_len);
     ip->id = htons(0xABCD); ip->frag_off = 0; ip->ttl = 64; ip->protocol = 17;
 
-    for (int i = 0; i < 4; i++) ip->saddr[i] = my_ip[i];
+    for (int i = 0; i < 4; i++) ip->saddr[i] = s.ip[i];
 
-    // DNS-сервер: из DHCP (опция 6), либо запасной 8.8.8.8 (см. g_dns_ip) — он
+    // DNS-сервер: из DHCP (опция 6), либо запасной 8.8.8.8 (см. dns_ip) — он
     // переварит нулевую UDP чексумму.
-    for (int i = 0; i < 4; i++) ip->daddr[i] = g_dns_ip[i];
+    for (int i = 0; i < 4; i++) ip->daddr[i] = s.dns_ip[i];
 
     ip->check = 0;
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
     volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
-    dns->id = htons(g_dns_id);
+    dns->id = htons(s.dns_id);
     dns->flags = htons(0x0100);
     dns->q_count = htons(1);
     dns->ans_count = dns->auth_count = dns->add_count = 0;
@@ -1363,12 +1630,12 @@ static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
     sys_puts(console_ep, "[NET] Sending DNS Query (");
     put_dec(console_ep, packet_len);
     sys_puts(console_ep, " bytes) to ");
-    put_ip(console_ep, g_dns_ip);
+    put_ip(console_ep, s.dns_ip);
     sys_puts(console_ep, "...\n");
 
-    net_send_packet(packet_len, tx_offset);
+    net_send_packet(iface, packet_len, tx_offset);
 
-    g_dns_outstanding = true;
+    s.dns_outstanding = true;
 }
 
 // Команды, которым нужен собственный IP/шлюз (ping/send/resolve/ntp), должны
@@ -1376,10 +1643,10 @@ static void net_send_dns_query(seL4_CPtr console_ep, const char* domain) {
 // ответа не будет никогда, и shell зависнет на 10с до аварийного respawn'а
 // net_driver'а (см. shell.cpp). Явная ошибка сразу + разблокировка mailbox —
 // куда лучше такого зависания.
-static bool net_require_ip(seL4_CPtr console_ep) {
-    if (g_dhcp_bound) return true;
+static bool net_require_ip(NetIface iface, seL4_CPtr console_ep) {
+    if (g_iface[iface].dhcp_bound) return true;
     sys_puts(console_ep, "[NET] Error: no IP address yet (DHCP pending). Try again shortly.\n");
-    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
     net_mailbox[0] = 0;
     return false;
 }
@@ -1388,14 +1655,34 @@ static bool net_require_ip(seL4_CPtr console_ep) {
 // теперь сообщение уже получено ГЛАВНЫМ циклом (обычный блокирующий
 // seL4_Recv, комбинированный с GENET RX/heartbeat нотификацией, см. main()
 // ниже), эта функция только разбирает уже лежащие в IPC-буфере MR.
+//
+// ПОКА (Фаза 4.5.2) команды шелла всегда выполняются на IFACE_GENET —
+// протокол IPC шелл<->net_driver ещё не несёт признак интерфейса (это
+// Фаза 4.5.6, вместе с переделкой shell.cpp под "-i genet|wifi"). До тех пор
+// это ЧИСТАЯ регрессия: Wi-Fi всё равно инертен, поведение не отличается от
+// того, что было до этой сессии.
 static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_MessageInfo_t info) {
     int len = seL4_MessageInfo_get_length(info);
     if (len == 0) return;
 
     seL4_Word cmd = seL4_GetMR(0);
+    // Фаза 4.5.6: MR4 — какой интерфейс выбрал шелл (см. net_send_text_command()
+    // в shell.cpp, "-i genet|wifi"). len>4 всегда истинно для обновлённого
+    // протокола (минимум 5 слов), проверка — чисто защитная.
+    NetIface iface = (len > 4 && seL4_GetMR(4) == 1) ? IFACE_WIFI : IFACE_GENET;
+
+    NetIfaceState &s = g_iface[iface];
 
     if (cmd == NET_CMD_PING && len >= 3) {
-        if (!net_require_ip(console_ep)) return;
+        if (!net_require_ip(iface, console_ep)) {
+            // Иначе шелл напечатал бы "ping statistics" с мусором предыдущей
+            // серии (или вовсе непроинициализированной памятью, если серия
+            // ни разу не стартовала в эту сессию) для запроса, который даже
+            // не отправил ни одного пакета.
+            uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
+            for (int i = 0; i < 7; i++) *(uint32_t*)(g_shm_vaddr + stats_off + i * 4) = 0;
+            return;
+        }
         uint8_t dst_ip[4];
         unpack_ipv4(seL4_GetMR(1), dst_ip);
         uint32_t count = (uint32_t)seL4_GetMR(2);
@@ -1406,18 +1693,18 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
         put_dec(console_ep, count);
         sys_puts(console_ep, ".\n");
         uint8_t dummy_mac[6];
-        if (resolve_dest_mac(dst_ip, dummy_mac)) {
-            net_start_ping_series(console_ep, timer_ep, dst_ip, count);
+        if (resolve_dest_mac(iface, dst_ip, dummy_mac)) {
+            net_start_ping_series(iface, console_ep, timer_ep, dst_ip, count);
         } else {
-            for (int i = 0; i < 4; i++) pending_ip[i] = dst_ip[i];
-            pending_ping_count = count;
-            pending_cmd = NET_CMD_PING;
+            for (int i = 0; i < 4; i++) s.pending_ip[i] = dst_ip[i];
+            s.pending_ping_count = count;
+            s.pending_cmd = NET_CMD_PING;
             uint8_t arp_target[4];
-            arp_target_for(dst_ip, arp_target);
-            net_send_arp_request(console_ep, arp_target);
+            arp_target_for(iface, dst_ip, arp_target);
+            net_send_arp_request(iface, console_ep, arp_target);
         }
     } else if (cmd == NET_CMD_SEND && len >= 4) {
-        if (!net_require_ip(console_ep)) return;
+        if (!net_require_ip(iface, console_ep)) return;
         uint8_t dst_ip[4];
         unpack_ipv4(seL4_GetMR(1), dst_ip);
         uint16_t dst_port = (uint16_t)seL4_GetMR(2);
@@ -1432,59 +1719,62 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
 
         sys_puts(console_ep, "[NET] Shell requested UDP send.\n");
         uint8_t dummy_mac2[6];
-        if (resolve_dest_mac(dst_ip, dummy_mac2)) {
-            net_send_udp(console_ep, dst_ip, dst_port, msg);
+        if (resolve_dest_mac(iface, dst_ip, dummy_mac2)) {
+            net_send_udp(iface, console_ep, dst_ip, dst_port, msg);
         } else {
-            for (int i = 0; i < 4; i++) pending_udp_ip[i] = dst_ip[i];
-            pending_udp_port = dst_port;
-            my_memcpy(pending_udp, msg, my_strlen(msg) + 1);
-            pending_cmd = NET_CMD_SEND;
+            for (int i = 0; i < 4; i++) s.pending_udp_ip[i] = dst_ip[i];
+            s.pending_udp_port = dst_port;
+            my_memcpy(s.pending_udp, msg, my_strlen(msg) + 1);
+            s.pending_cmd = NET_CMD_SEND;
             uint8_t arp_target[4];
-            arp_target_for(dst_ip, arp_target);
-            net_send_arp_request(console_ep, arp_target);
+            arp_target_for(iface, dst_ip, arp_target);
+            net_send_arp_request(iface, console_ep, arp_target);
         }
     } else if (cmd == NET_CMD_STATUS) {
-        sys_puts(console_ep, "[NET] Status: genet=up link=");
-        sys_puts(console_ep, g_phy_link_up ? "up" : "down");
+        sys_puts(console_ep, iface == IFACE_WIFI ? "[NET] Status: iface=wifi link=" : "[NET] Status: iface=genet link=");
+        sys_puts(console_ep, s.link_up ? "up" : "down");
         sys_puts(console_ep, " dhcp=");
-        sys_puts(console_ep, g_dhcp_state == DHCP_BOUND ? "bound" :
-                              g_dhcp_state == DHCP_DISCOVERING ? "discovering" :
-                              g_dhcp_state == DHCP_REQUESTING ? "requesting" : "idle");
+        sys_puts(console_ep, s.dhcp_state == DHCP_BOUND ? "bound" :
+                              s.dhcp_state == DHCP_DISCOVERING ? "discovering" :
+                              s.dhcp_state == DHCP_REQUESTING ? "requesting" :
+                              s.dhcp_state == DHCP_RENEWING ? "renewing" : "idle");
         sys_puts(console_ep, " ip=");
-        put_ip(console_ep, my_ip);
+        put_ip(console_ep, s.ip);
         sys_puts(console_ep, " gw=");
-        put_ip(console_ep, g_gateway_ip);
+        put_ip(console_ep, s.gateway_ip);
         sys_puts(console_ep, " mask=");
-        put_ip(console_ep, g_subnet_mask);
+        put_ip(console_ep, s.subnet_mask);
         sys_puts(console_ep, " dns=");
-        put_ip(console_ep, g_dns_ip);
+        put_ip(console_ep, s.dns_ip);
         sys_puts(console_ep, " router_mac=");
-        if (have_router_mac) {
+        if (s.have_router_mac) {
             sys_puts(console_ep, "known ");
             for (int i = 0; i < 6; i++) {
                 if (i > 0) sys_puts(console_ep, ":");
-                put_hex_byte(console_ep, router_mac[i]);
+                put_hex_byte(console_ep, s.router_mac[i]);
             }
         } else {
             sys_puts(console_ep, "unknown");
         }
         sys_puts(console_ep, " onlink_peer=");
-        if (g_have_onlink_mac) {
-            put_ip(console_ep, g_onlink_ip);
+        if (s.have_onlink_mac) {
+            put_ip(console_ep, s.onlink_ip);
             sys_puts(console_ep, "=");
             for (int i = 0; i < 6; i++) {
                 if (i > 0) sys_puts(console_ep, ":");
-                put_hex_byte(console_ep, g_onlink_mac[i]);
+                put_hex_byte(console_ep, s.onlink_mac[i]);
             }
         } else {
             sys_puts(console_ep, "none");
         }
-        sys_puts(console_ep, " tx_idx=");
-        put_dec(console_ep, g_tx_index);
-        sys_puts(console_ep, " rx_c_idx=");
-        put_dec(console_ep, g_rx_c_index);
+        if (iface == IFACE_GENET) { // tx/rx-кольцо — GENET-специфичная деталь, у Wi-Fi (SHM-mailbox) нет аналога
+            sys_puts(console_ep, " tx_idx=");
+            put_dec(console_ep, g_tx_index);
+            sys_puts(console_ep, " rx_c_idx=");
+            put_dec(console_ep, g_rx_c_index);
+        }
         sys_puts(console_ep, " rx_irq_wakeups=");
-        put_dec(console_ep, g_genet_irq_wakeups);
+        put_dec(console_ep, s.rx_irq_wakeups);
         sys_puts(console_ep, " heartbeat_wakeups=");
         put_dec(console_ep, g_heartbeat_wakeups);
         sys_puts(console_ep, " default_udp=");
@@ -1492,80 +1782,80 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
         sys_puts(console_ep, ":");
         put_dec(console_ep, default_udp_port);
         sys_puts(console_ep, " ping_sent=");
-        put_dec(console_ep, g_ping_sent_count);
+        put_dec(console_ep, s.ping_sent_count);
         sys_puts(console_ep, " ping_reply=");
-        put_dec(console_ep, g_ping_reply_count);
+        put_dec(console_ep, s.ping_reply_count);
         sys_puts(console_ep, " ping_timeout=");
-        put_dec(console_ep, g_ping_timeout_count);
-        if (g_ping_reply_count > 0) {
+        put_dec(console_ep, s.ping_timeout_count);
+        if (s.ping_reply_count > 0) {
             sys_puts(console_ep, " rtt_last=");
-            put_duration_us(console_ep, g_ping_last_rtt_us);
+            put_duration_us(console_ep, s.ping_last_rtt_us);
             sys_puts(console_ep, " rtt_avg=");
-            put_duration_us(console_ep, g_ping_total_rtt_us / g_ping_reply_count);
+            put_duration_us(console_ep, s.ping_total_rtt_us / s.ping_reply_count);
             sys_puts(console_ep, " rtt_min=");
-            put_duration_us(console_ep, g_ping_min_rtt_us);
-            sys_puts(console_ep, " rtt_max="); 
-            put_duration_us(console_ep, g_ping_max_rtt_us);
+            put_duration_us(console_ep, s.ping_min_rtt_us);
+            sys_puts(console_ep, " rtt_max=");
+            put_duration_us(console_ep, s.ping_max_rtt_us);
         }
         sys_puts(console_ep, " ntp_synced=");
-        sys_puts(console_ep, g_ntp_synced ? "yes" : "no");
-        if (g_ntp_synced) {
+        sys_puts(console_ep, s.ntp_synced ? "yes" : "no");
+        if (s.ntp_synced) {
             sys_puts(console_ep, " ntp_offset=");
-            if (g_ntp_last_offset_negative) sys_puts(console_ep, "-");
-            put_dec(console_ep, g_ntp_last_offset_s);
+            if (s.ntp_last_offset_negative) sys_puts(console_ep, "-");
+            put_dec(console_ep, s.ntp_last_offset_s);
             sys_puts(console_ep, "s");
         }
         sys_puts(console_ep, "\n");
-        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
         net_mailbox[0] = 0;
 
     } else if (cmd == NET_CMD_RECV) {
-        if (g_udp_rx_ready) {
+        if (s.udp_rx_ready) {
             sys_puts(console_ep, "[NET] UDP datagram from ");
-            put_ip(console_ep, g_udp_rx_src_ip);
+            put_ip(console_ep, s.udp_rx_src_ip);
             sys_puts(console_ep, ":");
-            put_dec(console_ep, g_udp_rx_src_port);
+            put_dec(console_ep, s.udp_rx_src_port);
             sys_puts(console_ep, " (");
-            put_dec(console_ep, g_udp_rx_len);
+            put_dec(console_ep, s.udp_rx_len);
             sys_puts(console_ep, " bytes): ");
-            sys_puts(console_ep, g_udp_rx_data);
+            sys_puts(console_ep, s.udp_rx_data);
             sys_puts(console_ep, "\n");
-            g_udp_rx_ready = false;
+            s.udp_rx_ready = false;
         } else {
             sys_puts(console_ep, "[NET] No pending UDP datagrams.\n");
         }
-        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
         net_mailbox[0] = 0;
 
     } else if (cmd == NET_CMD_RESOLVE) {
-        if (!net_require_ip(console_ep)) return;
+        if (!net_require_ip(iface, console_ep)) return;
         int text_len = (int)seL4_GetMR(3);
-        copy_text_from_mrs(g_dns_pending_domain, sizeof(g_dns_pending_domain), text_len, len);
+        copy_text_from_mrs(s.dns_pending_domain, sizeof(s.dns_pending_domain), text_len, len);
 
         uint8_t dummy_mac3[6];
-        if (resolve_dest_mac(g_dns_ip, dummy_mac3)) {
-            net_send_dns_query(console_ep, g_dns_pending_domain);
+        if (resolve_dest_mac(iface, s.dns_ip, dummy_mac3)) {
+            net_send_dns_query(iface, console_ep, s.dns_pending_domain);
         } else {
-            pending_cmd = NET_CMD_RESOLVE;
+            s.pending_cmd = NET_CMD_RESOLVE;
             uint8_t arp_target[4];
-            arp_target_for(g_dns_ip, arp_target);
-            net_send_arp_request(console_ep, arp_target);
+            arp_target_for(iface, s.dns_ip, arp_target);
+            net_send_arp_request(iface, console_ep, arp_target);
         }
 
     } else if (cmd == NET_CMD_NTP) {
-        if (!net_require_ip(console_ep)) return;
+        if (!net_require_ip(iface, console_ep)) return;
         uint8_t dummy_mac4[6];
-        if (g_ntp_outstanding) {
+        if (s.ntp_outstanding) {
             sys_puts(console_ep, "[NET] NTP request already in flight.\n");
-            volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+            volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
             net_mailbox[0] = 0;
-        } else if (resolve_dest_mac(g_ntp_server_ip, dummy_mac4)) {
-            net_send_ntp_request(console_ep, timer_ep);
+        } else if (resolve_dest_mac(iface, g_ntp_server_ip, dummy_mac4)) {
+            net_send_ntp_request(iface, console_ep, timer_ep);
         } else {
-            pending_cmd = NET_CMD_NTP;
+            s.pending_cmd = NET_CMD_NTP;
             uint8_t arp_target[4];
-            arp_target_for(g_ntp_server_ip, arp_target);
-            net_send_arp_request(console_ep, arp_target);
+            arp_target_for(iface, g_ntp_server_ip, arp_target);
+            net_send_arp_request(iface, console_ep, arp_target);
         }
 
     } else {
@@ -1675,10 +1965,24 @@ static void net_log_udp(seL4_CPtr timer_ep, const uint8_t src_ip[4], uint16_t sr
     net_log_flush();
 }
 
-static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep) {
+// Верхняя граница реального буфера RX-кадра, ЗАВИСИТ ОТ ИНТЕРФЕЙСА — GENET
+// использует физический RX-дескриптор (GENET_RX_BUF_LENGTH байт с начала eth,
+// см. genet_rx_descs_init()), Wi-Fi — SHM-мейлбокс фиксированного размера
+// (см. WIFI_SHM_RX_DATA_OFFSET, Фаза 4.5.3). Используется, чтобы разбор
+// DNS/NTP/DHCP-ответов и произвольных UDP-датаграмм не ушёл за пределы
+// реально выделенного буфера, независимо от того, что о своей длине
+// заявляют поля самого пакета.
+constexpr uint32_t WIFI_RX_FRAME_BUF_CAP = 1536; // должно совпадать с размером WIFI_SHM_RX_DATA_OFFSET (Фаза 4.5.3)
+static inline uint8_t* net_rx_buffer_end(NetIface iface, volatile ethernet_frame* eth) {
+    uint32_t cap = (iface == IFACE_GENET) ? (GENET_RX_BUF_LENGTH - GENET_RX_BUF_OFFSET) : WIFI_RX_FRAME_BUF_CAP;
+    return (uint8_t*)eth + cap;
+}
+
+static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep) {
+    NetIfaceState &s = g_iface[iface];
     uint8_t* frame_ptr;
     uint32_t frame_len;
-    while (net_hw_poll_rx(&frame_ptr, &frame_len)) {
+    while (net_hw_poll_rx(iface, &frame_ptr, &frame_len)) {
         volatile ethernet_frame* eth = (volatile ethernet_frame*)frame_ptr;
 
         uint16_t type = htons(eth->ethertype);
@@ -1687,70 +1991,70 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
             volatile arp_ipv4* arp_reply = (volatile arp_ipv4*)eth->payload;
             if (htons(arp_reply->oper) == 1) { // ARP-запрос от кого-то ещё
                 uint8_t tpa[4]; for (int i = 0; i < 4; i++) tpa[i] = arp_reply->tpa[i];
-                if (g_dhcp_bound && ip_eq(tpa, my_ip)) {
+                if (s.dhcp_bound && ip_eq(tpa, s.ip)) {
                     uint8_t requester_ip[4], requester_mac[6];
                     for (int i = 0; i < 4; i++) requester_ip[i] = arp_reply->spa[i];
                     for (int i = 0; i < 6; i++) requester_mac[i] = arp_reply->sha[i];
-                    net_send_arp_reply(console_ep, requester_ip, requester_mac);
+                    net_send_arp_reply(iface, console_ep, requester_ip, requester_mac);
                 }
             } else if (htons(arp_reply->oper) == 2) {
                 uint8_t spa[4]; for (int i = 0; i < 4; i++) spa[i] = arp_reply->spa[i];
-                bool is_gateway = ip_eq(spa, g_gateway_ip);
-                bool already_had = is_gateway ? have_router_mac : (g_have_onlink_mac && ip_eq(spa, g_onlink_ip));
+                bool is_gateway = ip_eq(spa, s.gateway_ip);
+                bool already_had = is_gateway ? s.have_router_mac : (s.have_onlink_mac && ip_eq(spa, s.onlink_ip));
 
                 if (!already_had) {
                     if (is_gateway) {
                         sys_puts(console_ep, "[NET RX] ARP Reply Received! Saving Router MAC.\n");
-                        for(int i=0; i<6; i++) router_mac[i] = arp_reply->sha[i];
-                        have_router_mac = true;
+                        for(int i=0; i<6; i++) s.router_mac[i] = arp_reply->sha[i];
+                        s.have_router_mac = true;
                     } else {
                         sys_puts(console_ep, "[NET RX] ARP Reply Received! Saving on-link peer MAC (");
                         put_ip(console_ep, spa);
                         sys_puts(console_ep, ").\n");
-                        for (int i = 0; i < 4; i++) g_onlink_ip[i] = spa[i];
-                        for(int i = 0; i < 6; i++) g_onlink_mac[i] = arp_reply->sha[i];
-                        g_have_onlink_mac = true;
+                        for (int i = 0; i < 4; i++) s.onlink_ip[i] = spa[i];
+                        for(int i = 0; i < 6; i++) s.onlink_mac[i] = arp_reply->sha[i];
+                        s.have_onlink_mac = true;
                     }
 
                     // Возобновляем ожидающую команду, только если резолвился именно
                     // тот MAC, которого она ждала — гейтвей и сосед по подсети
                     // резолвятся независимо и не мешают друг другу.
                     uint8_t dummy[6];
-                    if (pending_cmd == NET_CMD_RESOLVE && resolve_dest_mac(g_dns_ip, dummy)) {
+                    if (s.pending_cmd == NET_CMD_RESOLVE && resolve_dest_mac(iface, s.dns_ip, dummy)) {
                         sys_puts(console_ep, "[NET] ARP ready. Launching DNS Query...\n");
-                        pending_cmd = NET_CMD_NONE;
-                        net_send_dns_query(console_ep, g_dns_pending_domain);
-                    } else if (pending_cmd == NET_CMD_PING && resolve_dest_mac(pending_ip, dummy)) {
-                        uint32_t count = pending_ping_count;
-                        pending_cmd = NET_CMD_NONE;
-                        net_start_ping_series(console_ep, timer_ep, pending_ip, count);
-                    } else if (pending_cmd == NET_CMD_SEND && resolve_dest_mac(pending_udp_ip, dummy)) {
-                        net_send_udp(console_ep, pending_udp_ip, pending_udp_port, pending_udp);
-                        pending_cmd = NET_CMD_NONE;
-                    } else if (pending_cmd == NET_CMD_NTP && resolve_dest_mac(g_ntp_server_ip, dummy)) {
-                        pending_cmd = NET_CMD_NONE;
-                        net_send_ntp_request(console_ep, timer_ep);
+                        s.pending_cmd = NET_CMD_NONE;
+                        net_send_dns_query(iface, console_ep, s.dns_pending_domain);
+                    } else if (s.pending_cmd == NET_CMD_PING && resolve_dest_mac(iface, s.pending_ip, dummy)) {
+                        uint32_t count = s.pending_ping_count;
+                        s.pending_cmd = NET_CMD_NONE;
+                        net_start_ping_series(iface, console_ep, timer_ep, s.pending_ip, count);
+                    } else if (s.pending_cmd == NET_CMD_SEND && resolve_dest_mac(iface, s.pending_udp_ip, dummy)) {
+                        net_send_udp(iface, console_ep, s.pending_udp_ip, s.pending_udp_port, s.pending_udp);
+                        s.pending_cmd = NET_CMD_NONE;
+                    } else if (s.pending_cmd == NET_CMD_NTP && resolve_dest_mac(iface, g_ntp_server_ip, dummy)) {
+                        s.pending_cmd = NET_CMD_NONE;
+                        net_send_ntp_request(iface, console_ep, timer_ep);
                     }
                 }
             }
         }
         else if (type == 0x0800) { // IPv4
             volatile ipv4_header* ip = (volatile ipv4_header*)eth->payload;
-            
+
             if (ip->protocol == 1) { // ICMP
                 volatile icmp_header* icmp = (volatile icmp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);
-                if (icmp->type == 0 && htons(icmp->id) == 0x1337) { 
+                if (icmp->type == 0 && htons(icmp->id) == 0x1337) {
                     uint16_t seq = htons(icmp->sequence);
                     uint32_t ip_header_len = (ip->ihl_version & 0x0F) * 4;
                     uint32_t ip_total_len = htons(ip->tot_len);
                     uint32_t icmp_bytes = (ip_total_len > ip_header_len) ? (ip_total_len - ip_header_len) : 0;
-                    bool matched = g_ping_outstanding && seq == g_ping_outstanding_seq;
+                    bool matched = s.ping_outstanding && seq == s.ping_outstanding_seq;
                     // Честные микросекунды через аппаратный счётчик (read_cntvct/g_cntfrq
                     // выше) — раньше через timer_ep IPC, разрешение которого только целые
                     // миллисекунды (отсюда всегда ".000" для локальных хостов с реальным
                     // RTT сильно меньше 1мс), а до этого — вообще произвольная оценка по
                     // числу циклов главного цикла, никак не привязанная к настоящему времени.
-                    uint64_t rtt_us = matched ? ((read_cntvct() - g_ping_sent_cyc) * 1000000ULL) / g_cntfrq : 0;
+                    uint64_t rtt_us = matched ? ((read_cntvct() - s.ping_sent_cyc) * 1000000ULL) / g_cntfrq : 0;
                     uint8_t src_ip[4];
                     for (int i = 0; i < 4; i++) src_ip[i] = ip->saddr[i];
 
@@ -1766,27 +2070,27 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
                         put_duration_us(console_ep, rtt_us);
                         sys_puts(console_ep, "\n");
 
-                        g_ping_outstanding = false;
-                        net_record_ping_rtt(rtt_us);
-                        net_schedule_next_ping(timer_ep);
+                        s.ping_outstanding = false;
+                        net_record_ping_rtt(iface, rtt_us);
+                        net_schedule_next_ping(iface, timer_ep);
                     }
                 }
             }
-            
+
             else if (ip->protocol == 17) { // UDP
                 volatile udp_header* udp = (volatile udp_header*)(eth->payload + (ip->ihl_version & 0x0F) * 4);
 
                 if (htons(udp->src_port) == 53) {
                     sys_puts(console_ep, ">>> [NET RX] UDP Response from Port 53 captured!\n");
-                    
+
                     volatile dns_header* dns = (volatile dns_header*)((char*)udp + sizeof(udp_header));
-                    
-                    if (htons(dns->id) == g_dns_id && htons(dns->ans_count) > 0) {
-                        // Буфер этого RX-дескриптора занимает ровно GENET_RX_BUF_LENGTH
-                        // байт начиная с eth (см. genet_rx_descs_init()); reader не должен
-                        // уходить за эту границу, иначе — неограниченный OOB read при
+
+                    if (htons(dns->id) == s.dns_id && htons(dns->ans_count) > 0) {
+                        // Буфер этого RX-кадра ограничен net_rx_buffer_end() (зависит от
+                        // интерфейса — GENET-дескриптор или Wi-Fi SHM-мейлбокс); reader не
+                        // должен уходить за эту границу, иначе — неограниченный OOB read при
                         // DNS-ответе без корректного нуль-терминатора имени.
-                        uint8_t* buffer_end = (uint8_t*)eth + (GENET_RX_BUF_LENGTH - GENET_RX_BUF_OFFSET);
+                        uint8_t* buffer_end = net_rx_buffer_end(iface, eth);
                         uint8_t* reader = (uint8_t*)dns + sizeof(dns_header);
 
                         // Пропускаем QNAME вопроса, затем QTYPE/QCLASS (4 байта).
@@ -1806,7 +2110,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
                             dns_ok = (reader + 8 + 2) <= buffer_end;
                         }
 
-                        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
+                        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
 
                         if (dns_ok) {
                             reader += 8; // TYPE(2) + CLASS(2) + TTL(4)
@@ -1821,32 +2125,32 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
 
                                 seL4_Word packed_ip = (resolved_ip[0] << 24) | (resolved_ip[1] << 16) |
                                                     (resolved_ip[2] << 8) | resolved_ip[3];
-                                *((seL4_Word*)(g_shm_vaddr + 4064)) = packed_ip;
+                                *((seL4_Word*)(g_shm_vaddr + net_mailbox_dns_ip_offset(iface))) = packed_ip;
 
                                 net_mailbox[0] = 0;
-                                g_dns_outstanding = false;
+                                s.dns_outstanding = false;
                             } else {
                                 sys_puts(console_ep, ">>> [NET RX] DNS Error: Unexpected data_len (CNAME?). Length=");
                                 put_dec(console_ep, data_len); sys_puts(console_ep, "\n");
                                 // Не A-запись (например, честный CNAME) — не блокируем shell
                                 // на 10с/respawn, а сразу сообщаем, что резолвить нечего.
                                 net_mailbox[0] = 0;
-                                g_dns_outstanding = false;
+                                s.dns_outstanding = false;
                             }
                         } else {
                             sys_puts(console_ep, ">>> [NET RX] DNS Error: malformed/truncated response, ignored.\n");
                             net_mailbox[0] = 0;
-                            g_dns_outstanding = false;
+                            s.dns_outstanding = false;
                         }
                     } else {
                         sys_puts(console_ep, ">>> [NET RX] DNS Ignored: ID mismatch or 0 answers.\n");
                     }
-                } else if (htons(udp->src_port) == NTP_SERVER_PORT && g_ntp_outstanding) {
+                } else if (htons(udp->src_port) == NTP_SERVER_PORT && s.ntp_outstanding) {
                     // Ответ SNTP-сервера на наш запрос из net_send_ntp_request().
-                    uint8_t* buffer_end = (uint8_t*)eth + (GENET_RX_BUF_LENGTH - GENET_RX_BUF_OFFSET);
+                    uint8_t* buffer_end = net_rx_buffer_end(iface, eth);
                     uint8_t* data_ptr = (uint8_t*)udp + sizeof(udp_header);
-                    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + 4060);
-                    g_ntp_outstanding = false;
+                    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
+                    s.ntp_outstanding = false;
 
                     if (data_ptr + sizeof(ntp_packet) > buffer_end) {
                         sys_puts(console_ep, "[NET] NTP Error: truncated response, ignored.\n");
@@ -1859,7 +2163,7 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
                             sys_puts(console_ep, "[NET] NTP Error: Kiss-o'-Death or unexpected mode, ignored.\n");
                             net_mailbox[0] = 0;
                         } else {
-                            uint64_t t1 = g_ntp_t1_epoch_s;
+                            uint64_t t1 = s.ntp_t1_epoch_s;
                             uint64_t t2 = (uint64_t)bswap32(ntp->rx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
                             uint64_t t3 = (uint64_t)bswap32(ntp->tx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
                             uint64_t t4 = sys_get_time_ms(timer_ep) / 1000ULL;
@@ -1872,23 +2176,23 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
                             seL4_SetMR(1, (seL4_Word)offset_s);
                             seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 
-                            g_ntp_synced = true;
-                            g_ntp_last_offset_negative = offset_s < 0;
-                            g_ntp_last_offset_s = (uint32_t)(g_ntp_last_offset_negative ? -offset_s : offset_s);
+                            s.ntp_synced = true;
+                            s.ntp_last_offset_negative = offset_s < 0;
+                            s.ntp_last_offset_s = (uint32_t)(s.ntp_last_offset_negative ? -offset_s : offset_s);
 
                             sys_puts(console_ep, "[NET] NTP sync OK, offset ");
-                            if (g_ntp_last_offset_negative) sys_puts(console_ep, "-");
-                            put_dec(console_ep, g_ntp_last_offset_s);
+                            if (s.ntp_last_offset_negative) sys_puts(console_ep, "-");
+                            put_dec(console_ep, s.ntp_last_offset_s);
                             sys_puts(console_ep, "s applied.\n");
                             net_mailbox[0] = 0;
                         }
                     }
                 } else if (htons(udp->dst_port) == DHCP_CLIENT_PORT && htons(udp->src_port) == DHCP_SERVER_PORT) {
                     // Ответ DHCP-сервера (OFFER/ACK/NAK) на наш запрос из net_check_dhcp().
-                    uint8_t* buffer_end = (uint8_t*)eth + (GENET_RX_BUF_LENGTH - GENET_RX_BUF_OFFSET);
+                    uint8_t* buffer_end = net_rx_buffer_end(iface, eth);
                     volatile dhcp_packet* dhcp = (volatile dhcp_packet*)((char*)udp + sizeof(udp_header));
 
-                    if ((uint8_t*)dhcp + 240 <= buffer_end && bswap32(dhcp->xid) == g_dhcp_xid &&
+                    if ((uint8_t*)dhcp + 240 <= buffer_end && bswap32(dhcp->xid) == s.dhcp_xid &&
                         bswap32(dhcp->magic_cookie) == DHCP_MAGIC_COOKIE) {
 
                         uint8_t msg_type = 0;
@@ -1917,71 +2221,77 @@ static void net_poll(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr root_ep
                             p += olen;
                         }
 
-                        if (msg_type == 2 && g_dhcp_state == DHCP_DISCOVERING) { // DHCPOFFER
-                            for (int i = 0; i < 4; i++) g_dhcp_offered_ip[i] = dhcp->yiaddr[i];
-                            for (int i = 0; i < 4; i++) g_dhcp_server_ip[i] = opt_server[i];
+                        if (msg_type == 2 && s.dhcp_state == DHCP_DISCOVERING) { // DHCPOFFER
+                            for (int i = 0; i < 4; i++) s.dhcp_offered_ip[i] = dhcp->yiaddr[i];
+                            for (int i = 0; i < 4; i++) s.dhcp_server_ip[i] = opt_server[i];
                             sys_puts(console_ep, "[NET] DHCP: OFFER ");
-                            put_ip(console_ep, g_dhcp_offered_ip);
+                            put_ip(console_ep, s.dhcp_offered_ip);
                             sys_puts(console_ep, " received, requesting...\n");
-                            net_send_dhcp_packet(console_ep, 3 /* DHCPREQUEST */);
-                            g_dhcp_state = DHCP_REQUESTING;
-                            g_dhcp_retry_uptime_ms = sys_get_uptime_ms(timer_ep) + DHCP_RETRY_MS;
-                        } else if (msg_type == 5 && (g_dhcp_state == DHCP_REQUESTING || g_dhcp_state == DHCP_DISCOVERING)) { // DHCPACK
-                            for (int i = 0; i < 4; i++) my_ip[i] = dhcp->yiaddr[i];
-                            if (has_mask)   for (int i = 0; i < 4; i++) g_subnet_mask[i] = opt_mask[i];
-                            if (has_router) for (int i = 0; i < 4; i++) g_gateway_ip[i] = opt_router[i];
-                            if (has_dns)    for (int i = 0; i < 4; i++) g_dns_ip[i] = opt_dns[i];
+                            net_send_dhcp_packet(iface, console_ep, 3 /* DHCPREQUEST */);
+                            s.dhcp_state = DHCP_REQUESTING;
+                            s.dhcp_retry_uptime_ms = sys_get_uptime_ms(timer_ep) + DHCP_RETRY_MS;
+                        } else if (msg_type == 5 && (s.dhcp_state == DHCP_REQUESTING || s.dhcp_state == DHCP_DISCOVERING || s.dhcp_state == DHCP_RENEWING)) { // DHCPACK
+                            bool was_renewing = (s.dhcp_state == DHCP_RENEWING);
+                            for (int i = 0; i < 4; i++) s.ip[i] = dhcp->yiaddr[i];
+                            if (has_mask)   for (int i = 0; i < 4; i++) s.subnet_mask[i] = opt_mask[i];
+                            if (has_router) for (int i = 0; i < 4; i++) s.gateway_ip[i] = opt_router[i];
+                            if (has_dns)    for (int i = 0; i < 4; i++) s.dns_ip[i] = opt_dns[i];
                             if (lease_s == 0) lease_s = DHCP_DEFAULT_LEASE_S;
 
-                            g_dhcp_state = DHCP_BOUND;
-                            g_dhcp_bound = true;
-                            g_dhcp_attempt = 0;
-                            have_router_mac = false; // прежний MAC гейтвея (если был) мог устареть с новым адресом
-                            g_have_onlink_mac = false; // новая подсеть — старый MAC соседа по ней уже неактуален
+                            s.dhcp_state = DHCP_BOUND;
+                            s.dhcp_bound = true;
+                            s.dhcp_attempt = 0;
+                            // На простом renew той же аренды сеть не менялась — старый
+                            // MAC гейтвея/соседа всё ещё валиден, не сбрасываем (иначе
+                            // лишний ARP сразу после каждого renew, без всякой нужды).
+                            if (!was_renewing) {
+                                s.have_router_mac = false; // прежний MAC гейтвея (если был) мог устареть с новым адресом
+                                s.have_onlink_mac = false; // новая подсеть — старый MAC соседа по ней уже неактуален
+                            }
 
-                            g_dhcp_lease_deadline_uptime_ms = sys_get_uptime_ms(timer_ep) + ((uint64_t)lease_s * 1000ULL) / 2ULL;
+                            s.dhcp_lease_deadline_uptime_ms = sys_get_uptime_ms(timer_ep) + ((uint64_t)lease_s * 1000ULL) / 2ULL;
 
-                            sys_puts(console_ep, "[NET] DHCP: bound ip="); put_ip(console_ep, my_ip);
-                            sys_puts(console_ep, " gw="); put_ip(console_ep, g_gateway_ip);
-                            sys_puts(console_ep, " mask="); put_ip(console_ep, g_subnet_mask);
-                            sys_puts(console_ep, " dns="); put_ip(console_ep, g_dns_ip);
+                            sys_puts(console_ep, was_renewing ? "[NET] DHCP: lease renewed, ip=" : "[NET] DHCP: bound ip=");
+                            put_ip(console_ep, s.ip);
+                            sys_puts(console_ep, " gw="); put_ip(console_ep, s.gateway_ip);
+                            sys_puts(console_ep, " mask="); put_ip(console_ep, s.subnet_mask);
+                            sys_puts(console_ep, " dns="); put_ip(console_ep, s.dns_ip);
                             sys_puts(console_ep, " lease="); put_dec(console_ep, lease_s);
                             sys_puts(console_ep, "s\n");
                         } else if (msg_type == 6) { // DHCPNAK
                             sys_puts(console_ep, "[NET] DHCP: NAK received, restarting discovery.\n");
-                            g_dhcp_state = DHCP_IDLE;
-                            g_dhcp_bound = false;
+                            s.dhcp_state = DHCP_IDLE;
+                            s.dhcp_bound = false;
                         }
                     }
                 } else {
                     // Произвольная входящая UDP-датаграмма (не DNS) — сохраняем для команды `recv`.
-                    // Границы буфера те же 1536 байт RX-дескриптора, что и в разборе DNS выше.
-                    uint8_t* buffer_end = (uint8_t*)eth + (GENET_RX_BUF_LENGTH - GENET_RX_BUF_OFFSET);
+                    uint8_t* buffer_end = net_rx_buffer_end(iface, eth);
                     uint8_t* data_ptr = (uint8_t*)udp + sizeof(udp_header);
                     uint16_t udp_len = htons(udp->len);
                     int payload_len = (udp_len > sizeof(udp_header)) ? (udp_len - sizeof(udp_header)) : 0;
 
                     int avail = (data_ptr < buffer_end) ? (int)(buffer_end - data_ptr) : 0;
                     if (payload_len > avail) payload_len = avail;
-                    if (payload_len > (int)sizeof(g_udp_rx_data) - 1) payload_len = (int)sizeof(g_udp_rx_data) - 1;
+                    if (payload_len > (int)sizeof(s.udp_rx_data) - 1) payload_len = (int)sizeof(s.udp_rx_data) - 1;
                     if (payload_len < 0) payload_len = 0;
 
-                    for (int i = 0; i < payload_len; i++) g_udp_rx_data[i] = (char)data_ptr[i];
-                    g_udp_rx_data[payload_len] = '\0';
-                    g_udp_rx_len = payload_len;
+                    for (int i = 0; i < payload_len; i++) s.udp_rx_data[i] = (char)data_ptr[i];
+                    s.udp_rx_data[payload_len] = '\0';
+                    s.udp_rx_len = payload_len;
 
-                    for (int i = 0; i < 4; i++) g_udp_rx_src_ip[i] = ip->saddr[i];
-                    g_udp_rx_src_port = htons(udp->src_port);
-                    g_udp_rx_ready = true;
+                    for (int i = 0; i < 4; i++) s.udp_rx_src_ip[i] = ip->saddr[i];
+                    s.udp_rx_src_port = htons(udp->src_port);
+                    s.udp_rx_ready = true;
 
                     // В консоль больше не пишем (см. комментарий у net_log_udp выше) —
                     // только в /root/net_udp.log, чтобы не тормозить главный цикл.
-                    net_log_udp(timer_ep, g_udp_rx_src_ip, g_udp_rx_src_port, payload_len);
+                    net_log_udp(timer_ep, s.udp_rx_src_ip, s.udp_rx_src_port, payload_len);
                 }
             } // Конец проверки UDP
         } // Конец проверки IPv4
 
-        net_hw_rx_done();
+        net_hw_rx_done(iface);
     }
 }
 
@@ -1999,6 +2309,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];
     seL4_CPtr irq_ep     = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: настоящая IRQHandler-капа GENET RX (RPI4_GENET_IRQ_A), не общая ни с кем
     g_blk_ep = ipc->msg[7]; // см. main.cpp: local_blk_ep=7 — нужен только для net_log_udp()
+    g_wifi_tx_wake_ntfn = ipc->msg[BOOT_WIFI_TX_WAKE_CAP]; // Фаза 4.5.4: капа сигнала wifi_driver'у "кадр в TX-mailbox" (см. wifi_hw_send())
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -2013,6 +2324,13 @@ int main(int argc, char *argv[]) {
     
     g_shm_vaddr = (char*)seL4_GetMR(0);
     g_shm_paddr = (uint32_t)seL4_GetMR(1);
+
+    // Фаза 4.5 (Wi-Fi data-plane) — дефолты обоих интерфейсов ДО первого
+    // реального использования (см. NetIfaceState/net_iface_init_defaults()
+    // выше). IFACE_WIFI остаётся полностью инертным (link_up=false) до
+    // Фазы 4.5.3 — здесь просто готовим структуру, ничего ещё не включаем.
+    net_iface_init_defaults(IFACE_GENET);
+    net_iface_init_defaults(IFACE_WIFI);
 
     if (g_shm_vaddr == nullptr || g_shm_paddr == 0) {
         sys_puts(console_ep, "[NET] FATAL: Failed to get dynamic SHM!\n");
@@ -2064,7 +2382,7 @@ int main(int argc, char *argv[]) {
         seL4_Word badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(net_cmd_ep, &badge);
 
-        if (badge & (NET_EVENT_GENET_RX | NET_EVENT_HEARTBEAT)) {
+        if (badge & (NET_EVENT_GENET_RX | NET_EVENT_HEARTBEAT | NET_EVENT_WIFI_RX)) {
             if (badge & NET_EVENT_GENET_RX) {
                 // Сброс sticky-бита ПЕРЕД Ack (см. живой урок с EMMC2 в
                 // blk_driver.cpp/ROADMAP.md 4.5) — порядок как в эталонном
@@ -2075,16 +2393,28 @@ int main(int argc, char *argv[]) {
                 // линию ещё "поднятой" и тут же передоставит то же событие.
                 genet_write32(INTRL2_CPU_CLEAR, UMAC_IRQ_RXDMA_DONE);
                 seL4_IRQHandler_Ack(irq_ep);
-                g_genet_irq_wakeups++;
+                g_iface[IFACE_GENET].rx_irq_wakeups++;
             }
+            // Фаза 4.5.3+: wifi_driver сигналит этим же битом net_event_ntfn
+            // при постановке кадра в свой RX-mailbox (см. common.h) — пока
+            // (4.5.2) этот бит физически никогда не приходит (wifi_driver ещё
+            // не умеет его слать), но счётчик уже готов.
+            if (badge & NET_EVENT_WIFI_RX) g_iface[IFACE_WIFI].rx_irq_wakeups++;
             if (badge & NET_EVENT_HEARTBEAT) g_heartbeat_wakeups++;
-            if (g_net_up) {
-                net_check_link_status(console_ep, timer_ep);
-                net_check_dhcp(console_ep, timer_ep);
-                net_poll(console_ep, timer_ep, root_ep);
-                net_check_ping_timeout(console_ep, timer_ep);
-                net_check_ping_send(console_ep, timer_ep);
-                net_check_ntp_resync(console_ep, timer_ep);
+            // GENET-специфичная проверка линка (реальный MDIO read) и Wi-Fi
+            // (SHM-флаг от wifi_driver, Фаза 4.5.3) — независимые источники,
+            // оба дёшевы, проверяем каждый тик.
+            if (g_net_up) net_check_link_status(console_ep, timer_ep);
+            net_check_wifi_link(console_ep);
+            for (int i = 0; i < IFACE_COUNT; i++) {
+                NetIface iface = (NetIface)i;
+                if (iface == IFACE_GENET && !g_net_up) continue;
+                net_check_dhcp(iface, console_ep, timer_ep);
+                net_poll(iface, console_ep, timer_ep, root_ep);
+                net_check_ping_timeout(iface, console_ep, timer_ep);
+                net_check_ping_send(iface, console_ep, timer_ep);
+                net_check_ntp_resync(iface, console_ep, timer_ep);
+                net_publish_iface_ready(iface);
             }
             continue;
         }

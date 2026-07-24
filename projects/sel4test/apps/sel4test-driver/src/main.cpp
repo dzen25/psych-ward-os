@@ -100,7 +100,12 @@ static uintptr_t global_ipc_temp_vaddr = 0x200800000ULL;
 // с pcbs[]/любыми другими статическими данными невозможна в принципе, а не
 // просто "пока не встретилась".
 static char* rootserver_shm_base = (char*)0x200A00000ULL;
-static seL4_CPtr shm_frames[4]; // Массив Capability для 4-х страниц SHM
+// 5-я страница добавлена ради изолированного Wi-Fi TX/RX data-мейлбокса
+// (см. h/platform.h WIFI_SHM_TX_DATA_OFFSET/RX_DATA_OFFSET) — старые 4
+// страницы (0-16383) пересекались с GENET rx_buffer_offsets[] (живой баг,
+// см. situation.txt); SHM_TOTAL_SIZE в shell.cpp (VFS/`ps`) НАРОЧНО остаётся
+// 16384, не 20480 — 5-я страница не должна быть доступна файловому протоколу.
+static seL4_CPtr shm_frames[5]; // Массив Capability для 5 страниц SHM
 
 // rootserver_shm_base мапится КЭШИРУЕМО (см. цикл маппинга в main()), а все
 // остальные процессы (shell/blk_driver/net_driver/...) видят ЭТУ ЖЕ
@@ -113,7 +118,7 @@ static seL4_CPtr shm_frames[4]; // Массив Capability для 4-х стра�
 // Вызывать после записи (перед тем, как другой процесс должен её увидеть)
 // и/или перед чтением (после того, как другой процесс мог что-то записать).
 static void flush_rootserver_shm() {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         seL4_ARM_Page_CleanInvalidate_Data(shm_frames[i], 0, 4096);
     }
 }
@@ -230,12 +235,18 @@ struct ProcessControlBlock {
     seL4_CPtr net_cmd_send_ep;
     seL4_CPtr wifi_cmd_recv_ep;
     seL4_CPtr wifi_cmd_send_ep;
+    // Фаза 4.5 (Wi-Fi data-plane) — для авто-респавна (watchdog/SYS_START_WIFI)
+    // должны пережить рестарт процесса так же, как wifi_cmd_recv_ep выше:
+    // net_wifi_rx_badged — капа wifi_driver'а на сигнал net_driver'у (RX);
+    // wifi_tx_wake_badged — капа net_driver'а на сигнал wifi_driver'у (TX).
+    seL4_CPtr net_wifi_rx_badged;
+    seL4_CPtr wifi_tx_wake_badged;
 
     CapTracker cap_tracker;
 
     // --- НОВОЕ: Трекинг копий SHM для защиты от утечек ---
     bool has_shm;
-    seL4_CPtr shm_copies[4];
+    seL4_CPtr shm_copies[5];
 };
 
 // --- UNIX PIPES SUBSYSTEM ---
@@ -417,7 +428,27 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // (Фаза 4.5, см. PLAT_BLK_DMA_VADDR/platform.h) —
                          // та же схема, что mbox_buf_frame_param выше.
                          seL4_CPtr blk_dma_frame_param = 0,
-                         seL4_Word blk_dma_paddr_param = 0) {
+                         seL4_Word blk_dma_paddr_param = 0,
+                         // Фаза 4.5 (Wi-Fi data-plane) — три новых параметра,
+                         // тот же принцип, что extra_ntfn_param выше, каждый
+                         // читается РОВНО одним конкретным драйвером:
+                         // - extra_ntfn2_param: heartbeat-капа wifi_driver'а
+                         //   (badge WIFI_EVENT_HEARTBEAT из wifi_wake_ntfn),
+                         //   читает ТОЛЬКО timer_driver (is_driver==2), чтобы
+                         //   периодически её сигналить рядом с net-heartbeat.
+                         seL4_CPtr extra_ntfn2_param = 0,
+                         // - net_wifi_rx_badged_param: капа (badge
+                         //   NET_EVENT_WIFI_RX из net_event_ntfn), которой
+                         //   wifi_driver сигналит net_driver'у о новом RX-
+                         //   кадре — читает ТОЛЬКО wifi_driver (is_driver==5),
+                         //   передаётся заново при каждом (ре)спавне, как и
+                         //   wifi_cmd_recv_ep выше.
+                         seL4_CPtr net_wifi_rx_badged_param = 0,
+                         // - net_wifi_tx_wake_param: капа (badge
+                         //   WIFI_EVENT_TX_READY из wifi_wake_ntfn), которой
+                         //   net_driver сигналит wifi_driver'у о новом TX-
+                         //   кадре — читает ТОЛЬКО net_driver (is_driver==4).
+                         seL4_CPtr net_wifi_tx_wake_param = 0) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -467,6 +498,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_wifi_recv_ep = 8; // Wi-Fi (Фаза 4): wifi_driver слушает на этом слоте (см. BOOT_WIFI_EP)
     seL4_Word local_syscall_ep  = 10; // <-- Локальный индекс для Faults и Syscalls
     seL4_Word local_extra_ntfn  = 13; // Фаза 4.5: капа на heartbeat-нотификацию net_driver'а (только для timer_driver, см. extra_ntfn_param)
+    seL4_Word local_extra_ntfn2 = 14; // Фаза 4.5 (Wi-Fi data-plane): heartbeat-капа wifi_driver'а (только для timer_driver, см. extra_ntfn2_param)
+    seL4_Word local_net_wifi_rx = 15; // Фаза 4.5 (Wi-Fi data-plane): капа wifi_driver->net_driver сигнала RX (только для wifi_driver, см. net_wifi_rx_badged_param)
+    seL4_Word local_wifi_tx_wake = 16; // Фаза 4.5 (Wi-Fi data-plane): капа net_driver->wifi_driver сигнала TX (только для net_driver, см. net_wifi_tx_wake_param)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
@@ -500,6 +534,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (wifi_cmd_send_ep != 0) check_err(seL4_CNode_Mint(child_cnode, local_wifi_send_ep, 8, root_cnode, wifi_cmd_send_ep, seL4_WordBits, seL4_AllRights, pid), "Mint wifi send ep");
     if (wifi_cmd_recv_ep != 0) check_err(seL4_CNode_Copy(child_cnode, local_wifi_recv_ep, 8, root_cnode, wifi_cmd_recv_ep, seL4_WordBits, seL4_AllRights), "Copy wifi recv ep");
     if (extra_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_extra_ntfn, 8, root_cnode, extra_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy extra ntfn (heartbeat)");
+    if (extra_ntfn2_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_extra_ntfn2, 8, root_cnode, extra_ntfn2_param, seL4_WordBits, seL4_AllRights), "Copy extra ntfn2 (wifi heartbeat)");
+    if (net_wifi_rx_badged_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_net_wifi_rx, 8, root_cnode, net_wifi_rx_badged_param, seL4_WordBits, seL4_AllRights), "Copy net_wifi_rx signal cap");
+    if (net_wifi_tx_wake_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_wifi_tx_wake, 8, root_cnode, net_wifi_tx_wake_param, seL4_WordBits, seL4_AllRights), "Copy wifi_tx_wake signal cap");
 
     pcb.cspace = child_cnode;
     pcb.badged_ep = badged_ep; // Оставляем глобальный в pcb для нужд ядра
@@ -513,6 +550,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.net_cmd_send_ep = net_cmd_send_ep;
     pcb.wifi_cmd_recv_ep = wifi_cmd_recv_ep;
     pcb.wifi_cmd_send_ep = wifi_cmd_send_ep;
+    pcb.net_wifi_rx_badged = net_wifi_rx_badged_param;
+    pcb.wifi_tx_wake_badged = net_wifi_tx_wake_param;
 
     elf_t elf;
     elf_newFile(elf_file, elf_size, &elf);
@@ -690,6 +729,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep; // Таймер может логировать в консоль, но не обязан
             child_ipc_ptr->msg[BOOT_MBOX_BUF_PADDR] = mbox_buf_paddr_param; // Фаза 4.6, см. platform.h
             child_ipc_ptr->msg[BOOT_HEARTBEAT_NTFN_CAP] = (extra_ntfn_param != 0) ? local_extra_ntfn : 0; // Фаза 4.5, см. common.h
+            child_ipc_ptr->msg[BOOT_WIFI_HEARTBEAT_NTFN_CAP] = (extra_ntfn2_param != 0) ? local_extra_ntfn2 : 0; // Фаза 4.5 (Wi-Fi data-plane), см. common.h
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
@@ -711,6 +751,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             // EMMC2/Wi-Fi), поэтому net_driver держит её сам и Ack'ает сам,
             // без root-релея (тот же приём, что у timer_driver).
             child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
+            // Фаза 4.5 (Wi-Fi data-plane): капа net_driver->wifi_driver
+            // сигнала TX (badge WIFI_EVENT_TX_READY) — см. common.h.
+            child_ipc_ptr->msg[BOOT_WIFI_TX_WAKE_CAP] = (net_wifi_tx_wake_param != 0) ? local_wifi_tx_wake : 0;
         } else if (is_driver == 5) { // Wi-Fi driver (Фаза 4) - сервер для шелла, клиент консоли и blk (Милстоун 4.2: чтение прошивки/NVRAM с SD)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_recv_ep;
@@ -720,6 +763,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             // здесь тоже просто "слот с готовой capability на нотификацию",
             // не настоящий IRQHandler, см. wifi_irq_ntfn в main()).
             child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
+            // Фаза 4.5 (Wi-Fi data-plane): капа wifi_driver->net_driver
+            // сигнала RX (badge NET_EVENT_WIFI_RX) — см. common.h.
+            child_ipc_ptr->msg[BOOT_WIFI_NET_RX_SIGNAL_CAP] = (net_wifi_rx_badged_param != 0) ? local_net_wifi_rx : 0;
         }
 
     } else {
@@ -837,7 +883,7 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     // Если процесс использовал SHM, уничтожаем копии Capabilities, 
     // чтобы вернуть слоты в аллокатор и отмапить память!
     if (meta.has_shm) {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             if (meta.shm_copies[i] != 0) {
                 seL4_CNode_Delete(root_cnode, meta.shm_copies[i], seL4_WordBits);
                 alloc.free(meta.shm_copies[i]);
@@ -852,7 +898,9 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
                                     meta.is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                     meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep,
-                                    meta.wifi_cmd_recv_ep, meta.wifi_cmd_send_ep);
+                                    meta.wifi_cmd_recv_ep, meta.wifi_cmd_send_ep,
+                                    0, 0, 0, 0, 0, 0, 0,
+                                    meta.net_wifi_rx_badged, meta.wifi_tx_wake_badged);
 
         if (new_pid > 0) {
             uart_puts("[WATCHDOG] Service restored successfully. New PID: "); uart_putdec(new_pid); uart_puts("\n");
@@ -1059,7 +1107,7 @@ int main(int argc, char *argv[]) {
     // "дырочный" (чужой/неинициализированный) физический адрес вместо
     // настоящей 2-й/3-й страницы SHM — net_driver читал свою страницу и
     // видел одни нули (см. ROADMAP.md 4.5, живой баг ethertype=0).
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         shm_frames[i] = alloc.alloc_slot();
         seL4_Error err = seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
                                              root_cnode, 0, 0, shm_frames[i], 1);
@@ -1068,7 +1116,7 @@ int main(int argc, char *argv[]) {
             while(1);
         }
     }
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         // Мапим эти физические фреймы в виртуальную память Rootserver'а —
         // ОБЯЗАТЕЛЬНО кэшируемой (seL4_ARM_Default_VMAttributes), в отличие
         // от map_frame_robust() ниже (та мапит некэшируемо ради когерентности
@@ -1140,6 +1188,9 @@ int main(int argc, char *argv[]) {
     // тоже аллоцируются только под своим флагом) — при выключенном wifi этот
     // код не должен потреблять вообще ничего лишнего (раньше по ошибке создавался
     // безусловно, см. ROADMAP.md Милстоун 4.1 — расследование halt'а на живом железе).
+    seL4_CPtr wifi_wake_ntfn = 0;
+    seL4_CPtr wifi_wake_heartbeat_badged = 0;
+    seL4_CPtr wifi_wake_tx_ready_badged = 0;
     if (RPI4_ENABLE_WIFI) {
         wifi_cmd_ep = alloc.alloc_slot();
         wifi_cmd_recv_ep = alloc.alloc_slot();
@@ -1149,6 +1200,22 @@ int main(int argc, char *argv[]) {
                         root_cnode, wifi_cmd_ep, seL4_WordBits, seL4_CanRead);
         seL4_CNode_Copy(root_cnode, wifi_cmd_send_ep, seL4_WordBits,
                         root_cnode, wifi_cmd_ep, seL4_WordBits, seL4_CapRights_new(0, 1, 0, 1)); // Write + Grant
+
+        // Фаза 4.5 (Wi-Fi data-plane) — heartbeat/wake-нотификация самого
+        // wifi_driver'а: TCB-bind через обычный irq_ntfn-параметр spawn_process()
+        // (тот же механизм, что уже используется для net_event_ntfn у
+        // net_driver — см. ниже). Два бейджа с ОДНОГО объекта, seL4 сам OR'ит
+        // непотреблённые сигналы, поэтому wifi_driver одним Recv видит и
+        // heartbeat (от timer_driver), и "есть TX-кадр" (от net_driver).
+        // Создаётся один раз при загрузке и переживает рестарты wifi_driver
+        // (тот же принцип постоянства, что у wifi_cmd_recv_ep выше) — сам
+        // TCB-bind просто накатывается заново при каждом (ре)спавне.
+        wifi_wake_ntfn = alloc.alloc_slot();
+        wifi_wake_heartbeat_badged = alloc.alloc_slot();
+        wifi_wake_tx_ready_badged = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_wake_ntfn, 1);
+        seL4_CNode_Mint(root_cnode, wifi_wake_heartbeat_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_HEARTBEAT);
+        seL4_CNode_Mint(root_cnode, wifi_wake_tx_ready_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_TX_READY);
     }
 
     // Таймер (ARM generic timer) не MMIO-устройство и не генерирует IRQ,
@@ -1184,6 +1251,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr badged_genet_rx_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_net_heartbeat_ntfn = alloc.alloc_slot();
     seL4_CPtr genet_irq_handler = alloc.alloc_slot();
+    seL4_CPtr net_wifi_rx_badged = 0;
     if (RPI4_ENABLE_NET) {
         seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, net_event_ntfn, 1);
         seL4_CNode_Mint(root_cnode, badged_genet_rx_ntfn, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_GENET_RX);
@@ -1191,6 +1259,15 @@ int main(int argc, char *argv[]) {
         check_err(seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_GENET_IRQ_A, root_cnode, genet_irq_handler, seL4_WordBits), "IRQControl_Get(GENET_IRQ_A)");
         check_err(seL4_IRQHandler_SetNotification(genet_irq_handler, badged_genet_rx_ntfn), "IRQHandler_SetNotification(genet)");
         check_err(seL4_IRQHandler_Ack(genet_irq_handler), "IRQHandler_Ack(genet, initial)");
+
+        // Фаза 4.5 (Wi-Fi data-plane) — третий бейдж ТОГО ЖЕ net_event_ntfn:
+        // wifi_driver сигналит им net_driver, когда кладёт кадр в RX-mailbox.
+        // Сам объект/bind у net_driver не меняются — просто ещё один badge,
+        // который может прийти на тот же net_driver'а Recv (см. common.h).
+        if (RPI4_ENABLE_WIFI) {
+            net_wifi_rx_badged = alloc.alloc_slot();
+            seL4_CNode_Mint(root_cnode, net_wifi_rx_badged, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_WIFI_RX);
+        }
     }
 
     // Физический таймер (PPI 30, non-secure) — Фаза 4.5, событийный sys_sleep
@@ -1218,7 +1295,8 @@ int main(int argc, char *argv[]) {
     // Запускаем Драйвер Таймера (is_driver = 2)
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, avs_frame,
-                      nullptr, 0, 0, 0, 0, mbox_regs_frame, mbox_buf_frame, mbox_buf_paddr, badged_net_heartbeat_ntfn) < 0) {
+                      nullptr, 0, 0, 0, 0, mbox_regs_frame, mbox_buf_frame, mbox_buf_paddr, badged_net_heartbeat_ntfn,
+                      0, 0, wifi_wake_heartbeat_badged) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
@@ -1281,7 +1359,7 @@ int main(int argc, char *argv[]) {
     if (RPI4_ENABLE_NET) {
     if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       4, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, net_event_ntfn, genet_irq_handler, genet_frames[0], nullptr,
-                      net_cmd_recv_ep, 0) < 0) {
+                      net_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, wifi_wake_tx_ready_badged) < 0) {
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
     }
@@ -1864,10 +1942,13 @@ int main(int argc, char *argv[]) {
                 
                 for (int i = 1; i < 256; i++) {
                     if (pcbs[i].active) {
-                        // rootserver_shm_base — это ровно 4 страницы (16KB, shm_frames[4]).
+                        // Намеренно ограничено ПЕРВЫМИ 4 страницами (16KB) из 5 в
+                        // shm_frames[5] — 5-я страница зарезервирована исключительно под
+                        // Wi-Fi TX/RX data-мейлбокс (см. h/platform.h), файловому/ps-протоколу
+                        // она не должна быть доступна ни при каких обстоятельствах.
                         // Резервируем запас на самую длинную возможную строку записи
                         // ("    " + PID + " [RUNNING] " + name[32] + "\n"), чтобы не выйти
-                        // за пределы физических страниц при большом числе процессов.
+                        // за пределы этих 4 страниц при большом числе процессов.
                         if (offset > 16384 - 64) {
                             strcpy(shm + offset, "...\n");
                             offset += 4;
@@ -2024,13 +2105,13 @@ int main(int argc, char *argv[]) {
                 }
 
                 uintptr_t vaddr = pcbs[pid].vmap_bump_pointer;
-                pcbs[pid].vmap_bump_pointer += 0x4000; // Сдвигаем курсор на 16 КБ
+                pcbs[pid].vmap_bump_pointer += 0x5000; // Сдвигаем курсор на 20 КБ (5 страниц, см. shm_frames[5])
 
                 // Отмечаем, что этот процесс взял SHM
                 pcbs[pid].has_shm = true;
                 bool success = true;
 
-                for (int i = 0; i < 4; i++) {
+                for (int i = 0; i < 5; i++) {
                     seL4_CPtr frame_copy = alloc.alloc_slot();
                     if (frame_copy == 0) { success = false; pcbs[pid].shm_copies[i] = 0; }
                     else { pcbs[pid].shm_copies[i] = frame_copy; }
@@ -2053,15 +2134,15 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (!success) {
-                    uart_puts("[ROOT] FATAL: Failed to dynamically map 16KB SHM!\n");
-                    for (int i = 0; i < 4; i++) {
+                    uart_puts("[ROOT] FATAL: Failed to dynamically map 20KB SHM!\n");
+                    for (int i = 0; i < 5; i++) {
                         if (pcbs[pid].shm_copies[i] != 0) {
                             seL4_CNode_Delete(root_cnode, pcbs[pid].shm_copies[i], seL4_WordBits);
                             alloc.free(pcbs[pid].shm_copies[i]);
                         }
                     }
                     pcbs[pid].has_shm = false;
-                    pcbs[pid].vmap_bump_pointer -= 0x4000;
+                    pcbs[pid].vmap_bump_pointer -= 0x5000;
                     seL4_SetMR(0, 0);
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                     break;
@@ -2125,9 +2206,13 @@ int main(int argc, char *argv[]) {
                     // слот) — тот же приём, что у blk_irq_ntfn: обычная
                     // capability на нотификацию, не настоящий IRQHandler (см.
                     // is_driver==5 блок выше и common.h/SYS_WIFI_IRQ_ACK).
+                    // wifi_wake_ntfn идёт irq_ntfn-параметром (TCB-bind) — то
+                    // же самое место, где uart/timer/net получают свою
+                    // нотификацию (Фаза 4.5, Wi-Fi data-plane, см. common.h/
+                    // WIFI_EVENT_HEARTBEAT|WIFI_EVENT_TX_READY).
                     int new_pid = spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
-                                                0, 0, wifi_cmd_recv_ep, 0);
+                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
+                                                0, 0, wifi_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, net_wifi_rx_badged);
                     seL4_SetMR(0, new_pid > 0 ? 0 : (seL4_Word)-1);
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -2145,6 +2230,12 @@ int main(int argc, char *argv[]) {
                     generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
                                             shm_frames[0], console_ep, timer_ep, blk_ep, /*respawn=*/false);
                     g_wifi_driver_ready = false;
+                    // Фаза 4.5.3 (Wi-Fi data-plane): гасим link-state в SHM-мейлбоксе,
+                    // чтобы net_driver увидел wifi-интерфейс down в течение одного
+                    // тика, а не ждал, пока сам wifi_driver (уже убитый) это сделает.
+                    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_OFFSET) = 0;
+                    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_REASON_OFFSET) = WIFI_LINK_REASON_SYS_STOP_WIFI; // диагностика живого бага, см. platform.h
+                    flush_rootserver_shm(); // иначе запись может годами остаться в dirty-кэше root'а и не долететь до RAM, а net_driver читает эту страницу некэшируемо (см. flush_rootserver_shm())
                     seL4_SetMR(0, 0);
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));

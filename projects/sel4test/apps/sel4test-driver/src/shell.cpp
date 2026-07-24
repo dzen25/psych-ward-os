@@ -247,6 +247,36 @@ enum NetCommand {
     NET_CMD_NTP = 6,
 };
 
+// Фаза 4.5.6 (Wi-Fi data-plane, per-interface команды шелла) — значения
+// ДОЛЖНЫ совпадать с NetIface enum в net_driver.cpp (IFACE_GENET/IFACE_WIFI);
+// протокол NET_CMD_* между процессами и так уже задаётся простым совпадением
+// чисел без общего заголовка (см. enum NetCommand выше), это тот же приём.
+constexpr seL4_Word NET_IFACE_GENET = 0;
+constexpr seL4_Word NET_IFACE_WIFI  = 1;
+
+// Офсеты readiness-флага/DNS-IP/ping-статистики в общей SHM — по одному
+// набору на интерфейс. GENET занимает исторический диапазон 4060-4095
+// (не трогаем, старые скрипты/привычки не должны сломаться), Wi-Fi получает
+// отдельный диапазон дальше (4100-8191 между net_vfs_lock'ом на 4096 и
+// WIFI_SHM_* на 8192 — полностью свободно, с большим запасом). Числа ДОЛЖНЫ
+// совпадать с одноимёнными функциями в net_driver.cpp.
+// ВАЖНО: dns_ip читается/пишется как seL4_Word (8 байт на aarch64) — на
+// Device-памяти (см. map_frame_robust()/main.cpp) невыровненный на 8 байт
+// доступ ловит Alignment Fault (живой краш: было 4204, не кратно 8 — см.
+// net_driver.cpp). Числа здесь ДОЛЖНЫ совпадать с net_driver.cpp.
+static inline uint32_t net_mailbox_ready_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4200 : 4060; }
+static inline uint32_t net_mailbox_dns_ip_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4208 : 4064; }
+static inline uint32_t net_mailbox_ping_stats_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4216 : 4068; }
+
+// По просьбе пользователя — без явного `-W` шелл сам выбирает интерфейс:
+// GENET, если у него реально есть IP (dhcp_bound), иначе Wi-Fi, если есть у
+// него, иначе сразу ошибка "нет сети" — БЕЗ обращения к net_driver вообще
+// (незачем ждать таймаут DHCP на мёртвом интерфейсе). net_driver публикует
+// dhcp_bound обоих интерфейсов сюда каждый тик (см. net_publish_iface_ready()
+// в net_driver.cpp) — простые uint32_t, 4-байтного выравнивания достаточно.
+// Числа ДОЛЖНЫ совпадать с net_ready_flag_offset() там же.
+static inline uint32_t net_ready_flag_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4248 : 4244; }
+
 static char *next_token(char **cursor) {
     if (!cursor || !*cursor) return nullptr;
     char *tok = *cursor;
@@ -303,7 +333,52 @@ static seL4_Word pack_ipv4(const uint8_t ip[4]) {
            ((seL4_Word)ip[2] << 8) | (seL4_Word)ip[3];
 }
 
-static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip, seL4_Word port, const char *text) {
+// Общий разбор "-W" (принудительно Wi-Fi, игнорируя авто-выбор ниже) для
+// ping/send/sendto/recv/ntp. НЕ через next_token(): тот необратимо режет
+// строку на месте (заменяет разделяющий пробел на '\0'), а send/sendto
+// должны получить остаток строки как есть, ВКЛЮЧАЯ пробелы (это текст
+// сообщения, не токен) — поэтому здесь ручной, недеструктивный разбор
+// префикса: если флага нет, *cursor вообще не трогаем. Возвращает true,
+// если флаг был и cursor сдвинут; false — флага нет, cursor как был.
+static bool parse_wifi_flag(char **cursor) {
+    if (!cursor || !*cursor) return false; // netstat/recv/ntp без аргументов вообще (arg == nullptr)
+    char *p = *cursor;
+    while (*p == ' ') p++;
+    if (p[0] == '-' && p[1] == 'W' && (p[2] == ' ' || p[2] == '\0')) {
+        p += 2;
+        while (*p == ' ') p++;
+        *cursor = p;
+        return true;
+    }
+    return false;
+}
+
+// Без явного "-W" — авто-выбор интерфейса по умолчанию (по просьбе
+// пользователя): GENET, если у него реально есть IP; иначе Wi-Fi, если есть
+// у него; иначе сообщаем "нет сети" СРАЗУ, локально, вообще не трогая
+// net_driver — незачем ждать 5-10с таймаута DHCP на заведомо мёртвом
+// интерфейсе. Готовность обоих читается напрямую из SHM (net_driver
+// публикует dhcp_bound туда каждый тик, см. net_publish_iface_ready() в
+// net_driver.cpp) — дёшево, без единого IPC-вызова.
+static bool pick_default_iface(seL4_CPtr console_ep, seL4_Word *out_iface) {
+    volatile uint32_t *genet_ready = (volatile uint32_t*)(shm_base + net_ready_flag_offset(NET_IFACE_GENET));
+    volatile uint32_t *wifi_ready  = (volatile uint32_t*)(shm_base + net_ready_flag_offset(NET_IFACE_WIFI));
+    if (*genet_ready) { *out_iface = NET_IFACE_GENET; return true; }
+    if (*wifi_ready)  { *out_iface = NET_IFACE_WIFI;  return true; }
+    sys_puts(console_ep, "[SHELL] Error: no network connection available (neither GENET nor Wi-Fi has an IP). Use 'wifi connect' or plug in the cable.\n");
+    return false;
+}
+
+// Общая обвязка для ping/send/sendto/recv/ntp: "-W" — принудительно Wi-Fi;
+// иначе — авто-выбор (см. pick_default_iface() выше). Возвращает false,
+// если сети нет вообще (ошибка уже напечатана, вызывающий код должен сразу
+// `continue`).
+static bool resolve_iface(seL4_CPtr console_ep, char **cursor, seL4_Word *out_iface) {
+    if (parse_wifi_flag(cursor)) { *out_iface = NET_IFACE_WIFI; return true; }
+    return pick_default_iface(console_ep, out_iface);
+}
+
+static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip, seL4_Word port, const char *text, seL4_Word iface) {
     const int word_bytes = sizeof(seL4_Word);
     const int max_text = 48;
     char clipped[max_text];
@@ -320,6 +395,7 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
     seL4_SetMR(1, ip);
     seL4_SetMR(2, port);
     seL4_SetMR(3, (seL4_Word)text_len);
+    seL4_SetMR(4, iface); // Фаза 4.5.6 — см. NetIface в net_driver.cpp; текст теперь начинается с MR5, не MR4
 
     int word_count = (text_len + word_bytes - 1) / word_bytes;
     for (int w = 0; w < word_count; w++) {
@@ -330,10 +406,10 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
                 packed |= ((seL4_Word)(uint8_t)clipped[idx]) << (b * 8);
             }
         }
-        seL4_SetMR(4 + w, packed);
+        seL4_SetMR(5 + w, packed);
     }
 
-    seL4_Send(net_ep, seL4_MessageInfo_new(0, 0, 0, 4 + word_count));
+    seL4_Send(net_ep, seL4_MessageInfo_new(0, 0, 0, 5 + word_count));
     seL4_Yield();
 }
 
@@ -535,8 +611,8 @@ static void wifi_print_not_ready(seL4_CPtr console_ep, int status) {
 // завершилась), false — если пришлось снимать блокировку по таймауту (см.
 // использование в "ping": печатать статистику серии имеет смысл только в
 // первом случае — во втором никакой статистики в SHM ещё не записано).
-static bool wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms) {
-    volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+static bool wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms, seL4_Word iface) {
+    volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
     int elapsed = 0;
     while (net_mailbox[0] == 1 && elapsed < timeout_ms) {
         sys_sleep(timer_ep, 100);
@@ -1172,9 +1248,11 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "ping") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: ping <domain_or_ip> [count]\n"); continue; }
-                
+                if (!arg) { sys_puts(console_ep, "Usage: ping [-W] <domain_or_ip> [count]\n"); continue; }
+
                 char *cursor = arg;
+                seL4_Word iface;
+                if (!resolve_iface(console_ep, &cursor, &iface)) continue;
                 char *target_str = next_token(&cursor);
                 char *count_str = next_token(&cursor);
                 uint8_t ip[4];
@@ -1182,25 +1260,25 @@ int main(int argc, char *argv[]) {
 
                 if (count_str && parse_port(count_str, &count) != 0) count = 1;
 
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
 
                 // Пытаемся распарсить как IP. Если не вышло — это домен!
                 if (parse_ipv4(target_str, ip) != 0) {
                     sys_puts(console_ep, "[SHELL] Target looks like a domain. Starting DNS resolution...\n");
                     net_mailbox[0] = 1;
-                    net_send_text_command(net_ep, NET_CMD_RESOLVE, 0, 0, target_str);
+                    net_send_text_command(net_ep, NET_CMD_RESOLVE, 0, 0, target_str, iface);
 
                     // ВАЖНО: используем именно возвращаемое значение, а не
                     // "net_mailbox[0] == 0" — wait_for_net_mailbox() сама
                     // насильно обнуляет mailbox и при таймауте тоже, так что
                     // эта проверка всегда была бы true и читала бы протухший
                     // IP от предыдущего успешного resolve (если был).
-                    if (!wait_for_net_mailbox(console_ep, timer_ep, 10000)) {
+                    if (!wait_for_net_mailbox(console_ep, timer_ep, 10000, iface)) {
                         sys_puts(console_ep, "[SHELL] DNS Resolution failed.\n");
                         continue;
                     }
 
-                    seL4_Word packed_ip = *((seL4_Word*)(shm_base + 4064));
+                    seL4_Word packed_ip = *((seL4_Word*)(shm_base + net_mailbox_dns_ip_offset(iface)));
                     if (packed_ip == 0) {
                         sys_puts(console_ep, "[SHELL] DNS Error: Domain not found.\n");
                         continue;
@@ -1214,7 +1292,7 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, " ("); print_ip(console_ep, ip); sys_puts(console_ep, ") 56(84) bytes of data.\n");
 
                 net_mailbox[0] = 1;
-                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr);
+                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr, iface);
 
                 int timeout = 5000;
                 if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000;
@@ -1222,14 +1300,15 @@ int main(int argc, char *argv[]) {
                 // Статистику серии (см. net_driver.cpp: net_schedule_next_ping)
                 // печатаем только если mailbox разблокировался сам — при
                 // вынужденном таймауте net_driver ничего в SHM ещё не записал.
-                if (wait_for_net_mailbox(console_ep, timer_ep, timeout)) {
-                    uint32_t sent    = *((uint32_t*)(shm_base + 4068));
-                    uint32_t reply   = *((uint32_t*)(shm_base + 4072));
-                    uint32_t min_us  = *((uint32_t*)(shm_base + 4076));
-                    uint32_t max_us  = *((uint32_t*)(shm_base + 4080));
-                    uint32_t avg_us  = *((uint32_t*)(shm_base + 4084));
-                    uint32_t mdev_us = *((uint32_t*)(shm_base + 4088));
-                    uint32_t elapsed = *((uint32_t*)(shm_base + 4092));
+                if (wait_for_net_mailbox(console_ep, timer_ep, timeout, iface)) {
+                    uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
+                    uint32_t sent    = *((uint32_t*)(shm_base + stats_off + 0));
+                    uint32_t reply   = *((uint32_t*)(shm_base + stats_off + 4));
+                    uint32_t min_us  = *((uint32_t*)(shm_base + stats_off + 8));
+                    uint32_t max_us  = *((uint32_t*)(shm_base + stats_off + 12));
+                    uint32_t avg_us  = *((uint32_t*)(shm_base + stats_off + 16));
+                    uint32_t mdev_us = *((uint32_t*)(shm_base + stats_off + 20));
+                    uint32_t elapsed = *((uint32_t*)(shm_base + stats_off + 24));
                     uint32_t loss_pct = sent > 0 ? ((sent - reply) * 100) / sent : 0;
 
                     sys_puts(console_ep, "\n--- "); sys_puts(console_ep, target_str);
@@ -1250,25 +1329,30 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "send") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: send <text>\n"); continue; }
-                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
-
-                uint8_t ip[4] = {10, 0, 2, 2};
-                
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
-                net_mailbox[0] = 1; // Запираем Mailbox!
-
-                sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
-                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), 8080, arg);
-
-                wait_for_net_mailbox(console_ep, timer_ep, 5000);
-            }
-
-            else if (my_strcmp(cmd_ptr, "sendto") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n"); continue; }
+                if (!arg) { sys_puts(console_ep, "Usage: send [-W] <text>\n"); continue; }
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
                 char *cursor = arg;
+                seL4_Word iface;
+                if (!resolve_iface(console_ep, &cursor, &iface)) continue; // остаток cursor'а — сообщение как есть, с пробелами
+                uint8_t ip[4] = {10, 0, 2, 2};
+
+                volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
+                net_mailbox[0] = 1; // Запираем Mailbox!
+
+                sys_puts(console_ep, "UDP datagram queued for 10.0.2.2:8080.\n");
+                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), 8080, cursor, iface);
+
+                wait_for_net_mailbox(console_ep, timer_ep, 5000, iface);
+            }
+
+            else if (my_strcmp(cmd_ptr, "sendto") == 0) {
+                if (!arg) { sys_puts(console_ep, "Usage: sendto [-W] <ip_address> <port> <text>\n"); continue; }
+                if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
+
+                char *cursor = arg;
+                seL4_Word iface;
+                if (!resolve_iface(console_ep, &cursor, &iface)) continue;
                 char *ip_str = next_token(&cursor);
                 char *port_str = next_token(&cursor);
                 char *text = cursor;
@@ -1285,53 +1369,65 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (!text || text[0] == '\0') {
-                    sys_puts(console_ep, "Usage: sendto <ip_address> <port> <text>\n");
+                    sys_puts(console_ep, "Usage: sendto [-W] <ip_address> <port> <text>\n");
                     continue;
                 }
 
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
                 net_mailbox[0] = 1; // Запираем Mailbox!
 
                 sys_puts(console_ep, "UDP datagram queued.\n");
-                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), port, text);
+                net_send_text_command(net_ep, NET_CMD_SEND, pack_ipv4(ip), port, text, iface);
 
-                wait_for_net_mailbox(console_ep, timer_ep, 5000);
+                wait_for_net_mailbox(console_ep, timer_ep, 5000, iface);
             }
 
             else if (my_strcmp(cmd_ptr, "netstat") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
-                
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
-                net_mailbox[0] = 1; // Запираем Mailbox!
-                
+
+                // По просьбе пользователя — единый отчёт по обоим интерфейсам
+                // сразу (2 строки), без -i: GENET и Wi-Fi полностью
+                // равноправны в остальных командах, но netstat — это просто
+                // статус, а не действие над ОДНИМ конкретным интерфейсом,
+                // поэтому смысла выбирать только один тут нет.
                 sys_puts(console_ep, "Net status requested.\n");
-                net_send_text_command(net_ep, NET_CMD_STATUS, 0, 0, nullptr);
-                
-                wait_for_net_mailbox(console_ep, timer_ep, 2000); // Для статуса достаточно 2-х секунд
+                seL4_Word ifaces[2] = { NET_IFACE_GENET, NET_IFACE_WIFI };
+                for (int i = 0; i < 2; i++) {
+                    volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(ifaces[i]));
+                    net_mailbox[0] = 1; // Запираем Mailbox!
+                    net_send_text_command(net_ep, NET_CMD_STATUS, 0, 0, nullptr, ifaces[i]);
+                    wait_for_net_mailbox(console_ep, timer_ep, 2000, ifaces[i]); // Для статуса достаточно 2-х секунд
+                }
             }
 
             else if (my_strcmp(cmd_ptr, "recv") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                char *cursor = arg;
+                seL4_Word iface;
+                if (!resolve_iface(console_ep, &cursor, &iface)) continue;
+                volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
                 net_mailbox[0] = 1; // Запираем Mailbox!
 
-                net_send_text_command(net_ep, NET_CMD_RECV, 0, 0, nullptr);
+                net_send_text_command(net_ep, NET_CMD_RECV, 0, 0, nullptr, iface);
 
-                wait_for_net_mailbox(console_ep, timer_ep, 2000);
+                wait_for_net_mailbox(console_ep, timer_ep, 2000, iface);
             }
 
             else if (my_strcmp(cmd_ptr, "ntp") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
-                volatile int* net_mailbox = (volatile int*)(shm_base + 4060);
+                char *cursor = arg;
+                seL4_Word iface;
+                if (!resolve_iface(console_ep, &cursor, &iface)) continue;
+                volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
                 net_mailbox[0] = 1; // Запираем Mailbox!
 
                 sys_puts(console_ep, "Requesting NTP time sync...\n");
-                net_send_text_command(net_ep, NET_CMD_NTP, 0, 0, nullptr);
+                net_send_text_command(net_ep, NET_CMD_NTP, 0, 0, nullptr, iface);
 
                 // ARP (если еще не разрешен) + запрос-ответ через интернет — щедрый запас.
-                wait_for_net_mailbox(console_ep, timer_ep, 5000);
+                wait_for_net_mailbox(console_ep, timer_ep, 5000, iface);
             }
 
             else if (my_strcmp(cmd_ptr, "wifiprobe") == 0) {
@@ -1396,10 +1492,10 @@ int main(int argc, char *argv[]) {
                         sys_stop_wifi(); // без эффекта, если уже не запущен
                     }
                     // Бит подробности для ФОНОВОГО bring-up — должен лежать в SHM
-                    // ДО спавна процесса (см. WIFI_SHM_VERBOSE_OFFSET в
-                    // wifi_driver.cpp: main() читает его один раз в самом начале,
+                    // ДО спавна процесса (см. WIFI_SHM_VERBOSE_OFFSET, h/platform.h:
+                    // main() читает его один раз в самом начале,
                     // до отправки WIFI_CMD_* тут вообще возможно).
-                    shm[8296] = verbose ? 1 : 0;
+                    shm[WIFI_SHM_VERBOSE_OFFSET] = verbose ? 1 : 0;
                     int r = sys_start_wifi();
                     if (r == 0) sys_puts(console_ep, "wifi_driver starting (SDIO/firmware bring-up in background)...\n");
                     else if (r == 1) sys_puts(console_ep, "wifi_driver is already running.\n");
@@ -1529,10 +1625,10 @@ int main(int argc, char *argv[]) {
                     uint32_t ssid_len = 0; while (ssid[ssid_len] && ssid_len < 32) ssid_len++;
                     uint32_t pass_len = 0; while (pass[pass_len] && pass_len < 63) pass_len++;
 
-                    *(uint32_t*)(shm + 8192) = ssid_len;
-                    for (uint32_t i = 0; i < 32; i++) (shm + 8196)[i] = (i < ssid_len) ? ssid[i] : '\0';
-                    *(uint32_t*)(shm + 8228) = pass_len;
-                    for (uint32_t i = 0; i < 64; i++) (shm + 8232)[i] = (i < pass_len) ? pass[i] : '\0';
+                    *(uint32_t*)(shm + WIFI_SHM_SSID_LEN_OFFSET) = ssid_len;
+                    for (uint32_t i = 0; i < 32; i++) (shm + WIFI_SHM_SSID_OFFSET)[i] = (i < ssid_len) ? ssid[i] : '\0';
+                    *(uint32_t*)(shm + WIFI_SHM_PASS_LEN_OFFSET) = pass_len;
+                    for (uint32_t i = 0; i < 64; i++) (shm + WIFI_SHM_PASS_OFFSET)[i] = (i < pass_len) ? pass[i] : '\0';
 
                     sys_puts(console_ep, "Connecting to \""); sys_puts(console_ep, ssid);
                     sys_puts(console_ep, "\" (WPA2-PSK) — this can take up to ~15s while firmware completes the 4-way handshake...\n");

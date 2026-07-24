@@ -218,6 +218,14 @@ int main(int argc, char *argv[]) {
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr irq_ep     = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: настоящий IRQHandler физического таймера, не общий ни с кем
     seL4_CPtr heartbeat_ntfn = ipc->msg[BOOT_HEARTBEAT_NTFN_CAP]; // Фаза 4.5: badged-капа на net_driver, см. common.h
+    // Фаза 4.5 (Wi-Fi data-plane) — вторая badged-капа, на этот раз для
+    // wifi_driver'а (WIFI_EVENT_HEARTBEAT из wifi_wake_ntfn, см. common.h).
+    // Сознательно НЕ заводим для неё отдельные enabled/period/deadline —
+    // просто сигналим на том же самом тике, что и net-heartbeat (period тот
+    // же самый ~100мс, net_driver всегда подписывается на старте, так что к
+    // моменту любого "wifi start" heartbeat уже тикает). Если capability не
+    // передана (RPI4_ENABLE_WIFI=false), просто ничего не делаем.
+    seL4_CPtr wifi_heartbeat_ntfn = ipc->msg[BOOT_WIFI_HEARTBEAT_NTFN_CAP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -291,6 +299,7 @@ int main(int argc, char *argv[]) {
             }
             if (heartbeat_enabled && now >= next_heartbeat_deadline) {
                 seL4_Signal(heartbeat_ntfn);
+                if (wifi_heartbeat_ntfn != 0) seL4_Signal(wifi_heartbeat_ntfn);
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
             rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);

@@ -1,6 +1,10 @@
 #pragma once
 #include <stdint.h>
 
+// Имя хоста а так же имя сбоки, которое net_driver.cpp шлёт в DHCP-опции 12 (Host Name) —
+// видно в списке клиентов роутера.
+constexpr char DHCP_HOSTNAME[] = "SeL4-CrouN";
+
 // --- Флаги отладочных логов по компонентам. Гасят только рутинные
 // info/diagnostic-сообщения (регистровые дампы, "X initialized" и т.п.) —
 // ошибки/предупреждения печатаются всегда, независимо от этих флагов.
@@ -837,6 +841,57 @@ constexpr uint32_t BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN = 12;
 constexpr uint32_t BRCMF_EXT_JOIN_PARAMS_LE_LEN =
     BRCMF_SSID_LE_LEN + BRCMF_JOIN_SCAN_PARAMS_LE_LEN + BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN; // 36+20+12 = 68
 
+// НАЙДЕН РЕАЛЬНЫЙ КОРЕНЬ живого бага "Wi-Fi link печатается сам по себе"
+// (см. situation.txt — полная хронология расследования: 3 канарейки, дебаунс,
+// GENET rx_buffer_offsets проверены и отвергнуты как причина ИМЕННО этого
+// поля). Настоящая причина — ТРЕТЬЕ по счёту столкновение в одной SHM:
+// blk_driver.cpp (SYS_WRITE_FILE, cmd=113) использует "3-ю страницу SHM"
+// (g_shm_vaddr+0x2000..+0x3000, т.е. байты 8192-12287) как СВОЙ СОБСТВЕННЫЙ,
+// зарезервированный staging-буфер — БЕЗУСЛОВНО зануляет все 4096 байт этого
+// диапазона (`for(i<4096) safe_text_buf[i]=0;`) при КАЖДОМ файловом
+// SYS_WRITE_FILE, включая полностью АВТОМАТИЧЕСКИЕ вызовы: net_log_udp()
+// (net_driver.cpp) пишет в /root/net_udp.log при КАЖДОЙ входящей
+// non-DNS/NTP/DHCP UDP-датаграмме (mDNS/SSDP/NetBIOS-шум от соседей по
+// LAN — отсюда непериодичность: срабатывает не по таймеру, а по случайному
+// приходу чужого широковещательного пакета), и wifi_pqw_rewrite() при
+// "wifi connect ...&&save". А control-plane офсеты Wi-Fi (SSID/пароль/
+// verbose — заведены ещё в Milestone 4.2/4.4, ДО того, как blk_driver обзавёлся
+// этим staging-буфером) исторически жили ИМЕННО на 8192-8296 — ровно внутри
+// зарезервированной страницы blk_driver'а! Отсюда и LINK_STATE(8304)/
+// MAC/TX_LEN, заведённые рядом в Фазе 4.5.3 по аналогии, и "мусорные" числа
+// в ssid_len/pass_len (это на самом деле байты ЧУЖОГО файлового содержимого,
+// прочитанные как uint32) — все объяснились одной причиной.
+// РЕШЕНИЕ: ВЕСЬ Wi-Fi SHM (control-plane И data-plane, раньше разбросанный
+// между 8192-8320 и 5-й страницей) теперь ЦЕЛИКОМ на 5-й физической SHM-
+// странице (16384-20479) — единственной, которую НЕ трогают ни GENET
+// (10240-16383), ни VFS/`ps` (бережно ограничены старыми 16384 байтами), ни
+// blk_driver (его staging-буфер на 8192-12287 остаётся никем не тронут).
+// Раньше SSID/PASS/VERBOSE дублировались локальными constexpr в
+// wifi_driver.cpp и хардкод-числами в shell.cpp — теперь единственный
+// источник истины здесь, оба файла ссылаются на эти константы по имени.
+constexpr uint32_t WIFI_SHM_SSID_LEN_OFFSET   = 16384; // 4 байта
+constexpr uint32_t WIFI_SHM_SSID_OFFSET       = 16388; // 32 байта, до 16420
+constexpr uint32_t WIFI_SHM_PASS_LEN_OFFSET   = 16420; // 4 байта
+constexpr uint32_t WIFI_SHM_PASS_OFFSET       = 16424; // 64 байта, до 16488
+constexpr uint32_t WIFI_SHM_VERBOSE_OFFSET    = 16488; // 1 байт — "-l" для фонового bring-up при "wifi start"
+constexpr uint32_t WIFI_SHM_LINK_STATE_OFFSET = 16492; // 4 байта, 0/1, пишет wifi_driver (join)/root (stop), читает net_driver
+constexpr uint32_t WIFI_SHM_MAC_OFFSET        = 16496; // 6 из 8 байт — РЕАЛЬНЫЙ MAC чипа (cur_etheraddr), не выдуманный как у GENET
+constexpr uint32_t WIFI_SHM_TX_LEN_OFFSET     = 16504; // 4 байта, 0=пусто, пишет net_driver, читает wifi_driver
+constexpr uint32_t WIFI_SHM_TX_DATA_OFFSET    = 16512; // 1536 байт, до 18048
+constexpr uint32_t WIFI_SHM_RX_LEN_OFFSET     = 18048; // 4 байта, 0=пусто, пишет wifi_driver, читает net_driver
+constexpr uint32_t WIFI_SHM_RX_DATA_OFFSET    = 18052; // 1536 байт, до 19588
+constexpr uint32_t WIFI_SHM_FRAME_CAP         = 1536;  // максимальный размер одного кадра в TX/RX-мейлбоксах
+constexpr uint32_t WIFI_SHM_LINK_STATE_REASON_OFFSET = 19588; // диагностика (см. situation.txt) — уже сослужила службу, оставлена как регресс-проверка
+constexpr uint32_t WIFI_LINK_REASON_NONE           = 0;
+constexpr uint32_t WIFI_LINK_REASON_STARTUP_RESET  = 1; // защитный сброс при (ре)старте wifi_driver
+constexpr uint32_t WIFI_LINK_REASON_CONNECT_OK     = 2; // успешный WIFI_CMD_CONNECT
+constexpr uint32_t WIFI_LINK_REASON_CONNECT_FAIL   = 3; // неуспешный WIFI_CMD_CONNECT
+constexpr uint32_t WIFI_LINK_REASON_SYS_STOP_WIFI  = 4; // ручной "wifi stop" (main.cpp)
+// Однa канарейка-регресс-проверка (была нужна для поиска бага — теперь для
+// защиты от повторения): гарантированно ничей хвост 5-й страницы.
+constexpr uint32_t WIFI_SHM_CANARY_OFFSET = 19600;
+constexpr uint32_t WIFI_SHM_CANARY_MAGIC  = 0xC0FFEEEEu;
+
 // BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
 // ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от
 // 16-байтного dcmd-заголовка на CONTROL(0)-канале (см. BCDC_DCMD_* выше).
@@ -925,6 +980,7 @@ constexpr uint32_t BRCMF_ESCAN_BLIND_LEN = BRCMF_ESCAN_PARAMS_HDR_LEN + BRCMF_SC
 // фиксированной части, затем один struct brcmf_bss_info_le (при bss_count>=1
 // — на практике прошивка шлёт ровно один BSS на PARTIAL-событие).
 constexpr uint32_t BRCMF_ESCAN_RESULT_FIXED_LEN  = 12;
+constexpr uint32_t BRCMF_ESCAN_RESULT_SYNCID_OFF   = 8;  // le16, смещение от начала brcmf_escan_result_le
 constexpr uint32_t BRCMF_ESCAN_RESULT_BSSCOUNT_OFF = 10; // le16, смещение от начала brcmf_escan_result_le
 
 // struct brcmf_bss_info_le — смещения нужных полей ОТ начала самой структуры

@@ -18,6 +18,12 @@ enum BootIPCSlot {
     BOOT_MBOX_BUF_PADDR = 106, // физический адрес приватного буфера timer_driver под VideoCore mailbox (Фаза 4.6, см. ROADMAP.md/main.cpp)
     BOOT_HEARTBEAT_NTFN_CAP = 107, // капа, которой timer_driver сигналит net_driver'у периодический будильник (Фаза 4.5, см. NET_EVENT_HEARTBEAT ниже)
     BOOT_BLK_DMA_PADDR = 108, // физический адрес приватного некэшируемого DMA bounce-буфера blk_driver (Фаза 4.5/ADMA2, см. PLAT_BLK_DMA_VADDR/main.cpp)
+    // Фаза 4.5 (Wi-Fi data-plane, см. ROADMAP.md/situation.txt) — три новых
+    // слота под тот же принцип, что и BOOT_HEARTBEAT_NTFN_CAP выше, только
+    // для новых межпроцессных нотификаций net_driver<->wifi_driver:
+    BOOT_WIFI_HEARTBEAT_NTFN_CAP = 111, // капа, которой timer_driver сигналит wifi_driver'у периодический опрос SDIO data-канала (читает ТОЛЬКО wifi_driver, см. WIFI_EVENT_HEARTBEAT ниже)
+    BOOT_WIFI_NET_RX_SIGNAL_CAP  = 112, // капа (badge NET_EVENT_WIFI_RX, минтится из net_event_ntfn), которой wifi_driver сигналит net_driver'у "кадр в RX-mailbox" — читает ТОЛЬКО wifi_driver, передаётся заново при каждом "wifi start" (см. wifi_cmd_recv_ep)
+    BOOT_WIFI_TX_WAKE_CAP        = 113, // капа (badge WIFI_EVENT_TX_READY, минтится из wifi_wake_ntfn), которой net_driver сигналит wifi_driver'у "кадр в TX-mailbox" — читает ТОЛЬКО net_driver
 };
 
 // Фаза 4.5 (событийный GENET RX + периодический будильник для net_driver,
@@ -30,6 +36,18 @@ enum BootIPCSlot {
 // настоящим клиентским сообщением на net_cmd_ep.
 constexpr seL4_Word NET_EVENT_GENET_RX  = 0x1000; // пришёл кадр (см. RPI4_GENET_IRQ_A/UMAC_IRQ_RXDMA_DONE)
 constexpr seL4_Word NET_EVENT_HEARTBEAT = 0x2000; // периодическая проверка DHCP/ARP/ping/link-таймаутов (см. timer_driver.cpp)
+// Фаза 4.5 (Wi-Fi data-plane) — третий бейдж того же net_event_ntfn: пришёл
+// кадр от wifi_driver (см. WIFI_SHM_RX_LEN_OFFSET в net_driver.cpp), сигналит
+// сам wifi_driver через badge NET_EVENT_WIFI_RX (BOOT_WIFI_NET_RX_SIGNAL_CAP).
+constexpr seL4_Word NET_EVENT_WIFI_RX   = 0x4000;
+
+// Фаза 4.5 (Wi-Fi data-plane) — биты СОБСТВЕННОЙ нотификации wifi_driver'а
+// (wifi_wake_ntfn в main.cpp), тот же принцип OR'а бейджей одного объекта,
+// что и у NET_EVENT_* выше, но в отдельном (не пересекающемся с net_driver)
+// пространстве — эти два badge'а сравниваются только между собой и с
+// PID/пайп-бейджами my_ep САМОГО wifi_driver, никогда не с NET_EVENT_*.
+constexpr seL4_Word WIFI_EVENT_HEARTBEAT = 0x1000; // периодический опрос SDIO data-канала на входящие 802.11-кадры (см. BOOT_WIFI_HEARTBEAT_NTFN_CAP)
+constexpr seL4_Word WIFI_EVENT_TX_READY  = 0x2000; // net_driver положил кадр в TX-mailbox — разбудить сразу, не ждать heartbeat (см. BOOT_WIFI_TX_WAKE_CAP)
 
 // Слот CSpace процесса, в который ядро минтит capability активного пайпа
 // (см. SYS_PIPE/SYS_PIPE_CLOSE в main.cpp и запрос пайпа в shell.cpp).
