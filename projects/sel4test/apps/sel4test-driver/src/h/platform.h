@@ -15,7 +15,7 @@ constexpr bool LOG_UART    = false;
 constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
 constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежий/менее обкатанный компонент
-constexpr bool LOG_WIFI    = true;  // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
+constexpr bool LOG_WIFI    = false;  // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
 // абсолютные (с ведущего '/'), чтобы не зависеть от current_dir_cluster —
@@ -270,6 +270,12 @@ constexpr uint32_t EMMC_TM_DMA_EN      = (1u << 0);     // Фаза 4.5/ADMA2 �
 constexpr uint32_t EMMC_TM_BLKCNT_EN   = (1u << 1);
 constexpr uint32_t EMMC_TM_MULTI_BLOCK = (1u << 5);
 constexpr uint32_t EMMC_TM_DAT_DIR_READ = (1u << 4);    // 1 = card->host (чтение)
+// Auto CMD Enable, биты [3:2]: 00=выкл, 01=авто-CMD12 (Stop Transmission) после
+// последнего блока, 10=авто-CMD23. Обязателен для CMD18/25 (multi-block) —
+// без него контроллер не остановит передачу сам, и карта продолжит держать
+// DAT-линию занятой в ожидании явного CMD12 (см. SD Host Controller Simplified
+// Specification, "Transfer Mode Register").
+constexpr uint32_t EMMC_TM_AUTO_CMD12  = (1u << 2);
 
 // --- ADMA2 (32-битный) дескриптор, 8 байт (см. SD Host Controller Simplified
 // Specification, "ADMA2 Descriptor Table") — Фаза 4.5 (ROADMAP.md): заменяет
@@ -841,56 +847,54 @@ constexpr uint32_t BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN = 12;
 constexpr uint32_t BRCMF_EXT_JOIN_PARAMS_LE_LEN =
     BRCMF_SSID_LE_LEN + BRCMF_JOIN_SCAN_PARAMS_LE_LEN + BRCMF_ASSOC_PARAMS_LE_TRUNC_LEN; // 36+20+12 = 68
 
-// НАЙДЕН РЕАЛЬНЫЙ КОРЕНЬ живого бага "Wi-Fi link печатается сам по себе"
-// (см. situation.txt — полная хронология расследования: 3 канарейки, дебаунс,
-// GENET rx_buffer_offsets проверены и отвергнуты как причина ИМЕННО этого
-// поля). Настоящая причина — ТРЕТЬЕ по счёту столкновение в одной SHM:
-// blk_driver.cpp (SYS_WRITE_FILE, cmd=113) использует "3-ю страницу SHM"
-// (g_shm_vaddr+0x2000..+0x3000, т.е. байты 8192-12287) как СВОЙ СОБСТВЕННЫЙ,
-// зарезервированный staging-буфер — БЕЗУСЛОВНО зануляет все 4096 байт этого
-// диапазона (`for(i<4096) safe_text_buf[i]=0;`) при КАЖДОМ файловом
-// SYS_WRITE_FILE, включая полностью АВТОМАТИЧЕСКИЕ вызовы: net_log_udp()
-// (net_driver.cpp) пишет в /root/net_udp.log при КАЖДОЙ входящей
-// non-DNS/NTP/DHCP UDP-датаграмме (mDNS/SSDP/NetBIOS-шум от соседей по
-// LAN — отсюда непериодичность: срабатывает не по таймеру, а по случайному
-// приходу чужого широковещательного пакета), и wifi_pqw_rewrite() при
-// "wifi connect ...&&save". А control-plane офсеты Wi-Fi (SSID/пароль/
-// verbose — заведены ещё в Milestone 4.2/4.4, ДО того, как blk_driver обзавёлся
-// этим staging-буфером) исторически жили ИМЕННО на 8192-8296 — ровно внутри
-// зарезервированной страницы blk_driver'а! Отсюда и LINK_STATE(8304)/
-// MAC/TX_LEN, заведённые рядом в Фазе 4.5.3 по аналогии, и "мусорные" числа
-// в ssid_len/pass_len (это на самом деле байты ЧУЖОГО файлового содержимого,
-// прочитанные как uint32) — все объяснились одной причиной.
-// РЕШЕНИЕ: ВЕСЬ Wi-Fi SHM (control-plane И data-plane, раньше разбросанный
-// между 8192-8320 и 5-й страницей) теперь ЦЕЛИКОМ на 5-й физической SHM-
-// странице (16384-20479) — единственной, которую НЕ трогают ни GENET
-// (10240-16383), ни VFS/`ps` (бережно ограничены старыми 16384 байтами), ни
-// blk_driver (его staging-буфер на 8192-12287 остаётся никем не тронут).
-// Раньше SSID/PASS/VERBOSE дублировались локальными constexpr в
-// wifi_driver.cpp и хардкод-числами в shell.cpp — теперь единственный
-// источник истины здесь, оба файла ссылаются на эти константы по имени.
+// Фаза 5.3 (least-privilege, см. situation.txt/ROADMAP.md): раньше ВСЁ Wi-Fi
+// SHM (control-plane + link-state + TX/RX-мейлбокс + канарейка) жило на одной
+// странице — при постраничных capability-правах (main.cpp, seL4_CapRights_new)
+// это означало, что любой процесс с доступом к ХОТЬ ОДНОМУ Wi-Fi полю получал
+// те же права на ВСЕ остальные, включая пароль. Теперь это 3 отдельные
+// страницы с разной ролевой видимостью — см. shm_pages_mask_for_role()/
+// shm_page_readonly_for_role() в main.cpp:
+//   - control-plane (эта страница, 16384-20479): shell RW, wifi_driver RO
+//     (wifi_driver больше не пишет сюда — зануление пароля после использования
+//     перенесено в shell.cpp, см. его комментарий у WIFI_CMD_CONNECT).
+//   - link-state (следующая страница): wifi_driver RW, net_driver/shell RO.
+//   - TX/RX-мейлбокс+канарейка (ещё одна страница): net_driver/wifi_driver RW
+//     (оба и пишут, и читают — consumer сам обнуляет длину как сигнал "забрал",
+//     honest read-only тут недостижим).
 constexpr uint32_t WIFI_SHM_SSID_LEN_OFFSET   = 16384; // 4 байта
 constexpr uint32_t WIFI_SHM_SSID_OFFSET       = 16388; // 32 байта, до 16420
 constexpr uint32_t WIFI_SHM_PASS_LEN_OFFSET   = 16420; // 4 байта
 constexpr uint32_t WIFI_SHM_PASS_OFFSET       = 16424; // 64 байта, до 16488
 constexpr uint32_t WIFI_SHM_VERBOSE_OFFSET    = 16488; // 1 байт — "-l" для фонового bring-up при "wifi start"
-constexpr uint32_t WIFI_SHM_LINK_STATE_OFFSET = 16492; // 4 байта, 0/1, пишет wifi_driver (join)/root (stop), читает net_driver
-constexpr uint32_t WIFI_SHM_MAC_OFFSET        = 16496; // 6 из 8 байт — РЕАЛЬНЫЙ MAC чипа (cur_etheraddr), не выдуманный как у GENET
-constexpr uint32_t WIFI_SHM_TX_LEN_OFFSET     = 16504; // 4 байта, 0=пусто, пишет net_driver, читает wifi_driver
-constexpr uint32_t WIFI_SHM_TX_DATA_OFFSET    = 16512; // 1536 байт, до 18048
-constexpr uint32_t WIFI_SHM_RX_LEN_OFFSET     = 18048; // 4 байта, 0=пусто, пишет wifi_driver, читает net_driver
-constexpr uint32_t WIFI_SHM_RX_DATA_OFFSET    = 18052; // 1536 байт, до 19588
-constexpr uint32_t WIFI_SHM_FRAME_CAP         = 1536;  // максимальный размер одного кадра в TX/RX-мейлбоксах
-constexpr uint32_t WIFI_SHM_LINK_STATE_REASON_OFFSET = 19588; // диагностика (см. situation.txt) — уже сослужила службу, оставлена как регресс-проверка
+
+// Link-state — своя страница (20480-24575), read-only для net_driver/shell.
+constexpr uint32_t WIFI_SHM_LINK_STATE_OFFSET = 20480; // 4 байта, 0/1, пишет wifi_driver (join)/root (stop), читает net_driver/shell
+constexpr uint32_t WIFI_SHM_MAC_OFFSET        = 20484; // 6 из 8 байт — РЕАЛЬНЫЙ MAC чипа (cur_etheraddr), не выдуманный как у GENET
+constexpr uint32_t WIFI_SHM_LINK_STATE_REASON_OFFSET = 20492; // диагностика (см. situation.txt) — уже сослужила службу, оставлена как регресс-проверка
 constexpr uint32_t WIFI_LINK_REASON_NONE           = 0;
 constexpr uint32_t WIFI_LINK_REASON_STARTUP_RESET  = 1; // защитный сброс при (ре)старте wifi_driver
 constexpr uint32_t WIFI_LINK_REASON_CONNECT_OK     = 2; // успешный WIFI_CMD_CONNECT
 constexpr uint32_t WIFI_LINK_REASON_CONNECT_FAIL   = 3; // неуспешный WIFI_CMD_CONNECT
 constexpr uint32_t WIFI_LINK_REASON_SYS_STOP_WIFI  = 4; // ручной "wifi stop" (main.cpp)
-// Однa канарейка-регресс-проверка (была нужна для поиска бага — теперь для
-// защиты от повторения): гарантированно ничей хвост 5-й страницы.
-constexpr uint32_t WIFI_SHM_CANARY_OFFSET = 19600;
+
+// TX/RX-мейлбокс + канарейка — своя страница (24576-28671), RW для net_driver
+// И wifi_driver (двусторонний обмен, см. комментарий выше).
+constexpr uint32_t WIFI_SHM_TX_LEN_OFFSET     = 24576; // 4 байта, 0=пусто, пишет net_driver, читает wifi_driver
+constexpr uint32_t WIFI_SHM_TX_DATA_OFFSET    = 24580; // 1536 байт, до 26116
+constexpr uint32_t WIFI_SHM_RX_LEN_OFFSET     = 26116; // 4 байта, 0=пусто, пишет wifi_driver, читает net_driver
+constexpr uint32_t WIFI_SHM_RX_DATA_OFFSET    = 26120; // 1536 байт, до 27656
+constexpr uint32_t WIFI_SHM_FRAME_CAP         = 1536;  // максимальный размер одного кадра в TX/RX-мейлбоксах
+// Канарейка-регресс-проверка — специально на этой странице (не на link-state),
+// т.к. net_driver и так RW здесь (пишет TX_LEN) — на link-state net_driver
+// теперь read-only, канарейка там сломала бы это урезание прав.
+constexpr uint32_t WIFI_SHM_CANARY_OFFSET = 27656;
 constexpr uint32_t WIFI_SHM_CANARY_MAGIC  = 0xC0FFEEEEu;
+
+// blk_driver'ов staging-буфер (см. комментарий у первого появления этого
+// класса бага — GENET rx_buffer_offsets[] пересечение) — переехал на
+// отдельную страницу (28672-32767), чтобы освободить 20480 под Wi-Fi
+// link-state выше (Фаза 5.3, раскладка страниц пересчитана).
+constexpr uint32_t BLK_SHM_STAGING_OFFSET = 28672;
 
 // BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
 // ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от

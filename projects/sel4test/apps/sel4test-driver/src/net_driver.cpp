@@ -291,6 +291,12 @@ struct NetIfaceState {
     bool ntp_last_offset_negative;
     bool ntp_synced;
     uint64_t ntp_next_resync_uptime_ms;
+    uint64_t ntp_last_sync_uptime_ms; // для `ntp status` — 0, если ни разу не синхронизировались
+    // Различает периодический авторесинк от ручной команды `ntp` — периодика
+    // не должна печатать ничего в консоль (см. situation.txt), ручная должна.
+    // Переживает ARP-резолв (см. pending_cmd==NET_CMD_NTP) — выставляется ДО
+    // него, читается в net_send_ntp_request()/обработчике ответа.
+    bool ntp_is_periodic;
 
     // --- Однослотовый мейлбокс произвольных входящих UDP-датаграмм (`recv`) ---
     bool udp_rx_ready;
@@ -306,6 +312,13 @@ struct NetIfaceState {
     uint8_t pending_udp_ip[4];
     uint16_t pending_udp_port;
     char pending_udp[64];
+    // Фикс мейлбоксов->IPC (см. situation.txt): pending_cmd==NET_CMD_PING
+    // ждёт резолва ARP БЕЗ вообще какого-либо таймаута (та же категория
+    // бага, что чинили у blk_driver) — раньше это маскировалось тем, что
+    // шелл сам ждал через wait_for_net_mailbox() с собственным таймаутом;
+    // теперь шелл блокируется НАСТОЯЩИМ seL4_Call, и без явного дедлайна
+    // здесь недостижимый ARP означал бы вечное зависание шелла. 0 = не ждём.
+    uint64_t ping_arp_deadline_ms;
 
     // --- Диагностика (netstat) ---
     uint32_t rx_irq_wakeups;
@@ -436,6 +449,7 @@ enum NetCommand {
     NET_CMD_RESOLVE = 4,
     NET_CMD_RECV = 5,
     NET_CMD_NTP = 6,
+    NET_CMD_NTP_STATUS = 7,
 };
 
 // --- Настройки NTP-клиента (правьте здесь) ---
@@ -457,6 +471,7 @@ static const uint64_t NTP_RESYNC_INTERVAL_MS = 30ull * 60 * 1000; // 30 мину
 // натурально тормозила главный цикл ровно тогда, когда мог прийти настоящий
 // ответ на исходящий ping — прямое подозрение на часть "случайных" таймаутов.
 static seL4_CPtr g_blk_ep = 0;
+static seL4_CPtr g_vfs_mutex_ep = 0; // Фаза 6 (SMP): общий мьютекс на нотификации, см. main.cpp/vfs_mutex_ntfn
 static const char* NET_LOG_PATH = PATH_NET_UDP_LOG; // см. platform.h — единый источник известных путей
 // С запасом под лимит blk_driver'а (SYS_WRITE_FILE клампит len до 4096).
 static const uint32_t NET_LOG_BUF_CAP = 3584;
@@ -478,6 +493,33 @@ static uint16_t default_udp_port = 8080;
 // ~21мс (8.8.8.8) укладывался. Показанные раньше "21.195 ms" были не
 // измерением, а произвольным loops*15 — теперь берём настоящее время.
 static const uint64_t PING_TIMEOUT_MS = 2000;
+
+// Фикс мейлбоксов->IPC (см. situation.txt): раньше NET_CMD_PING отвечал
+// шеллу через SHM-мейлбокс (net_mailbox_ready_offset), который шелл сам
+// поллил с собственным таймаутом (wait_for_net_mailbox). Теперь шелл шлёт
+// ping через блокирующий seL4_Call, а net_driver откладывает reply тем же
+// приёмом, что uart_driver.cpp (SYS_READ) и timer_driver.cpp (SYS_SLEEP_MS):
+// seL4_CNode_SaveCaller при получении команды, seL4_Send+seL4_CNode_Delete,
+// когда серия пингов реально завершена (см. net_schedule_next_ping). Два
+// слота, не один — по одному на интерфейс, хотя одновременно активен только
+// один (шелл однопоточный) — не завязываемся на это специально.
+constexpr seL4_Word PING_REPLY_SLOT_GENET = 20;
+constexpr seL4_Word PING_REPLY_SLOT_WIFI  = 21;
+static inline seL4_Word ping_reply_slot_for(NetIface iface) {
+    return (iface == IFACE_WIFI) ? PING_REPLY_SLOT_WIFI : PING_REPLY_SLOT_GENET;
+}
+// Общая часть отложенного ответа (см. выше) — публикация статистики/
+// зануление мейлбокса делает вызывающий код ДО этого вызова, тут только
+// сам IPC-реплай и освобождение слота.
+static void net_ping_reply(NetIface iface) {
+    seL4_Word slot = ping_reply_slot_for(iface);
+    seL4_Send(slot, seL4_MessageInfo_new(0, 0, 0, 0));
+    seL4_CNode_Delete(SELF_CNODE_SLOT, slot, 8);
+}
+// ARP на цель ping может никогда не резолвиться (недостижимый хост) — без
+// явного дедлайна pending_cmd==NET_CMD_PING висел бы вечно, и вместе с ним
+// блокирующий seL4_Call шелла (см. ping_arp_deadline_ms/NetIfaceState).
+static const uint64_t PING_ARP_TIMEOUT_MS = 3000;
 
 // Стандартный размер полезной нагрузки ICMP echo (как у обычного unix ping) —
 // 8 (заголовок ICMP) + 56 = 64 байта самого ICMP-сообщения, что и печатается
@@ -1332,7 +1374,8 @@ static void net_schedule_next_ping(NetIface iface, seL4_CPtr timer_ep) {
     } else {
         net_publish_ping_stats(iface, timer_ep);
         volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
-        net_mailbox[0] = 0; // Готово, разблокируем Shell
+        net_mailbox[0] = 0; // легаси-мейлбокс, больше никто не поллит, оставлен безвредным
+        net_ping_reply(iface); // фикс мейлбоксов->IPC — настоящий разблокирующий reply шеллу
     }
 }
 
@@ -1389,6 +1432,24 @@ static void net_check_ping_timeout(NetIface iface, seL4_CPtr console_ep, seL4_CP
     // равно считается — используется в netstat.
     s.ping_outstanding = false; s.ping_timeout_count++;
     net_schedule_next_ping(iface, timer_ep);
+}
+
+// Фикс мейлбоксов->IPC (см. situation.txt/PING_ARP_TIMEOUT_MS выше) —
+// недостижимый хост никогда не ответит на ARP, и без этой проверки
+// pending_cmd==NET_CMD_PING (и вместе с ним заблокированный seL4_Call
+// шелла) висел бы вечно.
+static void net_check_ping_arp_timeout(NetIface iface, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    if (s.pending_cmd != NET_CMD_PING || s.ping_arp_deadline_ms == 0) return;
+    if (sys_get_uptime_ms(timer_ep) < s.ping_arp_deadline_ms) return;
+
+    s.pending_cmd = NET_CMD_NONE;
+    s.ping_arp_deadline_ms = 0;
+    uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
+    for (int i = 0; i < 7; i++) *(uint32_t*)(g_shm_vaddr + stats_off + i * 4) = 0;
+    volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
+    net_mailbox[0] = 0;
+    net_ping_reply(iface);
 }
 
 static void net_send_udp(NetIface iface, seL4_CPtr console_ep, const uint8_t dst_ip[4], uint16_t dst_port, const char* message) {
@@ -1459,9 +1520,17 @@ static void net_send_ntp_request(NetIface iface, seL4_CPtr console_ep, seL4_CPtr
     ntp->li_vn_mode = 0x23; // LI=0, VN=4, Mode=3 (client)
 
     // T1: наш "текущий" момент отправки — используется вместе с T2..T4 в формуле
-    // офсета ((T2-T1)+(T3-T4))/2 ниже, при получении ответа.
+    // офсета ((T2-T1)+(T3-T4))/2 ниже, при получении ответа. ИСПРАВЛЕНО (см.
+    // situation.txt): T1 должен быть RAW uptime (sys_get_uptime_ms), а НЕ уже
+    // скорректированное время (sys_get_time_ms) — иначе на ПЕРИОДИЧЕСКОЙ
+    // ресинхронизации T1 уже включает предыдущую NTP-поправку, формула
+    // считает лишь маленькую дельту дрейфа (например -1с) вместо полного
+    // офсета, а SYS_SET_TIME_OFFSET ЗАМЕНЯЕТ (не складывает) сохранённое
+    // смещение — обнуляя предыдущую поправку и отбрасывая часы к 1970 году.
+    // Поле ntp->tx_ts_sec, отправляемое СЕРВЕРУ, — отдельно, ему нужен
+    // best-effort реальный эпох (не участвует в нашей же формуле офсета).
     uint64_t our_epoch_s = sys_get_time_ms(timer_ep) / 1000ULL;
-    s.ntp_t1_epoch_s = our_epoch_s;
+    s.ntp_t1_epoch_s = sys_get_uptime_ms(timer_ep) / 1000ULL;
     ntp->tx_ts_sec = bswap32((uint32_t)(our_epoch_s + NTP_UNIX_EPOCH_DELTA));
     ntp->tx_ts_frac = 0;
 
@@ -1474,9 +1543,11 @@ static void net_send_ntp_request(NetIface iface, seL4_CPtr console_ep, seL4_CPtr
     ip->check = 0;
     ip->check = calculate_checksum((void*)ip, sizeof(ipv4_header));
 
-    sys_puts(console_ep, "[NET] Sending NTP request to ");
-    put_ip(console_ep, g_ntp_server_ip);
-    sys_puts(console_ep, ":123...\n");
+    if (!s.ntp_is_periodic) {
+        sys_puts(console_ep, "[NET] Sending NTP request to ");
+        put_ip(console_ep, g_ntp_server_ip);
+        sys_puts(console_ep, ":123...\n");
+    }
 
     net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
     s.ntp_outstanding = true;
@@ -1506,7 +1577,12 @@ static void net_check_ntp_resync(NetIface iface, seL4_CPtr console_ep, seL4_CPtr
     if (sys_get_uptime_ms(timer_ep) < s.ntp_next_resync_uptime_ms) return;
     if (!s.dhcp_bound) { net_schedule_next_ntp_resync(iface, timer_ep); return; } // нет IP — нечего слать, пробуем позже
 
-    sys_puts(console_ep, "[NET] Periodic NTP resync...\n");
+    // Фикс шума в консоли (см. situation.txt): периодический авторесинк
+    // больше ничего не печатает — ни этого объявления, ни "Sending NTP
+    // request"/"NTP sync OK" внутри net_send_ntp_request()/обработчика
+    // ответа (см. ntp_is_periodic). Ручная команда `ntp` по-прежнему
+    // печатает всё как раньше.
+    s.ntp_is_periodic = true;
     uint8_t dummy_mac[6];
     if (resolve_dest_mac(iface, g_ntp_server_ip, dummy_mac)) {
         net_send_ntp_request(iface, console_ep, timer_ep);
@@ -1674,6 +1750,14 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
     NetIfaceState &s = g_iface[iface];
 
     if (cmd == NET_CMD_PING && len >= 3) {
+        // ВАЖНО: SaveCaller — ПЕРВЫМ делом, до net_require_ip() (внутри
+        // которого sys_puts() делает seL4_Call к uart_driver) и вообще
+        // любого чужого IPC — тот же урок, что уже задокументирован в
+        // timer_driver.cpp у SYS_SLEEP_MS: неявное право на reply держится
+        // только до СЛЕДУЮЩЕГО Recv/Call этого треда.
+        seL4_Word ping_slot = ping_reply_slot_for(iface);
+        seL4_CNode_SaveCaller(SELF_CNODE_SLOT, ping_slot, 8);
+
         if (!net_require_ip(iface, console_ep)) {
             // Иначе шелл напечатал бы "ping statistics" с мусором предыдущей
             // серии (или вовсе непроинициализированной памятью, если серия
@@ -1681,6 +1765,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
             // не отправил ни одного пакета.
             uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
             for (int i = 0; i < 7; i++) *(uint32_t*)(g_shm_vaddr + stats_off + i * 4) = 0;
+            net_ping_reply(iface);
             return;
         }
         uint8_t dst_ip[4];
@@ -1699,6 +1784,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
             for (int i = 0; i < 4; i++) s.pending_ip[i] = dst_ip[i];
             s.pending_ping_count = count;
             s.pending_cmd = NET_CMD_PING;
+            s.ping_arp_deadline_ms = sys_get_uptime_ms(timer_ep) + PING_ARP_TIMEOUT_MS;
             uint8_t arp_target[4];
             arp_target_for(iface, dst_ip, arp_target);
             net_send_arp_request(iface, console_ep, arp_target);
@@ -1844,6 +1930,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
 
     } else if (cmd == NET_CMD_NTP) {
         if (!net_require_ip(iface, console_ep)) return;
+        s.ntp_is_periodic = false; // ручная команда — печатаем всё, см. ntp_is_periodic
         uint8_t dummy_mac4[6];
         if (s.ntp_outstanding) {
             sys_puts(console_ep, "[NET] NTP request already in flight.\n");
@@ -1858,6 +1945,30 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
             net_send_arp_request(iface, console_ep, arp_target);
         }
 
+    } else if (cmd == NET_CMD_NTP_STATUS) {
+        // Чисто локальный запрос (см. ROADMAP.md/situation.txt) — никакого
+        // сетевого обмена, только текущее состояние; в отличие от `ntp`
+        // (ручная ресинхронизация), это просто чтение, поэтому обычный
+        // Send+mailbox-poll вместо блокирующего Call — как у NET_CMD_STATUS.
+        uint64_t now_up = sys_get_uptime_ms(timer_ep);
+        sys_puts(console_ep, iface == IFACE_WIFI ? "[NET] NTP status (wifi): synced=" : "[NET] NTP status (genet): synced=");
+        sys_puts(console_ep, s.ntp_synced ? "yes" : "no");
+        if (s.ntp_synced) {
+            sys_puts(console_ep, " offset=");
+            if (s.ntp_last_offset_negative) sys_puts(console_ep, "-");
+            put_dec(console_ep, s.ntp_last_offset_s);
+            sys_puts(console_ep, "s last_sync=");
+            put_dec(console_ep, (uint32_t)((now_up - s.ntp_last_sync_uptime_ms) / 1000));
+            sys_puts(console_ep, "s ago");
+        }
+        if (s.ntp_next_resync_uptime_ms > now_up) {
+            sys_puts(console_ep, " next_resync=");
+            put_dec(console_ep, (uint32_t)((s.ntp_next_resync_uptime_ms - now_up) / 1000));
+            sys_puts(console_ep, "s");
+        }
+        sys_puts(console_ep, "\n");
+        volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
+        net_mailbox[0] = 0;
     } else {
         sys_puts(console_ep, "[NET] Unknown Shell command.\n");
     }
@@ -1894,34 +2005,30 @@ static int fmt_ip(char* buf, const uint8_t ip[4]) {
     return pos;
 }
 
-// Общий межпроцессный спинлок на офсет 0/128 разделяемой SHM — та же
-// физическая память и тот же офсет 4096, что и vfs_spinlock_ptr в shell.cpp
-// (см. комментарий там). Нужен, потому что net_log_flush() ниже пишет в тот
-// же офсет 0/128, что shell использует для ЛЮБОГО файлового syscall'а
-// (ps/cat/touch/...) — без этого лока фоновая запись журнала (по приходу
-// произвольного UDP-пакета, независимо от команд шелла) может перезаписать
-// буфер посреди чужого запроса (был замечен на живом железе: `ps` иногда
-// печатал "/root/net_udp.log" вместо таблицы процессов).
-// ВАЖНО: обычные volatile чтение/запись, БЕЗ __sync_lock_test_and_set/
-// __sync_lock_release. Эта SHM мапится некэшируемой Device-памятью
-// (map_frame_robust(), main.cpp — ради когерентности с GENET DMA), а
-// exclusive-load/store инструкции (LDXR/STXR, именно в них компилируются
-// __sync_lock_*) на Device-памяти по спеке ARM имеют непредсказуемое
-// поведение — именно это уронило ВЕСЬ kernel seL4 на живом железе
-// необрабатываемым исключением шины ("halting... Kernel entry via Unknown
-// (0)"), причём сразу при загрузке (net_log_flush() вызывается в main()
-// безусловно), а не что-то специфичное для Wi-Fi. Настоящий hardware-atomic
-// тут и не нужен: система однопроцессорная (SMP OFF, easy-settings.cmake) —
-// переключение контекста происходит только на syscall/yield, а не посреди
-// пары "прочитать/проверить -> записать" ниже.
+// Фаза 6 (SMP): общий межпроцессный мьютекс на нотификации (shell/
+// net_driver/wifi_driver, см. main.cpp/vfs_mutex_ntfn) вместо старого
+// non-atomic busy-spin флага на офсете 4096 разделяемой SHM. Нужен, потому
+// что net_log_flush() ниже пишет в тот же офсет 0/128, что shell использует
+// для ЛЮБОГО файлового syscall'а (ps/cat/touch/...) — без лока фоновая
+// запись журнала (по приходу произвольного UDP-пакета, независимо от команд
+// шелла) может перезаписать буфер посреди чужого запроса (был замечен на
+// живом железе: `ps` иногда печатал "/root/net_udp.log" вместо таблицы
+// процессов). Старый флаг был безопасен только пока не было настоящего
+// межъядерного параллелизма: та SHM мапится некэшируемой Device-памятью
+// (ради когерентности с GENET DMA), а exclusive-load/store инструкции
+// (LDXR/STXR — hardware atomic) на Device-памяти по спеке ARM дают
+// непредсказуемое поведение — на живом железе это уже роняло ВЕСЬ kernel
+// seL4 необрабатываемым исключением шины ("halting... Kernel entry via
+// Unknown (0)"). Мьютекс на нотификации не трогает эту память вообще —
+// состояние живёт в ядре (seL4_Wait/Signal).
 static inline void net_vfs_lock() {
-    volatile int* lock = (volatile int*)(g_shm_vaddr + 4096);
-    while (*lock) seL4_Yield();
-    *lock = 1;
+    if (!g_vfs_mutex_ep) return;
+    seL4_Word badge;
+    seL4_Wait(g_vfs_mutex_ep, &badge);
 }
 static inline void net_vfs_unlock() {
-    volatile int* lock = (volatile int*)(g_shm_vaddr + 4096);
-    *lock = 0;
+    if (!g_vfs_mutex_ep) return;
+    seL4_Signal(g_vfs_mutex_ep);
 }
 
 // Перезаписывает /root/net_udp.log целиком текущим содержимым g_udp_log_buf —
@@ -2027,6 +2134,7 @@ static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, s
                     } else if (s.pending_cmd == NET_CMD_PING && resolve_dest_mac(iface, s.pending_ip, dummy)) {
                         uint32_t count = s.pending_ping_count;
                         s.pending_cmd = NET_CMD_NONE;
+                        s.ping_arp_deadline_ms = 0;
                         net_start_ping_series(iface, console_ep, timer_ep, s.pending_ip, count);
                     } else if (s.pending_cmd == NET_CMD_SEND && resolve_dest_mac(iface, s.pending_udp_ip, dummy)) {
                         net_send_udp(iface, console_ep, s.pending_udp_ip, s.pending_udp_port, s.pending_udp);
@@ -2153,20 +2261,20 @@ static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, s
                     s.ntp_outstanding = false;
 
                     if (data_ptr + sizeof(ntp_packet) > buffer_end) {
-                        sys_puts(console_ep, "[NET] NTP Error: truncated response, ignored.\n");
+                        if (!s.ntp_is_periodic) sys_puts(console_ep, "[NET] NTP Error: truncated response, ignored.\n");
                         net_mailbox[0] = 0;
                     } else {
                         volatile ntp_packet* ntp = (volatile ntp_packet*)data_ptr;
                         // Mode=4 (server) ожидается в ответ на наш Mode=3 (client) запрос;
                         // stratum=0 значит Kiss-o'-Death (сервер отказывается отвечать).
                         if (ntp->stratum == 0 || (ntp->li_vn_mode & 0x07) != 4) {
-                            sys_puts(console_ep, "[NET] NTP Error: Kiss-o'-Death or unexpected mode, ignored.\n");
+                            if (!s.ntp_is_periodic) sys_puts(console_ep, "[NET] NTP Error: Kiss-o'-Death or unexpected mode, ignored.\n");
                             net_mailbox[0] = 0;
                         } else {
-                            uint64_t t1 = s.ntp_t1_epoch_s;
+                            uint64_t t1 = s.ntp_t1_epoch_s; // raw uptime, см. фикс в net_send_ntp_request()
                             uint64_t t2 = (uint64_t)bswap32(ntp->rx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
                             uint64_t t3 = (uint64_t)bswap32(ntp->tx_ts_sec) - NTP_UNIX_EPOCH_DELTA;
-                            uint64_t t4 = sys_get_time_ms(timer_ep) / 1000ULL;
+                            uint64_t t4 = sys_get_uptime_ms(timer_ep) / 1000ULL; // ИСПРАВЛЕНО: тоже raw uptime, не sys_get_time_ms()
 
                             // Стандартная формула офсета NTP; секундной точности достаточно
                             // для этой коррекции (округляем миллисекунды generic timer'а).
@@ -2179,11 +2287,14 @@ static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, s
                             s.ntp_synced = true;
                             s.ntp_last_offset_negative = offset_s < 0;
                             s.ntp_last_offset_s = (uint32_t)(s.ntp_last_offset_negative ? -offset_s : offset_s);
+                            s.ntp_last_sync_uptime_ms = sys_get_uptime_ms(timer_ep); // для `ntp status`
 
-                            sys_puts(console_ep, "[NET] NTP sync OK, offset ");
-                            if (s.ntp_last_offset_negative) sys_puts(console_ep, "-");
-                            put_dec(console_ep, s.ntp_last_offset_s);
-                            sys_puts(console_ep, "s applied.\n");
+                            if (!s.ntp_is_periodic) {
+                                sys_puts(console_ep, "[NET] NTP sync OK, offset ");
+                                if (s.ntp_last_offset_negative) sys_puts(console_ep, "-");
+                                put_dec(console_ep, s.ntp_last_offset_s);
+                                sys_puts(console_ep, "s applied.\n");
+                            }
                             net_mailbox[0] = 0;
                         }
                     }
@@ -2310,6 +2421,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr irq_ep     = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: настоящая IRQHandler-капа GENET RX (RPI4_GENET_IRQ_A), не общая ни с кем
     g_blk_ep = ipc->msg[7]; // см. main.cpp: local_blk_ep=7 — нужен только для net_log_udp()
     g_wifi_tx_wake_ntfn = ipc->msg[BOOT_WIFI_TX_WAKE_CAP]; // Фаза 4.5.4: капа сигнала wifi_driver'у "кадр в TX-mailbox" (см. wifi_hw_send())
+    g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -2356,11 +2468,16 @@ int main(int argc, char *argv[]) {
     // timer_driver — DHCP/ARP/ping/link-таймауты завязаны на wall-clock, а
     // не на GENET RX IRQ, им нужен отдельный "тик" даже когда кадры не
     // приходят вообще (см. SYS_TIMER_HEARTBEAT_SUBSCRIBE в timer_driver.cpp).
-    // 100мс — с большим запасом ниже самого мелкого из реальных интервалов
+    // 20мс — с большим запасом ниже самого мелкого из реальных интервалов
     // (LINK_CHECK_INTERVAL_MS=1000 и т.д., см. константы выше) — не задержит
-    // ничего заметно, но НАМНОГО реже, чем прежний busy-yield без сна вообще.
+    // ничего заметно. Период общий на весь процесс (см. timer_driver.cpp,
+    // heartbeat_period_ticks не per-подписчик) — ЭТО ЖЕ значение должно
+    // совпадать с blk_driver.cpp's подпиской ниже, иначе кто подписался
+    // последним молча переустановит период для всех (см. situation.txt:
+    // уменьшено с 100мс, чтобы сократить худший случай ожидания EMMC-
+    // прерывания в blk_driver с ~3с до ~0.6с).
     seL4_SetMR(0, 9); // 9 = SYS_TIMER_HEARTBEAT_SUBSCRIBE
-    seL4_SetMR(1, 100);
+    seL4_SetMR(1, 20);
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 
     // Не ждём ни PHY-линка, ни NTP-синхронизации — сигналим готовность сразу,
@@ -2412,6 +2529,7 @@ int main(int argc, char *argv[]) {
                 net_check_dhcp(iface, console_ep, timer_ep);
                 net_poll(iface, console_ep, timer_ep, root_ep);
                 net_check_ping_timeout(iface, console_ep, timer_ep);
+                net_check_ping_arp_timeout(iface, timer_ep);
                 net_check_ping_send(iface, console_ep, timer_ep);
                 net_check_ntp_resync(iface, console_ep, timer_ep);
                 net_publish_iface_ready(iface);

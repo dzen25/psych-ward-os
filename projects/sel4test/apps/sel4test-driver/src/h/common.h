@@ -24,7 +24,64 @@ enum BootIPCSlot {
     BOOT_WIFI_HEARTBEAT_NTFN_CAP = 111, // капа, которой timer_driver сигналит wifi_driver'у периодический опрос SDIO data-канала (читает ТОЛЬКО wifi_driver, см. WIFI_EVENT_HEARTBEAT ниже)
     BOOT_WIFI_NET_RX_SIGNAL_CAP  = 112, // капа (badge NET_EVENT_WIFI_RX, минтится из net_event_ntfn), которой wifi_driver сигналит net_driver'у "кадр в RX-mailbox" — читает ТОЛЬКО wifi_driver, передаётся заново при каждом "wifi start" (см. wifi_cmd_recv_ep)
     BOOT_WIFI_TX_WAKE_CAP        = 113, // капа (badge WIFI_EVENT_TX_READY, минтится из wifi_wake_ntfn), которой net_driver сигналит wifi_driver'у "кадр в TX-mailbox" — читает ТОЛЬКО net_driver
+    // Фикс живого зависания blk_driver (см. situation.txt): blk_driver
+    // блокировался на seL4_Wait без таймаута, ожидая EMMC-прерывание — если
+    // карта его пропустит, зависает навсегда, а вместе с ним и root (см.
+    // load_elf_from_disk() — синхронный вызов из обработчика root'а). Тот
+    // же принцип, что и BOOT_WIFI_HEARTBEAT_NTFN_CAP выше — timer_driver
+    // периодически сигналит доп. badged-копию ТОГО ЖЕ notification-объекта,
+    // на котором blk_driver уже блокируется (g_emmc_irq_ntfn), так что
+    // seL4_Wait гарантированно просыпается каждые ~100мс независимо от
+    // реального железного IRQ.
+    BOOT_BLK_HEARTBEAT_NTFN_CAP  = 114,
+    // Фикс дедлока (см. situation.txt): notify_root_irq_handled() раньше
+    // звал root СИНХРОННЫМ seL4_Call (SYS_MMC_IRQ_ACK), чтобы root вызвал
+    // seL4_IRQHandler_Ack() — но если ИМЕННО root является текущим
+    // синхронным вызывающим blk_driver (SYS_EXEC -> load_elf_from_disk()),
+    // root уже заблокирован в ожидании ЭТОГО САМОГО ответа, и обратный
+    // вызов к нему мертво блокируется (root ждёт blk_driver, blk_driver
+    // ждёт root). blk_driver получает СОБСТВЕННУЮ копию capability на
+    // IRQHandler и вызывает Ack() сам, без какого-либо IPC к root —
+    // безопасно, т.к. к этому моменту девайсный статус-бит уже снят (см.
+    // emmc_wait_irpt_bit).
+    BOOT_MMC_IRQ_HANDLER_CAP     = 115,
+    // Фикс задержки (см. situation.txt): переход read/write на multi-block
+    // (CMD18/25) — физический адрес ВТОРОЙ приватной страницы blk_driver'а
+    // (только под ADMA2-дескриптор; данные больше не помещаются рядом с ним
+    // в одной странице, см. main.cpp/blk_dma_frame2_param).
+    BOOT_BLK_DMA2_PADDR          = 116,
+    // Фаза 6 (SMP, см. ROADMAP.md): общий межпроцессный мьютекс на
+    // нотификации для VFS-прокси staging области в SHM (офсет 4096) —
+    // заменяет старые non-atomic busy-spin локи (vfs_lock/net_vfs_lock/
+    // wifi_vfs_lock), которые были безопасны только на одном ядре. Капа
+    // читается shell/net_driver/wifi_driver — тот же самый объект у всех
+    // троих, без бейджа (чистый mutex, различать источник не нужно).
+    BOOT_VFS_MUTEX_NTFN_CAP      = 117,
 };
+
+// Общий IRQ 158 (EMMC2 + Wi-Fi SDIO — одна физическая GIC-линия на обоих
+// контроллерах, см. platform.h/ROADMAP.md 4.5) слушает САМ root, а не
+// какой-то конкретный драйвер — только один процесс вообще может держать
+// IRQHandler-капу на этот номер. ПРОБОВАЛИ (см. situation.txt) TCB-bind
+// напрямую к blk_driver, чтобы обойти задержку root-инициированных чтений
+// (root не крутит свой Recv-цикл, пока сам синхронно ждёт ответа от
+// blk_driver, и не может вовремя отрелеить реальное прерывание) — ОТКАЧЕНО:
+// вызвало катастрофический регресс (чтение WiFi-прошивки: 800мс -> 27с),
+// т.к. blk_driver копит пендинг-сигналы от каждого реального завершения
+// EMMC-команды, пока сам занят обработкой (не в Recv/Wait), и следующий
+// seL4_Recv в его главном цикле перехватывается этим накопленным сигналом
+// вместо реального клиентского запроса. Схема снова: root релеит ОБОИМ
+// процессам (blk_irq_ntfn/wifi_irq_ntfn), каждый сам проверяет свой
+// статусный регистр. Badge заведомо вне диапазонов PID (1-255) и пайпов
+// (1000-1015), чтобы не путаться с обычными сообщениями в главном цикле root'а.
+constexpr seL4_Word IRQ_MMC_SHARED_BADGE = 2000;
+
+// Бейдж badged-копии blk_irq_ntfn, которую держит timer_driver (см.
+// BOOT_BLK_HEARTBEAT_NTFN_CAP выше) — конкретное значение некритично,
+// blk_driver не различает бейджи на этой нотификации (перечитывает
+// статусный регистр на любое пробуждение независимо от причины), но
+// именованная константа лучше магического числа в main.cpp.
+constexpr seL4_Word BLK_HEARTBEAT_BADGE = 0x8000;
 
 // Фаза 4.5 (событийный GENET RX + периодический будильник для net_driver,
 // см. ROADMAP.md) — биты нотификации net_driver'а. Оба минтятся из ОДНОГО
@@ -116,6 +173,17 @@ constexpr seL4_Word SYS_MMC_IRQ_ACK = 133;
 // событию), звонить сюда не нужно вообще, blk_driver сам вызовет
 // SYS_MMC_IRQ_ACK для своей части.
 constexpr seL4_Word SYS_WIFI_IRQ_ACK = 134;
+
+// Фаза 5.4 (least-privilege, см. situation.txt/ROADMAP.md Фаза 5): узкий
+// файловый доступ для exec-процессов (is_driver=254), которые с Фазы 5.2
+// не получают ни одной страницы SHM — root выполняет операцию от их имени
+// (тем же приёмом, что уже использует load_elf_from_disk(): собственный
+// scratch в rootserver_shm_base + seL4_Call к blk_driver), путь и данные
+// приходят прямо в MR, никакого SHM у вызывающего не требуется.
+// MR1.. = путь (до 63 байт, нуль-терминированный, упакован по байту на слово
+// — простота важнее плотности, это редкий/маленький вызов).
+constexpr seL4_Word SYS_PROXY_READ_FILE  = 135; // MR1..=путь; ответ: MR0=статус(0=ok), MR1=длина, MR2..=данные (до ~100 байт за вызов)
+constexpr seL4_Word SYS_PROXY_WRITE_FILE = 136; // MR1=длина данных, MR2..=путь+данные упакованы см. main.cpp; ответ: MR0=статус
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

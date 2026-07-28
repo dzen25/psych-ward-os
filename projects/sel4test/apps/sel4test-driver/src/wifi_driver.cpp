@@ -1109,26 +1109,30 @@ static uint32_t wifi_calc_ramsize(seL4_CPtr console_ep) {
 // статический буфер вместо буфера рутсервера. ---
 static char *g_wifi_shm = nullptr;
 static seL4_CPtr g_wifi_blk_ep = 0;
+static seL4_CPtr g_wifi_vfs_mutex_ep = 0; // Фаза 6 (SMP): общий мьютекс на нотификации, см. main.cpp/vfs_mutex_ntfn
 
-// Общий межпроцессный спинлок на офсете 4096 разделяемой SHM — тот же самый,
-// что vfs_spinlock_ptr в shell.cpp и net_vfs_lock/unlock в net_driver.cpp (см.
-// их комментарии). wifi_read_file() ниже пишет имя файла в тот же офсет 0-63
-// общей SHM, что и ЛЮБОЙ файловый syscall шелла и фоновый net_log_flush()
-// net_driver'а — без этого лока их запись может гонкой перезатереть имя файла
-// прямо между тем, как мы его положили в SHM, и тем, как blk_driver его
-// прочитает (та же причина, что ранее ломала `ps`). Обычные volatile
-// чтение/запись, БЕЗ __sync_lock_test_and_set/release — на некэшируемой
-// Device-памяти они компилируются в LDXR/STXR с непредсказуемым поведением
-// (см. подробный комментарий в net_driver.cpp); настоящий atomic не нужен,
-// ядро однопроцессорное (SMP OFF).
+// Фаза 6 (SMP): общий межпроцессный мьютекс на нотификации — тот же самый
+// объект (без бейджа), что vfs_mutex_ep в shell.cpp и g_vfs_mutex_ep в
+// net_driver.cpp (см. main.cpp/vfs_mutex_ntfn и их комментарии).
+// wifi_read_file() ниже пишет имя файла в тот же офсет 0-63 общей SHM, что и
+// ЛЮБОЙ файловый syscall шелла и фоновый net_log_flush() net_driver'а — без
+// этого мьютекса их запись может гонкой перезатереть имя файла прямо между
+// тем, как мы его положили в SHM, и тем, как blk_driver его прочитает (та же
+// причина, что ранее ломала `ps`). ОСОБЕННО важно именно здесь: wifi_driver —
+// единственный процесс, реально перенесённый на второе ядро (см. main.cpp/
+// seL4_TCB_SetAffinity), так что этот лок — единственное место, где старый
+// non-atomic SHM-флаг стал бы настоящей гонкой, а не просто перестраховкой.
+// Мьютекс на нотификации не трогает SHM вообще, так что вопрос
+// exclusive-monitor инструкций на Device-памяти (см. net_driver.cpp) не
+// встаёт — состояние живёт в ядре (seL4_Wait/Signal).
 static inline void wifi_vfs_lock() {
-    volatile int* lock = (volatile int*)(g_wifi_shm + 4096);
-    while (*lock) seL4_Yield();
-    *lock = 1;
+    if (!g_wifi_vfs_mutex_ep) return;
+    seL4_Word badge;
+    seL4_Wait(g_wifi_vfs_mutex_ep, &badge);
 }
 static inline void wifi_vfs_unlock() {
-    volatile int* lock = (volatile int*)(g_wifi_shm + 4096);
-    *lock = 0;
+    if (!g_wifi_vfs_mutex_ep) return;
+    seL4_Signal(g_wifi_vfs_mutex_ep);
 }
 
 static int wifi_read_file(const char *filename, uint8_t *out_buf, uint32_t max_len) {
@@ -3549,6 +3553,7 @@ int main(int argc, char *argv[]) {
     g_wifi_irq_ntfn       = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO (см. main.cpp)
     g_wifi_root_ep        = root_ep; // см. notify_root_wifi_irq_handled()/SYS_WIFI_IRQ_ACK
     seL4_CPtr net_wifi_rx_ntfn = ipc->msg[BOOT_WIFI_NET_RX_SIGNAL_CAP]; // Фаза 4.5.5: капа сигнала net_driver'у "кадр в RX-mailbox"
+    g_wifi_vfs_mutex_ep  = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -3636,10 +3641,10 @@ int main(int argc, char *argv[]) {
         if (badge & (WIFI_EVENT_HEARTBEAT | WIFI_EVENT_TX_READY)) {
             if (badge & WIFI_EVENT_HEARTBEAT) {
                 g_wifi_heartbeat_ticks++;
-                if (g_wifi_verbose && (g_wifi_heartbeat_ticks % 10 == 0)) {
-                    sys_putdec32(console_ep, "[WIFI][HEARTBEAT] tick ", (int32_t)g_wifi_heartbeat_ticks);
-                    sys_puts(console_ep, "\n");
-                }
+                // Печать тика убрана (была нужна только для проверки Фазы 4.5.1,
+                // что нотификация реально приходит с ~100мс кадансом) — счётчик
+                // остаётся живым и теперь виден через "wifi status" (см.
+                // shell.cpp) как индикатор, что главный цикл драйвера жив.
                 // Фаза 4.5.5 (RX-путь): опрашиваем data-канал на каждом тике —
                 // ограниченное число попыток за раз (не бесконечный busy-loop
                 // внутри одной итерации главного цикла), останавливаемся раньше,
@@ -3686,7 +3691,8 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(3, g_wifi_fw_alive ? 1u : 0u);
             seL4_SetMR(4, g_wifi_shaddr);
             seL4_SetMR(5, g_wifi_sdpcm_ok ? 1u : 0u);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 6));
+            seL4_SetMR(6, g_wifi_heartbeat_ticks); // для "wifi status" (shell.cpp) — индикатор, что главный цикл жив
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 7));
         } else if (cmd == WIFI_CMD_CONNECT) {
             // Синхронно (как wifiprobe) — но может занять до ~15с (см.
             // wifi_wait_for_join_result), пока не увидим события успеха/
@@ -3703,6 +3709,14 @@ int main(int argc, char *argv[]) {
                 const char *ssid = g_wifi_shm + WIFI_SHM_SSID_OFFSET;
                 const char *pass = g_wifi_shm + WIFI_SHM_PASS_OFFSET;
                 result = (uint32_t)wifi_connect(console_ep, ssid, ssid_len, pass, pass_len, &reason);
+                // Фаза 5.3 (least-privilege): обнуление пароля в SHM после
+                // использования переехало в shell.cpp (сразу после того, как
+                // синхронный seL4_Call сюда возвращается) — раньше это делал
+                // сам wifi_driver (Фаза 5.1), но эта запись требовала RW-права
+                // на control-plane страницу, а wifi_driver теперь read-only
+                // там (см. shm_page_readonly_for_role(), main.cpp). shell и
+                // так пишет пароль в эту страницу изначально, у него уже RW —
+                // логично, что он же его и убирает.
             }
             // Фаза 4.5.3: сообщаем net_driver о новом состоянии линка через SHM.
             // На успехе — реальный MAC чипа (см. g_wifi_chip_mac, прочитан ранее

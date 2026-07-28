@@ -15,7 +15,7 @@ static char ls_thread_stack[16384] __attribute__((aligned(16)));
 static char grep_thread_stack[16384] __attribute__((aligned(16)));
 
 static char* shm_base = nullptr;
-static volatile int* vfs_spinlock_ptr = nullptr;
+static seL4_CPtr vfs_mutex_ep = 0;
 
 // Милстоун 4.4 (см. wifi_driver.cpp) — "знакомые сети" (PATH_WIFI_PQW,
 // строки "имясети|пароль"). Буферы для чтения/перезаписи файла целиком
@@ -29,28 +29,29 @@ static char g_pqw_new[4000];
 // (используется командой "wifi clean" без явного имени сети — см. ниже).
 static char g_wifi_current_ssid[33] = {0};
 
-// ВАЖНО: обычные volatile чтение/запись, БЕЗ __sync_lock_test_and_set/
-// __sync_lock_release. Разделяемая SHM (см. vfs_spinlock_ptr ниже) мапится
-// некэшируемой Device-памятью (map_frame_robust(), main.cpp — ради
-// когерентности с GENET DMA), а exclusive-load/store инструкции (LDXR/STXR,
-// именно в них компилируются __sync_lock_*) на Device-памяти по спеке ARM
-// имеют непредсказуемое поведение — на живом железе это уронило ВЕСЬ kernel
-// seL4 необрабатываемым исключением шины ("halting... Kernel entry via
-// Unknown (0)"), а не просто эту функцию. Настоящий hardware-atomic тут и не
-// нужен: система однопроцессорная (SMP OFF, easy-settings.cmake) — переключение
-// контекста происходит только на syscall/yield, а не посреди пары "прочитать
-// проверить -> записать" ниже, так что обычного volatile-флага достаточно.
+// Фаза 6 (SMP): общий межпроцессный мьютекс на нотификации (shell/
+// net_driver/wifi_driver, см. main.cpp/vfs_mutex_ntfn), вместо старого
+// non-atomic busy-spin флага в SHM. Тот флаг был безопасен только пока не
+// было настоящего межъядерного параллелизма (переключение контекста —
+// исключительно на syscall/yield границе): разделяемая SHM мапится
+// некэшируемой Device-памятью (ради когерентности с GENET DMA), а
+// exclusive-load/store инструкции (LDXR/STXR — hardware atomic) на
+// Device-памяти по спеке ARM дают непредсказуемое поведение — на живом
+// железе это уже роняло ВЕСЬ kernel seL4 необрабатываемым исключением шины
+// ("halting... Kernel entry via Unknown (0)"). Мьютекс на нотификации не
+// трогает эту память вообще — состояние живёт в ядре: main.cpp сигналит
+// vfs_mutex_ntfn один раз сразу после создания ("разблокировано"), lock() —
+// seL4_Wait (снимает сигнал, блокируется если уже снят), unlock() —
+// seL4_Signal (возвращает).
 void vfs_lock() {
-    if (!vfs_spinlock_ptr) return; // Guard against early calls
-    while (*vfs_spinlock_ptr) {
-        seL4_Yield();
-    }
-    *vfs_spinlock_ptr = 1;
+    if (!vfs_mutex_ep) return; // Guard against early calls
+    seL4_Word badge;
+    seL4_Wait(vfs_mutex_ep, &badge);
 }
 
 void vfs_unlock() {
-    if (!vfs_spinlock_ptr) return;
-    *vfs_spinlock_ptr = 0;
+    if (!vfs_mutex_ep) return;
+    seL4_Signal(vfs_mutex_ep);
 }
 
 void __assert_fail(const char *assertion, const char *file, int line, const char *function) { while(1); }
@@ -104,6 +105,15 @@ static void print_ip(seL4_CPtr console_ep, const uint8_t ip[4]) {
     sys_putdec(ip[1]); sys_puts(console_ep, ".");
     sys_putdec(ip[2]); sys_puts(console_ep, ".");
     sys_putdec(ip[3]);
+}
+
+static void print_mac(seL4_CPtr console_ep, const uint8_t mac[6]) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    for (int i = 0; i < 6; i++) {
+        char buf[3] = { hex_chars[(mac[i] >> 4) & 0xF], hex_chars[mac[i] & 0xF], '\0' };
+        sys_puts(console_ep, buf);
+        if (i < 5) sys_puts(console_ep, ":");
+    }
 }
 
 // Печатает микросекунды как "N.NNN" мс (для вывода в стиле обычного unix ping).
@@ -245,6 +255,7 @@ enum NetCommand {
     NET_CMD_RESOLVE = 4,
     NET_CMD_RECV = 5,
     NET_CMD_NTP = 6,
+    NET_CMD_NTP_STATUS = 7,
 };
 
 // Фаза 4.5.6 (Wi-Fi data-plane, per-interface команды шелла) — значения
@@ -411,6 +422,23 @@ static void net_send_text_command(seL4_CPtr net_ep, seL4_Word cmd, seL4_Word ip,
 
     seL4_Send(net_ep, seL4_MessageInfo_new(0, 0, 0, 5 + word_count));
     seL4_Yield();
+}
+
+// Фикс мейлбоксов->IPC (см. situation.txt) — ping отдельно от
+// net_send_text_command() выше: тот всегда шлёт fire-and-forget seL4_Send
+// (остальные команды по-прежнему сами поллят SHM-мейлбокс), а ping теперь
+// блокирующий seL4_Call — net_driver откладывает reply (seL4_CNode_SaveCaller)
+// и присылает его, только когда серия пингов реально завершена (см.
+// net_driver.cpp: NET_CMD_PING/net_schedule_next_ping). Без текстового
+// payload (ping его не использует), поэтому формат сообщения проще, чем в
+// net_send_text_command().
+static void net_call_ping(seL4_CPtr net_ep, seL4_Word ip, seL4_Word count, seL4_Word iface) {
+    seL4_SetMR(0, NET_CMD_PING);
+    seL4_SetMR(1, ip);
+    seL4_SetMR(2, count);
+    seL4_SetMR(3, 0);
+    seL4_SetMR(4, iface);
+    seL4_Call(net_ep, seL4_MessageInfo_new(0, 0, 0, 5));
 }
 
 #define sys_puts_direct sys_puts
@@ -931,6 +959,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];
     seL4_CPtr blk_ep     = ipc->msg[BOOT_BLK_EP];
     seL4_CPtr wifi_ep    = ipc->msg[BOOT_WIFI_EP]; // Фаза 4, Милстоун 4.1 (см. wifi_driver.cpp)
+    vfs_mutex_ep         = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -949,20 +978,6 @@ int main(int argc, char *argv[]) {
 
     shm_base = (char*)seL4_GetMR(0);
     // Physical address is not needed by the shell, only by DMA-capable drivers.
-
-    // Общий межпроцессный спинлок на офсет 0/128 разделяемой SHM (16КБ, те же
-    // физические страницы у shell/rootserver/blk_driver/net_driver — см.
-    // SYS_SHM_GET). Раньше vfs_spinlock_ptr никогда не присваивался — все
-    // вызовы vfs_lock()/vfs_unlock() ниже были тихими no-op'ами. Пока это не
-    // было заметно: shell был единственным, кто писал в офсет 0/128. Как
-    // только net_driver.cpp сам стал писать туда же (net_log_flush(), журнал
-    // /root/net_udp.log — фоновая, независимая от команд шелла активность),
-    // гонка стала реальной: `ps` (пишет в тот же офсет 0 через rootserver)
-    // мог получить обратно "/root/net_udp.log" вместо таблицы процессов,
-    // если net_driver успевал перезаписать буфер между ответом рутсервера и
-    // чтением его шеллом. Офсет 4096 — сразу после последнего занятого поля
-    // net_driver'а (ping-статистика, 4068..4092, см. net_driver.cpp).
-    vfs_spinlock_ptr = (volatile int*)(shm_base + 4096);
 
     if (shm_base == nullptr) {
         sys_puts(console_ep, "[SHELL] FATAL: Failed to get dynamic SHM!\n");
@@ -1291,16 +1306,16 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "PING "); sys_puts(console_ep, target_str);
                 sys_puts(console_ep, " ("); print_ip(console_ep, ip); sys_puts(console_ep, ") 56(84) bytes of data.\n");
 
-                net_mailbox[0] = 1;
-                net_send_text_command(net_ep, NET_CMD_PING, pack_ipv4(ip), count, nullptr, iface);
+                // Фикс мейлбоксов->IPC (см. situation.txt): ping больше не
+                // поллит SHM-мейлбокс со своим таймаутом — блокирующий
+                // seL4_Call возвращается РОВНО тогда, когда net_driver
+                // реально опубликовал статистику завершённой серии (см.
+                // net_driver.cpp: net_schedule_next_ping/net_ping_reply).
+                // Не может зависнуть навсегда даже при недостижимом хосте —
+                // net_driver сам ограничивает ожидание ARP (PING_ARP_TIMEOUT_MS).
+                net_call_ping(net_ep, pack_ipv4(ip), count, iface);
 
-                int timeout = 5000;
-                if (count * 2000 + 2000 > timeout) timeout = count * 2000 + 2000;
-
-                // Статистику серии (см. net_driver.cpp: net_schedule_next_ping)
-                // печатаем только если mailbox разблокировался сам — при
-                // вынужденном таймауте net_driver ничего в SHM ещё не записал.
-                if (wait_for_net_mailbox(console_ep, timer_ep, timeout, iface)) {
+                {
                     uint32_t stats_off = net_mailbox_ping_stats_offset(iface);
                     uint32_t sent    = *((uint32_t*)(shm_base + stats_off + 0));
                     uint32_t reply   = *((uint32_t*)(shm_base + stats_off + 4));
@@ -1417,6 +1432,21 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "ntp") == 0) {
                 if (net_ep == 0) { sys_puts(console_ep, "Net driver endpoint is unavailable.\n"); continue; }
 
+                // "ntp status" — чисто локальный запрос состояния (offset/
+                // время последней и следующей ресинхронизации), оба
+                // интерфейса сразу, тот же приём, что netstat выше — не
+                // выбираем один конкретный, это не действие над интерфейсом.
+                if (arg && my_strncmp(arg, "status", 6) == 0 && (arg[6] == '\0' || arg[6] == ' ')) {
+                    seL4_Word ifaces[2] = { NET_IFACE_GENET, NET_IFACE_WIFI };
+                    for (int i = 0; i < 2; i++) {
+                        volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(ifaces[i]));
+                        net_mailbox[0] = 1;
+                        net_send_text_command(net_ep, NET_CMD_NTP_STATUS, 0, 0, nullptr, ifaces[i]);
+                        wait_for_net_mailbox(console_ep, timer_ep, 2000, ifaces[i]);
+                    }
+                    continue;
+                }
+
                 char *cursor = arg;
                 seL4_Word iface;
                 if (!resolve_iface(console_ep, &cursor, &iface)) continue;
@@ -1467,7 +1497,8 @@ int main(int argc, char *argv[]) {
                     "Usage: wifi start|stop|restart [-l]\n"
                     "       wifi scan [-l]\n"
                     "       wifi connect <ssid> [password] [-l] [&&save]\n"
-                    "       wifi clean [all] [-l]\n";
+                    "       wifi clean [all] [-l]\n"
+                    "       wifi status\n";
                 if (!arg) { sys_puts(console_ep, WIFI_USAGE); continue; }
                 char *cursor = arg;
                 char *subcmd = next_token(&cursor);
@@ -1639,6 +1670,16 @@ int main(int argc, char *argv[]) {
                     seL4_Word result = seL4_GetMR(0);
                     seL4_Word reason = seL4_GetMR(1);
 
+                    // Фаза 5.3 (least-privilege): пароль в SHM нужен был только
+                    // на время этого (синхронного) вызова — wifi_driver уже
+                    // вернулся, дальше он ему не нужен. Раньше зануление делал
+                    // сам wifi_driver (Фаза 5.1), но теперь у него read-only
+                    // доступ к control-plane странице (main.cpp,
+                    // shm_page_readonly_for_role) — эту запись выполняет shell,
+                    // у которого и так RW здесь (он же пароль сюда и положил).
+                    for (uint32_t i = 0; i < 64; i++) (shm + WIFI_SHM_PASS_OFFSET)[i] = 0;
+                    *(uint32_t*)(shm + WIFI_SHM_PASS_LEN_OFFSET) = 0;
+
                     if (result == 0) {
                         sys_puts(console_ep, "Connected!\n");
                         my_strlcpy(g_wifi_current_ssid, ssid, sizeof(g_wifi_current_ssid));
@@ -1678,6 +1719,42 @@ int main(int argc, char *argv[]) {
                     } else {
                         sys_puts(console_ep, "Failed to update known networks file.\n");
                     }
+                }
+
+                else if (my_strcmp(subcmd, "status") == 0) {
+                    if (wifi_ep == 0) { sys_puts(console_ep, "Wi-Fi driver endpoint is unavailable (RPI4_ENABLE_WIFI=false?).\n"); continue; }
+                    int st = sys_wifi_status();
+                    if (st != 2) { wifi_print_not_ready(console_ep, st); continue; }
+
+                    // Низкоуровневый bring-up (как wifiprobe) — тот же запрос,
+                    // плюс счётчик heartbeat-тиков (см. wifi_driver.cpp).
+                    seL4_SetMR(0, 1); // WIFI_CMD_PROBE_STATUS
+                    seL4_SetMR(1, 0);
+                    seL4_Call(wifi_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                    seL4_Word probe_ok = seL4_GetMR(0);
+                    seL4_Word fw_alive = seL4_GetMR(3);
+                    seL4_Word sdpcm_ok = seL4_GetMR(5);
+                    seL4_Word ticks    = seL4_GetMR(6);
+
+                    sys_puts(console_ep, "wifi_driver:  running\n");
+                    sys_puts(console_ep, probe_ok == 0 ? "  SDIO probe: OK\n" : "  SDIO probe: FAILED (see boot log)\n");
+                    sys_puts(console_ep, fw_alive ? "  Firmware:   ALIVE\n" : "  Firmware:   not alive (see boot log)\n");
+                    sys_puts(console_ep, sdpcm_ok ? "  sdpcm:      OK\n" : "  sdpcm:      FAILED (see boot log)\n");
+                    sys_puts(console_ep, "  Heartbeat:  "); sys_putdec(ticks); sys_puts(console_ep, " ticks (~100ms each, alive-индикатор главного цикла)\n");
+
+                    // Состояние подключения — читаем прямо из SHM (страница
+                    // Wi-Fi уже замаплена шеллу, см. main.cpp
+                    // shm_pages_mask_for_role), без лишнего IPC-звонка.
+                    uint32_t link_up = *(volatile uint32_t*)(shm + WIFI_SHM_LINK_STATE_OFFSET);
+                    sys_puts(console_ep, link_up ? "  Link:       UP\n" : "  Link:       DOWN\n");
+                    if (link_up) {
+                        sys_puts(console_ep, "  SSID:       ");
+                        sys_puts(console_ep, g_wifi_current_ssid[0] ? g_wifi_current_ssid : "(unknown)");
+                        sys_puts(console_ep, "\n  MAC:        ");
+                        print_mac(console_ep, (const uint8_t*)(shm + WIFI_SHM_MAC_OFFSET));
+                        sys_puts(console_ep, "\n");
+                    }
+                    sys_puts(console_ep, "  (IP/DHCP/ping-статистика — см. 'netstat')\n");
                 }
 
                 else {
@@ -1781,7 +1858,7 @@ int main(int argc, char *argv[]) {
                 // держим лок на весь путь "запрос -> ответ рутсервера ->
                 // чтение shm", иначе фоновая запись net_driver может
                 // перезаписать буфер до того, как мы его прочитаем (см.
-                // vfs_spinlock_ptr выше).
+                // vfs_lock() выше).
                 vfs_lock();
                 ipc->msg[0] = 104;
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
@@ -2014,7 +2091,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

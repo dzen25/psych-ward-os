@@ -226,6 +226,14 @@ int main(int argc, char *argv[]) {
     // моменту любого "wifi start" heartbeat уже тикает). Если capability не
     // передана (RPI4_ENABLE_WIFI=false), просто ничего не делаем.
     seL4_CPtr wifi_heartbeat_ntfn = ipc->msg[BOOT_WIFI_HEARTBEAT_NTFN_CAP];
+    // Фикс живого зависания blk_driver (см. situation.txt) — третья
+    // badged-капа, тем же принципом: blk_driver блокируется на seL4_Wait
+    // без таймаута, ожидая EMMC-прерывание; эта капа — badged-копия ТОГО ЖЕ
+    // notification-объекта (не отдельный объект, в отличие от
+    // wifi_heartbeat_ntfn выше) — так что периодический сигнал сюда
+    // гарантированно будит blk_driver's seL4_Wait независимо от того,
+    // пришло ли реальное железное прерывание.
+    seL4_CPtr blk_heartbeat_ntfn = ipc->msg[BOOT_BLK_HEARTBEAT_NTFN_CAP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -300,6 +308,7 @@ int main(int argc, char *argv[]) {
             if (heartbeat_enabled && now >= next_heartbeat_deadline) {
                 seL4_Signal(heartbeat_ntfn);
                 if (wifi_heartbeat_ntfn != 0) seL4_Signal(wifi_heartbeat_ntfn);
+                if (blk_heartbeat_ntfn != 0) seL4_Signal(blk_heartbeat_ntfn);
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
             rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);
