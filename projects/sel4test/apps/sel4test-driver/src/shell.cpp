@@ -1871,6 +1871,45 @@ int main(int argc, char *argv[]) {
                 vfs_unlock();
             }
 
+            // Фаза 6.1 (SMP, см. ROADMAP.md): разовый снимок нагрузки — по
+            // умолчанию компактная таблица "ядро/%CPU/кто на нём" (MR1=0);
+            // `top -l` — подробная построчная таблица PID/CORE/%CPU/NAME
+            // (MR1=1). Тот же паттерн, что `ps` выше (SYS_TOP_STATS пишет
+            // готовый текст в ту же VFS SHM-страницу, root сам держит окно
+            // измерения ~300мс).
+            else if (my_strcmp(cmd_ptr, "top") == 0) {
+                seL4_IPCBuffer *ipc = get_local_ipc();
+                bool longFormat = arg && my_strcmp(arg, "-l") == 0;
+                vfs_lock();
+                ipc->msg[0] = SYS_TOP_STATS;
+                seL4_SetMR(1, longFormat ? 1 : 0);
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                if (is_piping) {
+                    sys_write(pipe_fd, shm);
+                    sys_pipe_wr_close(pipe_fd);
+                } else {
+                    sys_puts(console_ep, shm);
+                }
+                vfs_unlock();
+            }
+
+            // Фаза 6.1 (продолжение, см. ROADMAP.md): `balance` — по команде,
+            // но цель переноса выбирает root сам (см. SYS_BALANCE). Тот же
+            // паттерн вывода, что у `top`/`ps`.
+            else if (my_strcmp(cmd_ptr, "balance") == 0) {
+                seL4_IPCBuffer *ipc = get_local_ipc();
+                vfs_lock();
+                ipc->msg[0] = SYS_BALANCE;
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                if (is_piping) {
+                    sys_write(pipe_fd, shm);
+                    sys_pipe_wr_close(pipe_fd);
+                } else {
+                    sys_puts(console_ep, shm);
+                }
+                vfs_unlock();
+            }
+
             else if (my_strcmp(cmd_ptr, "kill") == 0) {
                 seL4_IPCBuffer *ipc = get_local_ipc();
                 if (!arg) { sys_puts(console_ep, "Usage: kill <pid>\n"); continue; }
@@ -1878,6 +1917,31 @@ int main(int argc, char *argv[]) {
                 ipc->msg[1] = simple_atoi(arg);
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 sys_puts(console_ep, "Signal sent.\n");
+            }
+
+            // Фаза 6.1 (SMP, см. ROADMAP.md): ручной перенос уже запущенного
+            // процесса на другое ядро в рантайме — SYS_SET_AFFINITY.
+            else if (my_strcmp(cmd_ptr, "taskset") == 0) {
+                char *cursor = arg;
+                char *pid_str = arg ? next_token(&cursor) : nullptr;
+                char *core_str = arg ? next_token(&cursor) : nullptr;
+                if (!pid_str || !core_str) {
+                    sys_puts(console_ep, "Usage: taskset <pid> <ядро 0-3>\n");
+                    continue;
+                }
+                seL4_SetMR(0, SYS_SET_AFFINITY);
+                seL4_SetMR(1, simple_atoi(pid_str));
+                seL4_SetMR(2, simple_atoi(core_str));
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 3));
+                seL4_Word status = seL4_GetMR(0);
+                switch (status) {
+                    case 0: sys_puts(console_ep, "OK.\n"); break;
+                    case 1: sys_puts(console_ep, "Процесс не найден.\n"); break;
+                    case 2: sys_puts(console_ep, "root зафиксирован на ядре 0, перенос невозможен.\n"); break;
+                    case 3: sys_puts(console_ep, "timer_driver нельзя переносить: держит физический таймер (PPI) через капу, привязанную к ядру 0 — перенос вызовет тихое зависание при следующем перевзведении.\n"); break;
+                    case 4: sys_puts(console_ep, "Некорректный номер ядра (0-3).\n"); break;
+                    default: sys_puts(console_ep, "Неизвестная ошибка.\n"); break;
+                }
             }
 
             else if (my_strcmp(cmd_ptr, "exec") == 0) {

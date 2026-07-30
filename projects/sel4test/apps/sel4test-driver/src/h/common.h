@@ -57,6 +57,14 @@ enum BootIPCSlot {
     // читается shell/net_driver/wifi_driver — тот же самый объект у всех
     // троих, без бейджа (чистый mutex, различать источник не нужно).
     BOOT_VFS_MUTEX_NTFN_CAP      = 117,
+    // Фаза 6.1 (продолжение, см. ROADMAP.md): собственная копия TCB-капы
+    // процесса на самого себя — нужна uart/blk/net/wifi (is_driver
+    // 1/3/4/5), чтобы при просьбе root'а "финализируй бенчмарк и отдай
+    // свой total/idle" вызвать seL4_BenchmarkGetThreadUtilisation(себя) —
+    // единственный способ получить ЧЕСТНЫЙ total/idle СВОЕГО ядра (это поле
+    // в ядре всегда берётся от ВЫЗЫВАЮЩЕГО, не от того, чей TCB спрашивают
+    // — root, вызывая с ядра 0, иначе всегда получал бы период ядра 0).
+    BOOT_SELF_TCB_CAP            = 118,
 };
 
 // Общий IRQ 158 (EMMC2 + Wi-Fi SDIO — одна физическая GIC-линия на обоих
@@ -184,6 +192,51 @@ constexpr seL4_Word SYS_WIFI_IRQ_ACK = 134;
 // — простота важнее плотности, это редкий/маленький вызов).
 constexpr seL4_Word SYS_PROXY_READ_FILE  = 135; // MR1..=путь; ответ: MR0=статус(0=ok), MR1=длина, MR2..=данные (до ~100 байт за вызов)
 constexpr seL4_Word SYS_PROXY_WRITE_FILE = 136; // MR1=длина данных, MR2..=путь+данные упакованы см. main.cpp; ответ: MR0=статус
+
+// Фаза 6.1 (SMP, см. ROADMAP.md): ручной перенос уже запущенного процесса на
+// другое ядро в рантайме (команда шелла `taskset <pid> <ядро>`). MR1=pid,
+// MR2=целевое ядро (0..3). Ответ: MR0=статус (0=ok, иначе код отказа — см.
+// таблицу в main.cpp: root/timer_driver нельзя переносить никогда, см.
+// найденную PPI-опасность в ROADMAP Фазы 6.1).
+constexpr seL4_Word SYS_SET_AFFINITY = 137;
+// Разовый снимок нагрузки (команда шелла `top`) — без параметров. Ответ:
+// MR0=статус; текстовая таблица (общая нагрузка по ядрам + PID/NAME/CORE/%CPU)
+// пишется в rootserver_shm_base, тем же путём, что SYS_PS.
+constexpr seL4_Word SYS_TOP_STATS = 138;
+
+// Фаза 6.1 (продолжение): "вызови у себя seL4_BenchmarkResetLog() и ответь" —
+// root не может включить учёт benchmark utilisation НА ДРУГОМ ядре сам
+// (per-core состояние в ядре seL4), поэтому просит представителя (любой
+// активный uart/blk/net/wifi процесс на этом ядре) сделать это самому.
+// Общая для uart_driver/blk_driver (разбирают этот SYS_*-неймспейс
+// напрямую по числу) — net_driver/wifi_driver используют собственные
+// NetCommand/WIFI_CMD_* и получают свою локальную константу того же
+// назначения (см. net_driver.cpp/wifi_driver.cpp). Без параметров, ответ:
+// MR0=0.
+constexpr seL4_Word SYS_BENCHMARK_RESET_LOCAL = 139;
+
+// Фаза 6.1 (продолжение): "вызови у себя seL4_BenchmarkFinalizeLog(), затем
+// seL4_BenchmarkGetThreadUtilisation(себя) и отдай МОЙ idle/total" —
+// вызывается ПОСЛЕ сна (300мс), парой к SYS_BENCHMARK_RESET_LOCAL выше.
+// Без этого root, читая total/idle через СВОЙ (ядро 0) вызов
+// GetThreadUtilisation, получал бы total С ЯДРА 0 (это поле в ядре всегда
+// от вызывающего, не от того, чей TCB спрашивают) — а не честный период
+// того ядра, где реально исполняется представитель (найдено по факту:
+// агрегат по ядру 1 совсем не сходился с суммой процессов на нём). Нужна
+// собственная TCB-капа (см. BOOT_SELF_TCB_CAP) — без параметров, ответ:
+// MR0=idle (BENCHMARK_IDLE_LOCALCPU_UTILISATION), MR1=total
+// (BENCHMARK_TOTAL_UTILISATION), оба — 4 и 9 в
+// benchmark_track_util_ipc_index.
+constexpr seL4_Word SYS_BENCHMARK_FINALIZE_LOCAL = 140;
+
+// Фаза 6.1 (продолжение): команда шелла `balance` — без параметров. Снимает
+// ту же нагрузку, что и `top` (collect_load_snapshot()), находит САМОЕ
+// занятое ядро с >=2 резидентами, оставляет на нём "тяжёлый" (максимальный
+// %CPU) процесс, а всех остальных резидентов (кроме root/timer_driver —
+// те же две защиты, что у SYS_SET_AFFINITY) раскидывает по наименее
+// загруженным другим ядрам. Ответ: MR0=0, текстовый отчёт — в
+// rootserver_shm_base, тем же путём, что SYS_TOP_STATS/SYS_PS.
+constexpr seL4_Word SYS_BALANCE = 141;
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

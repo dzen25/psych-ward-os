@@ -140,6 +140,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
     seL4_CPtr my_ep   = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr irq_ep  = ipc->msg[BOOT_IRQ_EP];
+    seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
 
     // Запрашиваем SHM для обратной совместимости
     seL4_SetMR(0, 107); // SYS_SHM_GET
@@ -209,13 +210,28 @@ int main(int argc, char *argv[]) {
         } else {
             // Сообщение IPC от клиента. Badge - это PID отправителя.
             seL4_Word sender_pid = badge;
-            if (sender_pid <= 0 || sender_pid >= MAX_CLIENTS) {
-                // Невалидный PID, игнорируем
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
-                continue;
+            seL4_Word sys = seL4_GetMR(0);
+
+            // SYS_BENCHMARK_RESET_LOCAL/FINALIZE_LOCAL — единственные команды,
+            // которые шлёт САМ root (см. collect_load_snapshot() в main.cpp)
+            // через свою НЕ-минченную копию console_ep (badge=0 — root держит
+            // исходный объект от seL4_Untyped_Retype, а клиентам минтится
+            // копия с badge=pid, см. main.cpp). Проверка "badge похож на
+            // валидный PID" ниже такое отбраковывала — найдено по факту на
+            // живом железе (`balance` перенёс uart_driver на пустое ядро,
+            // `top` показал по нему 100% при 0% у самого процесса): root
+            // получал в ответ пустое сообщение, ResetLog/FinalizeLog у
+            // uart_driver ни разу реально не вызывались. Эти две команды не
+            // трогают никакое pid-индексированное состояние — обходить
+            // проверку для них безопасно.
+            if (sys != SYS_BENCHMARK_RESET_LOCAL && sys != SYS_BENCHMARK_FINALIZE_LOCAL) {
+                if (sender_pid <= 0 || sender_pid >= MAX_CLIENTS) {
+                    // Невалидный PID, игнорируем
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                    continue;
+                }
             }
 
-            seL4_Word sys = seL4_GetMR(0);
             if (sys == 8) { // SYS_PUTS
                 int len = seL4_MessageInfo_get_length(info) - 1;
                 
@@ -272,6 +288,18 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, (seL4_Word)-1);
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 }
+            } else if (sys == SYS_BENCHMARK_RESET_LOCAL) { // Фаза 6.1 (продолжение, см. ROADMAP.md)
+                seL4_BenchmarkResetLog();
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            } else if (sys == SYS_BENCHMARK_FINALIZE_LOCAL) { // пара к RESET выше, см. h/common.h
+                seL4_BenchmarkFinalizeLog();
+                seL4_BenchmarkGetThreadUtilisation(self_tcb);
+                seL4_Word idle_local = seL4_GetMR(4);  // BENCHMARK_IDLE_LOCALCPU_UTILISATION
+                seL4_Word total_local = seL4_GetMR(9); // BENCHMARK_TOTAL_UTILISATION
+                seL4_SetMR(0, idle_local);
+                seL4_SetMR(1, total_local);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
             } else {
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             }

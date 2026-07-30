@@ -5,6 +5,7 @@
 #include "h/platform.h"
 
 #include <sel4/sel4.h>
+#include <sel4/benchmark_utilisation_types.h> // Фаза 6.1 (SMP): seL4_BenchmarkGetThreadUtilisation, см. SYS_TOP_STATS
 
 extern "C" {
 #include <cpio/cpio.h>
@@ -133,6 +134,45 @@ static void flush_rootserver_shm() {
     for (int i = 0; i < 8; i++) {
         seL4_ARM_Page_CleanInvalidate_Data(shm_frames[i], 0, 4096);
     }
+}
+
+// Фаза 6.1 (SMP): дописывает десятичное представление val в buf (без
+// нуль-терминатора), возвращает число записанных символов — тот же приём
+// реверса цифр, что уже инлайнился в SYS_PS для pid, вынесен в helper, т.к.
+// в SYS_TOP_STATS нужен трижды на строку (PID/CORE/%CPU) для каждого процесса.
+static int append_udec(char *buf, uint64_t val) {
+    if (val == 0) { buf[0] = '0'; return 1; }
+    char tmp[20];
+    int j = 0;
+    while (val > 0) { tmp[j++] = (char)('0' + (val % 10)); val /= 10; }
+    int n = j;
+    while (j > 0) *buf++ = tmp[--j];
+    return n;
+}
+
+// Фаза 6.1 (продолжение, см. ROADMAP.md): та же цифра, но прижатая вправо в
+// поле фиксированной ширины (пробелами слева) — для выровненных таблиц
+// `top`/`top -l`. Если число шире width — не обрезаем, просто печатаем как
+// есть (ширина колонки в таком случае "поедет", но данные не потеряются).
+static int append_udec_width(char *buf, uint64_t val, int width) {
+    char tmp[20];
+    int n = append_udec(tmp, val);
+    int pad = (width > n) ? (width - n) : 0;
+    for (int i = 0; i < pad; i++) buf[i] = ' ';
+    for (int i = 0; i < n; i++) buf[pad + i] = tmp[i];
+    return pad + n;
+}
+
+// Та же логика, но для строк (заголовки столбцов и "?" на месте
+// отсутствующих данных) — чтобы заголовок и значения выравнивались по
+// одной и той же ширине колонки.
+static int append_str_width(char *buf, const char *s, int width) {
+    int n = 0;
+    while (s[n]) n++;
+    int pad = (width > n) ? (width - n) : 0;
+    for (int i = 0; i < pad; i++) buf[i] = ' ';
+    for (int i = 0; i < n; i++) buf[pad + i] = s[i];
+    return pad + n;
 }
 
 // Индексы SHM-страниц (Фаза 5.3) — используются в shm_pages_mask_for_role()/
@@ -327,6 +367,13 @@ struct ProcessControlBlock {
     // --- НОВОЕ: Трекинг копий SHM для защиты от утечек ---
     bool has_shm;
     seL4_CPtr shm_copies[8];
+
+    // Фаза 6.1 (SMP, см. ROADMAP.md): на каком ядре сейчас реально исполняется
+    // этот процесс — проставляется при спавне (0 по умолчанию, 1 для
+    // wifi_driver) и обновляется SYS_SET_AFFINITY. НЕ переживает респавн
+    // намеренно (при respawn — назад к зашитому дефолту, см. ROADMAP) — это
+    // просто отображение текущего факта, не персистентная настройка.
+    int core;
 };
 
 // --- UNIX PIPES SUBSYSTEM ---
@@ -475,6 +522,121 @@ static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, se
     return true;
 }
 
+// Фаза 6.1 (продолжение, см. ROADMAP.md): снимок нагрузки за короткое окно
+// (~300мс), общий для `top` (SYS_TOP_STATS) и `balance` (SYS_BALANCE) —
+// вынесено в отдельную функцию, т.к. протокол измерения хрупкий (трижды
+// доводился через баги на живом железе, см. ROADMAP) и дублировать его
+// нельзя. См. подробности каждого шага в исходном месте использования
+// (main.cpp, до рефакторинга) и в SYS_BENCHMARK_RESET_LOCAL/
+// SYS_BENCHMARK_FINALIZE_LOCAL (h/common.h).
+struct LoadSnapshot {
+    bool core_enabled[4];
+    uint64_t total[4];
+    uint64_t core_idle[4];
+    uint64_t proc_util[256]; // валиден только если core_enabled[pcbs[i].core]
+};
+
+static void collect_load_snapshot(LoadSnapshot &snap, seL4_CPtr console_ep, seL4_CPtr blk_ep,
+                                   seL4_CPtr net_cmd_send_ep, seL4_CPtr wifi_cmd_send_ep,
+                                   seL4_CPtr timer_ep) {
+    seL4_BenchmarkResetThreadUtilisation(seL4_CapInitThreadTCB);
+    for (int i = 1; i < 256; i++) {
+        if (pcbs[i].active) seL4_BenchmarkResetThreadUtilisation(pcbs[i].tcb);
+    }
+
+    // Включить учёт utilisation на каждом занятом ненулевом ядре — root не
+    // может сделать это за другое ядро сам (per-core состояние в ядре),
+    // просит ЛЮБОЙ активный uart/blk/net/wifi процесс на этом ядре сделать
+    // это самому. Одного представителя достаточно — включает учёт СРАЗУ
+    // для ВСЕХ потоков на этом ядре (в т.ч. шелл/exec).
+    snap.core_enabled[0] = true;
+    snap.core_enabled[1] = snap.core_enabled[2] = snap.core_enabled[3] = false;
+    int representative[4] = {-1, -1, -1, -1}; // pid представителя каждого ядра (для парного Finalize после сна)
+    for (int c = 1; c < 4; c++) {
+        for (int i = 1; i < 256; i++) {
+            if (!pcbs[i].active || pcbs[i].core != c) continue;
+            int d = pcbs[i].is_driver;
+            if (d == 1) {
+                seL4_SetMR(0, SYS_BENCHMARK_RESET_LOCAL);
+                seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            } else if (d == 3) {
+                seL4_SetMR(0, SYS_BENCHMARK_RESET_LOCAL);
+                seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            } else if (d == 4) {
+                seL4_SetMR(0, 8); // NET_CMD_BENCHMARK_RESET, см. net_driver.cpp
+                seL4_Call(net_cmd_send_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            } else if (d == 5) {
+                seL4_SetMR(0, 4); // WIFI_CMD_BENCHMARK_RESET, см. wifi_driver.cpp
+                seL4_SetMR(1, 0); // wifi_driver читает MR1 (verbose) безусловно
+                seL4_Call(wifi_cmd_send_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+            } else {
+                continue; // шелл/exec на этом ядре — попросить не может, пробуем следующего
+            }
+            snap.core_enabled[c] = true;
+            representative[c] = i;
+            break; // один представитель на ядро достаточно
+        }
+    }
+
+    seL4_BenchmarkResetLog();
+
+    seL4_SetMR(0, 8); // SYS_SLEEP_MS (см. shell.cpp/sys_sleep) — root как обычный клиент timer_ep
+    seL4_SetMR(1, 300);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
+    seL4_BenchmarkFinalizeLog();
+
+    for (int c = 0; c < 4; c++) { snap.total[c] = 1; snap.core_idle[c] = 0; }
+
+    // pid 0 = rootserver, TCB = seL4_CapInitThreadTCB, всегда ядро 0
+    seL4_BenchmarkGetThreadUtilisation(seL4_CapInitThreadTCB);
+    uint64_t root_util = seL4_GetMR(BENCHMARK_TCB_UTILISATION);
+    snap.total[0] = seL4_GetMR(BENCHMARK_TOTAL_UTILISATION);
+    if (snap.total[0] == 0) snap.total[0] = 1;
+    snap.core_idle[0] = seL4_GetMR(BENCHMARK_IDLE_TCBCPU_UTILISATION);
+
+    // total у ядра N нельзя считать от значения ядра 0
+    // (BENCHMARK_TOTAL_UTILISATION всегда от ВЫЗЫВАЮЩЕГО, не от того, чей
+    // TCB спрашивают) — просим ТОГО ЖЕ представителя финализировать и
+    // отдать СВОЙ честный idle/total (см. SYS_BENCHMARK_FINALIZE_LOCAL).
+    for (int c = 1; c < 4; c++) {
+        if (!snap.core_enabled[c] || representative[c] < 0) continue;
+        int i = representative[c];
+        int d = pcbs[i].is_driver;
+        seL4_Word idle_local = 0, total_local = 0;
+        if (d == 1) {
+            seL4_SetMR(0, SYS_BENCHMARK_FINALIZE_LOCAL);
+            seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            idle_local = seL4_GetMR(0); total_local = seL4_GetMR(1);
+        } else if (d == 3) {
+            seL4_SetMR(0, SYS_BENCHMARK_FINALIZE_LOCAL);
+            seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            idle_local = seL4_GetMR(0); total_local = seL4_GetMR(1);
+        } else if (d == 4) {
+            seL4_SetMR(0, 9); // NET_CMD_BENCHMARK_FINALIZE, см. net_driver.cpp
+            seL4_Call(net_cmd_send_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            idle_local = seL4_GetMR(0); total_local = seL4_GetMR(1);
+        } else if (d == 5) {
+            seL4_SetMR(0, 5); // WIFI_CMD_BENCHMARK_FINALIZE, см. wifi_driver.cpp
+            seL4_SetMR(1, 0);
+            seL4_Call(wifi_cmd_send_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+            idle_local = seL4_GetMR(0); total_local = seL4_GetMR(1);
+        }
+        snap.core_idle[c] = idle_local;
+        snap.total[c] = (total_local == 0) ? 1 : total_local;
+    }
+
+    for (int i = 0; i < 256; i++) snap.proc_util[i] = 0;
+    snap.proc_util[0] = root_util;
+    for (int i = 1; i < 256; i++) {
+        if (!pcbs[i].active) continue;
+        int c = pcbs[i].core;
+        if (c < 0 || c >= 4 || !snap.core_enabled[c]) continue;
+        seL4_BenchmarkGetThreadUtilisation(pcbs[i].tcb);
+        snap.proc_util[i] = seL4_GetMR(BENCHMARK_TCB_UTILISATION);
+    }
+}
+
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
                          seL4_CPtr shm_frame_root, int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep,
@@ -606,6 +768,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_extra_ntfn3 = 17; // Фикс зависания blk_driver: heartbeat-капа blk_driver'а (badge BLK_HEARTBEAT_BADGE, только для timer_driver, см. extra_ntfn3_param)
     seL4_Word local_mmc_irq_handler = 18; // Фикс дедлока root<->blk_driver: собственная копия IRQHandler общей линии (только для blk_driver, см. mmc_irq_handler_param)
     seL4_Word local_vfs_mutex_ntfn = 19; // Фаза 6 (SMP): капа общего VFS-мьютекса (только для shell/net_driver/wifi_driver, см. vfs_mutex_ntfn_param)
+    seL4_Word local_self_tcb = 20; // Фаза 6.1 (продолжение): собственная TCB-капа (только для uart/blk/net/wifi, is_driver 1/3/4/5)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
@@ -840,8 +1003,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
         if (is_driver == 1) { // UART
             // UART driver является сервером для console_ep, он на нем слушает.
-            child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep; 
+            child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
+            // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
+            child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
         } else if (is_driver == 2) { // Timer
             // Timer driver является сервером для timer_ep, он на нем слушает.
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
@@ -874,6 +1039,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             // собственная копия IRQHandler'а общей линии — blk_driver Ack'ает
             // сам, без обратного IPC к root.
             child_ipc_ptr->msg[BOOT_MMC_IRQ_HANDLER_CAP] = (mmc_irq_handler_param != 0) ? local_mmc_irq_handler : 0;
+            // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
+            child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
         } else if (is_driver == 4) { // Net driver - клиент консоли, таймера и blk (журнал net_udp.log)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
@@ -889,6 +1056,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_WIFI_TX_WAKE_CAP] = (net_wifi_tx_wake_param != 0) ? local_wifi_tx_wake : 0;
             // Фаза 6 (SMP): капа общего VFS-мьютекса — см. common.h.
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
+            // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
+            child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
         } else if (is_driver == 5) { // Wi-Fi driver (Фаза 4) - сервер для шелла, клиент консоли и blk (Милстоун 4.2: чтение прошивки/NVRAM с SD)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_recv_ep;
@@ -903,6 +1072,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_WIFI_NET_RX_SIGNAL_CAP] = (net_wifi_rx_badged_param != 0) ? local_net_wifi_rx : 0;
             // Фаза 6 (SMP): капа общего VFS-мьютекса — см. common.h.
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
+            // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
+            child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
         }
 
     } else {
@@ -928,6 +1099,15 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.tcb = tcb;
     pcb.vspace = child_vspace;
     seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1);
+
+    // Фаза 6.1 (продолжение, см. ROADMAP.md): собственная TCB-капа — только
+    // uart/blk/net/wifi (is_driver 1/3/4/5), см. BOOT_SELF_TCB_CAP выше.
+    // ПОСЛЕ Retype (tcb должен уже существовать) — copy в cnode не трогает
+    // child_ipc_ptr (уже отмаплен из root'а строкой выше), поэтому порядок
+    // относительно unmap'а не важен, важен только относительно Retype.
+    if (is_driver == 1 || is_driver == 3 || is_driver == 4 || is_driver == 5) {
+        check_err(seL4_CNode_Copy(child_cnode, local_self_tcb, 8, root_cnode, tcb, seL4_WordBits, seL4_AllRights), "Copy self TCB cap");
+    }
 
     seL4_Word cspace_guard = seL4_CNode_CapData_new(0, seL4_WordBits - 8).words[0];
     
@@ -969,6 +1149,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (is_driver == 5) {
         seL4_TCB_SetAffinity(tcb, 1);
     }
+    pcb.core = (is_driver == 5) ? 1 : 0; // Фаза 6.1: отображение текущего ядра для taskset/top
 
     // Привязываем прерывание только тем драйверам, у кого реально есть IRQ
     // (раньше это было "is_driver == 1 || is_driver == 2", но таймер (2)
@@ -2188,6 +2369,266 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 flush_rootserver_shm(); // иначе шелл может некэшируемо прочитать не эту таблицу, а что-то устаревшее (см. flush_rootserver_shm())
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // Фаза 6.1 (SMP, см. ROADMAP.md): ручной перенос уже запущенного
+            // процесса на другое ядро в рантайме. Коды ответа (MR0):
+            // 0=успех, 1=процесс не найден, 2=root зафиксирован на ядре 0,
+            // 3=timer_driver нельзя переносить (PPI-опасность — см. ROADMAP),
+            // 4=некорректное ядро. seL4_TCB_SetAffinity безопасно звать на
+            // уже resumed/running TCB (см. kernel/src/object/tcb.c,
+            // invokeTCB_SetAffinity — сам разруливает dequeue/remote-stall).
+            case SYS_SET_AFFINITY: {
+                seL4_Word target_pid = seL4_GetMR(1);
+                seL4_Word target_core = seL4_GetMR(2);
+                seL4_Word status;
+
+                if (target_pid == 0) {
+                    status = 2;
+                } else if (target_pid >= 256 || !pcbs[target_pid].active) {
+                    status = 1;
+                } else if (pcbs[target_pid].is_driver == 2) {
+                    status = 3;
+                } else if (target_core > 3) {
+                    status = 4;
+                } else {
+                    seL4_TCB_SetAffinity(pcbs[target_pid].tcb, target_core);
+                    pcbs[target_pid].core = (int)target_core;
+                    status = 0;
+                }
+
+                seL4_SetMR(0, status);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // Фаза 6.1 (SMP, см. ROADMAP.md): разовый снимок нагрузки для
+            // команды `top`. seL4_BenchmarkGetThreadUtilisation(tcb) отдаёт
+            // через ipc-буфер вызывающего: BENCHMARK_TCB_UTILISATION — такты
+            // занятости запрошенного потока; BENCHMARK_IDLE_TCBCPU_UTILISATION —
+            // такты простоя ЯДРА, на котором этот поток сейчас крутится;
+            // BENCHMARK_TOTAL_UTILISATION — общие такты периода на ядре
+            // вызывающего (root, всегда ядро 0) — переиспользуем как общий
+            // знаменатель для % на всех ядрах (период один и тот же для всех,
+            // частота одна и та же). Короткое окно (~300мс) вместо "с момента
+            // загрузки" — иначе на давно висящей системе load был бы
+            // бессмысленным нулём.
+            case SYS_TOP_STATS: {
+                // MR1 (см. shell.cpp): 0 = разовый снимок по умолчанию —
+                // компактная таблица "какое ядро насколько занято и кто на
+                // нём" (как в примере пользователя); 1 = `top -l` —
+                // подробная построчная таблица PID/CORE/%CPU/NAME (старый
+                // формат), но с выровненными по ширине столбцами вместо
+                // "плывущих" при разном числе цифр.
+                seL4_Word mode = (seL4_MessageInfo_get_length(recv_info) >= 2) ? seL4_GetMR(1) : 0;
+
+                LoadSnapshot snap;
+                collect_load_snapshot(snap, console_ep, blk_ep, net_cmd_send_ep, wifi_cmd_send_ep, timer_ep);
+
+                char *shm = rootserver_shm_base;
+                int offset = 0;
+
+                if (mode == 0) {
+                    strcpy(shm, "CORE    %CPU  NAME\n"); offset = strlen(shm);
+                    for (int c = 0; c < 4; c++) {
+                        offset += append_udec_width(shm + offset, c, 4);
+                        strcpy(shm + offset, " "); offset += 1;
+                        if (snap.core_enabled[c]) {
+                            uint64_t idle_pct = (snap.core_idle[c] >= snap.total[c]) ? 100 : (100 * snap.core_idle[c] / snap.total[c]);
+                            offset += append_udec_width(shm + offset, 100 - idle_pct, 5);
+                        } else {
+                            offset += append_str_width(shm + offset, "?", 5);
+                        }
+                        strcpy(shm + offset, "  "); offset += 2;
+
+                        bool first = true;
+                        if (c == 0) {
+                            strcpy(shm + offset, "rootserver"); offset = strlen(shm);
+                            first = false;
+                        }
+                        for (int i = 1; i < 256; i++) {
+                            if (!pcbs[i].active || pcbs[i].core != c) continue;
+                            if (!first) { strcpy(shm + offset, ", "); offset += 2; }
+                            strcpy(shm + offset, pcbs[i].name); offset = strlen(shm);
+                            first = false;
+                        }
+                        if (first) { strcpy(shm + offset, "-"); offset = strlen(shm); }
+                        strcpy(shm + offset, "\n"); offset = strlen(shm);
+                    }
+                } else {
+                    strcpy(shm, "Ядро:"); offset = strlen(shm);
+                    for (int c = 0; c < 4; c++) {
+                        strcpy(shm + offset, "  "); offset += 2;
+                        offset += append_udec(shm + offset, c);
+                        strcpy(shm + offset, "="); offset += 1;
+                        if (snap.core_enabled[c]) {
+                            uint64_t idle_pct = (snap.core_idle[c] >= snap.total[c]) ? 100 : (100 * snap.core_idle[c] / snap.total[c]);
+                            offset += append_udec(shm + offset, 100 - idle_pct);
+                            strcpy(shm + offset, "%"); offset += 1;
+                        } else {
+                            strcpy(shm + offset, "нет данных"); offset = strlen(shm);
+                        }
+                    }
+                    strcpy(shm + offset, "\n"); offset = strlen(shm);
+
+                    offset += append_str_width(shm + offset, "PID", 5);
+                    strcpy(shm + offset, " "); offset += 1;
+                    offset += append_str_width(shm + offset, "CORE", 5);
+                    strcpy(shm + offset, " "); offset += 1;
+                    offset += append_str_width(shm + offset, "%CPU", 5);
+                    strcpy(shm + offset, " NAME\n"); offset = strlen(shm);
+
+                    offset += append_udec_width(shm + offset, 0, 5);
+                    strcpy(shm + offset, " "); offset += 1;
+                    offset += append_udec_width(shm + offset, 0, 5);
+                    strcpy(shm + offset, " "); offset += 1;
+                    offset += append_udec_width(shm + offset, 100 * snap.proc_util[0] / snap.total[0], 5);
+                    strcpy(shm + offset, " rootserver\n"); offset = strlen(shm);
+
+                    for (int i = 1; i < 256; i++) {
+                        if (!pcbs[i].active) continue;
+                        if (offset > 16384 - 64) { strcpy(shm + offset, "...\n"); offset += 4; break; }
+
+                        offset += append_udec_width(shm + offset, i, 5);
+                        strcpy(shm + offset, " "); offset += 1;
+                        offset += append_udec_width(shm + offset, pcbs[i].core, 5);
+                        strcpy(shm + offset, " "); offset += 1;
+                        {
+                            int c = pcbs[i].core;
+                            if (c >= 0 && c < 4 && snap.core_enabled[c]) {
+                                offset += append_udec_width(shm + offset, 100 * snap.proc_util[i] / snap.total[c], 5);
+                            } else {
+                                offset += append_str_width(shm + offset, "?", 5);
+                            }
+                        }
+                        strcpy(shm + offset, " "); offset += 1;
+                        strcpy(shm + offset, pcbs[i].name); offset = strlen(shm);
+                        strcpy(shm + offset, "\n"); offset++;
+                    }
+                }
+
+                flush_rootserver_shm();
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // Фаза 6.1 (продолжение, см. ROADMAP.md): `balance` — по команде
+            // шелла, но цель переноса выбирает алгоритм. Политика: находим
+            // САМОЕ занятое ядро (среди тех, где есть реальные данные и
+            // >=2 резидентов), оставляем на нём "тяжёлый" (максимальный
+            // %CPU) процесс в одиночестве, а всех остальных резидентов
+            // (кроме root/timer_driver — те же две защиты, что у
+            // SYS_SET_AFFINITY) раскидываем по наименее загруженным другим
+            // ядрам. Идея пользователя: если на ядре один тяжёлый процесс и
+            // несколько мелких — освободить ядро целиком под тяжёлый, а не
+            // наоборот "увести самого тяжёлого".
+            case SYS_BALANCE: {
+                LoadSnapshot snap;
+                collect_load_snapshot(snap, console_ep, blk_ep, net_cmd_send_ep, wifi_cmd_send_ep, timer_ep);
+
+                char *shm = rootserver_shm_base;
+                int offset = 0;
+
+                // Агрегатный % по ядру. Для ядра без данных (core_enabled
+                // false) трактуем как 0 — но ТОЛЬКО как "привлекательную"
+                // цель для переноса (пустое ядро без драйвера почти
+                // наверняка простаивает); источником такое ядро ниже не
+                // выбирается — без реальных данных нельзя утверждать, что
+                // оно "самое занятое".
+                int core_pct[4];
+                for (int c = 0; c < 4; c++) {
+                    if (snap.core_enabled[c]) {
+                        uint64_t idle_pct = (snap.core_idle[c] >= snap.total[c]) ? 100 : (100 * snap.core_idle[c] / snap.total[c]);
+                        core_pct[c] = (int)(100 - idle_pct);
+                    } else {
+                        core_pct[c] = 0;
+                    }
+                }
+
+                int resident_count[4] = {0, 0, 0, 0};
+                for (int i = 0; i < 256; i++) {
+                    if (i != 0 && !pcbs[i].active) continue;
+                    int c = (i == 0) ? 0 : pcbs[i].core;
+                    if (c >= 0 && c < 4) resident_count[c]++;
+                }
+
+                int source = -1;
+                for (int c = 0; c < 4; c++) {
+                    if (!snap.core_enabled[c] || resident_count[c] < 2) continue;
+                    if (source < 0 || core_pct[c] > core_pct[source]) source = c;
+                }
+
+                if (source < 0) {
+                    strcpy(shm, "Балансировать нечего: ни на одном ядре с известной нагрузкой нет более одного процесса.\n");
+                    flush_rootserver_shm();
+                    seL4_SetMR(0, 0);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                // "Тяжёлый" — резидент источника с максимальным %CPU (может
+                // быть и root/timer_driver — тогда он и так не переносится
+                // защитой в цикле переноса ниже, отдельно разбирать не надо).
+                int heavy = -1;
+                uint64_t heavy_util = 0;
+                for (int i = 0; i < 256; i++) {
+                    if (i != 0 && !pcbs[i].active) continue;
+                    int c = (i == 0) ? 0 : pcbs[i].core;
+                    if (c != source) continue;
+                    if (heavy < 0 || snap.proc_util[i] > heavy_util) { heavy = i; heavy_util = snap.proc_util[i]; }
+                }
+                int working_pct[4];
+                for (int c = 0; c < 4; c++) working_pct[c] = core_pct[c];
+
+                strcpy(shm, "Ядро "); offset = strlen(shm);
+                offset += append_udec(shm + offset, source);
+                strcpy(shm + offset, " было самым занятым ("); offset = strlen(shm);
+                offset += append_udec(shm + offset, core_pct[source]);
+                strcpy(shm + offset, "%). Тяжёлый процесс остаётся: "); offset = strlen(shm);
+                strcpy(shm + offset, (heavy == 0) ? "rootserver" : pcbs[heavy].name); offset = strlen(shm);
+                strcpy(shm + offset, "\n"); offset = strlen(shm);
+
+                int moved = 0;
+                for (int i = 1; i < 256; i++) {
+                    if (!pcbs[i].active) continue;
+                    if (pcbs[i].core != source) continue;
+                    if (i == heavy) continue;
+                    if (pcbs[i].is_driver == 2) continue; // timer_driver — никогда не переносим (PPI-опасность)
+
+                    int dest = -1;
+                    for (int c = 0; c < 4; c++) {
+                        if (c == source) continue;
+                        if (dest < 0 || working_pct[c] < working_pct[dest]) dest = c;
+                    }
+
+                    seL4_TCB_SetAffinity(pcbs[i].tcb, dest);
+                    pcbs[i].core = dest;
+
+                    int contrib_pct = (int)(100 * snap.proc_util[i] / snap.total[source]);
+                    working_pct[dest] += contrib_pct;
+
+                    strcpy(shm + offset, "  "); offset += 2;
+                    strcpy(shm + offset, pcbs[i].name); offset = strlen(shm);
+                    strcpy(shm + offset, " -> ядро "); offset = strlen(shm);
+                    offset += append_udec(shm + offset, dest);
+                    strcpy(shm + offset, "\n"); offset = strlen(shm);
+                    moved++;
+                }
+
+                if (moved == 0) {
+                    strcpy(shm + offset, "  (нечего переносить — остальные резиденты этого ядра тоже защищены)\n");
+                    offset = strlen(shm);
+                } else {
+                    strcpy(shm + offset, "Перенесено процессов: "); offset = strlen(shm);
+                    offset += append_udec(shm + offset, moved);
+                    strcpy(shm + offset, "\n"); offset = strlen(shm);
+                }
+
+                flush_rootserver_shm();
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;

@@ -605,6 +605,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr my_ep   = ipc->msg[7]; // BOOT_BLK_EP
     seL4_CPtr timer_ep = ipc->msg[BOOT_TIMER_EP]; // Фикс зависания (см. situation.txt): нужен для SYS_TIMER_HEARTBEAT_SUBSCRIBE ниже
+    seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
     g_emmc_irq_ntfn = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: капа на нотификацию общего IRQ EMMC2/Wi-Fi SDIO (см. main.cpp)
     g_root_ep = root_ep; // используется только на error-путях инициализации
     g_mmc_irq_handler = ipc->msg[BOOT_MMC_IRQ_HANDLER_CAP]; // фикс дедлока — см. notify_root_irq_handled()
@@ -860,6 +861,22 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
+
+        else if (cmd == SYS_BENCHMARK_RESET_LOCAL) { // Фаза 6.1 (продолжение, см. ROADMAP.md)
+            seL4_BenchmarkResetLog();
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        }
+
+        else if (cmd == SYS_BENCHMARK_FINALIZE_LOCAL) { // пара к RESET выше, см. h/common.h
+            seL4_BenchmarkFinalizeLog();
+            seL4_BenchmarkGetThreadUtilisation(self_tcb);
+            seL4_Word idle_local = seL4_GetMR(4);  // BENCHMARK_IDLE_LOCALCPU_UTILISATION
+            seL4_Word total_local = seL4_GetMR(9); // BENCHMARK_TOTAL_UTILISATION
+            seL4_SetMR(0, idle_local);
+            seL4_SetMR(1, total_local);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+        }
 
         else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));

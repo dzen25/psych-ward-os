@@ -450,6 +450,13 @@ enum NetCommand {
     NET_CMD_RECV = 5,
     NET_CMD_NTP = 6,
     NET_CMD_NTP_STATUS = 7,
+    // Фаза 6.1 (продолжение, см. ROADMAP.md): "вызови у себя
+    // seL4_BenchmarkResetLog() и ответь" — root не может включить учёт
+    // benchmark utilisation на чужом ядре сам (per-core состояние в ядре),
+    // просит net_driver сделать это самому, на своём текущем ядре.
+    NET_CMD_BENCHMARK_RESET = 8,
+    // Пара к NET_CMD_BENCHMARK_RESET выше — см. h/common.h/SYS_BENCHMARK_FINALIZE_LOCAL.
+    NET_CMD_BENCHMARK_FINALIZE = 9,
 };
 
 // --- Настройки NTP-клиента (правьте здесь) ---
@@ -2422,6 +2429,7 @@ int main(int argc, char *argv[]) {
     g_blk_ep = ipc->msg[7]; // см. main.cpp: local_blk_ep=7 — нужен только для net_log_udp()
     g_wifi_tx_wake_ntfn = ipc->msg[BOOT_WIFI_TX_WAKE_CAP]; // Фаза 4.5.4: капа сигнала wifi_driver'у "кадр в TX-mailbox" (см. wifi_hw_send())
     g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
+    seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -2534,6 +2542,29 @@ int main(int argc, char *argv[]) {
                 net_check_ntp_resync(iface, console_ep, timer_ep);
                 net_publish_iface_ready(iface);
             }
+            continue;
+        }
+
+        // Фаза 6.1 (продолжение, см. ROADMAP.md): проверяем ДО "if (g_net_up)"
+        // ниже — иначе root, вызывая эту команду через обычный блокирующий
+        // seL4_Call, завис бы навсегда, если сеть физически не поднята
+        // (кабель не подключён), потому что net_handle_command() (и вместе с
+        // ним любой Reply) тогда вообще не вызывается. Операция мгновенная и
+        // локальная, от состояния сети не зависит.
+        if (seL4_MessageInfo_get_length(info) >= 1 && seL4_GetMR(0) == NET_CMD_BENCHMARK_RESET) {
+            seL4_BenchmarkResetLog();
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+        if (seL4_MessageInfo_get_length(info) >= 1 && seL4_GetMR(0) == NET_CMD_BENCHMARK_FINALIZE) {
+            seL4_BenchmarkFinalizeLog();
+            seL4_BenchmarkGetThreadUtilisation(self_tcb);
+            seL4_Word idle_local = seL4_GetMR(4);  // BENCHMARK_IDLE_LOCALCPU_UTILISATION
+            seL4_Word total_local = seL4_GetMR(9); // BENCHMARK_TOTAL_UTILISATION
+            seL4_SetMR(0, idle_local);
+            seL4_SetMR(1, total_local);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
             continue;
         }
 

@@ -3536,6 +3536,13 @@ constexpr seL4_Word WIFI_CMD_CONNECT = 2;
 // сообщает, сколько событий вообще пришло за окно ожидания — этого хватает,
 // чтобы отличить "радио работает" от "радио молчит".
 constexpr seL4_Word WIFI_CMD_SCAN = 3;
+// Фаза 6.1 (продолжение, см. ROADMAP.md): "вызови у себя
+// seL4_BenchmarkResetLog() и ответь" — root не может включить учёт
+// benchmark utilisation на чужом ядре сам (per-core состояние в ядре),
+// просит wifi_driver сделать это самому, на своём текущем ядре.
+constexpr seL4_Word WIFI_CMD_BENCHMARK_RESET = 4;
+// Пара к WIFI_CMD_BENCHMARK_RESET выше — см. h/common.h/SYS_BENCHMARK_FINALIZE_LOCAL.
+constexpr seL4_Word WIFI_CMD_BENCHMARK_FINALIZE = 5;
 // "-l" для "wifi start"/"wifi restart" (см. shell.cpp) — фоновый bring-up
 // (Милстоуны 4.1-4.3) запускается прямо в main(), ДО того как шелл вообще
 // может послать какую-либо WIFI_CMD_* команду, поэтому бит подробности для
@@ -3554,6 +3561,7 @@ int main(int argc, char *argv[]) {
     g_wifi_root_ep        = root_ep; // см. notify_root_wifi_irq_handled()/SYS_WIFI_IRQ_ACK
     seL4_CPtr net_wifi_rx_ntfn = ipc->msg[BOOT_WIFI_NET_RX_SIGNAL_CAP]; // Фаза 4.5.5: капа сигнала net_driver'у "кадр в RX-mailbox"
     g_wifi_vfs_mutex_ep  = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
+    seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -3764,6 +3772,18 @@ int main(int argc, char *argv[]) {
             }
             seL4_SetMR(0, status);
             seL4_SetMR(1, events_seen);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+        } else if (cmd == WIFI_CMD_BENCHMARK_RESET) {
+            seL4_BenchmarkResetLog();
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (cmd == WIFI_CMD_BENCHMARK_FINALIZE) {
+            seL4_BenchmarkFinalizeLog();
+            seL4_BenchmarkGetThreadUtilisation(self_tcb);
+            seL4_Word idle_local = seL4_GetMR(4);  // BENCHMARK_IDLE_LOCALCPU_UTILISATION
+            seL4_Word total_local = seL4_GetMR(9); // BENCHMARK_TOTAL_UTILISATION
+            seL4_SetMR(0, idle_local);
+            seL4_SetMR(1, total_local);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
