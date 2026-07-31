@@ -25,7 +25,12 @@ int main(int argc, char *argv[]) {
 
         char *shm = env.shm;
         build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
-        if (vfs_syscall(112, env.blk_ep) != 0) {
+        int status = vfs_syscall(112, env.blk_ep);
+        if (status == 1) {
+            sys_puts(0, "touch: '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "' уже существует — ничего не делаю\n");
+        } else if (status != 0) {
             sys_puts(0, "touch: failed to create '");
             sys_puts(0, start_of_arg);
             sys_puts(0, "'\n");

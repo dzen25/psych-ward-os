@@ -152,11 +152,25 @@ constexpr uintptr_t PLAT_MBOX_BUF_VADDR     = 0x20001c000ULL;    // приват
 
 // --- Оффсеты/биты регистров VideoCore mailbox, считаются от MAILBOX_BASE
 // (см. PLAT_MBOX_PADDR — сама страница начинается на 0x880 раньше). ---
-constexpr uintptr_t MBOX_BASE_OFFSET   = 0x880;
-constexpr uintptr_t MBOX_READ_OFFSET   = MBOX_BASE_OFFSET + 0x00;  // VC -> ARM
-constexpr uintptr_t MBOX_STATUS_OFFSET = MBOX_BASE_OFFSET + 0x18;
-constexpr uintptr_t MBOX_WRITE_OFFSET  = MBOX_BASE_OFFSET + 0x20;  // ARM -> VC
-constexpr uint32_t  MBOX_STATUS_FULL   = (1u << 31);               // писать нельзя, входной FIFO VC полон
+// РЕАЛЬНАЯ ПРИЧИНА, почему mailbox "не отвечал" (Фаза 4.6/7 — было записано
+// как принятая деградация): сверка с рабочим драйвером U-Boot этой же платы
+// (`arch/arm/mach-bcm283x/mbox.c`, `struct bcm2835_mbox_regs`) показала, что
+// физически это ДВА независимых почтовых ящика с ОТДЕЛЬНЫМИ status-регистрами:
+// mail0 (VC -> ARM, читаем из `read`, статус в `mail0_status`) и mail1
+// (ARM -> VC, пишем в `write`, статус в `mail1_status`) — старый код здесь
+// использовал ОДИН и тот же MBOX_STATUS_OFFSET (это на самом деле mail0_status)
+// и для проверки "не полон ли исходящий FIFO перед записью", и для проверки
+// "не пуст ли входящий FIFO при чтении ответа". Проверка перед записью должна
+// смотреть на mail1_status, а не mail0_status — иначе ждём бита совсем не той
+// очереди и в худшем случае вечно не доходим до самой записи в `write`,
+// что и объясняет "статус не меняется, ответа нет" на ВСЕХ вариантах
+// bus-адреса разом (адрес тут был ни при чём).
+constexpr uintptr_t MBOX_BASE_OFFSET         = 0x880;
+constexpr uintptr_t MBOX_READ_OFFSET         = MBOX_BASE_OFFSET + 0x00;  // VC -> ARM (mail0)
+constexpr uintptr_t MBOX_MAIL0_STATUS_OFFSET = MBOX_BASE_OFFSET + 0x18;  // статус очереди VC -> ARM (для чтения ответа)
+constexpr uintptr_t MBOX_WRITE_OFFSET        = MBOX_BASE_OFFSET + 0x20;  // ARM -> VC (mail1)
+constexpr uintptr_t MBOX_MAIL1_STATUS_OFFSET = MBOX_BASE_OFFSET + 0x38;  // статус очереди ARM -> VC (для проверки места перед записью)
+constexpr uint32_t  MBOX_STATUS_FULL   = (1u << 31);               // писать нельзя, исходящий FIFO полон
 constexpr uint32_t  MBOX_STATUS_EMPTY  = (1u << 30);                // читать нечего
 constexpr uint32_t  MBOX_CHANNEL_PROP  = 8;                         // ARM -> VC property tags channel
 
@@ -165,6 +179,25 @@ constexpr uint32_t MBOX_TAG_GET_FIRMWARE_REVISION = 0x00000001;
 constexpr uint32_t MBOX_TAG_LAST                  = 0x00000000;
 constexpr uint32_t MBOX_CODE_REQUEST              = 0x00000000;
 constexpr uint32_t MBOX_CODE_RESPONSE_SUCCESS     = 0x80000000;
+
+// Фаза 7 (DVFS) — теги смены/чтения частоты тактирования. Подтверждено на
+// живом железе (см. ROADMAP.md): mailbox отвечает БЕЗ какого-либо
+// bus-смещения (raw ARM physical), пока буфер лежит ниже 1ГиБ (см.
+// low_untyped в main.cpp) — production-код (в отличие от диагностического
+// mbox_probe() с перебором вариантов) сразу использует этот один
+// подтверждённый вариант.
+constexpr uint32_t MBOX_TAG_GET_CLOCK_RATE     = 0x00030002;
+constexpr uint32_t MBOX_TAG_SET_CLOCK_RATE     = 0x00038002;
+constexpr uint32_t MBOX_TAG_GET_MIN_CLOCK_RATE = 0x00030007;
+constexpr uint32_t MBOX_TAG_GET_MAX_CLOCK_RATE = 0x00030004;
+constexpr uint32_t MBOX_CLOCK_ID_ARM           = 3; // см. firmware wiki: "0x000000003: ARM"
+// ВАЖНО (см. официальную вики-документацию): GET_CLOCK_RATE (0x00030002)
+// отдаёт "next enable rate" — т.е. может быть ПРОСТО эхом последнего
+// SET_CLOCK_RATE, даже если тактирование физически не работает. Реальную
+// (измеренную, с учётом clamping/throttling) частоту отдаёт ТОЛЬКО этот тег —
+// используем его для диагностики "правда ли DVFS меняет железо", а не только
+// то, что подтвердила прошивка на запрос.
+constexpr uint32_t MBOX_TAG_GET_CLOCK_RATE_MEASURED = 0x00030047;
 
 // --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
 // от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
@@ -872,6 +905,15 @@ constexpr uint32_t WIFI_SHM_PASS_OFFSET       = 16424; // 64 байта, до 16
 constexpr uint32_t WIFI_SHM_VERBOSE_OFFSET    = 16488; // 1 байт — "-l" для фонового bring-up при "wifi start"
 
 // Link-state — своя страница (20480-24575), read-only для net_driver/shell.
+// issuse.txt ("без арбитража записи" — расследовано, реальной гонки нет):
+// два писателя (wifi_driver при join/connect, root при "wifi stop"), но НЕ
+// одновременно — SYS_STOP_WIFI (main.cpp) вызывает generic_recover_process()
+// с respawn=false, который ДЕЛАЕТ seL4_TCB_Suspend(wifi_driver) ПЕРВЫМ ДЕЛОМ,
+// и только ПОСЛЕ этого root сам пишет сюда 0 — к этому моменту wifi_driver
+// физически не может исполнять ни одной инструкции, значит и писать тоже.
+// Явного мьютекса это не заменяет (если когда-нибудь появится ВТОРОЙ путь
+// записи от root без предварительной остановки wifi_driver — гонка станет
+// реальной), но при текущем единственном вызывающем месте — безопасно.
 constexpr uint32_t WIFI_SHM_LINK_STATE_OFFSET = 20480; // 4 байта, 0/1, пишет wifi_driver (join)/root (stop), читает net_driver/shell
 constexpr uint32_t WIFI_SHM_MAC_OFFSET        = 20484; // 6 из 8 байт — РЕАЛЬНЫЙ MAC чипа (cur_etheraddr), не выдуманный как у GENET
 constexpr uint32_t WIFI_SHM_LINK_STATE_REASON_OFFSET = 20492; // диагностика (см. situation.txt) — уже сослужила службу, оставлена как регресс-проверка
@@ -883,6 +925,20 @@ constexpr uint32_t WIFI_LINK_REASON_SYS_STOP_WIFI  = 4; // ручной "wifi st
 
 // TX/RX-мейлбокс + канарейка — своя страница (24576-28671), RW для net_driver
 // И wifi_driver (двусторонний обмен, см. комментарий выше).
+// issuse.txt ("порядок доступа явно не задокументирован" — расследовано и
+// задокументировано здесь): net_driver и wifi_driver — РАЗНЫЕ процессы,
+// потенциально на РАЗНЫХ ядрах (wifi_driver пришпилен к ядру 1, см.
+// ROADMAP.md Фаза 6). "Данные, потом длина" при записи / "длина, потом
+// данные" при чтении (см. wifi_hw_send/wifi_hw_poll_rx в net_driver.cpp,
+// TX/RX-обработчики в wifi_driver.cpp) безопасно БЕЗ явных барьеров памяти
+// ТОЛЬКО потому, что вся эта страница замаплена как Device-память
+// (VMAttributes=0 у map_frame_robust() на обеих сторонах, см. main.cpp) —
+// архитектура ARM гарантирует, что обращения к Device-памяти наблюдаются В
+// ПОРЯДКЕ ПРОГРАММЫ ЛЮБЫМ наблюдателем в том же shareability domain, без
+// барьера (то же свойство, на которое неявно полагается любой MMIO-драйвер
+// на SMP-системе). Если эта страница когда-нибудь станет Normal/кэшируемой
+// (например, ради производительности) — эта гарантия ИСЧЕЗНЕТ, и потребуются
+// явные dmb/dsb вокруг каждой пары запись-данные/запись-флага.
 constexpr uint32_t WIFI_SHM_TX_LEN_OFFSET     = 24576; // 4 байта, 0=пусто, пишет net_driver, читает wifi_driver
 constexpr uint32_t WIFI_SHM_TX_DATA_OFFSET    = 24580; // 1536 байт, до 26116
 constexpr uint32_t WIFI_SHM_RX_LEN_OFFSET     = 26116; // 4 байта, 0=пусто, пишет wifi_driver, читает net_driver

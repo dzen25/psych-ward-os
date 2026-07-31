@@ -44,18 +44,35 @@ static inline void write_cntp_ctl(uint64_t val) {
 constexpr uint64_t CNTP_CTL_ENABLE = 1u; // бит 0: включить; бит 1 (IMASK) оставляем 0 — не маскируем
 
 // Фаза 4.5 (см. ROADMAP.md/net_driver.cpp): физический таймер — ЕДИНСТВЕННЫЙ
-// аппаратный ресурс (один компаратор), а нужд у нас теперь две — разовый
-// sleep(ms) по запросу шелла И периодический heartbeat для net_driver
-// (DHCP/ARP/ping/link-таймауты, которые сами по себе ни с каким IRQ не
-// связаны). Мультиплексируем обе поверх одного CNTP_CVAL по принципу
-// "взводим на БЛИЖАЙШИЙ из известных дедлайнов" — простейшая версия
-// software timer wheel (тот же принцип, что hrtimer в Linux, просто на
-// два таймера, а не на N).
-static void rearm_timer(bool pending_sleep, uint64_t sleep_deadline,
+// аппаратный ресурс (один компаратор), а нужд у нас МНОГО — до
+// MAX_PENDING_SLEEPS одновременных отложенных sleep(ms) от РАЗНЫХ процессов
+// (шелл, root, кто угодно ещё) И периодический heartbeat для net_driver.
+// ИСПРАВЛЕНО (issuse.txt): раньше был только ОДИН слот отложенного sleep на
+// весь timer_driver — второй одновременный запрос получал мгновенный отказ
+// (-1) вместо ожидания, а shell.cpp это код возврата не проверял и
+// "проматывал" заявленный таймаут почти мгновенно, из-за чего живой,
+// здоровый net_driver иногда убивался по ложной тревоге. Компаратор всё ещё
+// один физический (CNTP_CVAL_EL0) — взводим его на БЛИЖАЙШИЙ дедлайн среди
+// ВСЕХ слотов + heartbeat (software timer wheel, тот же приём, что hrtimer в
+// Linux, просто на N таймеров вместо 2).
+constexpr int MAX_PENDING_SLEEPS = 8;
+// owner_pid — badge вызывающего (см. main.cpp: timer_ep минтится с badge=pid
+// для обычных клиентов) — нужен для SYS_CANCEL_PENDING_FOR_PID (issuse.txt):
+// если владелец слота убит/восстановлен watchdog'ом ДО того, как физический
+// дедлайн реально наступил, root просит отбросить слот молча (без
+// seL4_Send — отвечать уже некому, TCB не существует).
+struct PendingSleep { bool active; uint64_t deadline; int owner_pid; };
+
+static void rearm_timer(const PendingSleep* sleeps, int n,
                         bool heartbeat_enabled, uint64_t next_heartbeat_deadline) {
     bool have_deadline = false;
     uint64_t next = 0;
-    if (pending_sleep) { next = sleep_deadline; have_deadline = true; }
+    for (int i = 0; i < n; i++) {
+        if (sleeps[i].active && (!have_deadline || sleeps[i].deadline < next)) {
+            next = sleeps[i].deadline;
+            have_deadline = true;
+        }
+    }
     if (heartbeat_enabled && (!have_deadline || next_heartbeat_deadline < next)) {
         next = next_heartbeat_deadline;
         have_deadline = true;
@@ -116,6 +133,16 @@ static void sys_puthex32(seL4_CPtr console_ep, const char* label, uint32_t val) 
 static volatile uint32_t *g_mbox_buf = nullptr;   // PLAT_MBOX_BUF_VADDR, некэшируемый, 4KB
 static uint32_t g_mbox_buf_paddr = 0;
 
+// Фаза 7 (DVFS) — состояние губернатора частоты ARM-ядер, см. mbox_probe()
+// выше по поводу того, почему mailbox теперь реально отвечает. g_cpufreq_available
+// остаётся false (feature просто молчит, без падения), если GET_MIN/MAX_CLOCK_RATE
+// не ответили на старте — тот же принцип "мягкой деградации", что и у прочих
+// диагностических возможностей этого файла (термодатчик, mboxprobe).
+static bool     g_cpufreq_available = false;
+static uint32_t g_cpufreq_min_hz    = 0;
+static uint32_t g_cpufreq_max_hz    = 0;
+static bool     g_cpufreq_is_low    = false; // текущее состояние губернатора (гистерезис, см. SYS_CPUFREQ_GOVERNOR_TICK)
+
 static inline uint32_t mbox_reg_read(uintptr_t off) { return *(volatile uint32_t*)(PLAT_MBOX_VADDR + off); }
 static inline void mbox_reg_write(uintptr_t off, uint32_t val) { *(volatile uint32_t*)(PLAT_MBOX_VADDR + off) = val; }
 
@@ -126,14 +153,26 @@ static inline void mbox_reg_write(uintptr_t off, uint32_t val) { *(volatile uint
 // не рабочий путь с требованиями к времени).
 static bool mbox_call(uint32_t bus_addr, int timeout_iters) {
     int i = 0;
-    while (mbox_reg_read(MBOX_STATUS_OFFSET) & MBOX_STATUS_FULL) {
+    // Слить чужие "залежавшиеся" ответы из входящей очереди (mail0) перед
+    // отправкой — тот же порядок действий, что в референсном U-Boot
+    // bcm2835_mbox_call_raw(), на случай если VC что-то оставил во входящей
+    // очереди ещё во время работы самого U-Boot.
+    while (!(mbox_reg_read(MBOX_MAIL0_STATUS_OFFSET) & MBOX_STATUS_EMPTY)) {
+        (void)mbox_reg_read(MBOX_READ_OFFSET);
+        if (++i > timeout_iters) return false;
+    }
+
+    i = 0;
+    // Проверяем именно mail1_status (очередь ARM -> VC), а не mail0_status —
+    // см. комментарий у MBOX_MAIL1_STATUS_OFFSET в platform.h.
+    while (mbox_reg_read(MBOX_MAIL1_STATUS_OFFSET) & MBOX_STATUS_FULL) {
         if (++i > timeout_iters) return false;
     }
     mbox_reg_write(MBOX_WRITE_OFFSET, bus_addr);
 
     i = 0;
     while (true) {
-        while (mbox_reg_read(MBOX_STATUS_OFFSET) & MBOX_STATUS_EMPTY) {
+        while (mbox_reg_read(MBOX_MAIL0_STATUS_OFFSET) & MBOX_STATUS_EMPTY) {
             if (++i > timeout_iters) return false;
         }
         uint32_t resp = mbox_reg_read(MBOX_READ_OFFSET);
@@ -174,6 +213,12 @@ static int mbox_probe(seL4_CPtr console_ep) {
         return -1;
     }
 
+    // Диагностика: буфер обязан физически лежать ниже 1ГиБ (0x40000000) —
+    // см. комментарий у low_untyped в main.cpp. Печатаем всегда, вне
+    // зависимости от результата, чтобы при следующей неудаче сразу было
+    // видно, актуальна ли ещё эта гипотеза.
+    sys_puthex32(console_ep, "[MBOX] буфер физически по адресу ", g_mbox_buf_paddr);
+
     for (int v = 0; v < kMboxAddrVariantCount; v++) {
         // Формируем property-tag запрос заново перед КАЖДОЙ попыткой — GPU
         // мог что-то дописать в буфер при предыдущей неудачной попытке.
@@ -203,6 +248,51 @@ static int mbox_probe(seL4_CPtr console_ep) {
     }
     sys_puts(console_ep, "[MBOX] не ответил ни на один вариант адреса — см. ROADMAP.md 4.6 (возможная деградация)\n");
     return -1;
+}
+
+// ========================================================
+// Фаза 7 (DVFS) — чтение/установка частоты ARM-ядер через тот же property-tag
+// канал, что и mbox_probe() выше, но уже без перебора вариантов bus-адреса —
+// на живом железе подтверждено (см. platform.h), что нужен ровно один вариант
+// (raw ARM physical, без смещения).
+// ========================================================
+static inline uint32_t mbox_bus_addr() {
+    return (g_mbox_buf_paddr & ~0xFu) | MBOX_CHANNEL_PROP;
+}
+
+// Общий по форме для GET_CLOCK_RATE/GET_MIN_CLOCK_RATE/GET_MAX_CLOCK_RATE —
+// у всех трёх одинаковый layout (запрос: только clock_id, ответ: clock_id + Hz).
+static bool mbox_clock_query(uint32_t tag_id, uint32_t clock_id, uint32_t *out_hz) {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 8 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = tag_id;
+    g_mbox_buf[3] = 8; // val_buf_size: ответ — 2 слова (clock_id + Hz)
+    g_mbox_buf[4] = 4; // val_len (запрос): 1 слово (clock_id)
+    g_mbox_buf[5] = clock_id;
+    g_mbox_buf[6] = 0;
+    g_mbox_buf[7] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    if (g_mbox_buf[1] != MBOX_CODE_RESPONSE_SUCCESS) return false;
+    *out_hz = g_mbox_buf[6];
+    return true;
+}
+
+static bool mbox_set_clock_rate(uint32_t clock_id, uint32_t hz, uint32_t *out_hz) {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 9 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = MBOX_TAG_SET_CLOCK_RATE;
+    g_mbox_buf[3] = 12; // val_buf_size: запрос (3 слова) больше ответа (2 слова)
+    g_mbox_buf[4] = 12; // val_len (запрос): clock_id + Hz + skip_setting_turbo
+    g_mbox_buf[5] = clock_id;
+    g_mbox_buf[6] = hz;
+    g_mbox_buf[7] = 0; // skip_setting_turbo=0 — прошивка сама подстроит напряжение под частоту
+    g_mbox_buf[8] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    if (g_mbox_buf[1] != MBOX_CODE_RESPONSE_SUCCESS) return false;
+    *out_hz = g_mbox_buf[6];
+    return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -246,6 +336,20 @@ int main(int argc, char *argv[]) {
     g_mbox_buf = (volatile uint32_t*)PLAT_MBOX_BUF_VADDR;
     g_mbox_buf_paddr = (uint32_t)ipc->msg[BOOT_MBOX_BUF_PADDR];
 
+    // Фаза 7 (DVFS): один раз на старте узнаём границы частоты ARM-ядер.
+    // Если mailbox почему-то не ответит (другая плата/прошивка) — фича просто
+    // молчит (g_cpufreq_available остаётся false), без паники.
+    {
+        uint32_t min_hz = 0, max_hz = 0;
+        if (mbox_clock_query(MBOX_TAG_GET_MIN_CLOCK_RATE, MBOX_CLOCK_ID_ARM, &min_hz) &&
+            mbox_clock_query(MBOX_TAG_GET_MAX_CLOCK_RATE, MBOX_CLOCK_ID_ARM, &max_hz) &&
+            min_hz != 0 && max_hz != 0 && min_hz <= max_hz) {
+            g_cpufreq_min_hz = min_hz;
+            g_cpufreq_max_hz = max_hz;
+            g_cpufreq_available = true;
+        }
+    }
+
     const uint64_t cntfrq = read_cntfrq();
     // Момент запуска драйвера — точка отсчета аптайма. Не корректируется
     // NTP-смещением: аптайм должен оставаться монотонным независимо от
@@ -262,13 +366,14 @@ int main(int argc, char *argv[]) {
 
     // Отложенный reply на SYS_SLEEP_MS (Фаза 4.5, см. ROADMAP.md) — тот же
     // приём, что uart_driver.cpp уже использует для SYS_READ: сохраняем
-    // reply-cap вызывающего (SELF_CNODE_SLOT, common.h) и отвечаем из ветки
-    // IRQ ниже, когда физический таймер реально сработает. Только ОДИН
-    // отложенный sleep одновременно — аппаратный дедлайн-регистр один на
-    // процесс, второй одновременный запрос получает отказ сразу (см. ниже).
-    constexpr seL4_Word SLEEP_REPLY_SLOT = 12;
-    bool pending_sleep = false;
-    uint64_t sleep_deadline = 0;
+    // reply-cap вызывающего и отвечаем из ветки IRQ ниже, когда физический
+    // таймер реально сработает. До MAX_PENDING_SLEEPS одновременных
+    // отложенных sleep'ов от разных вызывающих (см. PendingSleep выше) —
+    // слоты 30..30+MAX_PENDING_SLEEPS-1 в СОБСТВЕННОМ CNode этого процесса
+    // (main.cpp занимает под is_driver==2 только 0-20, см. local_*/
+    // extra_ntfn* там — 30+ заведомо свободны).
+    constexpr seL4_Word SLEEP_REPLY_SLOT_BASE = 30;
+    PendingSleep pending_sleeps[MAX_PENDING_SLEEPS] = {};
 
     // Периодический heartbeat для net_driver (Фаза 4.5, см. rearm_timer()
     // выше) — подписка одна на весь процесс (net_driver — единственный
@@ -294,16 +399,18 @@ int main(int argc, char *argv[]) {
             seL4_IRQHandler_Ack(irq_ep);
             if (LOG_TIMER) sys_puts(console_ep, "[TIMER] IRQ физического таймера пришёл\n");
 
-            // Один компаратор, два независимых дедлайна (см. rearm_timer()
+            // Один компаратор, МНОГО независимых дедлайнов (см. rearm_timer()
             // выше) — проверяем КАЖДЫЙ отдельно по факту истечения, а не
-            // просто "раз IRQ пришёл, значит это sleep": если heartbeat был
-            // взведён раньше sleep'а, этот конкретный firing вполне может
-            // быть только за heartbeat, а sleep ещё не наступил.
+            // просто "раз IRQ пришёл, значит это конкретный sleep": любой
+            // другой дедлайн (heartbeat или чей-то ещё sleep) вполне мог
+            // взвести таймер раньше, а этот конкретный ещё не наступил.
             uint64_t now = read_cntvct();
-            if (pending_sleep && now >= sleep_deadline) {
-                seL4_Send(SLEEP_REPLY_SLOT, seL4_MessageInfo_new(0, 0, 0, 0));
-                seL4_CNode_Delete(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT, 8); // depth=8, см. урок из uart_driver.cpp
-                pending_sleep = false;
+            for (int i = 0; i < MAX_PENDING_SLEEPS; i++) {
+                if (pending_sleeps[i].active && now >= pending_sleeps[i].deadline) {
+                    seL4_Send(SLEEP_REPLY_SLOT_BASE + i, seL4_MessageInfo_new(0, 0, 0, 0));
+                    seL4_CNode_Delete(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT_BASE + i, 8); // depth=8, см. урок из uart_driver.cpp
+                    pending_sleeps[i].active = false;
+                }
             }
             if (heartbeat_enabled && now >= next_heartbeat_deadline) {
                 seL4_Signal(heartbeat_ntfn);
@@ -311,7 +418,7 @@ int main(int argc, char *argv[]) {
                 if (blk_heartbeat_ntfn != 0) seL4_Signal(blk_heartbeat_ntfn);
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
-            rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
             continue;
         }
 
@@ -341,27 +448,34 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(0, variant); // -1 = не ответил ни на один вариант адреса
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else if (sys == 8) { // SYS_SLEEP_MS: событийный sleep (Фаза 4.5, см. shell.cpp sys_sleep())
-            if (pending_sleep) {
-                // Уже кто-то спит — аппаратный дедлайн один на процесс (см.
-                // комментарий у pending_sleep выше). Отказ сразу, не зависаем.
+            int slot = -1;
+            for (int i = 0; i < MAX_PENDING_SLEEPS; i++) { if (!pending_sleeps[i].active) { slot = i; break; } }
+            if (slot < 0) {
+                // ВСЕ MAX_PENDING_SLEEPS слотов заняты одновременно —
+                // практически недостижимо при нынешнем числе процессов
+                // (раньше это было НОРМОЙ уже при двух одновременных sleep,
+                // см. историю бага в issuse.txt — теперь это genuinely
+                // редкий предел). Отказ сразу, не зависаем.
                 seL4_SetMR(0, (seL4_Word)-1);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             } else {
                 seL4_Word ms = seL4_GetMR(1);
-                sleep_deadline = read_cntvct() + ((uint64_t)ms * cntfrq) / 1000;
-                pending_sleep = true;
+                pending_sleeps[slot].deadline = read_cntvct() + ((uint64_t)ms * cntfrq) / 1000;
+                pending_sleeps[slot].active = true;
+                pending_sleeps[slot].owner_pid = (int)badge;
                 // rearm_timer() сам разберётся, что взводить — этот дедлайн
-                // или уже тикающий heartbeat, смотря что ближе (см. функцию
-                // выше). ВАЖНО: SaveCaller — ПЕРВЫМ делом, до любых чужих
-                // IPC-вызовов (даже sys_puts()!). Неявное право на reply
-                // исходному вызывающему держится только до СЛЕДУЮЩЕГО Recv
-                // этого треда — а seL4_Call внутри sys_puts() как раз делает
-                // Recv (ждёт ответ uart_driver'а). Если бы печать была раньше
-                // SaveCaller, она сама стёрла бы ещё не сохранённое право на
-                // reply, и шелл завис бы навсегда — ровно того же рода баг,
-                // что уже ловили в Блоке A/B (см. depth=8 у SaveCaller ниже).
-                seL4_CNode_SaveCaller(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT, 8); // depth=8, см. урок из uart_driver.cpp
-                rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);
+                // или уже тикающий heartbeat/чужой sleep, смотря что ближе
+                // (см. функцию выше). ВАЖНО: SaveCaller — ПЕРВЫМ делом, до
+                // любых чужих IPC-вызовов (даже sys_puts()!). Неявное право
+                // на reply исходному вызывающему держится только до
+                // СЛЕДУЮЩЕГО Recv этого треда — а seL4_Call внутри
+                // sys_puts() как раз делает Recv (ждёт ответ uart_driver'а).
+                // Если бы печать была раньше SaveCaller, она сама стёрла бы
+                // ещё не сохранённое право на reply, и вызывающий завис бы
+                // навсегда — ровно того же рода баг, что уже ловили в
+                // Блоке A/B (см. depth=8 у SaveCaller ниже).
+                seL4_CNode_SaveCaller(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT_BASE + slot, 8); // depth=8, см. урок из uart_driver.cpp
+                rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
                 if (LOG_TIMER) sys_puts(console_ep, "[TIMER] sleep: взвели физический таймер, ждём IRQ...\n");
                 // Reply НЕ отправляем — см. ветку badge==TIMER_IRQ_BADGE выше.
             }
@@ -372,8 +486,64 @@ int main(int argc, char *argv[]) {
             heartbeat_period_ticks = ((uint64_t)period_ms * cntfrq) / 1000;
             next_heartbeat_deadline = read_cntvct() + heartbeat_period_ticks;
             heartbeat_enabled = (heartbeat_ntfn != 0);
-            rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
             seL4_SetMR(0, heartbeat_enabled ? 0 : (seL4_Word)-1);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == SYS_CANCEL_PENDING_FOR_PID) {
+            // issuse.txt: root шлёт это ПЕРЕД тем, как окончательно убрать
+            // жертву (kill/watchdog) — если у неё был отложенный sleep,
+            // отбрасываем слот молча (без seL4_Send: TCB жертвы уже не
+            // существует или вот-вот перестанет — отвечать некому и незачем,
+            // иначе именно это и роняет "Attempted to invoke a null cap").
+            seL4_Word target_pid = seL4_GetMR(1);
+            for (int i = 0; i < MAX_PENDING_SLEEPS; i++) {
+                if (pending_sleeps[i].active && pending_sleeps[i].owner_pid == (int)target_pid) {
+                    seL4_CNode_Delete(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT_BASE + i, 8);
+                    pending_sleeps[i].active = false;
+                }
+            }
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 10) { // SYS_CPUFREQ_GET (Фаза 7): заявленная/измеренная/мин/макс частота ARM
+            uint32_t cur_hz = 0, measured_hz = 0;
+            bool ok = g_cpufreq_available && mbox_clock_query(MBOX_TAG_GET_CLOCK_RATE, MBOX_CLOCK_ID_ARM, &cur_hz);
+            // GET_CLOCK_RATE_MEASURED — независимая проверка "правда ли железо
+            // поменялось", а не просто эхо последнего SET_CLOCK_RATE (см.
+            // комментарий у MBOX_TAG_GET_CLOCK_RATE_MEASURED в platform.h).
+            // Необязательная: если не ответит — 0, cpufreq просто не покажет её.
+            if (ok) mbox_clock_query(MBOX_TAG_GET_CLOCK_RATE_MEASURED, MBOX_CLOCK_ID_ARM, &measured_hz);
+            seL4_SetMR(0, ok ? 1 : 0);
+            seL4_SetMR(1, cur_hz);
+            seL4_SetMR(2, g_cpufreq_min_hz);
+            seL4_SetMR(3, g_cpufreq_max_hz);
+            seL4_SetMR(4, measured_hz);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 5));
+        } else if (sys == 11) { // SYS_CPUFREQ_SET (Фаза 7, ручной вызов из shell): MR1: 0=min, 1=max
+            uint32_t target = (seL4_GetMR(1) == 0) ? g_cpufreq_min_hz : g_cpufreq_max_hz;
+            uint32_t actual = 0;
+            bool ok = g_cpufreq_available && mbox_set_clock_rate(MBOX_CLOCK_ID_ARM, target, &actual);
+            if (ok) g_cpufreq_is_low = (seL4_GetMR(1) == 0);
+            seL4_SetMR(0, ok ? 1 : 0);
+            seL4_SetMR(1, actual);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+        } else if (sys == 12) { // SYS_CPUFREQ_GOVERNOR_TICK (Фаза 7): только root, после каждого SYS_BALANCE
+            // Простой двухпороговый гистерезис (min/max, без промежуточных
+            // ступеней — см. ROADMAP.md Фаза 7): переход в low только при
+            // busy < 10%, обратно в high — при busy >= 30%. Полоса 10-30%
+            // — мёртвая зона, не даёт дребезжать туда-сюда на границе.
+            seL4_Word busy_pct = seL4_GetMR(1);
+            if (g_cpufreq_available) {
+                bool want_low = g_cpufreq_is_low ? (busy_pct < 30) : (busy_pct < 10);
+                if (want_low != g_cpufreq_is_low) {
+                    uint32_t target = want_low ? g_cpufreq_min_hz : g_cpufreq_max_hz;
+                    uint32_t actual = 0;
+                    if (mbox_set_clock_rate(MBOX_CLOCK_ID_ARM, target, &actual)) {
+                        g_cpufreq_is_low = want_low;
+                    }
+                }
+            }
+            seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));

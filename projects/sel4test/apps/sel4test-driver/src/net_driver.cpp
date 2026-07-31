@@ -297,6 +297,16 @@ struct NetIfaceState {
     // Переживает ARP-резолв (см. pending_cmd==NET_CMD_NTP) — выставляется ДО
     // него, читается в net_send_ntp_request()/обработчике ответа.
     bool ntp_is_periodic;
+    // issuse.txt: ping уже получил ARP-таймаут (ping_arp_deadline_ms) и
+    // reply-таймаут ещё в Фазе 5, у NTP такой защиты не было вообще ни для
+    // ARP-резолва (pending_cmd==NET_CMD_NTP мог зависнуть навсегда), ни для
+    // самого ntp_outstanding (ответ сервера мог не прийти вообще) — оба
+    // случая намертво блокировали ВСЕ будущие ntp/периодические ресинки
+    // (см. net_check_ntp_resync/ручную NET_CMD_NTP: обе проверяют эти же
+    // флаги как "уже идёт", без разбора, застряли они или реально в работе).
+    // 0 = не ждём (тот же контракт, что у ping_arp_deadline_ms).
+    uint64_t ntp_arp_deadline_ms;
+    uint64_t ntp_reply_deadline_ms;
 
     // --- Однослотовый мейлбокс произвольных входящих UDP-датаграмм (`recv`) ---
     bool udp_rx_ready;
@@ -527,6 +537,16 @@ static void net_ping_reply(NetIface iface) {
 // явного дедлайна pending_cmd==NET_CMD_PING висел бы вечно, и вместе с ним
 // блокирующий seL4_Call шелла (см. ping_arp_deadline_ms/NetIfaceState).
 static const uint64_t PING_ARP_TIMEOUT_MS = 3000;
+
+// Тот же класс бага, что у ping (см. выше), но для NTP: ARP на сервер NTP
+// может не резолвиться, ИЛИ сам UDP-ответ сервера может не прийти вообще —
+// без обоих таймаутов ntp_outstanding/pending_cmd==NET_CMD_NTP зависали бы
+// навсегда, блокируя ВСЕ последующие ручные `ntp` и периодические ресинки
+// до перезагрузки (issuse.txt: "ping/ntp иногда виснут"). Reply-таймаут
+// заметно больше ARP — это реальный round-trip до внешнего сервера, не
+// локальная подсеть.
+static const uint64_t NTP_ARP_TIMEOUT_MS = 3000;
+static const uint64_t NTP_REPLY_TIMEOUT_MS = 5000;
 
 // Стандартный размер полезной нагрузки ICMP echo (как у обычного unix ping) —
 // 8 (заголовок ICMP) + 56 = 64 байта самого ICMP-сообщения, что и печатается
@@ -1558,6 +1578,7 @@ static void net_send_ntp_request(NetIface iface, seL4_CPtr console_ep, seL4_CPtr
 
     net_send_packet(iface, 14 + sizeof(ipv4_header) + sizeof(udp_header) + sizeof(ntp_packet), tx_offset);
     s.ntp_outstanding = true;
+    s.ntp_reply_deadline_ms = sys_get_uptime_ms(timer_ep) + NTP_REPLY_TIMEOUT_MS;
 }
 
 // Ставит в план следующую автоматическую ресинхронизацию через NTP_RESYNC_INTERVAL_MS
@@ -1574,6 +1595,27 @@ static void net_schedule_next_ntp_resync(NetIface iface, seL4_CPtr timer_ep) {
 static void signal_net_driver_ready(seL4_CPtr root_ep) {
     seL4_SetMR(0, SYS_DRIVER_READY);
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
+// Тот же фикс, что net_check_ping_arp_timeout(), но для NTP (issuse.txt) —
+// без него застрявший ARP-резолв ИЛИ никогда не пришедший ответ сервера
+// намертво блокируют net_check_ntp_resync()/ручную команду `ntp` до
+// перезагрузки (обе просто видят "уже занято" и ничего не делают).
+static void net_check_ntp_timeout(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep) {
+    NetIfaceState &s = g_iface[iface];
+    uint64_t now = sys_get_uptime_ms(timer_ep);
+
+    if (s.pending_cmd == NET_CMD_NTP && s.ntp_arp_deadline_ms != 0 && now >= s.ntp_arp_deadline_ms) {
+        s.pending_cmd = NET_CMD_NONE;
+        s.ntp_arp_deadline_ms = 0;
+        if (!s.ntp_is_periodic) sys_puts(console_ep, "[NET] NTP: ARP resolve timed out.\n");
+    }
+
+    if (s.ntp_outstanding && s.ntp_reply_deadline_ms != 0 && now >= s.ntp_reply_deadline_ms) {
+        s.ntp_outstanding = false;
+        s.ntp_reply_deadline_ms = 0;
+        if (!s.ntp_is_periodic) sys_puts(console_ep, "[NET] NTP: no reply from server, timed out.\n");
+    }
 }
 
 // Периодически перезапускает NTP-синхронизацию, не дожидаясь команды `ntp` из shell.
@@ -1595,6 +1637,7 @@ static void net_check_ntp_resync(NetIface iface, seL4_CPtr console_ep, seL4_CPtr
         net_send_ntp_request(iface, console_ep, timer_ep);
     } else {
         s.pending_cmd = NET_CMD_NTP;
+        s.ntp_arp_deadline_ms = sys_get_uptime_ms(timer_ep) + NTP_ARP_TIMEOUT_MS;
         uint8_t arp_target[4];
         arp_target_for(iface, g_ntp_server_ip, arp_target);
         net_send_arp_request(iface, console_ep, arp_target);
@@ -1947,6 +1990,7 @@ static void net_handle_command(seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_Me
             net_send_ntp_request(iface, console_ep, timer_ep);
         } else {
             s.pending_cmd = NET_CMD_NTP;
+            s.ntp_arp_deadline_ms = sys_get_uptime_ms(timer_ep) + NTP_ARP_TIMEOUT_MS;
             uint8_t arp_target[4];
             arp_target_for(iface, g_ntp_server_ip, arp_target);
             net_send_arp_request(iface, console_ep, arp_target);
@@ -2148,6 +2192,7 @@ static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, s
                         s.pending_cmd = NET_CMD_NONE;
                     } else if (s.pending_cmd == NET_CMD_NTP && resolve_dest_mac(iface, g_ntp_server_ip, dummy)) {
                         s.pending_cmd = NET_CMD_NONE;
+                        s.ntp_arp_deadline_ms = 0;
                         net_send_ntp_request(iface, console_ep, timer_ep);
                     }
                 }
@@ -2266,6 +2311,7 @@ static void net_poll(NetIface iface, seL4_CPtr console_ep, seL4_CPtr timer_ep, s
                     uint8_t* data_ptr = (uint8_t*)udp + sizeof(udp_header);
                     volatile int* net_mailbox = (volatile int*)(g_shm_vaddr + net_mailbox_ready_offset(iface));
                     s.ntp_outstanding = false;
+                    s.ntp_reply_deadline_ms = 0;
 
                     if (data_ptr + sizeof(ntp_packet) > buffer_end) {
                         if (!s.ntp_is_periodic) sys_puts(console_ep, "[NET] NTP Error: truncated response, ignored.\n");
@@ -2540,6 +2586,7 @@ int main(int argc, char *argv[]) {
                 net_check_ping_arp_timeout(iface, timer_ep);
                 net_check_ping_send(iface, console_ep, timer_ep);
                 net_check_ntp_resync(iface, console_ep, timer_ep);
+                net_check_ntp_timeout(iface, console_ep, timer_ep);
                 net_publish_iface_ready(iface);
             }
             continue;

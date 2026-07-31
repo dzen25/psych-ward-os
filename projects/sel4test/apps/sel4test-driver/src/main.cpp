@@ -391,6 +391,18 @@ struct ProcessControlBlock {
     // намеренно (при respawn — назад к зашитому дефолту, см. ROADMAP) — это
     // просто отображение текущего факта, не персистентная настройка.
     int core;
+
+    // issuse.txt: watchdog не мог респавнить не-драйверные процессы
+    // (/sbin-утилиты, обычный exec, init.conf-сервисы вроде balancer) — их
+    // ELF не встроен в CPIO-архив образа, грузится с диска, а generic_
+    // recover_process() умел перечитывать с диска только один хардкод —
+    // "/service/wifi.elf" для wifi_driver. path — реальный путь на диске,
+    // ИМЕННО ТОТ, которым процесс был загружен (не путать с name — это
+    // короткое отображаемое имя для ps/поиска по имени, например
+    // "wifi_driver"/"balancer", у /sbin-утилит name уже совпадает с path,
+    // но для wifi_driver/init.conf-сервисов они РАЗНЫЕ, см. spawn-сайты).
+    // Пусто ("") — процесс встроен в CPIO (drivers/shell), respawn как раньше.
+    char path[64];
 };
 
 // --- UNIX PIPES SUBSYSTEM ---
@@ -416,6 +428,11 @@ struct pipe_t {
 
 static ProcessControlBlock pcbs[256];
 static int next_pid = 1;
+
+// Фаза 7 (DVFS), см. SYS_MARK_SHELL_ACTIVITY в common.h — момент (аптайм в мс)
+// последнего введённого в шелле символа команды. 0 = ещё не было ни одной
+// команды (считаем это "недавняя активность", не идём в low сразу на старте).
+static seL4_Word g_last_shell_activity_ms = 0;
 
 static seL4_CPtr alloc_and_track_cap(PsychAllocator &alloc, ProcessControlBlock &pcb) {
     seL4_CPtr cap = alloc.alloc_slot();
@@ -753,7 +770,18 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // см. EXEC_CWD_MSG_SLOT/common.h. Через boot-IPC
                          // msg[], а не через общую VFS SHM — там его затирает
                          // load_elf_from_disk() (см. комментарий у слота).
-                         const char *cwd_payload = nullptr) {
+                         const char *cwd_payload = nullptr,
+                         // issuse.txt (пайпинг для /sbin-команд): -1 = обычный
+                         // stdout на console_ep, как всегда. >=0 — номер
+                         // пайпа (g_pipes[]), созданного шеллом ДО спавна
+                         // (см. SYS_PIPE/case 20) — вместо console_ep в FD 1
+                         // минтится badged-копия ep с PIPE_BASE_BADGE+id, тем
+                         // же способом, каким сам пайп создаётся для любого
+                         // другого писателя. /sbin-утилита пишет через
+                         // обычный sys_write(1, ...) — caps_or_badges[1] уже
+                         // generic, никаких изменений в самих утилитах не
+                         // нужно (см. h/sys_client.h).
+                         int stdout_pipe_id = -1) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -991,8 +1019,23 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // Вместо этого мы используем локальные слоты, в которые мы уже сминтовали
     // нужные capabilities (в данном случае, console_ep).
     child_ipc_ptr->caps_or_badges[0] = local_console_ep; // FD 0 = STDIN
-    child_ipc_ptr->caps_or_badges[1] = local_console_ep; // FD 1 = STDOUT
     child_ipc_ptr->caps_or_badges[2] = local_console_ep; // FD 2 = STDERR
+
+    // issuse.txt (пайпинг для /sbin-команд, левая сторона): если вызывающий
+    // (шелл) уже создал пайп через SYS_PIPE и передал его номер, минтим
+    // FD 1 (STDOUT) на badged-копию ep с тем же PIPE_BASE_BADGE+id, каким
+    // сам пайп и адресуется (см. case 20/case 8 ниже) — точно так же, как
+    // получает свою капу на пайп ЛЮБОЙ другой писатель. sys_write(1, ...) в
+    // /sbin-утилите (h/sys_client.h) уже общий по FD, менять её код не
+    // нужно. -1 (по умолчанию) — обычный console_ep, как было всегда.
+    if (stdout_pipe_id >= 0 && stdout_pipe_id < MAX_PIPES) {
+        constexpr seL4_Word local_stdout_pipe_ep = 22; // свободный слот, см. local_* выше (0-20 заняты)
+        seL4_Word pipe_badge = PIPE_BASE_BADGE + stdout_pipe_id;
+        seL4_CNode_Mint(child_cnode, local_stdout_pipe_ep, 8, root_cnode, ep, seL4_WordBits, seL4_AllRights, pipe_badge);
+        child_ipc_ptr->caps_or_badges[1] = local_stdout_pipe_ep;
+    } else {
+        child_ipc_ptr->caps_or_badges[1] = local_console_ep; // FD 1 = STDOUT
+    }
 
     child_ipc_ptr->msg[BOOT_ROOT_EP] = local_syscall_ep;
 
@@ -1249,6 +1292,25 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     uart_puts("\n[WATCHDOG] Emergency recovery initiated for PID: "); uart_putdec(pid);
     uart_puts(" ("); uart_puts(meta.name); uart_puts(")\n");
 
+    // issuse.txt: если у жертвы был отложенный (deferred-reply) запрос в
+    // timer_driver (SYS_SLEEP_MS) или uart_driver (SYS_READ), просим их
+    // отбросить свой слот ДО того, как реально уберём жертву — иначе когда
+    // дедлайн/ввод наступит, они попробуют ответить по капе на уже не
+    // существующий TCB и уронят "Attempted to invoke a null cap" (не
+    // фатально, но грязно и маскирует реальные проблемы в логе). Не шлём
+    // САМОМУ восстанавливаемому драйверу, если это как раз он и есть — его
+    // TCB уже подвешен/умирает, ответа не будет никогда.
+    if (timer_ep != 0 && meta.is_driver != 2) {
+        seL4_SetMR(0, SYS_CANCEL_PENDING_FOR_PID);
+        seL4_SetMR(1, (seL4_Word)pid);
+        seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    }
+    if (console_ep != 0 && meta.is_driver != 1) {
+        seL4_SetMR(0, SYS_CANCEL_PENDING_FOR_PID);
+        seL4_SetMR(1, (seL4_Word)pid);
+        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    }
+
     for (int i = 1; i < 256; i++) {
         if (pcbs[i].active && pcbs[i].waiting_for == pid) { 
             pcbs[i].waiting_for = 0;
@@ -1299,18 +1361,24 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     if (respawn && (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0)) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
 
-        // Фаза 9.B (см. ROADMAP.md): wifi_driver теперь грузится с диска
-        // (/service/wifi.elf), не из встроенного CPIO-архива — respawn
-        // после краша обязан читать его оттуда же, иначе watchdog не найдёт
-        // "wifi_driver" в архиве (там его больше нет) и респавн провалится.
+        // issuse.txt (было: watchdog не мог респавнить не-драйверные
+        // процессы — /sbin-утилиты, обычный exec, init.conf-сервисы вроде
+        // balancer): их ELF не встроен в CPIO-архив образа, грузится с
+        // диска — respawn обязан читать его ОТТУДА ЖЕ, иначе watchdog не
+        // найдёт файл во встроенном архиве (там его никогда и не было) и
+        // респавн провалится. meta.path — реальный путь, которым процесс
+        // был загружен изначально (см. ProcessControlBlock::path и все
+        // спавн-сайты, где он проставляется); пусто — значит процесс
+        // встроен в CPIO (драйверы uart/timer/blk/net, shell), респавн как
+        // раньше, из архива по имени.
         char *recover_elf_data = nullptr;
         int recover_elf_size = 0;
-        if (meta.is_driver == 5) {
-            recover_elf_size = load_elf_from_disk(blk_ep, "/service/wifi.elf", g_elf_load_buffer);
+        if (meta.path[0] != '\0') {
+            recover_elf_size = load_elf_from_disk(blk_ep, meta.path, g_elf_load_buffer);
             if (recover_elf_size > 0) {
                 recover_elf_data = g_elf_load_buffer;
             } else {
-                uart_puts("[WATCHDOG] /service/wifi.elf не найден на диске — respawn wifi_driver невозможен.\n");
+                uart_puts("[WATCHDOG] "); uart_puts(meta.path); uart_puts(" не найден на диске — respawn невозможен.\n");
                 recover_elf_size = 0;
             }
         }
@@ -1325,6 +1393,11 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
                                     meta.mmc_irq_handler);
 
         if (new_pid > 0) {
+            // path не приходит через spawn_process (и так огромный список
+            // параметров) — переносим вручную, чтобы ВТОРОЙ подряд краш
+            // тоже смог респавниться (см. path выше).
+            strncpy(pcbs[new_pid].path, meta.path, 63);
+            pcbs[new_pid].path[63] = '\0';
             uart_puts("[WATCHDOG] Service restored successfully. New PID: "); uart_putdec(new_pid); uart_puts("\n");
         } else {
             uart_puts("[WATCHDOG] CRITICAL ERROR: Failed to respawn component!\n");
@@ -1466,6 +1539,12 @@ static void start_init_services(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &
                 seL4_TCB_SetAffinity(pcbs[pid].tcb, core);
                 pcbs[pid].core = core;
             }
+            // issuse.txt: запоминаем реальный ПУТЬ (не name — тот короткий,
+            // "balancer", по нему ищут процесс, path — "/service/balancer.elf",
+            // именно ЕГО читает load_elf_from_disk() чуть выше), чтобы
+            // watchdog мог перечитать этот же файл при аварийном респавне.
+            strncpy(pcbs[pid].path, path, 63);
+            pcbs[pid].path[63] = '\0';
             uart_puts("[ROOT] Сервис запущен: "); uart_puts(name); uart_puts(" (pid "); uart_putdec(pid); uart_puts(")\n");
         } else {
             uart_puts("[ROOT] init.conf: не удалось запустить сервис "); uart_puts(name); uart_puts("\n");
@@ -1497,10 +1576,35 @@ int main(int argc, char *argv[]) {
     }
     if (max_size_bits == 0) while (1); // нет RAM – фатально
 
+    // VideoCore mailbox property-буфер (см. mbox_buf_frame ниже) обязан физически
+    // лежать НИЖЕ 1ГиБ (0x40000000) — классическая ARM->VC bus-alias схема
+    // (OR верхних битов адреса, см. platform.h/timer_driver.cpp mbox_call())
+    // адресует только нижний 1ГиБ ARM-физической памяти. normal_untyped выше
+    // выбирается как САМЫЙ БОЛЬШОЙ untyped, а на плате с несколькими ГиБ ОЗУ
+    // (см. лог: регионы [1000..3b400000) и [40000000..fc000000)) самый большой
+    // почти наверняка окажется ВЫШЕ 1ГиБ — тогда любой вариант bus-адреса для
+    // mailbox указывает VideoCore в никуда. Остальным RAM-аллокациям системы
+    // (DMA-буферы GENET/EMMC2, стеки, CNode) это ограничение не касается — те
+    // DMA-движки собственные ARM-периферийные AXI-мастера, а не VideoCore, и
+    // видят всю физическую память как есть.
+    size_t low_idx = 0;
+    uint8_t low_max_size_bits = 0;
+    bool have_low_untyped = false;
+    for (size_t i = 0; i < num_untyped; i++) {
+        if (!info->untypedList[i].isDevice &&
+            info->untypedList[i].paddr < 0x40000000ULL &&
+            info->untypedList[i].sizeBits > low_max_size_bits) {
+            low_max_size_bits = info->untypedList[i].sizeBits;
+            low_idx = i;
+            have_low_untyped = true;
+        }
+    }
+
     PsychAllocator alloc(info);
     seL4_CPtr root_cnode = seL4_CapInitThreadCNode;
     seL4_CPtr root_vspace = seL4_CapInitThreadVSpace;
     seL4_CPtr normal_untyped = alloc.get_untyped_cap(normal_idx);
+    seL4_CPtr low_untyped = have_low_untyped ? alloc.get_untyped_cap(low_idx) : normal_untyped;
 
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
@@ -1605,7 +1709,7 @@ int main(int argc, char *argv[]) {
         // усложнять cache maintenance (см. flush_rootserver_shm() — тот же
         // класс проблемы, но там от него отказаться было нельзя).
         mbox_buf_frame = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, mbox_buf_frame, 1);
+        seL4_Untyped_Retype(low_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, mbox_buf_frame, 1);
         seL4_ARM_Page_GetAddress_t mbox_buf_addr_res = seL4_ARM_Page_GetAddress(mbox_buf_frame);
         mbox_buf_paddr = (seL4_Word)mbox_buf_addr_res.paddr;
     }
@@ -2177,7 +2281,13 @@ int main(int argc, char *argv[]) {
                     if (err == seL4_NoError) {
                         // 3. Формируем ответ (только теперь трогаем MR)
                         seL4_SetMR(0, requested_fd); // Возвращаем реальный FD
-                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        // issuse.txt (пайпинг для /sbin-команд): MR1=pipe_id
+                        // — нужен вызывающему, чтобы передать его дальше в
+                        // SYS_EXEC (см. spawn_process/stdout_pipe_id), когда
+                        // левая часть пайпа — не встроенная команда, а
+                        // отдельный /sbin-процесс.
+                        seL4_SetMR(1, (seL4_Word)pipe_id);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
                     } else {
                         g_pipes[pipe_id].active = false; // Rollback
                         seL4_SetMR(0, -1);
@@ -2566,6 +2676,16 @@ int main(int argc, char *argv[]) {
                     exec_cwd_payload[63] = '\0';
                 }
 
+                // issuse.txt (пайпинг для /sbin-команд): MR17 = pipe_id, если
+                // шелл спавнит эту команду как ЛЕВУЮ часть конвейера (см.
+                // SYS_PIPE/case 20 — вызывающий получает pipe_id оттуда и
+                // передаёт сюда без изменений). -1 (нет MR17) — обычный
+                // exec, stdout на console_ep, как всегда.
+                int exec_stdout_pipe_id = -1;
+                if (seL4_MessageInfo_get_length(recv_info) >= 18) {
+                    exec_stdout_pipe_id = (int)seL4_GetMR(17);
+                }
+
                 uart_puts("[ROOT] Fetching ELF from disk: ");
                 uart_puts(app_name_and_args);
                 uart_puts("...\n");
@@ -2596,7 +2716,17 @@ int main(int argc, char *argv[]) {
                                                 0, // blk_dma_frame2_param
                                                 0, // blk_dma_paddr2_param
                                                 vfs_mutex_ntfn, // только реально используется при exec_is_driver==253, см. spawn_process
-                                                exec_cwd_payload);
+                                                exec_cwd_payload,
+                                                exec_stdout_pipe_id);
+                        // issuse.txt: запоминаем реальный путь на диске, чтобы
+                        // watchdog мог перечитать этот же файл при аварийном
+                        // респавне (см. ProcessControlBlock::path) — тут name
+                        // (app_name_and_args) и path это буквально одна и та
+                        // же строка, в отличие от wifi_driver/init.conf-сервисов.
+                        if (new_pid > 0) {
+                            strncpy(pcbs[new_pid].path, app_name_and_args, 63);
+                            pcbs[new_pid].path[63] = '\0';
+                        }
                     } else {
                         new_pid = -2; // Invalid ELF
                     }
@@ -2795,6 +2925,16 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            // Фаза 7 (DVFS), см. common.h — просто запоминаем момент
+            // последней команды в шелле, ничего больше не считаем здесь
+            // (сравнение с "сейчас" происходит в SYS_BALANCE ниже).
+            case SYS_MARK_SHELL_ACTIVITY: {
+                g_last_shell_activity_ms = seL4_GetMR(1);
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
             // Фаза 6.1 (продолжение, см. ROADMAP.md): `balance` — по команде
             // шелла, но цель переноса выбирает алгоритм. Политика: находим
             // САМОЕ занятое ядро (среди тех, где есть реальные данные и
@@ -2836,6 +2976,24 @@ int main(int argc, char *argv[]) {
                     } else {
                         core_pct[c] = 0;
                     }
+                }
+
+                // Фаза 7 (DVFS) — авто-губернатор ПЕРЕДЕЛАН: seL4_BenchmarkGetThreadUtilisation
+                // считал busy-poll циклы драйверов (blk/wifi/GENET) и heartbeat-будильник
+                // (~100мс) как реальную занятость, поэтому %busy почти никогда не опускался
+                // ниже порога "уйти в low" (см. issuse.txt). Вместо этого — честный признак
+                // простоя: давно ли был новый ввод в шелле (SYS_MARK_SHELL_ACTIVITY,
+                // g_last_shell_activity_ms). Не идеально (долгая ОДНА команда вроде `wifi
+                // scan` может словить low ближе к концу), но не завязан на busy-poll фон.
+                {
+                    seL4_SetMR(0, 4); // SYS_GET_UPTIME — свежее "сейчас" для сравнения
+                    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                    seL4_Word now_ms = seL4_GetMR(0);
+                    constexpr seL4_Word CPUFREQ_IDLE_THRESHOLD_MS = 8000;
+                    bool idle = (now_ms - g_last_shell_activity_ms) >= CPUFREQ_IDLE_THRESHOLD_MS;
+                    seL4_SetMR(0, 12); // SYS_CPUFREQ_GOVERNOR_TICK, см. timer_driver.cpp
+                    seL4_SetMR(1, idle ? 0 : 100); // переиспользуем готовый 10/30% гистерезис как чистый bool
+                    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 }
 
                 int resident_count[4] = {0, 0, 0, 0};
@@ -3285,6 +3443,13 @@ int main(int argc, char *argv[]) {
                                                 5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
                                                 0, 0, wifi_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, net_wifi_rx_badged,
                                                 0, 0, 0, 0, 0, vfs_mutex_ntfn);
+                    // issuse.txt: путь на диске для аварийного респавна (name
+                    // здесь и так "wifi_driver" — короткое имя для поиска
+                    // процесса, см. SYS_STOP_WIFI ниже, path — отдельно).
+                    if (new_pid > 0) {
+                        strncpy(pcbs[new_pid].path, "/service/wifi.elf", 63);
+                        pcbs[new_pid].path[63] = '\0';
+                    }
                     seL4_SetMR(0, new_pid > 0 ? 0 : (seL4_Word)-1);
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));

@@ -277,5 +277,28 @@ constexpr seL4_Word SYS_BENCHMARK_FINALIZE_LOCAL = 140;
 // rootserver_shm_base, тем же путём, что SYS_TOP_STATS/SYS_PS.
 constexpr seL4_Word SYS_BALANCE = 141;
 
+// issuse.txt: убитый/восстанавливаемый watchdog'ом процесс мог оставить
+// ОТЛОЖЕННЫЙ reply-cap в другом драйвере (uart_driver — SYS_READ ждёт
+// ввода, timer_driver — SYS_SLEEP_MS ждёт дедлайна) — когда тот реально
+// срабатывает, драйвер пытается ответить по капе, указывающей на уже
+// не существующий TCB, и ловит "Attempted to invoke a null cap" (безвредный
+// debug-принт ядра, но грязный и маскирующий реальные проблемы). root шлёт
+// эту команду в generic_recover_process() ДО того, как убирает саму жертву
+// — MR1=pid жертвы; драйвер молча отбрасывает свой отложенный слот (без
+// seL4_Send — отвечать уже некому), если он принадлежал именно этому pid.
+// Отправляется КАЖДОМУ драйверу, у которого есть такой механизм (сейчас:
+// uart_driver, timer_driver) — если слот жертве не принадлежал, драйвер
+// просто отвечает 0 и ничего не делает. Ответ: MR0=0 всегда.
+constexpr seL4_Word SYS_CANCEL_PENDING_FOR_PID = 142;
+
+// Фаза 7 (DVFS) — shell шлёт это ПРИ КАЖДОЙ новой введённой команде (MR1 =
+// текущий аптайм в мс, см. sys_get_uptime()); root просто запоминает момент
+// последней активности (g_last_shell_activity_ms) и использует его в
+// SYS_BALANCE, чтобы понять "система реально простаивает" НЕ через
+// seL4_BenchmarkGetThreadUtilisation (который считает busy-poll драйверов
+// как занятость, см. issuse.txt) — а через честный признак "давно не было
+// нового пользовательского ввода". Ответ: MR0=0 всегда.
+constexpr seL4_Word SYS_MARK_SHELL_ACTIVITY = 143;
+
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

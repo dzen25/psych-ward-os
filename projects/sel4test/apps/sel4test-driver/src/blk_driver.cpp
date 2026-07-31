@@ -120,11 +120,11 @@ static void sys_puts(seL4_CPtr console_ep, const char *str) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     int total_len = my_strlen(str);
     int offset = 0;
-    
+
     while (offset < total_len) {
         int chunk = total_len - offset;
         if (chunk > 100) chunk = 100;
-        
+
         ipc->msg[0] = 8; // SYS_PUTS ID
         for (int i = 0; i < chunk; i++) {
             ipc->msg[i + 1] = str[offset + i];
@@ -792,7 +792,8 @@ int main(int argc, char *argv[]) {
         else if (cmd == 112) { // SYS_TOUCH
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем имя файла со стека
-            if (exfat_create_file(&g_file_system, path)) seL4_SetMR(0, 0);
+            bool existed = false;
+            if (exfat_create_file(&g_file_system, path, &existed)) seL4_SetMR(0, existed ? 1 : 0); // 1 = уже существовал, ничего не создали
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -849,8 +850,9 @@ int main(int argc, char *argv[]) {
         else if (cmd == 117) { // SYS_MKDIR
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
-            if (exfat_mkdir(&g_file_system, path)) seL4_SetMR(0, 0);
-            else seL4_SetMR(0, -1);
+            bool existed = false;
+            if (exfat_mkdir(&g_file_system, path, &existed)) seL4_SetMR(0, 0);
+            else seL4_SetMR(0, existed ? 1 : -1); // 1 = уже существовал
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         

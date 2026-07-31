@@ -373,6 +373,14 @@ static void exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, cha
         int clen = 0;
         while (*p && *p != '/' && clen < 63) comp[clen++] = *p++;
         comp[clen] = '\0';
+        // Обрезаем пробелы В КОНЦЕ компонента (issuse.txt п.1): под FAT32/8.3
+        // конечный пробел в имени незаметно проглатывался space-padding'ом
+        // короткого имени, под exFAT "foo.txt"/"foo.txt " — разные имена.
+        // Уже исправлено в shell.cpp (там обрезается общий arg), но здесь —
+        // тот же фикс на уровне ФС, единая точка для ЛЮБОГО клиента
+        // blk_driver (не только шелла) и всех операций (create/write/mkdir/
+        // delete/rename/cd) разом, раз все они идут через resolve_parent.
+        while (clen > 0 && comp[clen - 1] == ' ') comp[--clen] = '\0';
         if (clen == 0) continue;
         if (my_strcmp(comp, ".") == 0) continue;
         if (my_strcmp(comp, "..") == 0) { if (depth > 0) depth--; continue; }
@@ -973,7 +981,8 @@ static bool exfat_mark_entry_deleted(DirCursor entry_cursor, int secondary_count
 // ============================================================================
 // === ЭТАП B: ПУБЛИЧНЫЙ API ЗАПИСИ ===
 // ============================================================================
-bool exfat_create_file(EXFAT_Instance* fs, const char* path) {
+bool exfat_create_file(EXFAT_Instance* fs, const char* path, bool* out_existed) {
+    if (out_existed) *out_existed = false;
     char basename[64];
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -982,7 +991,10 @@ bool exfat_create_file(EXFAT_Instance* fs, const char* path) {
     resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
 
     ExfatSlot existing;
-    if (exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &existing) && existing.found) return true; // уже существует
+    if (exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &existing) && existing.found) {
+        if (out_existed) *out_existed = true;
+        return true; // уже существует
+    }
 
     return exfat_write_entry_set(fs, parent_clus, parent_no_chain, parent_len, basename, 0x20 /* ARCHIVE */, 0, 0, true);
 }
@@ -1030,7 +1042,8 @@ bool exfat_write_file(EXFAT_Instance* fs, const char* path, const char* text, ui
     return true;
 }
 
-bool exfat_mkdir(EXFAT_Instance* fs, const char* path) {
+bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed) {
+    if (out_existed) *out_existed = false;
     char basename[64];
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -1039,7 +1052,10 @@ bool exfat_mkdir(EXFAT_Instance* fs, const char* path) {
     resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
 
     ExfatSlot existing;
-    if (exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &existing) && existing.found) return false; // уже существует
+    if (exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &existing) && existing.found) {
+        if (out_existed) *out_existed = true;
+        return false; // уже существует
+    }
 
     uint32_t new_clus = bitmap_alloc_run(fs, 1);
     if (new_clus == 0) return false;

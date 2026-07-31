@@ -500,6 +500,15 @@ static seL4_Word sys_get_uptime(seL4_CPtr timer_ep) {
     return seL4_GetMR(0);
 }
 
+// Фаза 7 (DVFS) — сообщает root "только что была введена команда", см.
+// SYS_MARK_SHELL_ACTIVITY в common.h. Вызывается один раз на каждую
+// непустую строку, независимо от того, builtin это или /sbin exec.
+static void sys_mark_activity(seL4_CPtr root_ep, seL4_CPtr timer_ep) {
+    seL4_SetMR(0, SYS_MARK_SHELL_ACTIVITY);
+    seL4_SetMR(1, sys_get_uptime(timer_ep));
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+}
+
 // Температура кристалла (миллиградусы Цельсия), см. SYS_GET_TEMP в
 // timer_driver.cpp. Возвращает false, пока AVS-датчик еще не выдал
 // валидное показание (единичные мс сразу после старта).
@@ -519,6 +528,27 @@ static int sys_mbox_probe(seL4_CPtr timer_ep) {
     seL4_SetMR(0, 7); // 7 = SYS_MBOX_PROBE
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
     return (int)(seL4_Word)seL4_GetMR(0);
+}
+
+// Фаза 7 (DVFS) — текущая/мин/макс частота ARM-ядер, см. SYS_CPUFREQ_GET
+// в timer_driver.cpp. Возвращает false, если mailbox недоступен вообще
+// (другая плата/прошивка — фича молчит, не падает).
+static bool sys_cpufreq_get(seL4_CPtr timer_ep, seL4_Word *cur_hz, seL4_Word *min_hz, seL4_Word *max_hz, seL4_Word *measured_hz) {
+    seL4_SetMR(0, 10); // 10 = SYS_CPUFREQ_GET
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word ok = seL4_GetMR(0);
+    *cur_hz = seL4_GetMR(1); *min_hz = seL4_GetMR(2); *max_hz = seL4_GetMR(3); *measured_hz = seL4_GetMR(4);
+    return ok != 0;
+}
+
+// want_min: true = принудительно частота-минимум, false = максимум (турбо).
+static bool sys_cpufreq_set(seL4_CPtr timer_ep, bool want_min, seL4_Word *actual_hz) {
+    seL4_SetMR(0, 11); // 11 = SYS_CPUFREQ_SET
+    seL4_SetMR(1, want_min ? 0 : 1);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    seL4_Word ok = seL4_GetMR(0);
+    *actual_hz = seL4_GetMR(1);
+    return ok != 0;
 }
 
 // Разбивает число дней с 1970-01-01 на (год, месяц, день) в пролептическом
@@ -640,10 +670,26 @@ static void wifi_print_not_ready(seL4_CPtr console_ep, int status) {
 // первом случае — во втором никакой статистики в SHM ещё не записано).
 static bool wait_for_net_mailbox(seL4_CPtr console_ep, seL4_CPtr timer_ep, int timeout_ms, seL4_Word iface) {
     volatile int* net_mailbox = (volatile int*)(shm_base + net_mailbox_ready_offset(iface));
+    // ИСПРАВЛЕНО (issuse.txt — ложные "timed out"/emergency recovery живого
+    // net_driver): раньше elapsed считался как число ВЫЗОВОВ sys_sleep(100)
+    // умножить на 100, в предположении, что каждый вызов реально проспал
+    // 100мс. Но timer_driver.cpp держит только ОДИН отложенный sleep
+    // одновременно (один аппаратный компаратор на процесс) и мгновенно
+    // отвечает -1 любому SYS_SLEEP_MS, пока слот занят (см. timer_driver.cpp
+    // sys==8) — а sys_sleep() в шелле этот код возврата вообще не проверяет.
+    // Если слот в это время занят (конкурентный сон откуда-то ещё), весь
+    // цикл пролетал заявленный таймаут почти мгновенно, реально не прождав
+    // ни секунды — живой лог поймал именно это: "timed out (10s)" появлялось
+    // тут же, вперемешку с print'ами net_driver, который в этот момент
+    // только начинал работу. SYS_GET_UPTIME — отдельный, всегда немедленно
+    // отвечающий запрос (не участвует в том же отложенном sleep-механизме),
+    // им и меряем реальное время; sys_sleep(100) остаётся только способом не
+    // жечь CPU в busy-loop, а не источником истины о прошедшем времени.
+    uint64_t start_ms = sys_get_uptime(timer_ep);
     int elapsed = 0;
     while (net_mailbox[0] == 1 && elapsed < timeout_ms) {
         sys_sleep(timer_ep, 100);
-        elapsed += 100;
+        elapsed = (int)(sys_get_uptime(timer_ep) - start_ms);
     }
     if (net_mailbox[0] == 1) {
         sys_puts(console_ep, "\n[SHELL] Error: Network operation timed out (");
@@ -702,7 +748,7 @@ static char arg_buffer[512];
 
 // История команд — только в оперативной памяти (кольцевой буфер), сбрасывается
 // при перезапуске shell. Размер строки (64) совпадает с буфером cmd[] в main().
-#define CMD_HISTORY_SIZE 16
+#define CMD_HISTORY_SIZE 400
 static char cmd_history[CMD_HISTORY_SIZE][64];
 static int cmd_history_count = 0;
 static int cmd_history_head = 0; // индекс слота для следующей записи
@@ -1086,10 +1132,21 @@ int main(int argc, char *argv[]) {
                     }
                     const char *new_line = (hist_nav == 0) ? saved_line : history_get(hist_nav);
 
-                    // Стираем текущую строку на терминале (курсор к началу, затем до конца строки)
-                    // и печатаем выбранную из истории команду взамен.
-                    if (cur > 0) { sys_puts(console_ep, "\x1b["); sys_putdec((seL4_Word)cur); sys_puts(console_ep, "D"); }
-                    sys_puts(console_ep, "\x1b[K");
+                    // ИСПРАВЛЕНО (визуальный баг — "хвост" длинной команды
+                    // оставался мусором на экране): старый редрав двигал курсор
+                    // назад на `cur` колонок ("\x1b[curD") и стирал только ДО
+                    // КОНЦА ТЕКУЩЕЙ СТРОКИ ("\x1b[K") — оба предположения ломались,
+                    // если предыдущая (более длинная) команда физически
+                    // переносилась терминалом на следующую строку: курсор мог не
+                    // "перепрыгнуть" через границу переноса при движении по
+                    // колонкам, а "\x1b[K" не трогает уже перенесённую строку
+                    // ниже вообще. \r возвращает курсор в начало ТЕКУЩЕЙ строки
+                    // терминала независимо от cur, "\x1b[J" стирает от курсора до
+                    // конца ЭКРАНА (а не одной строки) — чистит перенос любой
+                    // длины разом. Промпт перепечатывается заново, раз мы вернулись
+                    // в колонку 0 (до его начала тоже).
+                    sys_puts(console_ep, "\r\x1b[J");
+                    sys_puts(console_ep, prompt);
 
                     i = my_strlcpy(cmd, new_line, (int)sizeof(cmd));
                     cur = i;
@@ -1131,6 +1188,7 @@ int main(int argc, char *argv[]) {
 
         if (i > 0) {
             history_push(cmd);
+            sys_mark_activity(root_ep, timer_ep); // Фаза 7 (DVFS), см. common.h
 
             // НОВОЕ: Пропускаем пробелы в начале команды
             char *cmd_ptr = cmd;
@@ -1142,6 +1200,7 @@ int main(int argc, char *argv[]) {
 
             int pipe_fd = -1;
             seL4_CPtr pipe_cap = 0;
+            int pipe_id = -1; // issuse.txt: нужен для SYS_EXEC, если левая часть — /sbin-команда
 
             char *pipe_sym = cmd_ptr;
             while (*pipe_sym && *pipe_sym != '|') pipe_sym++;
@@ -1166,6 +1225,7 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(1, PIPE_FD_SLOT); // Просим ядро заминтить capability в наш слот пайпа
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
                 pipe_fd = seL4_GetMR(0);
+                pipe_id = (int)seL4_GetMR(1);
 
                 // Защита от кривых ответов ядра и исчерпания IPC-буфера
                 if (pipe_fd < 0 || pipe_fd >= 32) {
@@ -1186,6 +1246,21 @@ int main(int argc, char *argv[]) {
             }
             char *arg = cmd_ptr; while (*arg && *arg != ' ') arg++;
             if (*arg == ' ') { *arg = '\0'; arg++; while (*arg == ' ') arg++; } else { arg = nullptr; }
+
+            // Убираем пробелы В КОНЦЕ arg (issuse.txt п.1): случайный конечный
+            // пробел в имени файла (опечатка/автодополнение в терминале) под
+            // FAT32/8.3 незаметно проглатывался space-padding'ом короткого
+            // имени — под exFAT "foo.txt" и "foo.txt " это ДВА РАЗНЫХ файла,
+            // и второй ("foo.txt ") после этого никогда не находится ни
+            // одной командой, набранной без пробела на конце (баг воспроизведён
+            // и диагностирован на живом железе через временное логирование в
+            // exfat_write_file). Режем здесь один раз — до этой точки arg ещё
+            // не разошёлся по конкретным командам (echo/touch/rm/mkdir/mv/cat).
+            if (arg) {
+                int alen = (int)my_strlen(arg);
+                while (alen > 0 && arg[alen - 1] == ' ') { arg[--alen] = '\0'; }
+                if (alen == 0) arg = nullptr;
+            }
 
             char *shm = shm_base; // Адрес разделяемой памяти (Shared Memory)
 
@@ -1231,6 +1306,48 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "mboxprobe: mailbox не ответил ни на один вариант — см. ROADMAP.md 4.6\n");
                 } else {
                     sys_puts(console_ep, "mboxprobe: mailbox ЖИВ (сработавший вариант напечатан выше)\n");
+                }
+            }
+
+            else if (my_strcmp(cmd_ptr, "cpufreq") == 0) {
+                // Фаза 7 (DVFS): без аргумента — показать текущую/мин/макс
+                // частоту ARM-ядер; "cpufreq set min|max" — ручное принудительное
+                // переключение (тот же механизм, что и авто-губернатор в
+                // SYS_BALANCE, см. main.cpp/timer_driver.cpp SYS_CPUFREQ_*).
+                static const char *CPUFREQ_USAGE = "Usage: cpufreq [set min|max]\n";
+                seL4_Word cur_hz = 0, min_hz = 0, max_hz = 0, measured_hz = 0;
+                bool avail = sys_cpufreq_get(timer_ep, &cur_hz, &min_hz, &max_hz, &measured_hz);
+                if (!arg) {
+                    if (!avail) {
+                        sys_puts(console_ep, "cpufreq: VideoCore mailbox недоступен — см. ROADMAP.md Фаза 7\n");
+                    } else {
+                        sys_puts(console_ep, "ARM clock: заявлено "); sys_putdec(cur_hz / 1000000);
+                        sys_puts(console_ep, " MHz, измерено "); sys_putdec(measured_hz / 1000000);
+                        sys_puts(console_ep, " MHz (диапазон "); sys_putdec(min_hz / 1000000);
+                        sys_puts(console_ep, "-"); sys_putdec(max_hz / 1000000);
+                        sys_puts(console_ep, " MHz)\n");
+                    }
+                    continue;
+                }
+                char *cursor = arg;
+                char *subcmd = next_token(&cursor);
+                char *target = subcmd ? next_token(&cursor) : nullptr;
+                bool valid_target = target && (my_strcmp(target, "min") == 0 || my_strcmp(target, "max") == 0);
+                if (!subcmd || my_strcmp(subcmd, "set") != 0 || !valid_target) {
+                    sys_puts(console_ep, CPUFREQ_USAGE);
+                } else if (!avail) {
+                    sys_puts(console_ep, "cpufreq: VideoCore mailbox недоступен\n");
+                } else {
+                    seL4_Word actual = 0;
+                    bool ok = sys_cpufreq_set(timer_ep, my_strcmp(target, "min") == 0, &actual);
+                    if (ok) {
+                        seL4_Word c2=0,mn2=0,mx2=0,measured2=0;
+                        sys_cpufreq_get(timer_ep, &c2, &mn2, &mx2, &measured2);
+                        sys_puts(console_ep, "cpufreq: заявлено "); sys_putdec(actual / 1000000);
+                        sys_puts(console_ep, " MHz, измерено "); sys_putdec(measured2 / 1000000); sys_puts(console_ep, " MHz\n");
+                    } else {
+                        sys_puts(console_ep, "cpufreq: не удалось установить частоту\n");
+                    }
                 }
             }
 
@@ -1435,8 +1552,17 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "Requesting NTP time sync...\n");
                 net_send_text_command(net_ep, NET_CMD_NTP, 0, 0, nullptr, iface);
 
-                // ARP (если еще не разрешен) + запрос-ответ через интернет — щедрый запас.
-                wait_for_net_mailbox(console_ep, timer_ep, 5000, iface);
+                // ARP (если еще не разрешен) + запрос-ответ через интернет.
+                // ИСПРАВЛЕНО (issuse.txt — "ping/ntp иногда виснут и роняют
+                // net_driver"): 5с оказалось МАЛО на реальном Wi-Fi — в
+                // живом логе ARP на шлюз сам по себе занял почти всё это
+                // время, реальный ответ от NTP-сервера пришёл уже ПОСЛЕ
+                // того, как этот таймаут сработал и убил здоровый net_driver
+                // (emergency-recovery в wait_for_net_mailbox). Это была не
+                // авария net_driver, а слишком тесный бюджет времени у шелла.
+                // 10с — тот же порядок, что уже используется для DNS-резолва
+                // выше (тоже ARP + реальный интернет round-trip).
+                wait_for_net_mailbox(console_ep, timer_ep, 10000, iface);
             }
 
             else if (my_strcmp(cmd_ptr, "wifiprobe") == 0) {
@@ -1746,6 +1872,20 @@ int main(int argc, char *argv[]) {
                 sys_puts(console_ep, "\n");
             }
 
+            else if (my_strcmp(cmd_ptr, "history") == 0) {
+                // От старой к новой (как обычный shell history) — history_get(n)
+                // отдаёт "n команд назад от последней", n=cmd_history_count —
+                // самая старая ещё хранимая запись, n=1 — только что выполненная.
+                for (int n = cmd_history_count; n >= 1; n--) {
+                    const char *line = history_get(n);
+                    if (!line) continue;
+                    sys_putdec((seL4_Word)(cmd_history_count - n + 1));
+                    sys_puts(console_ep, "  ");
+                    sys_puts(console_ep, line);
+                    sys_puts(console_ep, "\n");
+                }
+            }
+
             else if (my_strcmp(cmd_ptr, "cd") == 0) {
                 char* path = arg;
                 if (!path || path[0] == '\0') {
@@ -1939,7 +2079,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);
@@ -2021,51 +2161,57 @@ int main(int argc, char *argv[]) {
             else {
                 // Фаза A (см. ROADMAP.md): не встроенная команда шелла —
                 // пробуем /sbin/<cmd>.elf (ps/kill/taskset/top/balance/ls/
-                // cat/touch/rm/mv/mkdir, см. src/sbin/). Пайпинг для таких
-                // команд пока не поддержан (exec'нутые процессы не пишут в
-                // pipe_fd — см. ROADMAP, принятое ограничение) — явно
-                // закрываем пайп, чтобы правая часть конвейера не зависла в
-                // ожидании данных, вместо попытки эмулировать вывод.
-                if (is_piping) {
-                    sys_pipe_wr_close(pipe_fd);
-                } else {
-                    char sbin_path[64] = {0};
-                    int plen = my_strlcpy(sbin_path, "/sbin/", sizeof(sbin_path));
-                    plen += my_strlcpy(sbin_path + plen, cmd_ptr, sizeof(sbin_path) - plen);
-                    my_strlcpy(sbin_path + plen, ".elf", sizeof(sbin_path) - plen);
+                // cat/touch/rm/mv/mkdir, см. src/sbin/). issuse.txt: пайпинг
+                // для ЛЕВОЙ части теперь поддержан — если is_piping, шлём
+                // root'у ещё и pipe_id (MR17), тот минтит FD1 (stdout) этого
+                // процесса прямо на пайп (см. spawn_process/stdout_pipe_id в
+                // main.cpp) — sys_write(1,...) внутри /sbin-утилиты (см.
+                // h/sys_client.h) уже общий по FD, менять её код не нужно.
+                char sbin_path[64] = {0};
+                int plen = my_strlcpy(sbin_path, "/sbin/", sizeof(sbin_path));
+                plen += my_strlcpy(sbin_path + plen, cmd_ptr, sizeof(sbin_path) - plen);
+                my_strlcpy(sbin_path + plen, ".elf", sizeof(sbin_path) - plen);
 
-                    char exec_payload[64] = {0};
-                    int elen = my_strlcpy(exec_payload, sbin_path, sizeof(exec_payload));
-                    if (arg && elen + 1 < (int)sizeof(exec_payload)) {
-                        exec_payload[elen] = ' ';
-                        my_strlcpy(exec_payload + elen + 1, arg, sizeof(exec_payload) - elen - 1);
-                    }
-
-                    // Передаём текущий cwd через MR9-16 (см. EXEC_CWD_MSG_SLOT
-                    // в common.h) — /sbin-утилиты резолвят относительные
-                    // пути сами (см. h/sys_client.h/build_absolute_path), как
-                    // раньше делал сам шелл для ls/cat/touch/rm/mv. НЕ через
-                    // общую VFS SHM — найдено на живом железе, что
-                    // load_elf_from_disk() (main.cpp) читает файл через ту же
-                    // физическую страницу и затирает записанный туда cwd
-                    // ДО того, как ребёнок успевает его прочитать.
-                    char cwd_payload[64] = {0};
-                    my_strlcpy(cwd_payload, current_working_dir, sizeof(cwd_payload));
-
-                    seL4_SetMR(0, 100); // SYS_EXEC
-                    uint64_t* name_ptr = (uint64_t*)exec_payload;
-                    for (int i = 0; i < 8; i++) seL4_SetMR(i + 1, name_ptr[i]);
-                    uint64_t* cwd_ptr = (uint64_t*)cwd_payload;
-                    for (int i = 0; i < 8; i++) seL4_SetMR(i + 9, cwd_ptr[i]);
-                    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 17));
-
-                    int pid = (int)seL4_GetMR(0);
-                    if (pid > 0) {
-                        sys_wait(root_ep, pid);
-                    } else {
-                        sys_puts(console_ep, "Unknown command. Type 'help'.\n");
-                    }
+                char exec_payload[64] = {0};
+                int elen = my_strlcpy(exec_payload, sbin_path, sizeof(exec_payload));
+                if (arg && elen + 1 < (int)sizeof(exec_payload)) {
+                    exec_payload[elen] = ' ';
+                    my_strlcpy(exec_payload + elen + 1, arg, sizeof(exec_payload) - elen - 1);
                 }
+
+                // Передаём текущий cwd через MR9-16 (см. EXEC_CWD_MSG_SLOT
+                // в common.h) — /sbin-утилиты резолвят относительные
+                // пути сами (см. h/sys_client.h/build_absolute_path), как
+                // раньше делал сам шелл для ls/cat/touch/rm/mv. НЕ через
+                // общую VFS SHM — найдено на живом железе, что
+                // load_elf_from_disk() (main.cpp) читает файл через ту же
+                // физическую страницу и затирает записанный туда cwd
+                // ДО того, как ребёнок успевает его прочитать.
+                char cwd_payload[64] = {0};
+                my_strlcpy(cwd_payload, current_working_dir, sizeof(cwd_payload));
+
+                seL4_SetMR(0, 100); // SYS_EXEC
+                uint64_t* name_ptr = (uint64_t*)exec_payload;
+                for (int i = 0; i < 8; i++) seL4_SetMR(i + 1, name_ptr[i]);
+                uint64_t* cwd_ptr = (uint64_t*)cwd_payload;
+                for (int i = 0; i < 8; i++) seL4_SetMR(i + 9, cwd_ptr[i]);
+                int exec_msg_len = 17;
+                if (is_piping) {
+                    seL4_SetMR(17, (seL4_Word)pipe_id);
+                    exec_msg_len = 18;
+                }
+                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, exec_msg_len));
+
+                int pid = (int)seL4_GetMR(0);
+                if (pid > 0) {
+                    sys_wait(root_ep, pid);
+                } else {
+                    sys_puts(console_ep, "Unknown command. Type 'help'.\n");
+                }
+                // Спавн не удался ИЛИ команда уже отработала — в обоих
+                // случаях сигналим EOF правой части (grep), иначе она
+                // зависнет в ожидании данных навсегда (см. sys_pipe_wr_close).
+                if (is_piping) sys_pipe_wr_close(pipe_fd);
             }
 
             // --- ПРАВАЯ ЧАСТЬ КОНВЕЙЕРА ---

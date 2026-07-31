@@ -34,7 +34,11 @@ int main(int argc, char *argv[]) {
         int ret = seL4_GetMR(0);
         vfs_unlock();
 
-        if (ret != 0) {
+        if (ret == 1) {
+            sys_puts(0, "mkdir: '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "' уже существует — ничего не делаю\n");
+        } else if (ret != 0) {
             sys_puts(0, "mkdir: cannot create directory '");
             sys_puts(0, start_of_arg);
             sys_puts(0, "'\n");

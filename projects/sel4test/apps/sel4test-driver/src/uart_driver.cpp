@@ -170,6 +170,11 @@ int main(int argc, char *argv[]) {
     // и до этой правки).
     constexpr seL4_Word UART_PENDING_REPLY_SLOT = 12;
     bool pending_reader = false;
+    // issuse.txt: PID владельца отложенного SYS_READ — нужен для
+    // SYS_CANCEL_PENDING_FOR_PID (см. common.h), иначе убитый/восстановленный
+    // watchdog'ом читатель оставляет здесь reply-cap на несуществующий TCB,
+    // и следующая же клавиша роняет "Attempted to invoke a null cap".
+    seL4_Word pending_reader_pid = 0;
 
     while(1) {
         seL4_Word badge = 0;
@@ -223,8 +228,11 @@ int main(int argc, char *argv[]) {
             // получал в ответ пустое сообщение, ResetLog/FinalizeLog у
             // uart_driver ни разу реально не вызывались. Эти две команды не
             // трогают никакое pid-индексированное состояние — обходить
-            // проверку для них безопасно.
-            if (sys != SYS_BENCHMARK_RESET_LOCAL && sys != SYS_BENCHMARK_FINALIZE_LOCAL) {
+            // проверку для них безопасно. SYS_CANCEL_PENDING_FOR_PID — та же
+            // история (тоже шлёт root через неминченную копию, см.
+            // generic_recover_process()/common.h) — целевой PID передаётся
+            // явно в MR1, а не через badge.
+            if (sys != SYS_BENCHMARK_RESET_LOCAL && sys != SYS_BENCHMARK_FINALIZE_LOCAL && sys != SYS_CANCEL_PENDING_FOR_PID) {
                 if (sender_pid <= 0 || sender_pid >= MAX_CLIENTS) {
                     // Невалидный PID, игнорируем
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
@@ -282,6 +290,7 @@ int main(int argc, char *argv[]) {
                     // про UART_PENDING_REPLY_SLOT выше по функции).
                     seL4_CNode_SaveCaller(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8); // depth=8, см. комментарий у seL4_CNode_Delete ниже
                     pending_reader = true;
+                    pending_reader_pid = sender_pid;
                 } else {
                     // Уже есть отложенный читатель (см. комментарий выше про
                     // единственность) — не зависаем, отвечаем сразу "нет данных".
@@ -300,6 +309,19 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(0, idle_local);
                 seL4_SetMR(1, total_local);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            } else if (sys == SYS_CANCEL_PENDING_FOR_PID) {
+                // issuse.txt: root шлёт это ПЕРЕД тем, как окончательно
+                // убрать жертву (kill/watchdog) — если это она сейчас
+                // отложенный читатель, отбрасываем слот молча (без
+                // seL4_Send — TCB жертвы уже не существует или вот-вот
+                // перестанет, отвечать некому).
+                seL4_Word target_pid = seL4_GetMR(1);
+                if (pending_reader && pending_reader_pid == target_pid) {
+                    seL4_CNode_Delete(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8);
+                    pending_reader = false;
+                }
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             } else {
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             }

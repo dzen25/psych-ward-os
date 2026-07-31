@@ -133,3 +133,49 @@ mkimage -A arm64 -O linux -T script -C none -d boot.cmd boot.scr
 `boot.scr` в корне SD-карты — U-Boot подхватывает его автоматически.
 
 </details>
+
+---
+
+<details>
+<summary><b>💾 Подготовка SD-карты (2 партиции: FAT32 + exFAT, Фаза 10)</b></summary>
+
+С Фазы 10 (см. [ROADMAP.md](ROADMAP.md)) карта размечена ДВУМЯ MBR-партициями — прошивка RPi4/U-Boot читают только FAT32, `blk_driver` монтирует только exFAT:
+
+- Партиция 1 (`BOOT`, FAT32) — `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`, `config.txt`, `u-boot.bin`, `boot.scr`, `overlays/`.
+- Партиция 2 (`RPI`, exFAT) — `bin/`, `sbin/`, `etc/`, `conf/`, `service/`, `root/`.
+
+Обе готовые структуры лежат в [`load_chain/`](load_chain) этого репозитория.
+
+### Разметка (macOS)
+
+```bash
+diskutil list                     # найти диск карты (например /dev/disk4) — НЕ системный
+sudo diskutil partitionDisk /dev/diskN MBR FAT32 BOOT 128MiB ExFAT RPI R
+```
+
+### Разметка (Linux)
+
+```bash
+lsblk                             # найти диск карты, НЕ системный
+sudo umount /dev/sdX*
+sudo parted /dev/sdX --script \
+    mklabel msdos \
+    mkpart primary fat32 1MiB 129MiB \
+    mkpart primary 129MiB 100%
+sudo mkfs.vfat -F 32 -n BOOT /dev/sdX1
+sudo mkfs.exfat -n RPI /dev/sdX2   # нужен exfatprogs (apt install exfatprogs)
+```
+
+### Копирование файлов
+
+Вручную (Finder/`cp -R`) — на `BOOT` содержимое первого списка выше, на `RPI` — второго.
+
+Либо скриптом `projects/sel4test/apps/sel4test-driver/src/rt/flash.sh` (rsync с хоста сборки на смонтированные тома, запускается на машине с картой — `-h` за полным списком флагов):
+
+```bash
+./flash.sh -b       # только BOOT (обновился образ ядра/загрузочные файлы)
+./flash.sh -r       # только RPI (обновились bin/sbin/etc/conf/service/root)
+./flash.sh -br      # обе партиции сразу
+```
+
+</details>

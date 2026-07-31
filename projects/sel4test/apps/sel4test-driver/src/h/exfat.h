@@ -52,9 +52,11 @@ bool exfat_format_dir_listing(EXFAT_Instance* fs, uint32_t dir_cluster, char* ou
 bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read);
 bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer);
 
-bool exfat_create_file(EXFAT_Instance* fs, const char* path);
+// out_existed (может быть nullptr) — при true уже существовал, ничего не
+// создавалось (в отличие от возврата false = реальная ошибка).
+bool exfat_create_file(EXFAT_Instance* fs, const char* path, bool* out_existed = nullptr);
 bool exfat_write_file(EXFAT_Instance* fs, const char* path, const char* text, uint32_t len);
-bool exfat_mkdir(EXFAT_Instance* fs, const char* path);
+bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed = nullptr);
 bool exfat_cd(EXFAT_Instance* fs, const char* path);
 bool exfat_delete_file(EXFAT_Instance* fs, const char* path);
 bool exfat_rename_file(EXFAT_Instance* fs, const char* old_path, const char* new_path);
