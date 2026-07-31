@@ -5,17 +5,6 @@ static void my_memcpy(void *dest, const void *src, int n);
 static void format_fat32_name(const char* input, char* output);
 
 // Вспомогательные функции (замена libc)
-// Вспомогательная функция для сравнения строк без учета регистра (case-insensitive)
-static int my_strcasecmp(const char *s1, const char *s2) {
-    while (*s1 && *s2) {
-        char c1 = (*s1 >= 'a' && *s1 <= 'z') ? *s1 - 32 : *s1;
-        char c2 = (*s2 >= 'a' && *s2 <= 'z') ? *s2 - 32 : *s2;
-        if (c1 != c2) return c1 - c2;
-        s1++; s2++;
-    }
-    return *s1 - *s2;
-}
-
 static int my_strlen(const char* s) { int l=0; while(s[l]) l++; return l; }
 static void my_strcpy(char* dest, const char* src) { while(*src) { *dest++ = *src++; } *dest = '\0'; }
 static void my_strcat(char* dest, const char* src) { while(*dest) dest++; my_strcpy(dest, src); }
@@ -437,7 +426,12 @@ static bool dir_scan(FAT32_Instance* fs, uint32_t dir_cluster, const char* targe
 
                 bool match = false;
                 if (lfn_buf[0] != '\0') {
-                    if (my_strcasecmp(lfn_buf, target_name) == 0) match = true;
+                    // Фаза 9.D (см. ROADMAP.md): регистрозависимое сравнение —
+                    // "Test.txt" и "test.txt" теперь разные файлы. LFN хранит
+                    // точный регистр (см. name_needs_lfn/lfn_checksum выше), так
+                    // что сравнивать строго можно без потери уже созданных
+                    // lowercase-имён (соглашение по умолчанию).
+                    if (my_strcmp(lfn_buf, target_name) == 0) match = true;
                     for (int k = 0; k < 261; k++) lfn_buf[k] = 0;
                 } else {
                     char entry_name[12];
@@ -1025,27 +1019,13 @@ bool fat32_create_file(FAT32_Instance* fs, const char* path) {
     if (!dir_scan(fs, parent_clus, basename, &slot)) return false;
     if (slot.found) return true; // Уже существует
 
-    uint32_t free_sector;
-    int free_offset;
-    if (slot.has_free) {
-        free_sector = slot.free_sector;
-        free_offset = slot.free_offset;
-    } else {
-        // Ни в одном из существующих кластеров каталога нет места — расширяем каталог.
-        if (!dir_grow(fs, slot.last_clus, &free_sector, nullptr)) return false;
-        free_offset = 0;
-    }
-
-    char sector_buf[512];
-    if (!fs->read_blocks(free_sector, 1, sector_buf)) return false;
-
-    uint8_t* new_entry = (uint8_t*)&sector_buf[free_offset];
-    for (int i = 0; i < 32; i++) new_entry[i] = 0;
-    char target_name[12];
-    format_fat32_name(basename, target_name);
-    my_memcpy(new_entry, target_name, 11);
-    new_entry[11] = 0x20; // Атрибут Archive
-    return fs->write_blocks(free_sector, 1, sector_buf);
+    // Фаза 9.D (см. ROADMAP.md): раньше здесь писалась голая 8.3-запись
+    // (всегда uppercase) напрямую — "Test.txt" и "test.txt" схлопывались в
+    // один и тот же алиас независимо от регистрозависимого поиска в
+    // dir_scan(). dir_write_named_entry() пишет LFN с точным регистром,
+    // когда имя того требует (name_needs_lfn), и сама ищет/расширяет место
+    // под запись — ручной free_sector/dir_grow здесь больше не нужен.
+    return dir_write_named_entry(fs, parent_clus, basename, 0, 0, 0x20);
 }
 
 // === ЗАПИСЬ В ФАЙЛ (echo > file) ===
@@ -1062,34 +1042,7 @@ bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, ui
 
     DirSlot slot;
     if (!dir_scan(fs, parent_clus, basename, &slot)) return false;
-
-    uint32_t entry_sector;
-    int entry_offset;
-    uint32_t old_clus = 0;
-
-    if (slot.found) {
-        entry_sector = slot.sector;
-        entry_offset = slot.offset;
-        old_clus = slot.clus;
-    } else if (slot.has_free) {
-        entry_sector = slot.free_sector;
-        entry_offset = slot.free_offset;
-    } else {
-        if (!dir_grow(fs, slot.last_clus, &entry_sector, nullptr)) return false;
-        entry_offset = 0;
-    }
-
-    char sector_buf[512];
-    if (!fs->read_blocks(entry_sector, 1, sector_buf)) return false;
-    uint8_t* target_entry = (uint8_t*)&sector_buf[entry_offset];
-
-    if (!slot.found) {
-        for (int i = 0; i < 32; i++) target_entry[i] = 0;
-        char formatted_name[12];
-        format_fat32_name(basename, formatted_name);
-        my_memcpy(target_entry, formatted_name, 11);
-        target_entry[11] = 0x20; // ATTR_ARCHIVE
-    }
+    uint32_t old_clus = slot.found ? slot.clus : 0;
 
     // echo > всегда перезаписывает файл целиком — освобождаем старую цепочку,
     // чтобы не оставлять "хвост" из старых кластеров длиннее новых данных.
@@ -1103,11 +1056,22 @@ bool fat32_write_file(FAT32_Instance* fs, const char* path, const char* text, ui
         if (new_clus == 0) return false; // Диск заполнен
     }
 
-    *(uint16_t*)&target_entry[20] = (uint16_t)(new_clus >> 16);
-    *(uint16_t*)&target_entry[26] = (uint16_t)(new_clus & 0xFFFF);
-    *(uint32_t*)&target_entry[28] = len;
-
-    if (!fs->write_blocks(entry_sector, 1, sector_buf)) return false;
+    if (slot.found) {
+        // Имя не меняется — обновляем клас/размер прямо в уже найденной
+        // записи (её LFN-цепочка, если есть, не трогается).
+        char sector_buf[512];
+        if (!fs->read_blocks(slot.sector, 1, sector_buf)) return false;
+        uint8_t* target_entry = (uint8_t*)&sector_buf[slot.offset];
+        *(uint16_t*)&target_entry[20] = (uint16_t)(new_clus >> 16);
+        *(uint16_t*)&target_entry[26] = (uint16_t)(new_clus & 0xFFFF);
+        *(uint32_t*)&target_entry[28] = len;
+        if (!fs->write_blocks(slot.sector, 1, sector_buf)) return false;
+    } else {
+        // Фаза 9.D: новое имя — через dir_write_named_entry (LFN при
+        // необходимости, точный регистр), см. тот же комментарий в
+        // fat32_create_file().
+        if (!dir_write_named_entry(fs, parent_clus, basename, new_clus, len, 0x20)) return false;
+    }
 
     if (len > 0) {
         return write_chain_data(fs, new_clus, text, len);
@@ -1166,7 +1130,8 @@ bool fat32_delete_file(FAT32_Instance* fs, const char* path) {
 
                 bool match = false;
                 if (lfn_buf[0] != '\0') {
-                    if (my_strcasecmp(lfn_buf, basename) == 0) match = true;
+                    // Фаза 9.D: регистрозависимо, см. тот же комментарий в dir_scan().
+                    if (my_strcmp(lfn_buf, basename) == 0) match = true;
                 } else {
                     char entry_name[12];
                     my_memcpy(entry_name, entry, 11); entry_name[11] = '\0';
@@ -1256,37 +1221,23 @@ bool fat32_mkdir(FAT32_Instance* fs, const char* path) {
     uint32_t original_parent_clus = parent_clus;
     if (parent_clus == 0) parent_clus = fs->root_cluster;
 
-    // 1. Ищем существующую запись / свободное место, обходя всю цепочку каталога
+    // 1. Проверяем, что такого имени ещё нет
     DirSlot slot;
     if (!dir_scan(fs, parent_clus, basename, &slot)) return false;
     if (slot.found) return false; // Уже существует
-
-    uint32_t free_sector;
-    int free_offset;
-    if (slot.has_free) {
-        free_sector = slot.free_sector;
-        free_offset = slot.free_offset;
-    } else {
-        if (!dir_grow(fs, slot.last_clus, &free_sector, nullptr)) return false; // Папка переполнена и не может расти
-        free_offset = 0;
-    }
 
     // 2. Аллоцируем новый кластер под содержимое директории (уже обнулён fat_alloc_chain)
     uint32_t new_clus = fat_alloc_chain(fs, 1);
     if (new_clus == 0) return false;
 
-    // 3. Создаем запись о папке в родительском каталоге
-    char sector_buf[512];
-    if (!fs->read_blocks(free_sector, 1, sector_buf)) { fat_free_chain(fs, new_clus); return false; }
-    uint8_t* new_entry = (uint8_t*)&sector_buf[free_offset];
-    for (int i = 0; i < 32; i++) new_entry[i] = 0;
-    char target_name[12];
-    format_fat32_name(basename, target_name);
-    my_memcpy(new_entry, target_name, 11);
-    new_entry[11] = 0x10; // ATTR_DIRECTORY
-    *(uint16_t*)&new_entry[20] = (uint16_t)(new_clus >> 16);
-    *(uint16_t*)&new_entry[26] = (uint16_t)(new_clus & 0xFFFF);
-    if (!fs->write_blocks(free_sector, 1, sector_buf)) { fat_free_chain(fs, new_clus); return false; }
+    // 3. Создаём запись о папке в родительском каталоге. Фаза 9.D: через
+    // dir_write_named_entry() — LFN с точным регистром при необходимости,
+    // раньше здесь писалась голая uppercase-8.3-запись напрямую (см. тот же
+    // комментарий в fat32_create_file()).
+    if (!dir_write_named_entry(fs, parent_clus, basename, new_clus, 0, 0x10)) {
+        fat_free_chain(fs, new_clus);
+        return false;
+    }
 
     // 4. Инициализируем новую папку (записи "." и "..")
     char new_dir_buf[512];

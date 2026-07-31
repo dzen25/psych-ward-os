@@ -36,7 +36,11 @@ target_link_options(shell PRIVATE "-Wl,-e,_start")
 target_link_libraries(shell sel4 sel4runtime muslc)
 
 # 4. НОВЫЙ БЛОЧНЫЙ ДРАЙВЕР (Файловая система)
-add_executable(blk_driver src/blk_driver.cpp src/fat32.cpp)
+# Уход от FAT32/8.3 на exFAT (см. ROADMAP.md/issuse.txt, план) — src/fat32.cpp
+# больше не подключается: вторая (единственная монтируемая нами) партиция
+# карты теперь exFAT, src/exfat.cpp. Сам fat32.cpp/h/fat32.h не удалены (не
+# критично, см. план), просто больше нигде не используются.
+add_executable(blk_driver src/blk_driver.cpp src/exfat.cpp)
 target_include_directories(blk_driver PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(blk_driver PRIVATE "-nostdlib" "-static")
 target_link_options(blk_driver PRIVATE "-Wl,-e,_start")
@@ -63,6 +67,13 @@ set(CPIO_FILE "${CMAKE_CURRENT_BINARY_DIR}/archive.cpio")
 set(ARCHIVE_S "${CMAKE_CURRENT_BINARY_DIR}/archive.S")
 
 # ВНИМАНИЕ: fat32.img мы отсюда убрали, так как он теперь работает как реальный диск
+#
+# Фаза 9.B (см. ROADMAP.md): wifi_driver БОЛЬШЕ НЕ здесь — вынесен на диск
+# (/service/wifi.elf, грузится SYS_START_WIFI через load_elf_from_disk()),
+# в отличие от uart/timer/blk/net, которые остаются встроенными в образ.
+# CMake-цель wifi_driver ниже (строка ~53) никуда не делась — просто больше
+# не участвует в CPIO-архиве, а собирается как обычный отдельный бинарник
+# (см. деплой в load_chain/service/wifi.elf).
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pack_vfs.sh"
 "#!/bin/bash
 cd ${CMAKE_CURRENT_BINARY_DIR}
@@ -71,7 +82,6 @@ echo 'timer_driver' >> file_list.txt
 echo 'shell' >> file_list.txt
 echo 'blk_driver' >> file_list.txt
 echo 'net_driver' >> file_list.txt # <--- ДОБАВЬ ЭТУ СТРОКУ
-echo 'wifi_driver' >> file_list.txt
 cat file_list.txt | cpio -o -H newc > archive.cpio
 
 echo '.section ._archive_cpio,\"aw\"' > archive.S
@@ -88,9 +98,8 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:shell>" "${CMAKE_CURRENT_BINARY_DIR}/shell"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:blk_driver>" "${CMAKE_CURRENT_BINARY_DIR}/blk_driver"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:net_driver>" "${CMAKE_CURRENT_BINARY_DIR}/net_driver"
-    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:wifi_driver>" "${CMAKE_CURRENT_BINARY_DIR}/wifi_driver"
     COMMAND bash "${CMAKE_CURRENT_BINARY_DIR}/pack_vfs.sh"
-    DEPENDS uart_driver timer_driver shell blk_driver net_driver wifi_driver
+    DEPENDS uart_driver timer_driver shell blk_driver net_driver
 )
 
 # ===================================================================
@@ -127,3 +136,29 @@ add_executable(test_app src/test.cpp)
 target_include_directories(test_app PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
 target_link_options(test_app PRIVATE "-static")
 target_link_libraries(test_app sel4 sel4runtime muslc)
+
+# Фаза A (см. ROADMAP.md): команды, вынесенные из shell.cpp в отдельные
+# /sbin/*.elf (см. src/sbin/, src/h/sys_client.h) — тот же паттерн сборки,
+# что у test_app выше. Имена целей CMake — с префиксом sb_, т.к. голые "rm"/
+# "mkdir" конфликтуют с уже существующими служебными целями внутри сборки
+# musllibc (обнаружено по факту: CMake ругался на цикл зависимостей через
+# muslc_gen). Имя файла результата сборки от имени цели НЕ зависит — при
+# копировании в load_chain переименовываем в <tool>.elf сами.
+set(PSYCH_SBIN_TOOLS ps kill taskset top balance ls cat touch rm mv mkdir)
+foreach(tool ${PSYCH_SBIN_TOOLS})
+    add_executable(sb_${tool} src/sbin/${tool}.cpp)
+    target_include_directories(sb_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+    target_link_options(sb_${tool} PRIVATE "-static")
+    target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
+endforeach()
+
+# Фаза 9.B (см. ROADMAP.md): фоновые сервисы для автозапуска из
+# /etc/init.conf (см. src/service/) — тот же паттерн сборки, что sb_*/
+# test_app выше. Префикс svc_ по той же причине, что sb_ у команд.
+set(PSYCH_SERVICE_TOOLS balancer)
+foreach(svc ${PSYCH_SERVICE_TOOLS})
+    add_executable(svc_${svc} src/service/${svc}.cpp)
+    target_include_directories(svc_${svc} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+    target_link_options(svc_${svc} PRIVATE "-static")
+    target_link_libraries(svc_${svc} sel4 sel4runtime muslc)
+endforeach()

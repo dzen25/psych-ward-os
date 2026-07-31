@@ -175,7 +175,7 @@ int main(int argc, char *argv[]) {
         seL4_Word badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
 
-        if (badge == 1) {
+        if (badge == UART_KBD_IRQ_BADGE) {
             // Прерывание от клавиатуры
             while ((*uart_lsr) & AUX_MU_LSR_RX_READY) {
                 char c = *uart_io;

@@ -1,10 +1,8 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
-#include "h/fat32.h"
+#include "h/exfat.h"
 #include "h/platform.h"
 #include <stdint.h>
-
-uint32_t fat32_find_in_dir(FAT32_Instance* fs, uint32_t dir_cluster, const char* target_name);
 
 // ARM generic timer (CNTVCT_EL0/CNTFRQ_EL0) — те же самые EL0-регистры, что
 // уже использует timer_driver.cpp/wifi_driver.cpp для честного wall-clock
@@ -24,7 +22,7 @@ static uint64_t g_cntfrq = 0; // читается один раз в main(), с�
 
 // --- Глобальные переменные ---
 static char* g_shm_vaddr = nullptr;
-static FAT32_Instance g_file_system;
+static EXFAT_Instance g_file_system;
 
 // Глобальные переменные EMMC2 (см. h/platform.h — регистровая карта SDHCI)
 static volatile uint32_t* g_emmc_base = nullptr;
@@ -53,17 +51,21 @@ static inline volatile Adma2Descriptor32* blk_dma_desc() {
     return (volatile Adma2Descriptor32*)(PLAT_BLK_DMA_VADDR + 0x1000);
 }
 
-// Смещение (в секторах) начала FAT32-раздела на физической карте — см.
-// find_fat32_partition() ниже. На стандартно размеченной SD-карте (с MBR)
-// сектор 0 диска — это НЕ BPB, а таблица разделов; реальный BPB лежит по
-// LBA первого FAT-раздела. 0 — если раздела нет и сектор 0 сам является BPB.
+// Смещение (в секторах) начала ВТОРОЙ (exFAT) партиции карты — см.
+// find_exfat_partition() ниже. Уход от FAT32/8.3 (см. ROADMAP.md/issuse.txt):
+// карта теперь размечена ДВУМЯ партициями — первая (FAT32, config.txt/
+// u-boot.bin/образ ОС/прошивка) читается ТОЛЬКО ROM-загрузчиком RPi и
+// U-Boot, этот драйвер её не монтирует и не трогает вообще никогда; вторая
+// (exFAT) — единственная, которую видит blk_driver, здесь живут /bin/sbin/
+// etc/conf/service/root. Все hardware_emmc_read/write ниже адресуют сектора
+// ОТНОСИТЕЛЬНО этого смещения, то есть всегда только вторую партицию.
 static uint32_t g_partition_start_sector = 0;
 
 // Чтение (ls/cat) подтверждено стабильным на 3 холодных перезагрузках —
-// включаем запись. ВНИМАНИЕ: FAT32-раздел на реальной SD-карте — тот же
-// раздел с config.txt/образом ОС, так что первые тесты (touch/echo/mkdir/rm/mv)
-// нужно делать на некритичных новых файлах, не трогая config.txt/u-boot.bin/
-// sel4test-driver-image-arm-bcm2711/bcm2711-rpi-4-b.dtb/START4.ELF/BOOT.SCR.
+// включаем запись. Начиная с ухода на exFAT (см. выше) вторая партиция —
+// ЧИСТО пользовательские данные, загрузочные файлы физически на другой
+// партиции и этим кодом недостижимы в принципе — специальная осторожность
+// при тестах записи (не трогать конкретные файлы) больше не требуется.
 constexpr bool RPI4_EMMC_ALLOW_WRITE = true;
 
 // Пользовательская рабочая директория (создаётся при первом запуске, если
@@ -156,15 +158,6 @@ static inline volatile uint32_t* emmc_reg(uintptr_t offset) {
 // настоящего события железа. Поэтому это отдельная капа, отдельный
 // seL4_Wait(), никак не пересекающийся с главным циклом диспетчеризации.
 static seL4_CPtr g_emmc_irq_ntfn = 0;
-
-// true после успешной инициализации (см. main(), ниже emmc_init()) — только
-// тогда включаем событийное ожидание вместо busy-yield. См. ROADMAP.md 4.5:
-// на этапе инициализации карта может вообще не отвечать (нет карты и т.п.),
-// и там честный отказ по счётчику итераций важнее — иначе весь boot
-// (SYS_WAIT_ALL_DRIVERS_READY) зависнет навсегда вместо чистой ошибки "EMMC2
-// init failed" (см. память проекта: driver обязан просигналить готовность,
-// иначе шелл висит вечно).
-static bool g_emmc_irq_ready = false;
 
 // Капа на root_ep (см. main(), ниже) — используется только на путях ошибок
 // инициализации (сигнал SYS_DRIVER_READY при неудаче), НЕ в notify_root_irq_handled().
@@ -351,8 +344,10 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     // процессе root, который вообще не даёт scheduler'у дойти до
     // blk_driver, чтобы тот наконец сбросил бит. Ровно так и подвис boot
     // сразу после первой же команды EMMC во время написания этого кода.
-    // IRPT_EN включается только ПОСЛЕ успешной инициализации (см. main(),
-    // g_emmc_irq_ready) — до этого статус-биты доступны только опросом.
+    // IRPT_EN остаётся 0 навсегда (см. ROADMAP.md/issuse.txt — "Spurious
+    // interrupt!" фикс в main()/после монтирования FAT32): статус-биты
+    // всегда доступны только опросом, реальный GIC-сигнал для них больше
+    // нигде не включается.
     *emmc_reg(EMMC_IRPT_EN_OFFSET)   = 0;
     *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF;
 
@@ -451,7 +446,7 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
 
     // Фаза 4.5/ADMA2 (см. ROADMAP.md) — режим DMA-select персистентный (не
     // per-команда, как EMMC_TM_DMA_EN), поэтому включаем один раз здесь, до
-    // ЛЮБОГО реального чтения/записи сектора (find_fat32_partition() дёргает
+    // ЛЮБОГО реального чтения/записи сектора (find_exfat_partition() дёргает
     // hardware_emmc_read() сразу после emmc_init(), см. main()). На обычные
     // безданные команды (CMD0/CMD2/CMD3/CMD7 выше) DMA Select не влияет —
     // учитывается контроллером только вместе с EMMC_CMD_ISDATA+DMA_EN.
@@ -539,18 +534,17 @@ bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
     return true;
 }
 
-// Стандартно размеченные SD-карты (в т.ч. подготовленные обычными
-// инструментами вроде Raspberry Pi Imager) несут MBR в секторе 0 — это НЕ
-// BPB, а таблица разделов, и реальный FAT32 начинается по LBA первого
-// FAT-раздела. fat32_init() слепо трактует сектор 0 как BPB и не проверяет
-// сигнатуры, поэтому на такой карте "монтирование" формально проходит (все
-// поля защищены дефолтами на случай нулевых значений), но реального
-// содержимого не видно — корневая директория читается из данных MBR/боот-кода,
-// что выглядит как пустой каталог. Проверяем сигнатуру 0x55AA и jump instruction
-// (0xEB/0xE9 — то, чем всегда начинается настоящий BPB), и если сектор 0 не
-// похож на BPB — ищем первый FAT32/FAT16-раздел (тип 0x0B/0x0C/0x0E) в
-// таблице MBR и сдвигаем все дальнейшие чтения/записи на его LBA.
-static void find_fat32_partition(seL4_CPtr console_ep) {
+// Уход от FAT32/8.3 (см. ROADMAP.md/issuse.txt, план): карта теперь
+// размечена ДВУМЯ MBR-партициями — первая FAT32 (для ROM-загрузчика RPi/
+// U-Boot, этот код её не трогает вообще), вторая exFAT (единственная,
+// которую монтирует blk_driver). Ищем ВТОРУЮ запись в таблице разделов с
+// типом 0x07 (стандартный MBR-тип exFAT — тот же байт, что у NTFS, поэтому
+// сам по себе не доказателен) и сдвигаем g_partition_start_sector на её LBA.
+// Реальную проверку "это точно exFAT, не чужой NTFS-раздел" делает
+// exfat_init() (сигнатура FileSystemName=="EXFAT   "+BootSignature) — здесь
+// достаточно найти КАНДИДАТА по типу байта, монтирование само откажет на
+// невалидном содержимом.
+static void find_exfat_partition(seL4_CPtr console_ep) {
     uint8_t sector0[512];
     if (!hardware_emmc_read(0, 1, sector0)) {
         sys_puts(console_ep, "[BLK] WARNING: couldn't read sector 0 to detect partition table.\n");
@@ -558,37 +552,23 @@ static void find_fat32_partition(seL4_CPtr console_ep) {
     }
 
     uint16_t sig = (uint16_t)sector0[510] | ((uint16_t)sector0[511] << 8);
-    bool looks_like_bpb = (sector0[0] == 0xEB || sector0[0] == 0xE9);
-
-    if (looks_like_bpb) {
-        if (LOG_BLK) sys_puts(console_ep, "[BLK] sector 0 looks like a raw FAT32 BPB (no MBR).\n");
-        return;
-    }
     if (sig != 0xAA55) {
-        sys_puts(console_ep, "[BLK] WARNING: sector 0 is neither a BPB nor has an MBR signature — mounting as-is.\n");
+        sys_puts(console_ep, "[BLK] WARNING: no MBR signature on sector 0 — карта не размечена под двухпартиционную схему exFAT, монтирование, вероятно, провалится.\n");
         return;
     }
 
     for (int i = 0; i < 4; i++) {
         const uint8_t* entry = &sector0[0x1BE + i * 16];
         uint8_t type = entry[4];
-        if (type == 0x0B || type == 0x0C || type == 0x0E) { // FAT32 (CHS/LBA) / FAT16 LBA
+        if (type == 0x07) { // exFAT/NTFS — уточняется в exfat_init() по сигнатуре
             g_partition_start_sector = (uint32_t)entry[8] | ((uint32_t)entry[9] << 8)
                                       | ((uint32_t)entry[10] << 16) | ((uint32_t)entry[11] << 24);
-            if (LOG_BLK) sys_puthex32(console_ep, "[BLK] MBR partition found, start LBA = ", g_partition_start_sector);
+            if (LOG_BLK) sys_puthex32(console_ep, "[BLK] exFAT partition candidate found, start LBA = ", g_partition_start_sector);
             return;
         }
     }
-    sys_puts(console_ep, "[BLK] WARNING: MBR signature found but no FAT partition entry — mounting sector 0 as-is.\n");
+    sys_puts(console_ep, "[BLK] WARNING: MBR found but no partition with type 0x07 (exFAT) — карта размечена по-старому (одна FAT32-партиция)?\n");
 }
-
-// Helper to get the sector of the current working directory
-static uint32_t get_cwd_sector(FAT32_Instance* fs) {
-    uint32_t clus = fs->current_dir_cluster;
-    if (clus == 0) clus = fs->root_cluster;
-    return fs->data_start_sector + (clus - 2) * fs->sectors_per_cluster;
-}
-
 
 // ==========================================
 // ГЛАВНАЯ ФУНКЦИЯ БЛОЧНОГО ДРАЙВЕРА
@@ -651,30 +631,40 @@ int main(int argc, char *argv[]) {
     }
     if (LOG_BLK) sys_puts(console_ep, "[BLK] EMMC2 initialized.\n");
 
-    // 2.5. Ищем реальное начало FAT32-раздела (MBR или нет — см. комментарий
-    // у find_fat32_partition()) до монтирования, иначе fat32_init() прочитает
+    // 2.5. Ищем реальное начало exFAT-раздела (см. комментарий у
+    // find_exfat_partition()) до монтирования, иначе exfat_init() прочитает
     // не тот сектор.
-    find_fat32_partition(console_ep);
+    find_exfat_partition(console_ep);
 
     // 3. Монтируем Файловую Систему!
-    if (fat32_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
+    if (exfat_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
         if (LOG_BLK) {
-            sys_puts(console_ep, "[BLK] FAT32 mounted.\n");
-            sys_puthex32(console_ep, "[BLK][FAT32] reserved_sectors  = ", g_file_system.reserved_sectors);
-            sys_puthex32(console_ep, "[BLK][FAT32] sectors_per_fat   = ", g_file_system.sectors_per_fat);
-            sys_puthex32(console_ep, "[BLK][FAT32] sectors_per_clus  = ", g_file_system.sectors_per_cluster);
-            sys_puthex32(console_ep, "[BLK][FAT32] root_cluster      = ", g_file_system.root_cluster);
-            sys_puthex32(console_ep, "[BLK][FAT32] data_start_sector = ", g_file_system.data_start_sector);
+            sys_puts(console_ep, "[BLK] exFAT mounted.\n");
+            sys_puthex32(console_ep, "[BLK][exFAT] fat_offset_sectors  = ", g_file_system.fat_offset_sectors);
+            sys_puthex32(console_ep, "[BLK][exFAT] fat_length_sectors  = ", g_file_system.fat_length_sectors);
+            sys_puthex32(console_ep, "[BLK][exFAT] cluster_heap_offset = ", g_file_system.cluster_heap_offset);
+            sys_puthex32(console_ep, "[BLK][exFAT] root_cluster        = ", g_file_system.root_cluster);
+            sys_puthex32(console_ep, "[BLK][exFAT] bitmap_cluster      = ", g_file_system.bitmap_cluster);
         }
 
-        // Пользовательская рабочая директория — отделяем от загрузочных
-        // файлов (config.txt/u-boot.bin/образ ОС и т.д.), которые обязаны
-        // оставаться в корне FAT-раздела для U-Boot/прошивки. Создаём при
-        // первом запуске, если её ещё нет (fat32_mkdir() безопасно вернёт
-        // false, если уже существует, см. slot.found в fat32.cpp — ничего
-        // не портит), заходим в неё и остаёмся там при старте системы.
-        fat32_mkdir(&g_file_system, USER_ROOT_DIR); // false здесь = "уже существует", это ок
-        if (fat32_cd(&g_file_system, USER_ROOT_DIR)) {
+        // Этап B (см. план — запись ещё не реализована, exfat_mkdir() пока
+        // всегда возвращает false): каталоги /root/bin/sbin/etc/service/conf/*
+        // на этом этапе НЕ создаются автоматически — карту нужно подготовить
+        // с ними вручную (Finder/diskutil) до первой загрузки, пока Этап B
+        // не реализован. Вызовы оставлены — они безопасно no-op'ают (false
+        // молча игнорируется, как и раньше игнорировалось "уже существует"),
+        // заработают сами по себе, как только exfat_mkdir получит реализацию.
+        exfat_mkdir(&g_file_system, USER_ROOT_DIR);
+        exfat_mkdir(&g_file_system, "/bin");
+        exfat_mkdir(&g_file_system, "/sbin");
+        exfat_mkdir(&g_file_system, "/etc");
+        exfat_mkdir(&g_file_system, "/service");
+        exfat_mkdir(&g_file_system, "/conf");
+        exfat_mkdir(&g_file_system, "/conf/wifi_conf");
+        exfat_mkdir(&g_file_system, "/conf/balancer_conf");
+        exfat_mkdir(&g_file_system, "/conf/logger_conf");
+
+        if (exfat_cd(&g_file_system, USER_ROOT_DIR)) {
             if (LOG_BLK) {
                 sys_puts(console_ep, "[BLK] cwd set to ");
                 sys_puts(console_ep, USER_ROOT_DIR);
@@ -683,26 +673,37 @@ int main(int argc, char *argv[]) {
         } else {
             sys_puts(console_ep, "[BLK] WARNING: couldn't cd into ");
             sys_puts(console_ep, USER_ROOT_DIR);
-            sys_puts(console_ep, ", staying at FAT root.\n");
+            sys_puts(console_ep, ", staying at exFAT root.\n");
         }
     } else {
-        sys_puts(console_ep, "[BLK] FAT32 mount failed.\n");
+        sys_puts(console_ep, "[BLK] exFAT mount failed.\n");
     }
 
-    // Только теперь безопасно включать реальный сигнальный IRQ (см. живой
-    // баг и подробный комментарий в emmc_init() у EMMC_IRPT_EN_OFFSET) — ВСЯ
-    // наша собственная инициализация (emmc_init + поиск раздела + монтирование
-    // FAT32 + cd в рабочую директорию, все они тоже гоняют EMMC-команды через
-    // emmc_send_cmd/emmc_wait_irpt_bit) уже прошла на старом проверенном
-    // busy-yield. Раньше эта строка стояла СРАЗУ после emmc_init() — из-за
-    // этого поиск раздела/монтирование FAT32 (которые тоже дергают железо)
-    // первыми же попадали под совершенно новый, ещё не обкатанный
-    // событийный путь ещё до готовности драйвера, и именно там подвисало.
-    if (g_emmc_irq_ntfn != 0) {
-        *emmc_reg(EMMC_IRPT_EN_OFFSET) = EMMC_INT_ALL_EN;
-        g_emmc_irq_ready = true;
-    }
-
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (см. ROADMAP.md/issuse.txt — "Spurious
+    // interrupt!" после КАЖДОЙ команды, задевающей диск, без всякого
+    // balance/taskset): эта строка раньше включала реальный GIC-сигнал
+    // (IRPT_EN = EMMC_INT_ALL_EN) для CMD_DONE/DATA_DONE/READ_RDY/
+    // WRITE_RDY — предполагая, что ПОСЛЕ инициализации blk_driver ждёт эти
+    // события через g_emmc_irq_ntfn/seL4_Wait (см. комментарий у неё выше).
+    // Но emmc_wait_irpt_bit() (единственное место, которое реально ждёт эти
+    // биты в горячем пути каждой команды) давно переведена на честный
+    // wall-clock busy-yield (CNTVCT_EL0 + опрос регистра) — seL4_Wait на
+    // g_emmc_irq_ntfn нигде в файле больше не вызывается, g_emmc_irq_ready
+    // не читается нигде. Значит эти биты физически включали GIC-прерывание
+    // ради события, которое ВСЕГДА обнаруживается и снимается софтом через
+    // полинг РАНЬШЕ, чем аппаратное прерывание успевает дойти до ядра:
+    // emmc_wait_irpt_bit сама снимает бит и сама зовёт
+    // seL4_IRQHandler_Ack() (см. notify_root_irq_handled) в тот момент,
+    // когда реальное аппаратное прерывание для ТОГО ЖЕ события зачастую
+    // ещё только "в полёте" — когда оно всё же доходит до CPU (общая
+    // level-triggered линия с Wi-Fi SDIO, см. IRQ_MMC_SHARED_BADGE), GIC
+    // уже деактивирован нашим же опережающим Ack'ом, checkInterrupt() не
+    // находит активного IRQ и печатает "Spurious interrupt!". Раз ждать
+    // эти биты через прерывание всё равно никто не пытается — отключаем их
+    // физическую генерацию совсем (тем же значением 0, что уже стоит в
+    // emmc_init() до этого места, см. выше) — статус по-прежнему читается
+    // полингом через EMMC_INTERRUPT, просто больше не дублируется настоящим
+    // GIC-прерыванием, которое некому вовремя обработать.
     // Фикс живого зависания (см. situation.txt): подписываемся на heartbeat
     // от timer_driver'а — тот же каданс (20мс), что и net_driver (период общий
     // на весь процесс timer_driver, см. комментарий там же — обе подписки
@@ -737,7 +738,7 @@ int main(int argc, char *argv[]) {
                 if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
             } else {
                 char basename[64];
-                uint32_t parent_clus = fat32_resolve_parent(&g_file_system, path, basename);
+                uint32_t parent_clus = exfat_resolve_parent(&g_file_system, path, basename);
                 if (parent_clus == 0xFFFFFFFF) {
                     my_strcpy(g_shm_vaddr, "ls: path not found\n");
                     seL4_SetMR(0, 0);
@@ -747,7 +748,7 @@ int main(int argc, char *argv[]) {
                 if (basename[0] == '\0') {
                     dir_cluster = parent_clus;
                 } else {
-                    dir_cluster = fat32_find_in_dir(&g_file_system, parent_clus, basename);
+                    dir_cluster = exfat_find_in_dir(&g_file_system, parent_clus, basename);
                 }
             }
 
@@ -759,10 +760,10 @@ int main(int argc, char *argv[]) {
             }
             if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
 
-            // fat32_format_dir_listing обходит ВСЮ цепочку кластеров каталога (а не
-            // только первый сектор), поэтому директории, не помещающиеся в 512 байт,
-            // теперь перечисляются полностью. Лимит — размер первой страницы SHM.
-            fat32_format_dir_listing(&g_file_system, dir_cluster, g_shm_vaddr, 0x1000 - 8);
+            // exfat_format_dir_listing обходит ВСЮ цепочку/пробег кластеров
+            // каталога, поэтому каталоги, не помещающиеся в один кластер,
+            // перечисляются полностью. Лимит — размер первой страницы SHM.
+            exfat_format_dir_listing(&g_file_system, dir_cluster, g_shm_vaddr, 0x1000 - 8);
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -772,11 +773,11 @@ int main(int argc, char *argv[]) {
 
             // ОЧЕНЬ ВАЖНО: Сейчас в SHM (g_shm_vaddr) лежит строковое имя файла,
             // которое передал Rootserver. Мы обязаны скопировать его себе на стек,
-            // потому что функция fat32_read_file перезапишет SHM бинарными данными ELF-файла!
+            // потому что функция exfat_read_file перезапишет SHM бинарными данными ELF-файла!
             char filename[64];
             my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
 
-            bool success = fat32_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
+            bool success = exfat_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
 
             if (success) {
                 seL4_SetMR(0, 0); // Статус: OK
@@ -791,7 +792,7 @@ int main(int argc, char *argv[]) {
         else if (cmd == 112) { // SYS_TOUCH
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем имя файла со стека
-            if (fat32_create_file(&g_file_system, path)) seL4_SetMR(0, 0);
+            if (exfat_create_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -813,7 +814,7 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < 4096; i++) safe_text_buf[i] = 0; // Очищаем мусор
             my_memcpy(safe_text_buf, g_shm_vaddr + 128, len);
             
-            if (fat32_write_file(&g_file_system, path, safe_text_buf, len)) seL4_SetMR(0, 0);
+            if (exfat_write_file(&g_file_system, path, safe_text_buf, len)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -823,7 +824,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             
             // Читаем напрямую в SHM, чтобы shell мог сразу это распечатать
-            if (fat32_read_text_file(&g_file_system, path, g_shm_vaddr)) seL4_SetMR(0, 0);
+            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -831,7 +832,7 @@ int main(int argc, char *argv[]) {
         else if (cmd == 120) { // SYS_RM
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
-            if (fat32_delete_file(&g_file_system, path)) seL4_SetMR(0, 0);
+            if (exfat_delete_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -840,7 +841,7 @@ int main(int argc, char *argv[]) {
             char old_p[32], new_p[32];
             my_strlcpy(old_p, g_shm_vaddr, sizeof(old_p));
             my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p)); // Ожидаем новое имя по смещению 128
-            if (fat32_rename_file(&g_file_system, old_p, new_p)) seL4_SetMR(0, 0);
+            if (exfat_rename_file(&g_file_system, old_p, new_p)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -848,7 +849,7 @@ int main(int argc, char *argv[]) {
         else if (cmd == 117) { // SYS_MKDIR
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
-            if (fat32_mkdir(&g_file_system, path)) seL4_SetMR(0, 0);
+            if (exfat_mkdir(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
@@ -856,7 +857,7 @@ int main(int argc, char *argv[]) {
         else if (cmd == 118) { // SYS_CD
             char path[64];
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
-            if (fat32_cd(&g_file_system, path)) seL4_SetMR(0, 0);
+            if (exfat_cd(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }

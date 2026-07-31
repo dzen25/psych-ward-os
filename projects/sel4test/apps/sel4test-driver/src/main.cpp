@@ -40,10 +40,6 @@ enum SyscallID {
     SYS_GETPID = 108,
     SYS_RECOVER = 117,
 
-    // --- ПРЕРЫВАНИЯ ЖЕЛЕЗА  ---
-    UART_IRQ_BADGE = (1 << 0), 
-    TIMER_IRQ_BADGE = (1 << 1)
-
 };
 
 static void uart_putdec(uint64_t val) {
@@ -119,6 +115,20 @@ static char* rootserver_shm_base = (char*)0x200A00000ULL;
 // странице. blk_driver'ов staging съехал с индекса 5 на индекс 7 (см.
 // platform.h). Итого 8 страниц вместо 6.
 static seL4_CPtr shm_frames[8]; // Массив Capability для 8 страниц SHM
+
+// НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (Фаза 9.B): каждый из четырёх мест, где root
+// читает .elf/текстовый файл целиком в память (SYS_EXEC, SYS_START_WIFI,
+// generic_recover_process при респавне wifi_driver, start_init_services
+// для сервисов из init.conf) заводил СВОЙ собственный статический буфер на
+// 1МБ — итого 4МБ лишнего BSS в образе root'а. Это раздуло физический
+// футпринт rootserver-образа настолько, что перестало хватать untyped-
+// памяти на CNode-слоты при спавне: "Untyped Retype: Slot #0 in
+// destination window non-empty" на ровном месте при загрузке, до первого
+// же спавна процесса, и итоговый "Failed to allocate normal RAM for SHM!".
+// root однопоточный и обрабатывает syscall'ы строго последовательно —
+// одного общего буфера достаточно, ни один из этих путей не выполняется
+// параллельно с другим.
+static char g_elf_load_buffer[1024 * 1024];
 
 // rootserver_shm_base мапится КЭШИРУЕМО (см. цикл маппинга в main()), а все
 // остальные процессы (shell/blk_driver/net_driver/...) видят ЭТУ ЖЕ
@@ -205,6 +215,13 @@ static uint32_t shm_pages_mask_for_role(int is_driver) {
         case 3: return 0b10000001; // blk_driver: VFS(0) + свой staging(7)
         case 4: return 0b01101111; // net_driver: VFS/lock(0,1) + GENET(2,3) + Wi-Fi link-state(5) + TX/RX-мейлбокс(6) — control-plane(4) ему не нужен вообще, там только пароль
         case 5: return 0b01110011; // wifi_driver: VFS(0, файлы прошивки/NVRAM/CLM) + net_vfs_lock(1) + Wi-Fi control(4) + link-state(5) + TX/RX-мейлбокс(6)
+        // Фаза A (см. ROADMAP.md): доверенные системные утилиты из /sbin
+        // (ps/kill/taskset/top/balance/ls/cat/touch/rm/mv/mkdir, см.
+        // src/sbin/) — ТОЛЬКО VFS(0), этого достаточно и для чтения ответа
+        // root'а (ps/top/balance), и для записи пути-аргумента (ls/cat/...).
+        // Обычный пользовательский exec (254) остаётся fail-closed ниже —
+        // Фаза 5 не ослабляется.
+        case 253: return 0b00000001;
         default: return 0;       // exec-процессы (254) и всё прочее — ни одной страницы по умолчанию (fail closed)
     }
 }
@@ -433,6 +450,24 @@ static seL4_CPtr driver_ready_wait_reply = 0;
 
 static bool all_drivers_ready() {
     return driver_ready[1] && driver_ready[2] && driver_ready[3] && driver_ready[4];
+}
+
+// Фаза 9.C (см. ROADMAP.md): узкая проверка права на административные
+// syscall'ы (SYS_KILL/SYS_SET_AFFINITY/SYS_BALANCE и присвоение is_driver=253
+// при SYS_EXEC "/sbin/..."). До этой фазы ЛЮБОЙ процесс, у которого есть
+// root_ep (а он есть у всех — даже у is_driver==254, untrusted exec, он нужен
+// им для базовых sys_write/sys_read), мог убить/переместить/сбалансировать
+// что угодно — достаточно было знать номер syscall'а, никакой проверки
+// вызывающего не было вообще. sender_pid здесь — это PID, извлечённый из
+// бейджа отправителя (см. цикл main(), decode бейджа перед switch), поэтому
+// подделать чужой PID нельзя (бейдж выдаётся root'ом при спавне и меняться
+// процессом не может). Разрешено: shell (is_driver==0) и доверенные /sbin- и
+// /service-процессы (is_driver==253, категория из Фазы 9.A). Не разрешено:
+// произвольный exec (is_driver==254) и сами драйверы (1/2/3/4/5) — им эти
+// операции не нужны и раньше не были доступны через штатные команды.
+static bool is_admin_caller(seL4_Word pid) {
+    if (pid == 0 || pid >= 256 || !pcbs[pid].active) return false;
+    return pcbs[pid].is_driver == 0 || pcbs[pid].is_driver == 253;
 }
 
 // Wi-Fi (index 5) сознательно НЕ входит в driver_ready[]/all_drivers_ready()
@@ -712,7 +747,13 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // (Фаза 6, SMP, см. common.h/BOOT_VFS_MUTEX_NTFN_CAP) —
                          // читают ТОЛЬКО shell/net_driver/wifi_driver, один и
                          // тот же объект без бейджа у всех троих.
-                         seL4_CPtr vfs_mutex_ntfn_param = 0) {
+                         seL4_CPtr vfs_mutex_ntfn_param = 0,
+                         // Фаза 9.A (см. ROADMAP.md): cwd вызывающего шелла —
+                         // ТОЛЬКО для доверенных /sbin-утилит (is_driver==253),
+                         // см. EXEC_CWD_MSG_SLOT/common.h. Через boot-IPC
+                         // msg[], а не через общую VFS SHM — там его затирает
+                         // load_elf_from_disk() (см. комментарий у слота).
+                         const char *cwd_payload = nullptr) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -895,11 +936,31 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         }
     }
 
-    uintptr_t child_stack = 0x500000;
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (см. ROADMAP.md/issuse.txt — FATAL FAULT у
+    // blk_driver на Mem Addr чуть НИЖЕ 0x500000 сразу после первых же
+    // реальных exfat_mkdir() при монтировании exFAT, Этап B): раньше на
+    // каждый процесс выделялась РОВНО одна страница (4КБ) стека. Глубокий
+    // вызывной путь Этапа B (exfat_mkdir -> exfat_resolve_parent
+    // [exfat_normalize_path: char[256]+char[16][64] на кадр] ->
+    // exfat_dir_scan [ExfatDirEntry: char[256]+DirCursor(~544Б с учётом
+    // sector_buf[512])] -> bitmap_alloc_run -> exfat_write_entry_set ->
+    // find_free_slot_run [два DirCursor подряд] -> exfat_write_entry_set_at
+    // [entries[608]+DirCursor]) суммарно перевалил за 4096 байт — SP ушёл
+    // ниже нижней границы единственной замапленной страницы, в
+    // несуществующую память. Стек теперь 4 страницы (16КБ) — с большим
+    // запасом, RAM на плате 3.9ГиБ, лишние ~12КБ на процесс ни на что не
+    // влияют. Верх стека (0x501000, вплотную под IPC-страницей child_ipc)
+    // НЕ меняется — расширяем только вниз, ничего больше в кодовой базе не
+    // завязано на конкретный адрес низа (проверено grep'ом).
+    constexpr int STACK_PAGES = 4;
+    uintptr_t child_stack = 0x500000 - (uintptr_t)(STACK_PAGES - 1) * 0x1000;
     uintptr_t child_ipc   = 0x501000;
-    seL4_CPtr stack_frame = alloc_and_track_cap(alloc, pcb);
+    seL4_CPtr stack_frames[STACK_PAGES];
+    for (int i = 0; i < STACK_PAGES; i++) {
+        stack_frames[i] = alloc_and_track_cap(alloc, pcb);
+        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frames[i], 1);
+    }
     seL4_CPtr ipc_frame = alloc_and_track_cap(alloc, pcb);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frame, 1);
     seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
 
     uintptr_t ipc_temp_vaddr = global_ipc_temp_vaddr;
@@ -918,6 +979,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // === STARTUP PAYLOAD ===
     if (args_payload && args_payload[0] != '\0') {
         strcpy((char*)&child_ipc_ptr->msg[0], args_payload);
+    }
+    // Фаза 9.A (см. ROADMAP.md/EXEC_CWD_MSG_SLOT): cwd вызывающего шелла для
+    // доверенных /sbin-утилит — отдельный слот, не пересекается ни с
+    // args_payload (msg[0..7]) выше, ни с boot-капами (100+) ниже.
+    if (cwd_payload && cwd_payload[0] != '\0') {
+        strcpy((char*)&child_ipc_ptr->msg[EXEC_CWD_MSG_SLOT], cwd_payload);
     }
 
     // ИСПРАВЛЕНИЕ: Мы не можем передавать Capability из CSpace ядра напрямую.
@@ -1083,7 +1150,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         child_ipc_ptr->msg[BOOT_NET_EP] = local_net_send_ep;
         child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_send_ep;
         child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
-        if (is_driver == 0) { // Shell — участник общего VFS-мьютекса (Фаза 6), exec-процессы (is_driver==254) — нет
+        // Shell (0) и доверенные /sbin-утилиты (253, см. Фазу A) — участники
+        // общего VFS-мьютекса (Фаза 6); обычный пользовательский exec
+        // (is_driver==254) — нет.
+        if (is_driver == 0 || is_driver == 253) {
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
         }
     }
@@ -1092,7 +1162,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     
     check_err(seL4_ARM_Page_Unmap(ipc_frame), "Unmap IPC from Root");
 
-    check_err(seL4_ARM_Page_Map(stack_frame, child_vspace, child_stack, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map Stack to Child");
+    for (int i = 0; i < STACK_PAGES; i++) {
+        check_err(seL4_ARM_Page_Map(stack_frames[i], child_vspace, child_stack + (uintptr_t)i * 0x1000, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map Stack to Child");
+    }
     check_err(seL4_ARM_Page_Map(ipc_frame, child_vspace, child_ipc, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Map IPC to Child");
 
     seL4_CPtr tcb = alloc_and_track_cap(alloc, pcb);
@@ -1125,7 +1197,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // ИСПРАВЛЕНО: Удален дублирующийся вызов seL4_TCB_Configure, который перезаписывал Fault Endpoint и скрывал падения.
     seL4_UserContext regs = {0};
     regs.pc = entry_point;
-    regs.sp = child_stack + 4096;
+    regs.sp = child_stack + (uintptr_t)STACK_PAGES * 4096; // = 0x501000 всегда, см. комментарий у STACK_PAGES выше
     regs.x0 = (seL4_Word)badged_ep;
     regs.x1 = (seL4_Word)child_ipc;
     regs.x2 = (seL4_Word)med_ep; 
@@ -1227,7 +1299,23 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     if (respawn && (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0)) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
 
-        int new_pid = spawn_process(meta.name, nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+        // Фаза 9.B (см. ROADMAP.md): wifi_driver теперь грузится с диска
+        // (/service/wifi.elf), не из встроенного CPIO-архива — respawn
+        // после краша обязан читать его оттуда же, иначе watchdog не найдёт
+        // "wifi_driver" в архиве (там его больше нет) и респавн провалится.
+        char *recover_elf_data = nullptr;
+        int recover_elf_size = 0;
+        if (meta.is_driver == 5) {
+            recover_elf_size = load_elf_from_disk(blk_ep, "/service/wifi.elf", g_elf_load_buffer);
+            if (recover_elf_size > 0) {
+                recover_elf_data = g_elf_load_buffer;
+            } else {
+                uart_puts("[WATCHDOG] /service/wifi.elf не найден на диске — respawn wifi_driver невозможен.\n");
+                recover_elf_size = 0;
+            }
+        }
+
+        int new_pid = spawn_process(meta.name, recover_elf_data, recover_elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                                     meta.is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                     meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep,
@@ -1250,6 +1338,141 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     }
 
     pcbs[pid].active = false;
+}
+
+// Фаза 9.B (см. ROADMAP.md): простой int со знаком — simple_atoi (см.
+// shell.cpp/sys_client.h) не понимает минус, а ядро "-1" в init.conf
+// (= не переставлять) как раз отрицательное.
+static int simple_atoi_signed(const char *str) {
+    bool neg = (*str == '-');
+    if (neg) str++;
+    int res = 0;
+    while (*str >= '0' && *str <= '9') { res = res * 10 + (*str - '0'); str++; }
+    return neg ? -res : res;
+}
+
+// Фаза 9.B (см. ROADMAP.md): читает /etc/init.conf и автозапускает
+// перечисленные там сервисы (например /service/balancer.elf) — вызывается
+// ОДИН раз, как только все базовые драйверы готовы (см. case
+// SYS_DRIVER_READY). Формат строки: "<имя> <путь> <приоритет> <ядро>",
+// разделители — пробелы/табы; '#'-комментарии и пустые строки пропускаются;
+// ядро -1 = не переставлять (остаётся там, где заспавнился). Ошибка на
+// отдельной строке (не хватает полей, файл не читается, битый ELF) — лог и
+// переход к следующей строке; отсутствие самого /etc/init.conf — не
+// ошибка, просто нет сконфигурированных сервисов.
+static void start_init_services(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc,
+                                 seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                                 seL4_CPtr blk_ep, seL4_CPtr console_ep, seL4_CPtr timer_ep,
+                                 seL4_CPtr net_cmd_send_ep, seL4_CPtr vfs_mutex_ntfn) {
+    static char conf_buf[16384];
+    int conf_len = load_elf_from_disk(blk_ep, "/etc/init.conf", conf_buf);
+    if (conf_len <= 0) {
+        uart_puts("[ROOT] init.conf не найден — автозапуск сервисов пропущен.\n");
+        return;
+    }
+    if (conf_len >= (int)sizeof(conf_buf)) conf_len = sizeof(conf_buf) - 1;
+    conf_buf[conf_len] = '\0';
+
+    char *line = conf_buf;
+    while (line) {
+        char *newline = line;
+        while (*newline && *newline != '\n') newline++;
+        bool has_more = (*newline == '\n');
+        *newline = '\0';
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+
+        if (*p == '\0' || *p == '#') {
+            line = has_more ? newline + 1 : nullptr;
+            continue;
+        }
+
+        char *name = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) { *p++ = '\0'; }
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *path = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) { *p++ = '\0'; }
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *prio_str = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) { *p++ = '\0'; }
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *core_str = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r') p++;
+        *p = '\0';
+
+        if (name[0] == '\0' || path[0] == '\0' || prio_str[0] == '\0' || core_str[0] == '\0') {
+            uart_puts("[ROOT] init.conf: строка с неверным числом полей, пропускаю: "); uart_puts(line); uart_puts("\n");
+            line = has_more ? newline + 1 : nullptr;
+            continue;
+        }
+
+        int priority = simple_atoi_signed(prio_str);
+        int core = simple_atoi_signed(core_str);
+
+        int elf_size = load_elf_from_disk(blk_ep, path, g_elf_load_buffer);
+        if (elf_size <= 0) {
+            uart_puts("[ROOT] init.conf: не удалось прочитать "); uart_puts(path);
+            uart_puts(", пропускаю сервис "); uart_puts(name); uart_puts("\n");
+            line = has_more ? newline + 1 : nullptr;
+            continue;
+        }
+
+        elf_t elf;
+        if (elf_newFile(g_elf_load_buffer, elf_size, &elf) != 0) {
+            uart_puts("[ROOT] init.conf: битый ELF "); uart_puts(path);
+            uart_puts(", пропускаю сервис "); uart_puts(name); uart_puts("\n");
+            line = has_more ? newline + 1 : nullptr;
+            continue;
+        }
+
+        int pid = spawn_process(name, g_elf_load_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                shm_frames[0], 253, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
+                                0, // irq_ntfn
+                                0, // irq_handler
+                                0, // hw_frame
+                                nullptr, // args_payload — сервисам аргументы не нужны
+                                0, // net_cmd_recv_ep
+                                net_cmd_send_ep,
+                                0, // wifi_cmd_recv_ep
+                                0, // wifi_cmd_send_ep
+                                0, // mbox_regs_frame
+                                0, // mbox_buf_frame_param
+                                0, // mbox_buf_paddr_param
+                                0, // extra_ntfn_param
+                                0, // blk_dma_frame_param
+                                0, // blk_dma_paddr_param
+                                0, // extra_ntfn2_param
+                                0, // net_wifi_rx_badged_param
+                                0, // net_wifi_tx_wake_param
+                                0, // extra_ntfn3_param
+                                0, // mmc_irq_handler_param
+                                0, // blk_dma_frame2_param
+                                0, // blk_dma_paddr2_param
+                                vfs_mutex_ntfn,
+                                nullptr); // cwd_payload — сервисам не нужен
+
+        if (pid > 0) {
+            if (priority >= 0 && priority <= 255) {
+                seL4_TCB_SetPriority(pcbs[pid].tcb, seL4_CapInitThreadTCB, priority);
+            }
+            if (core >= 0 && core <= 3) {
+                seL4_TCB_SetAffinity(pcbs[pid].tcb, core);
+                pcbs[pid].core = core;
+            }
+            uart_puts("[ROOT] Сервис запущен: "); uart_puts(name); uart_puts(" (pid "); uart_putdec(pid); uart_puts(")\n");
+        } else {
+            uart_puts("[ROOT] init.conf: не удалось запустить сервис "); uart_puts(name); uart_puts("\n");
+        }
+
+        line = has_more ? newline + 1 : nullptr;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -1580,7 +1803,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr badged_uart_ntfn = alloc.alloc_slot(); 
     seL4_CPtr uart_irq_handler = alloc.alloc_slot();
     seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, uart_ntfn, 1);
-    seL4_CNode_Mint(root_cnode, badged_uart_ntfn, seL4_WordBits, root_cnode, uart_ntfn, seL4_WordBits, seL4_AllRights, 1); 
+    seL4_CNode_Mint(root_cnode, badged_uart_ntfn, seL4_WordBits, root_cnode, uart_ntfn, seL4_WordBits, seL4_AllRights, UART_KBD_IRQ_BADGE);
     seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_UART_IRQ, root_cnode, uart_irq_handler, seL4_WordBits);
     seL4_IRQHandler_SetNotification(uart_irq_handler, badged_uart_ntfn); 
     uart_enable_interrupts();
@@ -1674,7 +1897,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr timer_irq_handler = alloc.alloc_slot();
     if (RPI4_ENABLE_TIMER) {
         seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
-        seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, 1);
+        seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, TIMER_IRQ_BADGE);
         // ВРЕМЕННО (отладка живого зависания sleep, см. ROADMAP.md 4.5): эти
         // три вызова раньше не проверялись (как и у UART) — заворачиваем в
         // check_err(), чтобы явно увидеть в логе загрузки, если PPI 30
@@ -2286,7 +2509,7 @@ int main(int argc, char *argv[]) {
 
             case SYS_EXEC: {
                 char app_name_and_args[64] = {0};
-                
+
                 // Распаковываем 64 байта (8 регистров) из MR1 - MR8
                 uint64_t* name_ptr = (uint64_t*)app_name_and_args;
                 for (int i = 0; i < 8; i++) {
@@ -2303,28 +2526,82 @@ int main(int argc, char *argv[]) {
                 } else {
                     args = (char*)""; // No args
                 }
-                
-                static char elf_staging_buffer[1024 * 1024];
+
+                // Фаза A (см. ROADMAP.md): путь вида "/sbin/..." — доверенная
+                // системная утилита (is_driver=253, см.
+                // shm_pages_mask_for_role()), всё остальное — обычный
+                // пользовательский exec (254, fail-closed по SHM, как раньше).
+                // Сравнение регистрозависимое (Фаза 9.D: ФС теперь тоже
+                // регистрозависима, см. fat32.cpp dir_scan) — "/SBIN/x.elf" не
+                // совпадёт с этим префиксом И не найдётся на диске (каталог
+                // называется "sbin", а не "SBIN"), так что ложного доверия не
+                // возникает в любом случае.
+                const char *sbin_prefix = "/sbin/";
+                bool is_trusted_sbin = true;
+                for (int i = 0; sbin_prefix[i] != '\0'; i++) {
+                    if (app_name_and_args[i] != sbin_prefix[i]) { is_trusted_sbin = false; break; }
+                }
+                // Фаза 9.C: is_driver=253 выдаём, только если сам вызывающий
+                // уже доверенный (shell или другой 253) — иначе untrusted
+                // exec (254) мог бы самоповысить себе привилегии просто
+                // запустив "/sbin/whatever.elf" и получить доступ к VFS SHM +
+                // мьютексу, которого у него не было. Легитимные пути (shell,
+                // balancer.elf) как вызывали /sbin с полным доверием, так и
+                // продолжают.
+                int exec_is_driver = (is_trusted_sbin && is_admin_caller(sender_pid)) ? 253 : 254;
+
+                // Фаза 9.A (продолжение, найдено на живом железе): cwd
+                // вызывающего шелла для доверенной /sbin-утилиты — MR9-16
+                // (тот же приём упаковки 8 регистров, что и путь+аргументы
+                // выше), если шелл их передал (length>=17). НЕ через общую
+                // VFS SHM — см. EXEC_CWD_MSG_SLOT/common.h, там его затирает
+                // load_elf_from_disk() ниже (читает файл через ту же
+                // физическую страницу).
+                char exec_cwd_payload[64] = {0};
+                if (seL4_MessageInfo_get_length(recv_info) >= 17) {
+                    uint64_t* cwd_ptr = (uint64_t*)exec_cwd_payload;
+                    for (int i = 0; i < 8; i++) {
+                        cwd_ptr[i] = seL4_GetMR(i + 9);
+                    }
+                    exec_cwd_payload[63] = '\0';
+                }
 
                 uart_puts("[ROOT] Fetching ELF from disk: ");
                 uart_puts(app_name_and_args);
                 uart_puts("...\n");
-                
-                int elf_size = load_elf_from_disk(blk_ep, app_name_and_args, elf_staging_buffer);
+
+                int elf_size = load_elf_from_disk(blk_ep, app_name_and_args, g_elf_load_buffer);
                 int new_pid = -1;
 
                 if (elf_size > 0) {
                     uart_puts("[ROOT] ELF loaded successfully! Spawning...\n");
                     elf_t elf;
-                    if (elf_newFile(elf_staging_buffer, elf_size, &elf) == 0) {
-                        new_pid = spawn_process(app_name_and_args, elf_staging_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
-                                                shm_frames[0], 254, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
-                                                0, 0, 0, args, 0, net_cmd_send_ep);
+                    if (elf_newFile(g_elf_load_buffer, elf_size, &elf) == 0) {
+                        new_pid = spawn_process(app_name_and_args, g_elf_load_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                                shm_frames[0], exec_is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
+                                                0, 0, 0, args, 0, net_cmd_send_ep,
+                                                0, // wifi_cmd_recv_ep
+                                                0, // wifi_cmd_send_ep
+                                                0, // mbox_regs_frame
+                                                0, // mbox_buf_frame_param
+                                                0, // mbox_buf_paddr_param
+                                                0, // extra_ntfn_param
+                                                0, // blk_dma_frame_param
+                                                0, // blk_dma_paddr_param
+                                                0, // extra_ntfn2_param
+                                                0, // net_wifi_rx_badged_param
+                                                0, // net_wifi_tx_wake_param
+                                                0, // extra_ntfn3_param
+                                                0, // mmc_irq_handler_param
+                                                0, // blk_dma_frame2_param
+                                                0, // blk_dma_paddr2_param
+                                                vfs_mutex_ntfn, // только реально используется при exec_is_driver==253, см. spawn_process
+                                                exec_cwd_payload);
                     } else {
                         new_pid = -2; // Invalid ELF
                     }
                 }
-                
+
                 seL4_SetMR(0, new_pid);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
@@ -2386,7 +2663,9 @@ int main(int argc, char *argv[]) {
                 seL4_Word target_core = seL4_GetMR(2);
                 seL4_Word status;
 
-                if (target_pid == 0) {
+                if (!is_admin_caller(sender_pid)) {
+                    status = 5; // Фаза 9.C: доступ запрещён
+                } else if (target_pid == 0) {
                     status = 2;
                 } else if (target_pid >= 256 || !pcbs[target_pid].active) {
                     status = 1;
@@ -2527,6 +2806,16 @@ int main(int argc, char *argv[]) {
             // несколько мелких — освободить ядро целиком под тяжёлый, а не
             // наоборот "увести самого тяжёлого".
             case SYS_BALANCE: {
+                if (!is_admin_caller(sender_pid)) {
+                    // Фаза 9.C: доступ запрещён — молча, без текста в SHM
+                    // (у untrusted-вызывающего всё равно нет страницы VFS SHM,
+                    // чтобы его прочитать, но сам перенос процессов не должен
+                    // происходить вообще).
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
                 LoadSnapshot snap;
                 collect_load_snapshot(snap, console_ep, blk_ep, net_cmd_send_ep, wifi_cmd_send_ep, timer_ep);
 
@@ -2636,7 +2925,13 @@ int main(int argc, char *argv[]) {
 
             case SYS_KILL: {
                 int target_pid = arg1;
-                
+
+                if (!is_admin_caller(sender_pid)) {
+                    seL4_SetMR(0, (seL4_Word)-2); // Фаза 9.C: доступ запрещён
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
                 if (target_pid == 0) {
                     uart_puts("\n[KERNEL PANIC] Attempted to kill Rootserver!\n");
                     seL4_SetMR(0, (seL4_Word)-1);
@@ -2698,13 +2993,48 @@ int main(int argc, char *argv[]) {
                         seL4_TCB_UnbindNotification(pcbs[sender_pid].tcb);
                     }
                     pcbs[sender_pid].active = false;
-                    seL4_CNode_Delete(root_cnode, pcbs[sender_pid].badged_ep, seL4_WordBits);
-                    seL4_CNode_Delete(root_cnode, pcbs[sender_pid].tcb, seL4_WordBits);
-                    if (pcbs[sender_pid].vspace != root_vspace) {
-                        seL4_CNode_Delete(root_cnode, pcbs[sender_pid].vspace, seL4_WordBits);
+
+                    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (см. ROADMAP.md/issuse.txt —
+                    // "KERNEL PANIC: Out of CSlots during process allocation!"
+                    // после десятка-другого обычных команд): раньше здесь
+                    // удалялись только 3 конкретные капы (badged_ep/tcb/
+                    // vspace) — БЕЗ единого alloc.free(), и совсем без учёта
+                    // остальных ~7 капов из cap_tracker (child_cnode, page-
+                    // table-слоты, stack/ipc-фреймы, см. spawn_process/
+                    // alloc_and_track_cap), которые при обычном (не аварийном)
+                    // выходе процесса не освобождались ВООБЩЕ — ни на уровне
+                    // ядра (revoke/delete), ни в пуле слотов аллокатора. Это
+                    // единственный путь выхода, которым пользуется КАЖДАЯ
+                    // /sbin-команда после нормального завершения — то есть
+                    // течь происходила при любом ls/ps/touch/cat/... и после
+                    // достаточного числа команд слоты CNode заканчивались.
+                    // Тот же паттерн полной очистки уже применяется в
+                    // generic_recover_process()/case 105 (SYS_THREAD_EXIT)
+                    // ниже — используем его здесь тоже, вместо трёх ручных
+                    // удалений.
+                    for (int i = 0; i < pcbs[sender_pid].cap_tracker.count; i++) {
+                        seL4_CPtr cap_to_free = pcbs[sender_pid].cap_tracker.caps[i];
+                        seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+                        seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
+                        alloc.free(cap_to_free);
+                    }
+                    pcbs[sender_pid].cap_tracker.count = 0;
+
+                    // Та же течь для SHM-копии (is_driver==253 /sbin-утилиты
+                    // получают её при спавне, см. shm_pages_mask_for_role()) —
+                    // тоже нигде не освобождалась при обычном выходе.
+                    if (pcbs[sender_pid].has_shm) {
+                        for (int i = 0; i < 8; i++) {
+                            if (pcbs[sender_pid].shm_copies[i] != 0) {
+                                seL4_CNode_Delete(root_cnode, pcbs[sender_pid].shm_copies[i], seL4_WordBits);
+                                alloc.free(pcbs[sender_pid].shm_copies[i]);
+                                pcbs[sender_pid].shm_copies[i] = 0;
+                            }
+                        }
+                        pcbs[sender_pid].has_shm = false;
                     }
                 }
-                continue; 
+                continue;
             }
 
             case SYS_GETPID: {
@@ -2730,6 +3060,20 @@ int main(int argc, char *argv[]) {
                 }
                 if (drv >= 1 && drv <= 4) {
                     driver_ready[drv] = true;
+
+                    // Фаза 9.B (см. ROADMAP.md): автозапуск сервисов из
+                    // /etc/init.conf — ровно в момент, когда все базовые
+                    // драйверы (включая blk_driver — FAT32 уже смонтирован)
+                    // впервые готовы, и ровно один раз (это событие в
+                    // теории может прийти снова при respawn какого-то
+                    // драйвера). ДО отпускания шелла ниже — сервисы успевают
+                    // подняться раньше первого приглашения.
+                    static bool init_services_started = false;
+                    if (all_drivers_ready() && !init_services_started) {
+                        init_services_started = true;
+                        start_init_services(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                             blk_ep, console_ep, timer_ep, net_cmd_send_ep, vfs_mutex_ntfn);
+                    }
 
                     // Отпускаем shell, ждавший на SYS_WAIT_ALL_DRIVERS_READY — ОТДЕЛЬНЫМ
                     // Send на сохраненный reply-cap, а не seL4_Reply() (тот отвечал бы
@@ -2907,6 +3251,28 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, (seL4_Word)-1); // не скомпилирован (RPI4_ENABLE_WIFI=false)
                 } else {
                     g_wifi_driver_ready = false;
+                    // Фаза 9.B (см. ROADMAP.md): wifi_driver теперь грузится
+                    // С ДИСКА (/service/wifi.elf), а не из встроенного в
+                    // образ CPIO-архива — тот же принцип, что /sbin/*.elf и
+                    // /service/balancer.elf, просто без общего init.conf-
+                    // парсера: is_driver==5 несёт СВОЙ, гораздо более богатый
+                    // набор capability (SDIO MMIO, heartbeat/RX-badge и
+                    // т.д.), который generic-парсер init.conf не понимает —
+                    // это специфика именно этого драйвера, отдельный путь.
+                    int wifi_elf_size = load_elf_from_disk(blk_ep, "/service/wifi.elf", g_elf_load_buffer);
+                    if (wifi_elf_size <= 0) {
+                        uart_puts("[ROOT] /service/wifi.elf не найден на диске.\n");
+                        seL4_SetMR(0, (seL4_Word)-1);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        break;
+                    }
+                    elf_t wifi_elf;
+                    if (elf_newFile(g_elf_load_buffer, wifi_elf_size, &wifi_elf) != 0) {
+                        uart_puts("[ROOT] /service/wifi.elf: битый ELF.\n");
+                        seL4_SetMR(0, (seL4_Word)-1);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        break;
+                    }
                     // wifi_irq_ntfn передаётся ДЕВЯТЫМ параметром (irq_handler
                     // слот) — тот же приём, что у blk_irq_ntfn: обычная
                     // capability на нотификацию, не настоящий IRQHandler (см.
@@ -2915,7 +3281,7 @@ int main(int argc, char *argv[]) {
                     // же самое место, где uart/timer/net получают свою
                     // нотификацию (Фаза 4.5, Wi-Fi data-plane, см. common.h/
                     // WIFI_EVENT_HEARTBEAT|WIFI_EVENT_TX_READY).
-                    int new_pid = spawn_process("wifi_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                    int new_pid = spawn_process("wifi_driver", g_elf_load_buffer, wifi_elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                                                 5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
                                                 0, 0, wifi_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, net_wifi_rx_badged,
                                                 0, 0, 0, 0, 0, vfs_mutex_ntfn);

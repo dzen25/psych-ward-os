@@ -283,7 +283,7 @@ int main(int argc, char *argv[]) {
         seL4_Word badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
 
-        if (badge == 1) {
+        if (badge == TIMER_IRQ_BADGE) {
             // IRQ физического таймера — снимаем условие СРАЗУ (ENABLE=0
             // гасит выход таймера независимо от ISTATUS), потом Ack: этот
             // IRQ не общий ни с чем (в отличие от IRQ 158 EMMC2/Wi-Fi), и
@@ -363,7 +363,7 @@ int main(int argc, char *argv[]) {
                 seL4_CNode_SaveCaller(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT, 8); // depth=8, см. урок из uart_driver.cpp
                 rearm_timer(pending_sleep, sleep_deadline, heartbeat_enabled, next_heartbeat_deadline);
                 if (LOG_TIMER) sys_puts(console_ep, "[TIMER] sleep: взвели физический таймер, ждём IRQ...\n");
-                // Reply НЕ отправляем — см. ветку badge==1 выше.
+                // Reply НЕ отправляем — см. ветку badge==TIMER_IRQ_BADGE выше.
             }
         } else if (sys == 9) { // SYS_TIMER_HEARTBEAT_SUBSCRIBE: разовая регистрация net_driver'а (Фаза 4.5)
             // MR1 = период в мс. Отвечаем сразу — это просто регистрация,

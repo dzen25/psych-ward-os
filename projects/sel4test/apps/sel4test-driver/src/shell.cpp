@@ -11,7 +11,6 @@
 static const int TZ_OFFSET_HOURS = 3;
 
 // Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
-static char ls_thread_stack[16384] __attribute__((aligned(16)));
 static char grep_thread_stack[16384] __attribute__((aligned(16)));
 
 static char* shm_base = nullptr;
@@ -20,7 +19,7 @@ static seL4_CPtr vfs_mutex_ep = 0;
 // Милстоун 4.4 (см. wifi_driver.cpp) — "знакомые сети" (PATH_WIFI_PQW,
 // строки "имясети|пароль"). Буферы для чтения/перезаписи файла целиком
 // (у blk_driver нет append, см. net_driver.cpp/platform.h) — статические
-// (не в стеке main()), по тому же принципу, что ls_thread_stack/cmd_history
+// (не в стеке main()), по тому же принципу, что grep_thread_stack/cmd_history
 // выше: единственный поток шелла обрабатывает одну команду за раз, повторный
 // вход невозможен, а 2x4000 байт на стеке main() было бы неоправданным риском.
 static char g_pqw_old[4000];
@@ -886,26 +885,6 @@ static void sys_pipe_close(int fd) {
     get_local_ipc()->caps_or_badges[fd] = 0; // Invalidate local FD
 }
 
-void ls_thread_func(seL4_Word _timer_ep, seL4_Word _console_ep, seL4_Word blk_ep) {
-    // CRITICAL: Initialize libsel4's IPC buffer for this thread.
-    seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r" (tls_addr));
-    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
-
-    // The shell has already placed the target path into shm_base.
-    // We just need to call the VFS syscall.
-    vfs_syscall(110, blk_ep); // SYS_LS
-
-    // The result is now in shm_base. Write it to our stdout (the pipe).
-    sys_write(1, shm_base);
-
-    // Signal end of data to the reader.
-    sys_pipe_wr_close(1);
-
-    // Terminate the thread.
-    sys_thread_exit();
-}
-
 void grep_thread_func(const char* pattern) {
     // CRITICAL: Initialize libsel4's IPC buffer for this thread.
     seL4_Word tls_addr;
@@ -1762,57 +1741,9 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            else if (my_strcmp(cmd_ptr, "ls") == 0) {
-                char *shm = shm_base; 
-                if (arg) { build_absolute_path(shm, arg, SHM_TOTAL_SIZE); }
-                else { build_absolute_path(shm, "", SHM_TOTAL_SIZE); }
-
-                if (is_piping) { 
-                    // Запускаем ls в потоке, перенаправив его stdout в пайп
-                    left_pid = spawn_thread((seL4_Word)ls_thread_func, (seL4_Word)ls_thread_stack + sizeof(ls_thread_stack) - 16,
-                                 timer_ep, console_ep, blk_ep, pipe_fd, ipc->caps_or_badges[0], pipe_cap, ipc->caps_or_badges[2]);
-                } else {
-                    vfs_syscall(110, blk_ep);
-                    sys_puts(console_ep, shm);
-                }
-            }
-
             else if (my_strcmp(cmd_ptr, "pwd") == 0) {
                 sys_puts(console_ep, current_working_dir);
                 sys_puts(console_ep, "\n");
-            }
-
-            else if (my_strcmp(cmd_ptr, "mkdir") == 0) {
-                if (!arg) {
-                    sys_puts(console_ep, "mkdir: missing operand\n");
-                    continue;
-                }
-
-                char* p = arg;
-                while (*p != '\0') {
-                    while (*p == ' ') p++;
-                    if (*p == '\0') break;
-
-                    char* start_of_arg = p;
-                    while (*p != ' ' && *p != '\0') p++;
-                    
-                    char temp_char = *p;
-                    *p = '\0';
-
-                    my_strcpy(shm_base, start_of_arg);
-                    vfs_lock();
-                    seL4_SetMR(0, 117); // SYS_MKDIR
-                    seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-                    int ret = seL4_GetMR(0);
-                    vfs_unlock();
-                    
-                    if (ret != 0) {
-                        sys_puts(console_ep, "mkdir: cannot create directory '");
-                        sys_puts(console_ep, start_of_arg);
-                        sys_puts(console_ep, "'\n");
-                    }
-                    *p = temp_char;
-                }
             }
 
             else if (my_strcmp(cmd_ptr, "cd") == 0) {
@@ -1847,100 +1778,6 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "cd: ");
                     sys_puts(console_ep, path);
                     sys_puts(console_ep, ": No such file or directory\n");
-                }
-            }
-
-            else if (my_strcmp(cmd_ptr, "ps") == 0) {
-                seL4_IPCBuffer *ipc = get_local_ipc();
-
-                // SYS_PS пишет таблицу процессов в тот же офсет 0 разделяемой
-                // SHM, что и net_driver.cpp (net_log_flush, журнал UDP) —
-                // держим лок на весь путь "запрос -> ответ рутсервера ->
-                // чтение shm", иначе фоновая запись net_driver может
-                // перезаписать буфер до того, как мы его прочитаем (см.
-                // vfs_lock() выше).
-                vfs_lock();
-                ipc->msg[0] = 104;
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-                if (is_piping) {
-                    sys_write(pipe_fd, shm);
-                    sys_pipe_wr_close(pipe_fd);
-                } else {
-                    sys_puts(console_ep, shm);
-                }
-                vfs_unlock();
-            }
-
-            // Фаза 6.1 (SMP, см. ROADMAP.md): разовый снимок нагрузки — по
-            // умолчанию компактная таблица "ядро/%CPU/кто на нём" (MR1=0);
-            // `top -l` — подробная построчная таблица PID/CORE/%CPU/NAME
-            // (MR1=1). Тот же паттерн, что `ps` выше (SYS_TOP_STATS пишет
-            // готовый текст в ту же VFS SHM-страницу, root сам держит окно
-            // измерения ~300мс).
-            else if (my_strcmp(cmd_ptr, "top") == 0) {
-                seL4_IPCBuffer *ipc = get_local_ipc();
-                bool longFormat = arg && my_strcmp(arg, "-l") == 0;
-                vfs_lock();
-                ipc->msg[0] = SYS_TOP_STATS;
-                seL4_SetMR(1, longFormat ? 1 : 0);
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
-                if (is_piping) {
-                    sys_write(pipe_fd, shm);
-                    sys_pipe_wr_close(pipe_fd);
-                } else {
-                    sys_puts(console_ep, shm);
-                }
-                vfs_unlock();
-            }
-
-            // Фаза 6.1 (продолжение, см. ROADMAP.md): `balance` — по команде,
-            // но цель переноса выбирает root сам (см. SYS_BALANCE). Тот же
-            // паттерн вывода, что у `top`/`ps`.
-            else if (my_strcmp(cmd_ptr, "balance") == 0) {
-                seL4_IPCBuffer *ipc = get_local_ipc();
-                vfs_lock();
-                ipc->msg[0] = SYS_BALANCE;
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-                if (is_piping) {
-                    sys_write(pipe_fd, shm);
-                    sys_pipe_wr_close(pipe_fd);
-                } else {
-                    sys_puts(console_ep, shm);
-                }
-                vfs_unlock();
-            }
-
-            else if (my_strcmp(cmd_ptr, "kill") == 0) {
-                seL4_IPCBuffer *ipc = get_local_ipc();
-                if (!arg) { sys_puts(console_ep, "Usage: kill <pid>\n"); continue; }
-                ipc->msg[0] = 102; // SYS_KILL
-                ipc->msg[1] = simple_atoi(arg);
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
-                sys_puts(console_ep, "Signal sent.\n");
-            }
-
-            // Фаза 6.1 (SMP, см. ROADMAP.md): ручной перенос уже запущенного
-            // процесса на другое ядро в рантайме — SYS_SET_AFFINITY.
-            else if (my_strcmp(cmd_ptr, "taskset") == 0) {
-                char *cursor = arg;
-                char *pid_str = arg ? next_token(&cursor) : nullptr;
-                char *core_str = arg ? next_token(&cursor) : nullptr;
-                if (!pid_str || !core_str) {
-                    sys_puts(console_ep, "Usage: taskset <pid> <ядро 0-3>\n");
-                    continue;
-                }
-                seL4_SetMR(0, SYS_SET_AFFINITY);
-                seL4_SetMR(1, simple_atoi(pid_str));
-                seL4_SetMR(2, simple_atoi(core_str));
-                seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 3));
-                seL4_Word status = seL4_GetMR(0);
-                switch (status) {
-                    case 0: sys_puts(console_ep, "OK.\n"); break;
-                    case 1: sys_puts(console_ep, "Процесс не найден.\n"); break;
-                    case 2: sys_puts(console_ep, "root зафиксирован на ядре 0, перенос невозможен.\n"); break;
-                    case 3: sys_puts(console_ep, "timer_driver нельзя переносить: держит физический таймер (PPI) через капу, привязанную к ядру 0 — перенос вызовет тихое зависание при следующем перевзведении.\n"); break;
-                    case 4: sys_puts(console_ep, "Некорректный номер ядра (0-3).\n"); break;
-                    default: sys_puts(console_ep, "Неизвестная ошибка.\n"); break;
                 }
             }
 
@@ -2044,59 +1881,6 @@ int main(int argc, char *argv[]) {
             }
 
             // === КОМАНДА TOUCH (Поддержка бесконечного числа аргументов) ===
-            else if (my_strcmp(cmd_ptr, "touch") == 0) {
-                char* p = arg;
-
-                // 1. Ошибка: если после пробелов сразу конец строки (нет аргументов)
-                if (!p || *p == '\0') {
-                    sys_puts(console_ep, "touch: missing file operand\n");
-                    continue;
-                }
-
-                // 2. Парсим бесконечное количество аргументов
-                while (*p != '\0') {
-                    // Пропускаем лишние пробелы перед очередным файлом (на случай "touch  a     b")
-                    while (*p == ' ') p++;
-                    if (*p == '\0') break;
-
-                    char* start_of_arg = p;
-                    // Ищем конец имени файла
-                    while (*p != ' ' && *p != '\0') p++;
-                    
-                    char temp_char = *p;
-                    *p = '\0'; // Временно обрезаем строку, чтобы получить один аргумент
-
-                    // 3. Отправляем IPC-вызов драйверу диска для ЭТОГО конкретного файла
-                    char *shm = shm_base;
-                    build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
-                    if (vfs_syscall(112, blk_ep) != 0) {
-                        sys_puts(console_ep, "touch: failed to create '");
-                        sys_puts(console_ep, start_of_arg);
-                        sys_puts(console_ep, "'\n");
-                    }
-                    *p = temp_char; // Восстанавливаем строку для следующей итерации
-                }
-            }
-
-            else if (my_strcmp(cmd_ptr, "cat") == 0) {
-                if (!arg) { sys_puts(console_ep, "Usage: cat <file>\n"); continue; }
-                char *shm = shm_base;
-                build_absolute_path(shm, arg, SHM_TOTAL_SIZE);
-                
-                if (vfs_syscall(114, blk_ep) == 0) { // Файл прочитан в shm
-                    if (is_piping) {
-                        sys_write(pipe_fd, shm);
-                        sys_write(pipe_fd, "\n");
-                        sys_pipe_wr_close(pipe_fd);
-                    } else {
-                        sys_puts(console_ep, shm);
-                        sys_puts(console_ep, "\n");
-                    }
-                } else {
-                    sys_puts(console_ep, "File not found or is a directory.\n");
-                }
-            }
-
             else if (my_strcmp(cmd_ptr, "echo") == 0) {
                 if (!arg) { if (!is_piping) sys_puts(console_ep, "\n"); continue; }
                 
@@ -2184,86 +1968,6 @@ int main(int argc, char *argv[]) {
             }
             // ==========================================
 
-            else if (my_strcmp(cmd_ptr, "rm") == 0) {
-                char* p = arg;
-
-                if (!p || *p == '\0') {
-                    sys_puts(console_ep, "rm: missing operand\n");
-                    continue;
-                }
-
-                while (*p != '\0') {
-                    while (*p == ' ') p++;
-                    if (*p == '\0') break;
-
-                    char* start_of_arg = p;
-                    while (*p != ' ' && *p != '\0') p++;
-                    
-                    char temp_char = *p;
-                    *p = '\0';
-
-                    char *shm = shm_base;
-                    build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
-                    if (vfs_syscall(120, blk_ep) != 0) {
-                        sys_puts(console_ep, "rm: cannot remove '");
-                        sys_puts(console_ep, start_of_arg);
-                        sys_puts(console_ep, "': No such file or directory\n");
-                    }
-                    *p = temp_char;
-                }
-            } 
-            // === КОМАНДА MV (Переименование) ===
-            else if (my_strcmp(cmd_ptr, "mv") == 0) {
-                if (!arg) {
-                    sys_puts(console_ep, "mv: missing file operand\n");
-                    continue;
-                }
-                char* p = arg;
-
-                // 1. Вытаскиваем ИМЯ СТАРОГО ФАЙЛА (old_name)
-                char old_name[32];
-                int i = 0;
-                while (*p != ' ' && *p != '\0' && i < 31) {
-                    old_name[i++] = *p++;
-                }
-                old_name[i] = '\0';
-
-                // 2. Пропускаем пробелы между аргументами
-                while (*p == ' ') p++; 
-
-                if (*p == '\0') {
-                    sys_puts(console_ep, "mv: missing destination file operand after '");
-                    sys_puts(console_ep, old_name);
-                    sys_puts(console_ep, "'\n");
-                    continue;
-                }
-
-                // 3. Вытаскиваем ИМЯ НОВОГО ФАЙЛА (new_name)
-                char new_name[32];
-                i = 0;
-                while (*p != ' ' && *p != '\0' && i < 31) {
-                    new_name[i++] = *p++;
-                }
-                new_name[i] = '\0';
-
-                // 4. Готовим IPC-сообщение
-                char *shm = shm_base;
-                build_absolute_path(shm, old_name, 128);
-                build_absolute_path(shm + 128, new_name, SHM_TOTAL_SIZE - 128);
-                
-                vfs_lock();
-                seL4_SetMR(0, 116); // SYS_RENAME
-                seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 1);
-                seL4_Call(blk_ep, info);
-                int ret_val = seL4_GetMR(0);
-                vfs_unlock();
-                
-                if (ret_val != 0) {
-                    sys_puts(console_ep, "mv: cannot stat '");
-                    sys_puts(console_ep, old_name);
-                    sys_puts(console_ep, "': No such file or directory\n");
-                }
-            }
             else if (my_strncmp(cmd_ptr, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf
                 char* filename = cmd_ptr + 2; // Пропускаем "./"
@@ -2314,7 +2018,55 @@ int main(int argc, char *argv[]) {
                     sys_puts(console_ep, "[SHELL] Error: Spawn failed.\n");
                 }
             } 
-            else { sys_puts(console_ep, "Unknown command. Type 'help'.\n"); }
+            else {
+                // Фаза A (см. ROADMAP.md): не встроенная команда шелла —
+                // пробуем /sbin/<cmd>.elf (ps/kill/taskset/top/balance/ls/
+                // cat/touch/rm/mv/mkdir, см. src/sbin/). Пайпинг для таких
+                // команд пока не поддержан (exec'нутые процессы не пишут в
+                // pipe_fd — см. ROADMAP, принятое ограничение) — явно
+                // закрываем пайп, чтобы правая часть конвейера не зависла в
+                // ожидании данных, вместо попытки эмулировать вывод.
+                if (is_piping) {
+                    sys_pipe_wr_close(pipe_fd);
+                } else {
+                    char sbin_path[64] = {0};
+                    int plen = my_strlcpy(sbin_path, "/sbin/", sizeof(sbin_path));
+                    plen += my_strlcpy(sbin_path + plen, cmd_ptr, sizeof(sbin_path) - plen);
+                    my_strlcpy(sbin_path + plen, ".elf", sizeof(sbin_path) - plen);
+
+                    char exec_payload[64] = {0};
+                    int elen = my_strlcpy(exec_payload, sbin_path, sizeof(exec_payload));
+                    if (arg && elen + 1 < (int)sizeof(exec_payload)) {
+                        exec_payload[elen] = ' ';
+                        my_strlcpy(exec_payload + elen + 1, arg, sizeof(exec_payload) - elen - 1);
+                    }
+
+                    // Передаём текущий cwd через MR9-16 (см. EXEC_CWD_MSG_SLOT
+                    // в common.h) — /sbin-утилиты резолвят относительные
+                    // пути сами (см. h/sys_client.h/build_absolute_path), как
+                    // раньше делал сам шелл для ls/cat/touch/rm/mv. НЕ через
+                    // общую VFS SHM — найдено на живом железе, что
+                    // load_elf_from_disk() (main.cpp) читает файл через ту же
+                    // физическую страницу и затирает записанный туда cwd
+                    // ДО того, как ребёнок успевает его прочитать.
+                    char cwd_payload[64] = {0};
+                    my_strlcpy(cwd_payload, current_working_dir, sizeof(cwd_payload));
+
+                    seL4_SetMR(0, 100); // SYS_EXEC
+                    uint64_t* name_ptr = (uint64_t*)exec_payload;
+                    for (int i = 0; i < 8; i++) seL4_SetMR(i + 1, name_ptr[i]);
+                    uint64_t* cwd_ptr = (uint64_t*)cwd_payload;
+                    for (int i = 0; i < 8; i++) seL4_SetMR(i + 9, cwd_ptr[i]);
+                    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 17));
+
+                    int pid = (int)seL4_GetMR(0);
+                    if (pid > 0) {
+                        sys_wait(root_ep, pid);
+                    } else {
+                        sys_puts(console_ep, "Unknown command. Type 'help'.\n");
+                    }
+                }
+            }
 
             // --- ПРАВАЯ ЧАСТЬ КОНВЕЙЕРА ---
             if (is_piping) {

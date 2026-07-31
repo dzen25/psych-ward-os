@@ -10,7 +10,7 @@ fat32.img
 .venv/
 env/
 venv/
-bin/
+issuse.txt
 obj/
 *.o
 *.a

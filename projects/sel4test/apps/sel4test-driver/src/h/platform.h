@@ -25,10 +25,14 @@ constexpr bool LOG_WIFI    = false;  // wifi_driver.cpp — новые кома�
 // истинном корне FAT-раздела — где живут файлы загрузчика (config.txt,
 // U-BOOT.BIN и т.п.). 
 constexpr const char* PATH_NET_UDP_LOG   = "/root/net_udp.log";
-constexpr const char* PATH_WIFI_FW       = "/wifi/wifi_fw.bin";
-constexpr const char* PATH_WIFI_NVRAM    = "/wifi/wifi_nvram.txt";
-constexpr const char* PATH_WIFI_CLM      = "/wifi/wifi_clm.bin"; // regulatory/channel-таблица, см. brcmf_c_process_clm_blob()
-constexpr const char* PATH_WIFI_PQW      = "/wifi/pqw.txt"; // знакомые сети: строки "имясети|пароль"
+// Фаза 9.B (см. ROADMAP.md): перенесено из "/wifi/..." в "/conf/wifi_conf/..."
+// — тот же принцип, что /conf/balancer_conf, теперь и Wi-Fi-конфиги/прошивка
+// живут под /conf. "/wifi" (mkdir нигде не было — только ручное соглашение
+// на SD-карте) больше не используется, весь контент переехал.
+constexpr const char* PATH_WIFI_FW       = "/conf/wifi_conf/wifi_fw.bin";
+constexpr const char* PATH_WIFI_NVRAM    = "/conf/wifi_conf/wifi_nvram.txt";
+constexpr const char* PATH_WIFI_CLM      = "/conf/wifi_conf/wifi_clm.bin"; // regulatory/channel-таблица, см. brcmf_c_process_clm_blob()
+constexpr const char* PATH_WIFI_PQW      = "/conf/wifi_conf/pqw.txt"; // знакомые сети: строки "имясети|пароль"
 
 // CLM blob download ("clmload" iovar, см. brcmf_c_download()/brcmf_c_process_clm_blob()
 // в эталоне) — без него регуляторная таблица прошивки пуста, и даже валидный
