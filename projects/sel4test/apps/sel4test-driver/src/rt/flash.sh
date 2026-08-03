@@ -22,10 +22,9 @@ REMOTE_DIR="/home/nikita/psych-ward-os/load_chain"
 # Что копируется на партицию BOOT (список путей относительно REMOTE_DIR)
 BOOT_ITEMS=(
     "bcm2711-rpi-4-b.dtb"
-    "boot.scr"
+    "boot.itb"
     "config.txt"
     "fixup4.dat"
-    "sel4test-driver-image-arm-bcm2711"
     "start4.elf"
     "u-boot.bin"
     "overlays"

@@ -1,0 +1,83 @@
+{
+  "nodes": [
+    {"id":"hdr","type":"text","x":0,"y":-260,"width":1900,"height":180,
+     "text":"# Psych Ward OS — схема подписей\n\nДва НЕЗАВИСИМЫХ механизма защиты от подмены — разная криптография, разный проверяющий, разный момент проверки. Оба приватных ключа существуют ТОЛЬКО на этой сборочной машине: никогда не попадают в git, никогда не пишутся на SD-карту."},
+
+    {"id":"grp-a","type":"group","x":-20,"y":-60,"width":920,"height":1000,
+     "label":"Фаза 12 — exFAT-раздел (/sbin, /service, init.conf) — Ed25519"},
+
+    {"id":"a-key","type":"text","x":20,"y":0,"width":360,"height":150,"color":"6",
+     "text":"🔑 Приватный ключ\n`.signing-key`\n\nEd25519 seed, 32 байта.\nТолько на этой машине.\nВ `.gitignore`, никогда в git,\nникогда на SD-карте."},
+
+    {"id":"a-pubkey","type":"text","x":440,"y":0,"width":360,"height":150,
+     "text":"🔓 Публичный ключ\n`OS_PUBLIC_KEY[32]`\n\nвшит в прошивку заранее\n(`main.cpp`) — не секрет,\nчасть исходников."},
+
+    {"id":"a-sign","type":"text","x":20,"y":190,"width":360,"height":170,
+     "text":"✍️ `tools/sign_elf sign`\n\nК файлу дописывается\n68-байтовый трейлер:\n`\"PWSG\"` (4 байта) +\nEd25519-подпись (64 байта)\nнад ВСЕМ файлом целиком."},
+
+    {"id":"a-verify","type":"text","x":440,"y":190,"width":360,"height":230,"color":"4",
+     "text":"🛡️ `load_elf_from_disk()`\n\nЕДИНАЯ точка проверки —\nпокрывает СРАЗУ все 5 мест:\n`SYS_EXEC`, загрузка `init.conf`,\nwatchdog-респавн,\nавтозапуск сервисов,\n`/service/wifi.elf`"},
+
+    {"id":"a-files","type":"text","x":20,"y":400,"width":360,"height":150,
+     "text":"📦 Подписанные файлы\n\n`load_chain/sbin/*.elf`\n`load_chain/service/*.elf`\n`load_chain/etc/init.conf`"},
+
+    {"id":"a-fail","type":"text","x":440,"y":460,"width":360,"height":140,"color":"1",
+     "text":"❌ Нет подписи / неверна\n\n`[SIG] ...` в логе,\nфайл просто не запускается\n(fail-closed, без паники ОС)"},
+
+    {"id":"a-sd","type":"text","x":20,"y":590,"width":360,"height":100,"color":"5",
+     "text":"💾 SD-карта, раздел RPI (exFAT)"},
+
+    {"id":"a-when","type":"text","x":20,"y":730,"width":780,"height":90,
+     "text":"⏱️ Когда проверяется: КАЖДЫЙ РАЗ при чтении файла с диска — уже когда psych-ward-os работает"},
+
+    {"id":"grp-b","type":"group","x":980,"y":-60,"width":1060,"height":1420,
+     "label":"Фаза 13 — FAT32-раздел (образ ядра + boot-команда) — RSA/FIT"},
+
+    {"id":"b-key","type":"text","x":1020,"y":0,"width":360,"height":150,"color":"6",
+     "text":"🔑 Приватный ключ\n`.fit-signing-key/`\n\nRSA-2048 (openssl).\nТолько на этой машине.\nВ `.gitignore`."},
+
+    {"id":"b-embed","type":"text","x":1020,"y":190,"width":360,"height":210,
+     "text":"🔧 `setup_uboot_secure_boot.sh`\n\nСобирает U-Boot с\n`CONFIG_FIT_SIGNATURE`,\nвстраивает публичный ключ +\n`required=\"conf\"` ПРЯМО\nв control dtb U-Boot\n(`mkimage -K ... -r`)"},
+
+    {"id":"b-uboot","type":"text","x":1020,"y":440,"width":360,"height":150,
+     "text":"📦 `load_chain/u-boot.bin`\n\nключ и boot-команда\n(`CONFIG_BOOTCOMMAND`)\nуже зашиты внутрь"},
+
+    {"id":"b-sign","type":"text","x":1460,"y":0,"width":440,"height":170,
+     "text":"✍️ `build_and_sign.sh`, шаг [6/6]\n\n`mkimage -f boot.its\n-k .fit-signing-key -r`\n→ подписывает образ ядра"},
+
+    {"id":"b-itb","type":"text","x":1460,"y":210,"width":440,"height":120,
+     "text":"📦 `load_chain/boot.itb`\n\nподписанный образ ядра seL4"},
+
+    {"id":"b-sd","type":"text","x":1200,"y":650,"width":440,"height":100,"color":"5",
+     "text":"💾 SD-карта, раздел BOOT (FAT32)\n`u-boot.bin` + `boot.itb`"},
+
+    {"id":"b-verify","type":"text","x":1200,"y":790,"width":440,"height":180,"color":"4",
+     "text":"🛡️ На плате: U-Boot (`bootm`)\n\nсверяет подпись `boot.itb`\nсо своим встроенным ключом\nДО запуска seL4"},
+
+    {"id":"b-fail","type":"text","x":1200,"y":1010,"width":440,"height":140,"color":"1",
+     "text":"❌ Нет подписи / неверна\n\nU-Boot отказывается грузить\n(проверено локально:\n`fit_check_sign`, 3 сценария)"},
+
+    {"id":"b-when","type":"text","x":1020,"y":1190,"width":880,"height":90,
+     "text":"⏱️ Когда проверяется: ОДИН РАЗ при каждой загрузке платы — ДО того, как вообще стартует psych-ward-os"},
+
+    {"id":"warn","type":"text","x":-20,"y":1430,"width":2020,"height":240,"color":"2",
+     "text":"⚠️ Что НЕ защищено НИ ОДНОЙ из этих двух схем\n\n`start4.elf`, `fixup4.dat`, `config.txt`, FAT32-копия `bcm2711-rpi-4-b.dtb`, сам `u-boot.bin` ДО своего запуска — всё это грузит GPU-прошивка Raspberry Pi 4 РАНЬШЕ, чем U-Boot вообще существует. Защита этого уровня — отдельный OTP secure boot самой платы (прожиг физических fuse-битов в SoC, необратимо, риск окирпичить конкретный экземпляр). Осознанно не делается — см. ROADMAP.md, Фаза 13."}
+  ],
+  "edges": [
+    {"id":"e1","fromNode":"a-key","fromSide":"bottom","toNode":"a-sign","toSide":"top","label":"подписывает"},
+    {"id":"e2","fromNode":"a-sign","fromSide":"bottom","toNode":"a-files","toSide":"top","label":"дописывает трейлер"},
+    {"id":"e3","fromNode":"a-files","fromSide":"bottom","toNode":"a-sd","toSide":"top","label":"build_and_sign.sh копирует"},
+    {"id":"e4","fromNode":"a-sd","fromSide":"right","toNode":"a-verify","toSide":"left","label":"плата читает при exec/загрузке"},
+    {"id":"e5","fromNode":"a-pubkey","fromSide":"bottom","toNode":"a-verify","toSide":"top","label":"сверяется с"},
+    {"id":"e6","fromNode":"a-verify","fromSide":"bottom","toNode":"a-fail","toSide":"top","label":"если не совпало"},
+
+    {"id":"e7","fromNode":"b-key","fromSide":"bottom","toNode":"b-embed","toSide":"top","label":"встраивается"},
+    {"id":"e8","fromNode":"b-embed","fromSide":"bottom","toNode":"b-uboot","toSide":"top","label":"результат"},
+    {"id":"e9","fromNode":"b-key","fromSide":"right","toNode":"b-sign","toSide":"left","label":"тот же ключ подписывает"},
+    {"id":"e10","fromNode":"b-sign","fromSide":"bottom","toNode":"b-itb","toSide":"top","label":"создаёт"},
+    {"id":"e11","fromNode":"b-uboot","fromSide":"bottom","toNode":"b-sd","toSide":"top"},
+    {"id":"e12","fromNode":"b-itb","fromSide":"bottom","toNode":"b-sd","toSide":"top"},
+    {"id":"e13","fromNode":"b-sd","fromSide":"bottom","toNode":"b-verify","toSide":"top","label":"прошивка (rt/flash.sh)"},
+    {"id":"e14","fromNode":"b-verify","fromSide":"bottom","toNode":"b-fail","toSide":"top","label":"если не совпало"}
+  ]
+}

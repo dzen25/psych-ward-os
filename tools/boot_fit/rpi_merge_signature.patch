@@ -1,0 +1,110 @@
+diff --git a/board/raspberrypi/rpi/rpi.c b/board/raspberrypi/rpi/rpi.c
+index 1da5df92..a7c152d4 100644
+--- a/board/raspberrypi/rpi/rpi.c
++++ b/board/raspberrypi/rpi/rpi.c
+@@ -567,14 +567,103 @@ int board_init(void)
+ }
+ 
+ /*
+- * If the firmware passed a device tree use it for U-Boot.
++ * Psych Ward OS (Фаза 13) — вписываем узел /signature (публичный RSA-ключ
++ * подписи + required="conf") из СВОЕГО OF_SEPARATE-DTB, который несёт сама
++ * сборка U-Boot, в DTB, переданный GPU-прошивкой — вместо того чтобы
++ * целиком заменять DTB прошивки собственным. Полная замена (через
++ * --disable OF_BOARD) ломает EMMC2 DMA на этой плате (реальный SD-card
++ * read перестаёт физически писать в память, хотя протокол рапортует
++ * успех) — подробности в ROADMAP.md, Фаза 13. Прошивочный DTB остаётся
++ * единственным источником аппаратного описания; из "своего" DTB берём
++ * ТОЛЬКО /signature.
++ */
++static int merge_signature_node(void *dst_fdt, const void *src_fdt)
++{
++	int src_sig, dst_sig;
++	int src_key, dst_key;
++	int prop_off;
++	const char *prop_name;
++	const void *prop_val;
++	int prop_len;
++	int ret;
++
++	src_sig = fdt_path_offset(src_fdt, "/signature");
++	if (src_sig < 0)
++		return src_sig;
++
++	src_key = fdt_first_subnode(src_fdt, src_sig);
++	if (src_key < 0)
++		return src_key;
++
++	dst_sig = fdt_add_subnode(dst_fdt, 0, "signature");
++	if (dst_sig < 0)
++		return dst_sig;
++
++	dst_key = fdt_add_subnode(dst_fdt, dst_sig,
++				   fdt_get_name(src_fdt, src_key, NULL));
++	if (dst_key < 0)
++		return dst_key;
++
++	fdt_for_each_property_offset(prop_off, src_fdt, src_key) {
++		prop_val = fdt_getprop_by_offset(src_fdt, prop_off,
++						  &prop_name, &prop_len);
++		if (!prop_val)
++			continue;
++		ret = fdt_setprop(dst_fdt, dst_key, prop_name, prop_val,
++				   prop_len);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * НЕ static-буфер (.bss) — U-Boot зачищает .bss ПОСЛЕ переноса самого себя
++ * на новый адрес (relocation), прямо перед прыжком в board_init_r (см.
++ * "Clear BSS section" в arch/arm/lib/crt0_64.S). board_fdt_blob_setup()
++ * вызывается из board_init_f — ДО этого переноса, так что всё записанное
++ * в static-буфер стирается ДО того, как driver model в board_init_r успеет
++ * это прочитать (симптом на живом железе: тихий сброс платы ~через 5 сек
++ * после строки "DRAM:", без единого сообщения об ошибке).
++ *
++ * Вместо этого — фиксированный физический адрес вне собственного образа
++ * U-Boot, тот же класс памяти, что уже занимает fw_dtb_pointer: reloc_fdt()
++ * (тоже INITCALL в board_init_f) и так умеет копировать ЛЮБОЙ такой внешний
++ * DTB в безопасное постоянное место при переносе — ровно тот же механизм,
++ * что уже работает для fw_dtb_pointer и для own_fdt (OF_SEPARATE). Адрес
++ * выбран далеко и от начального адреса загрузки U-Boot (~0x80000), и от
++ * типичного адреса релокации (у конца RAM) — с большим запасом даже для
++ * минимального поддерживаемого RPI4_MEMORY=1024 (см. INSTRUCTIONS.md).
++ * malloc() здесь тоже не подходит — ранний пул (CONFIG_SYS_MALLOC_F_LEN)
++ * всего 8 KiB, DTB прошивки (~40 KiB) + узел подписи туда не влезут.
++ */
++#define MERGED_FDT_ADDR ((void *)0x08000000UL)
++#define MERGED_FDT_BUF_SIZE (64 * 1024)
++
++/*
++ * If the firmware passed a device tree use it for U-Boot — but first
++ * merge in our own /signature node (see merge_signature_node() above).
+  */
+ int board_fdt_blob_setup(void **fdtp)
+ {
++	void *own_fdt = *fdtp;
++	void *merged = MERGED_FDT_ADDR;
++
+ 	if (fdt_magic(fw_dtb_pointer) != FDT_MAGIC)
+ 		return -ENXIO;
+ 
+-	*fdtp = (void *)fw_dtb_pointer;
++	if (fdt_totalsize((void *)fw_dtb_pointer) + 4096 > MERGED_FDT_BUF_SIZE)
++		return -ENOSPC;
++
++	if (fdt_open_into((void *)fw_dtb_pointer, merged,
++			   MERGED_FDT_BUF_SIZE))
++		return -EINVAL;
++
++	if (merge_signature_node(merged, own_fdt))
++		return -EINVAL;
++
++	*fdtp = merged;
+ 
+ 	return 0;
+ }

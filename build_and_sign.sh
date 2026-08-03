@@ -14,22 +14,27 @@ SIGN_ELF="$ROOT/tools/sign_elf/sign_elf"
 SIGN_KEY="$ROOT/.signing-key"
 B="$BUILD_DIR/apps/sel4test-driver"
 
+# Фаза 13 — FIT-подпись загрузочного образа (RSA, отдельно от Ed25519 выше).
+MKIMAGE="$(command -v mkimage || true)"
+FIT_KEY_DIR="$ROOT/.fit-signing-key"
+BOOT_ITS_TEMPLATE="$ROOT/tools/boot_fit/boot.its.template"
+
 echo "=== Psych Ward OS: сборка + подпись ==="
 
 # --- 1. sign_elf: пересобрать, если отсутствует или устарел ---
 if [ ! -x "$SIGN_ELF" ] || [ "$ROOT/tools/sign_elf/sign_elf.c" -nt "$SIGN_ELF" ]; then
-    echo "[1/5] Собираю tools/sign_elf/sign_elf..."
+    echo "[1/6] Собираю tools/sign_elf/sign_elf..."
     gcc -O2 -o "$SIGN_ELF" "$ROOT/tools/sign_elf/sign_elf.c" \
         "$ROOT/tools/monocypher/src/monocypher.c" \
         "$ROOT/tools/monocypher/src/optional/monocypher-ed25519.c" \
         -I"$ROOT/tools/monocypher/src" -I"$ROOT/tools/monocypher/src/optional"
 else
-    echo "[1/5] sign_elf уже собран."
+    echo "[1/6] sign_elf уже собран."
 fi
 
 # --- 2. Приватный ключ подписи ---
 if [ ! -f "$SIGN_KEY" ]; then
-    echo "[2/5] Приватный ключ подписи не найден: $SIGN_KEY"
+    echo "[2/6] Приватный ключ подписи не найден: $SIGN_KEY"
     read -r -p "      Сгенерировать новый сейчас? [y/N] " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
         "$SIGN_ELF" genkey "$SIGN_KEY"
@@ -42,11 +47,11 @@ if [ ! -f "$SIGN_KEY" ]; then
         exit 1
     fi
 else
-    echo "[2/5] Ключ подписи найден: $SIGN_KEY"
+    echo "[2/6] Ключ подписи найден: $SIGN_KEY"
 fi
 
 # --- 3. Сборка (ninja) ---
-echo "[3/5] ninja в $BUILD_DIR ..."
+echo "[3/6] ninja в $BUILD_DIR ..."
 if [ -f "$ROOT/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "$ROOT/.venv/bin/activate"
@@ -55,9 +60,12 @@ fi
 
 # --- 4. Раскладка сырых (ещё не подписанных) артефактов под их итоговые
 # имена в load_chain/ ---
-echo "[4/5] Раскладываю сырые артефакты в load_chain/ ..."
+echo "[4/6] Раскладываю сырые артефакты в load_chain/ ..."
 
-cp "$BUILD_DIR/images/sel4test-driver-image-arm-bcm2711" "$LOAD_CHAIN/"
+# Сырой образ ядра НЕ копируется в load_chain/ — на SD-карту он больше не
+# попадает (с Фазы 13 U-Boot грузит только подписанный boot.itb, см. шаг
+# [6/6] ниже, который берёт его прямо из $BUILD_DIR). Копия в load_chain/
+# была бы мёртвым грузом, который никто не читает.
 
 # /sbin, /service — любой sb_<имя>/svc_<имя> из сборки -> <имя>.elf.
 # Список НЕ хардкодится — что CMake реально собрал (PSYCH_SBIN_TOOLS/
@@ -90,7 +98,7 @@ fi
 # Подписывает КАЖДЫЙ .elf, что найдёт внутри, на месте. Новый .elf в любой
 # из перечисленных папок подхватится сам — редактировать этот список нужно,
 # только если появится СОВСЕМ НОВАЯ папка (не новый файл в существующей). ---
-echo "[5/5] Подписываю все .elf в load_chain/{sbin,service,bin,root} + init.conf ..."
+echo "[5/6] Подписываю все .elf в load_chain/{sbin,service,bin,root} + init.conf ..."
 
 SIGN_DIRS=("$LOAD_CHAIN/sbin" "$LOAD_CHAIN/service" "$LOAD_CHAIN/bin" "$LOAD_CHAIN/root")
 for dir in "${SIGN_DIRS[@]}"; do
@@ -104,6 +112,33 @@ done
 if [ -f "$LOAD_CHAIN/etc/init.conf" ]; then
     tmp="$(mktemp)"
     "$SIGN_ELF" sign "$SIGN_KEY" "$LOAD_CHAIN/etc/init.conf" "$tmp" && mv "$tmp" "$LOAD_CHAIN/etc/init.conf"
+fi
+
+# --- 6. FIT-подпись загрузочного образа (Фаза 13, RSA — отдельный механизм
+# от Ed25519 выше, проверяется САМИМ U-Boot, не rootserver'ом). Ключ здесь
+# только ПОДПИСЫВАЕТ — публичная половина уже зашита в load_chain/u-boot.bin
+# при его отдельной (не автоматизированной этим скриптом) пересборке, см.
+# INSTRUCTIONS.md. Если поменяли .fit-signing-key — u-boot.bin нужно
+# пересобрать и передать заново, иначе новый boot.itb не пройдёт проверку. ---
+echo "[6/6] Подписываю загрузочный образ (FIT/RSA) -> load_chain/boot.itb ..."
+
+if [ -z "$MKIMAGE" ]; then
+    echo "!!! mkimage не найден (пакет u-boot-tools) — пропускаю FIT-подпись."
+elif [ ! -d "$FIT_KEY_DIR" ]; then
+    echo "!!! Ключ подписи загрузочного образа не найден: $FIT_KEY_DIR"
+    echo "!!! Сгенерировать вручную (см. INSTRUCTIONS.md, раздел про Фазу 13):"
+    echo "!!!   mkdir -p $FIT_KEY_DIR"
+    echo "!!!   openssl genpkey -algorithm RSA -out $FIT_KEY_DIR/dev.key -pkeyopt rsa_keygen_bits:2048 -pkeyopt rsa_keygen_pubexp:65537"
+    echo "!!!   openssl req -batch -new -x509 -key $FIT_KEY_DIR/dev.key -out $FIT_KEY_DIR/dev.crt -days 36500 -subj /CN=psych-ward-os-boot-signing"
+    echo "!!! Затем u-boot.bin нужно пересобрать с этим ключом (см. INSTRUCTIONS.md) — пропускаю FIT-подпись."
+else
+    its_tmp="$(mktemp --suffix=.its)"
+    itb_tmp="$(mktemp --suffix=.itb)"
+    sed "s|@@IMAGE_PATH@@|$BUILD_DIR/images/sel4test-driver-image-arm-bcm2711|" \
+        "$BOOT_ITS_TEMPLATE" > "$its_tmp"
+    "$MKIMAGE" -f "$its_tmp" -k "$FIT_KEY_DIR" -r "$itb_tmp"
+    mv "$itb_tmp" "$LOAD_CHAIN/boot.itb"
+    rm -f "$its_tmp"
 fi
 
 echo
