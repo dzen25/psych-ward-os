@@ -13,8 +13,29 @@ extern "C" {
 }
 #include <string.h>
 
+// Фаза 12 (см. ROADMAP.md) — проверка подписи файлов с диска перед
+// исполнением/использованием, см. load_elf_from_disk() ниже. Заголовок сам
+// оборачивает объявления в extern "C" при сборке как C++ — свою обёртку не
+// добавляем.
+#include "monocypher-ed25519.h"
+
 extern char _cpio_archive[];
 extern char _cpio_archive_end[];
+
+// Фаза 12 (см. ROADMAP.md) — публичный ключ Ed25519, зашитый в rootserver.
+// Это НЕ секрет (публичный ключ по определению) — приватный ключ живёт
+// отдельно (`.signing-key` в корне репозитория, в .gitignore, никогда не
+// попадает ни в git, ни на SD-карту). Сгенерирован tools/sign_elf/sign_elf
+// genkey. Перевыпущен 2026-08-03 (см. issuse.txt/ROADMAP.md Фаза 12) —
+// исходный ключ был безвозвратно утрачен из-за бага в sign_elf.c (писал на
+// диск seed ПОСЛЕ вызова crypto_ed25519_key_pair(), которая сама затирает
+// свой параметр seed[] изнутри — на диск улетали нули).
+constexpr unsigned char OS_PUBLIC_KEY[32] = {
+    0x34, 0x1d, 0xa4, 0x22, 0x22, 0x1a, 0xdc, 0x88,
+    0x11, 0x2b, 0xd7, 0xfe, 0x23, 0x8a, 0xb5, 0x25,
+    0xdf, 0x3c, 0x14, 0x24, 0x5a, 0xbe, 0x18, 0xe9,
+    0x8e, 0x82, 0xb7, 0xc4, 0x93, 0xda, 0xaa, 0x76
+};
 
 enum SyscallID {
     // --- БАЗОВЫЕ КЕРНЕЛ-ВЫЗОВЫ ---
@@ -496,6 +517,17 @@ static bool is_admin_caller(seL4_Word pid) {
 // (в этом случае команды просто вернут код ошибки, а не зависнут).
 static bool g_wifi_driver_ready = false;
 
+// Фаза 12 (см. ROADMAP.md) — формат подписи: 4-байтовый magic + 64-байтовая
+// Ed25519-подпись, приклеенные в конец файла (см. tools/sign_elf/). Работает
+// одинаково для ELF-бинарников и текстовых конфигов (сама схема не смотрит
+// на содержимое) — единая точка проверки прямо здесь, в load_elf_from_disk(),
+// автоматически покрывает ВСЕ 5 мест, которые её вызывают (SYS_EXEC,
+// init.conf, watchdog-респавн, автозапуск сервисов, /service/wifi.elf), без
+// изменений в вызывающем коде: возврат -1 при провале уже трактуется всеми
+// вызывающими как обычная ошибка чтения.
+constexpr unsigned char SIG_MAGIC[4] = { 'P', 'W', 'S', 'G' };
+constexpr uint32_t SIG_TRAILER_SIZE = 68; // 4 (magic) + 64 (подпись)
+
 static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
     uint32_t total_read = 0;
 
@@ -523,7 +555,21 @@ static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load
         total_read += bytes_read;
     }
 
-    return total_read;
+    // Проверка подписи (Фаза 12) — fail-closed: нет валидного трейлера —
+    // файл не используется, точка. Никаких исключений "для старых
+    // неподписанных файлов" — иначе вся схема тривиально обходится.
+    if (total_read <= SIG_TRAILER_SIZE ||
+        memcmp(load_buffer + total_read - SIG_TRAILER_SIZE, SIG_MAGIC, 4) != 0) {
+        uart_puts("[SIG] отсутствует подпись, отказ: "); uart_puts(filename); uart_puts("\n");
+        return -1;
+    }
+    uint32_t data_len = total_read - SIG_TRAILER_SIZE;
+    const unsigned char *signature = (const unsigned char*)(load_buffer + data_len + 4);
+    if (crypto_ed25519_check(signature, OS_PUBLIC_KEY, (const unsigned char*)load_buffer, data_len) != 0) {
+        uart_puts("[SIG] ПОДПИСЬ НЕВЕРНА, исполнение отклонено: "); uart_puts(filename); uart_puts("\n");
+        return -1;
+    }
+    return data_len;
 }
 
 // Умная функция маппинга (Самовосстанавливающееся дерево VSpace)

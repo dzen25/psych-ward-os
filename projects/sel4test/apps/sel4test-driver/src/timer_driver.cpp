@@ -130,6 +130,17 @@ static void sys_puthex32(seL4_CPtr console_ep, const char* label, uint32_t val) 
     sys_puts(console_ep, "\n");
 }
 
+static void sys_putdec_local(seL4_CPtr console_ep, int val) {
+    char buf[12];
+    int i = 11;
+    buf[i--] = '\0';
+    bool neg = val < 0;
+    unsigned int uval = neg ? (unsigned int)(-val) : (unsigned int)val;
+    do { buf[i--] = '0' + (uval % 10); uval /= 10; } while (uval != 0);
+    if (neg) buf[i--] = '-';
+    sys_puts(console_ep, &buf[i + 1]);
+}
+
 static volatile uint32_t *g_mbox_buf = nullptr;   // PLAT_MBOX_BUF_VADDR, некэшируемый, 4KB
 static uint32_t g_mbox_buf_paddr = 0;
 
@@ -295,6 +306,67 @@ static bool mbox_set_clock_rate(uint32_t clock_id, uint32_t hz, uint32_t *out_hz
     return true;
 }
 
+// ========================================================
+// Фаза 7 (продолжение) — энергодомены VideoCore (HDMI/камера/видеокодек/3D),
+// см. platform.h про MBOX_TAG_*_DOMAIN_STATE. И GET, и SET шлют ПОЛНЫЙ
+// 8-байтовый пакет {domain, state} — сверено с Linux (rpi_firmware_property()
+// вызывается с sizeof(packet)=8 в обоих случаях, не только для SET).
+// ========================================================
+static bool mbox_get_domain_state(uint32_t domain_id, uint32_t *out_state) {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 8 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = MBOX_TAG_GET_DOMAIN_STATE;
+    g_mbox_buf[3] = 8;
+    g_mbox_buf[4] = 8;
+    g_mbox_buf[5] = domain_id;
+    g_mbox_buf[6] = 0;
+    g_mbox_buf[7] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    if (g_mbox_buf[1] != MBOX_CODE_RESPONSE_SUCCESS) return false;
+    *out_state = g_mbox_buf[6];
+    return true;
+}
+
+static bool mbox_set_domain_state(uint32_t domain_id, bool want_on, uint32_t *out_state) {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 8 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = MBOX_TAG_SET_DOMAIN_STATE;
+    g_mbox_buf[3] = 8;
+    g_mbox_buf[4] = 8;
+    g_mbox_buf[5] = domain_id;
+    g_mbox_buf[6] = want_on ? 1u : 0u;
+    g_mbox_buf[7] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    if (g_mbox_buf[1] != MBOX_CODE_RESPONSE_SUCCESS) return false;
+    *out_state = g_mbox_buf[6];
+    return true;
+}
+
+struct MboxDomainDef { uint32_t id; const char *name; };
+// Мультимедиа/камера-блоки, не нужные headless serial-only ОС — см. полный
+// список констант и обоснование в platform.h.
+static const MboxDomainDef kHeadlessUnusedDomains[] = {
+    { MBOX_DOMAIN_HDMI,       "HDMI" },
+    { MBOX_DOMAIN_VEC,        "VEC" },
+    { MBOX_DOMAIN_JPEG,       "JPEG" },
+    { MBOX_DOMAIN_H264,       "H264" },
+    { MBOX_DOMAIN_V3D,        "V3D" },
+    { MBOX_DOMAIN_ISP,        "ISP" },
+    { MBOX_DOMAIN_UNICAM0,    "UNICAM0" },
+    { MBOX_DOMAIN_UNICAM1,    "UNICAM1" },
+    { MBOX_DOMAIN_CCP2RX,     "CCP2RX" },
+    { MBOX_DOMAIN_CSI2,       "CSI2" },
+    { MBOX_DOMAIN_CPI,        "CPI" },
+    { MBOX_DOMAIN_DSI0,       "DSI0" },
+    { MBOX_DOMAIN_DSI1,       "DSI1" },
+    { MBOX_DOMAIN_TRANSPOSER, "TRANSPOSER" },
+    { MBOX_DOMAIN_CCP2TX,     "CCP2TX" },
+    { MBOX_DOMAIN_CDP,        "CDP" },
+};
+constexpr int kHeadlessUnusedDomainCount = sizeof(kHeadlessUnusedDomains) / sizeof(kHeadlessUnusedDomains[0]);
+
 int main(int argc, char *argv[]) {
     // 2. Достаем настоящий адрес буфера
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -348,6 +420,26 @@ int main(int argc, char *argv[]) {
             g_cpufreq_max_hz = max_hz;
             g_cpufreq_available = true;
         }
+    }
+
+    // Фаза 7 (продолжение) — разово гасим неиспользуемые на headless-плате
+    // мультимедиа-домены (HDMI/камера/видеокодек/3D, см. kHeadlessUnusedDomains
+    // выше) — эта ОС их не использует вообще, только serial-консоль. Не
+    // переключается обратно — сценария "вдруг понадобился HDMI" тут нет.
+    // Мягкая деградация: если mailbox недоступен, просто ничего не гасим.
+    if (g_cpufreq_available) {
+        int off_count = 0;
+        for (int i = 0; i < kHeadlessUnusedDomainCount; i++) {
+            uint32_t actual = 0;
+            if (mbox_set_domain_state(kHeadlessUnusedDomains[i].id, false, &actual) && actual == 0) {
+                off_count++;
+            }
+        }
+        sys_puts(console_ep, "[MBOX] неиспользуемые энергодомены (HDMI/камера/видео/3D): выключено ");
+        sys_putdec_local(console_ep, off_count);
+        sys_puts(console_ep, "/");
+        sys_putdec_local(console_ep, kHeadlessUnusedDomainCount);
+        sys_puts(console_ep, "\n");
     }
 
     const uint64_t cntfrq = read_cntfrq();
@@ -545,6 +637,12 @@ int main(int argc, char *argv[]) {
             }
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 13) { // SYS_MBOX_DOMAIN_GET (Фаза 7): MR1=domain id -> MR0=ok, MR1=state (0/1)
+            uint32_t state = 0;
+            bool ok = g_cpufreq_available && mbox_get_domain_state((uint32_t)seL4_GetMR(1), &state);
+            seL4_SetMR(0, ok ? 1 : 0);
+            seL4_SetMR(1, state);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         } else {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
         }

@@ -199,6 +199,40 @@ constexpr uint32_t MBOX_CLOCK_ID_ARM           = 3; // см. firmware wiki: "0x0
 // то, что подтвердила прошивка на запрос.
 constexpr uint32_t MBOX_TAG_GET_CLOCK_RATE_MEASURED = 0x00030047;
 
+// Фаза 7 (продолжение) — "новый" интерфейс энергодоменов VideoCore
+// (сверено с Linux drivers/pmdomain/bcm/raspberrypi-power.c —
+// RPI_FIRMWARE_GET/SET_DOMAIN_STATE; НЕ путать с MBOX_TAG_*_POWER_STATE,
+// которого тут нет вообще — старый интерфейс реализован прошивкой лишь для
+// пары legacy-устройств вроде USB, сюда не полез). Формат запроса/ответа —
+// ТЕ ЖЕ 2 слова (domain, state), что и у старого POWER_STATE, включая
+// сам вызов: `struct { u32 domain; u32 state; }`, 8 байт, и для GET, и для
+// SET (Linux шлёт полный пакет в обоих случаях, не 4 байта только domain).
+// Значения domain — это (индекс из dt-bindings/power/raspberrypi-power.h)
+// + 1, так задан сам прошивочный протокол. ARM = 23 — это буквально наши
+// же ARM-ядра, НИКОГДА не гасить. Ниже — только мультимедиа/камера-блоки,
+// не нужные headless serial-only ОС (I2C0-2 и VIDEO_SCALER/VPU1
+// сознательно не трогаем в первом заходе: I2C всё равно, скорее всего, и
+// так не запитан за ненадобностью, а "VPU1" — неочевидное название, может
+// быть завязано на сам VideoCore, который держит наш же mailbox-канал).
+constexpr uint32_t MBOX_TAG_GET_DOMAIN_STATE = 0x00030030;
+constexpr uint32_t MBOX_TAG_SET_DOMAIN_STATE = 0x00038030;
+constexpr uint32_t MBOX_DOMAIN_HDMI       = 6;
+constexpr uint32_t MBOX_DOMAIN_VEC        = 8;  // composite video
+constexpr uint32_t MBOX_DOMAIN_JPEG       = 9;
+constexpr uint32_t MBOX_DOMAIN_H264       = 10;
+constexpr uint32_t MBOX_DOMAIN_V3D        = 11; // 3D GPU
+constexpr uint32_t MBOX_DOMAIN_ISP        = 12;
+constexpr uint32_t MBOX_DOMAIN_UNICAM0    = 13; // камера
+constexpr uint32_t MBOX_DOMAIN_UNICAM1    = 14;
+constexpr uint32_t MBOX_DOMAIN_CCP2RX     = 15;
+constexpr uint32_t MBOX_DOMAIN_CSI2       = 16;
+constexpr uint32_t MBOX_DOMAIN_CPI        = 17;
+constexpr uint32_t MBOX_DOMAIN_DSI0       = 18; // дисплей (MIPI)
+constexpr uint32_t MBOX_DOMAIN_DSI1       = 19;
+constexpr uint32_t MBOX_DOMAIN_TRANSPOSER = 20;
+constexpr uint32_t MBOX_DOMAIN_CCP2TX     = 21;
+constexpr uint32_t MBOX_DOMAIN_CDP        = 22;
+
 // --- Оффсеты регистров mini-UART (BCM2835-style AUX-периферия). Смещения —
 // от PLAT_UART_PADDR (база AUX, 0xfe215000), НЕ PrimeCell-совместимый
 // формат — отдельные однобитовые флаги в LSR вместо PL011's DR/FR. ---

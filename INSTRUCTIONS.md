@@ -48,12 +48,14 @@ git clone https://github.com/dzen25/psych-ward-os/tree/RPi4
 cd psych-ward-os
 
 
-python3 -m venv ~/sel4-vibe
-source ~/sel4-vibe/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Дерево `sel4-rpi4-hello` (Фаза 1.3) переиспользует то же самое venv и те же зависимости из `requirements.txt` — пересоздавать отдельно не нужно.
+`.venv/` — прямо в корне репозитория (в `.gitignore`, не коммитится). `build_and_sign.sh` активирует его сам, если он есть — руками `source .venv/bin/activate` нужно только при работе напрямую с `ninja`/`init-build.sh` в обход скрипта.
+
+Дерево `sel4-rpi4-hello` (Фаза 1.3, отдельно от этого репозитория) может использовать тот же `requirements.txt`, но своё собственное `.venv` — venv в корне `psych-ward-os` для него не виден, если оно не смонтировано куда-то ещё.
 
 </details>
 
@@ -112,6 +114,49 @@ ninja
 Существующая папка `build/` в репозитории уже сконфигурирована под `-DPLATFORM=qemu-arm-virt` (наследие ветки `main`) — для rpi4 нужна отдельная чистая build-директория, а не пересборка в той же папке.
 
 После компиляции образа вы можете убрать предупреждения об ошибках в `main`: В папке `psych-ward-os/projects/sel4test/apps/sel4test-driver/src/rt` есть файл `c_cpp_properties.json` который надо переместить в папку `.vscode` - это нужно чтобы указать анализатору `IntelliSense`, что он работает с кодом для `AArch64`.
+</details>
+
+---
+
+<details>
+<summary><b>🔏 Подпись бинарников (Ed25519, Фаза 12)</b></summary>
+
+С Фазы 12 (см. [ROADMAP.md](ROADMAP.md)) `load_elf_from_disk()` в `main.cpp` отказывается использовать любой файл с диска без действительной Ed25519-подписи — это касается ВСЕХ файлов из `load_chain/sbin/`, `load_chain/service/` и `load_chain/etc/init.conf` (не только `.elf`).
+
+### Быстрый способ (рекомендуется)
+
+```bash
+./build_and_sign.sh
+```
+
+Один скрипт в корне репозитория: сам соберёт `tools/sign_elf`, если его ещё нет; проверит наличие приватного ключа (`~/.psych-ward-os-signing-key`) и, если ключа нет, интерактивно предложит его сгенерировать (после чего попросит вставить напечатанный публичный ключ в `main.cpp` и перезапуститься); прогонит `ninja`; подпишет и разложит по `load_chain/` **всё**, что реально собралось в `build-rpi4/apps/sel4test-driver/` — `/sbin` (любой `sb_*`) и `/service` (любой `svc_*`) находятся автогенерацией списка по факту сборки, не хардкодом, так что новая `/sbin`-команда подхватится сама, без правки скрипта. После него — как обычно, `rt/flash.sh` (`-br`).
+
+**`/etc/init.conf` — особый случай**: это не сборочный артефакт, а руками редактируемый текст, поэтому редактировать нужно `load_chain/etc/init.conf.src` (БЕЗ подписи) — `build_and_sign.sh` каждый раз подписывает его заново в `load_chain/etc/init.conf`. Редактировать `init.conf` напрямую нельзя — при повторном запуске скрипта он подпишет уже подписанный файл и трейлеры начнут копиться.
+
+### Узлы схемы (что там внутри)
+
+- **`tools/monocypher/`** — вендоренные исходники [Monocypher](https://monocypher.org/) (`src/monocypher.c`/`.h` + `src/optional/monocypher-ed25519.c`/`.h`), подключены напрямую в сборку `sel4test-driver` (см. `CMakeLists.txt`) — пересобираются автоматически вместе с ядром через `ninja`, отдельно ничего делать не нужно.
+- **`tools/sign_elf/sign_elf.c`** — офлайн-утилита подписи, которую `build_and_sign.sh` вызывает сама. Собирается ОТДЕЛЬНО от основной прошивки, ХОСТОВЫМ `gcc` (не `aarch64-linux-gnu-gcc`) — этот бинарник никогда не попадает на плату; вручную (если нужно):
+  ```bash
+  cd tools/sign_elf
+  gcc -O2 -o sign_elf sign_elf.c \
+      ../monocypher/src/monocypher.c \
+      ../monocypher/src/optional/monocypher-ed25519.c \
+      -I../monocypher/src -I../monocypher/src/optional
+  ```
+- **Ключи** — генерируются ОДИН РАЗ (уже сделано на этой машине; при клонировании репозитория на новой машине — заново, `build_and_sign.sh` сам предложит):
+  ```bash
+  ./sign_elf genkey ~/.psych-ward-os-signing-key
+  # печатает публичный ключ C-массивом — вставить в main.cpp как OS_PUBLIC_KEY[32]
+  ```
+  Приватный ключ (`~/.psych-ward-os-signing-key`, домашний каталог) — НЕ в git, НЕ на SD-карте, только на этой сборочной машине. Публичный (`OS_PUBLIC_KEY` в `main.cpp`) — не секрет, часть исходников.
+- **Подписывание файла вручную** (когда скрипт не подходит — единичный файл и т.п.), вместо `cp`:
+  ```bash
+  tools/sign_elf/sign_elf sign ~/.psych-ward-os-signing-key <вход> <выход_в_load_chain>
+  ```
+  Файл без подписи (или с неверной) — `load_elf_from_disk()` вернёт ошибку, в логе будет `[SIG] отсутствует подпись: <путь>` либо `[SIG] ПОДПИСЬ НЕВЕРНА: <путь>` — команда/сервис просто не запустится, паники всей ОС нет.
+- Образ ядра (`sel4test-driver-image-arm-bcm2711`) и встроенные в CPIO драйверы (`uart_driver`/`timer_driver`/`shell`/`blk_driver`/`net_driver`) подписи не требуют — они не проходят через `load_elf_from_disk()`. Загрузочная FAT32-партиция (`start4.elf`, `config.txt`, сам образ ядра) тоже вне этой схемы — U-Boot их грузит без проверки подписи вообще.
+
 </details>
 
 ---

@@ -551,6 +551,18 @@ static bool sys_cpufreq_set(seL4_CPtr timer_ep, bool want_min, seL4_Word *actual
     return ok != 0;
 }
 
+// Фаза 7 (продолжение) — состояние энергодомена VideoCore (HDMI/камера/
+// видеокодек/3D — см. platform.h MBOX_DOMAIN_*), см. SYS_MBOX_DOMAIN_GET
+// в timer_driver.cpp. *is_on валиден только если возвращает true.
+static bool sys_mbox_domain_get(seL4_CPtr timer_ep, seL4_Word domain_id, bool *is_on) {
+    seL4_SetMR(0, 13); // 13 = SYS_MBOX_DOMAIN_GET
+    seL4_SetMR(1, domain_id);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    seL4_Word ok = seL4_GetMR(0);
+    *is_on = seL4_GetMR(1) != 0;
+    return ok != 0;
+}
+
 // Разбивает число дней с 1970-01-01 на (год, месяц, день) в пролептическом
 // григорианском календаре. Алгоритм Хауарда Хиннанта (chrono-совместимый,
 // не требует libc/времени с плавающей точкой).
@@ -1351,6 +1363,41 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            else if (my_strcmp(cmd_ptr, "peripherals") == 0) {
+                // Фаза 7 (продолжение): состояние мультимедиа-энергодоменов
+                // VideoCore, погашенных при старте timer_driver (см.
+                // kHeadlessUnusedDomains в timer_driver.cpp) — read-only
+                // диагностика/подтверждение, что реально выключено.
+                struct { seL4_Word id; const char *name; } domains[] = {
+                    { MBOX_DOMAIN_HDMI,       "HDMI" },
+                    { MBOX_DOMAIN_VEC,        "VEC" },
+                    { MBOX_DOMAIN_JPEG,       "JPEG" },
+                    { MBOX_DOMAIN_H264,       "H264" },
+                    { MBOX_DOMAIN_V3D,        "V3D" },
+                    { MBOX_DOMAIN_ISP,        "ISP" },
+                    { MBOX_DOMAIN_UNICAM0,    "UNICAM0" },
+                    { MBOX_DOMAIN_UNICAM1,    "UNICAM1" },
+                    { MBOX_DOMAIN_CCP2RX,     "CCP2RX" },
+                    { MBOX_DOMAIN_CSI2,       "CSI2" },
+                    { MBOX_DOMAIN_CPI,        "CPI" },
+                    { MBOX_DOMAIN_DSI0,       "DSI0" },
+                    { MBOX_DOMAIN_DSI1,       "DSI1" },
+                    { MBOX_DOMAIN_TRANSPOSER, "TRANSPOSER" },
+                    { MBOX_DOMAIN_CCP2TX,     "CCP2TX" },
+                    { MBOX_DOMAIN_CDP,        "CDP" },
+                };
+                bool any_ok = false;
+                for (size_t di = 0; di < sizeof(domains) / sizeof(domains[0]); di++) {
+                    bool is_on = false;
+                    bool ok = sys_mbox_domain_get(timer_ep, domains[di].id, &is_on);
+                    sys_puts(console_ep, domains[di].name);
+                    for (int pad = (int)my_strlen(domains[di].name); pad < 12; pad++) sys_puts(console_ep, " ");
+                    sys_puts(console_ep, ok ? (is_on ? "ON\n" : "off\n") : "?\n");
+                    any_ok = any_ok || ok;
+                }
+                if (!any_ok) sys_puts(console_ep, "peripherals: VideoCore mailbox недоступен\n");
+            }
+
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
                 seL4_Word ms = arg ? (seL4_Word)simple_atoi(arg) : 3000; // без аргумента — 3с по умолчанию
                 sys_puts(console_ep, "Sleeping "); sys_putdec(ms); sys_puts(console_ep, " ms...\n");
@@ -2079,7 +2126,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);

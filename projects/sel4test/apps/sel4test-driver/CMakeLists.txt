@@ -105,16 +105,25 @@ add_custom_command(
 # ===================================================================
 # --- СБОРКА ЯДРА (ROOTSERVER) ---
 # ===================================================================
+# Фаза 12 (см. ROADMAP.md) — Monocypher (Ed25519), для проверки подписи
+# /sbin, /service, /etc/init.conf перед load_elf_from_disk() в main.cpp.
+# Просто исходники в общий список сборки rootserver'а — как и весь остальной
+# проект, никакого code-gen шага тут нет (в отличие от nanopb), отдельный
+# CMake-хелпер/библиотечная цель не нужны.
+set(MONOCYPHER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/monocypher/src")
+
 add_executable(sel4test-driver
     src/main.cpp
     src/common.cpp
     src/allocator.cpp
     src/uart.cpp
     src/hw_timer.cpp
-    ${ARCHIVE_S} 
+    "${MONOCYPHER_DIR}/monocypher.c"
+    "${MONOCYPHER_DIR}/optional/monocypher-ed25519.c"
+    ${ARCHIVE_S}
 )
 
-target_include_directories(sel4test-driver PRIVATE src)
+target_include_directories(sel4test-driver PRIVATE src "${MONOCYPHER_DIR}" "${MONOCYPHER_DIR}/optional")
 
 target_link_libraries(sel4test-driver
     sel4
