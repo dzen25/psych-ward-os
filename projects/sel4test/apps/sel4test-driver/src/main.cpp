@@ -135,7 +135,11 @@ static char* rootserver_shm_base = (char*)0x200A00000ULL;
 // странице с паролем просто потому что они были на одной физической
 // странице. blk_driver'ов staging съехал с индекса 5 на индекс 7 (см.
 // platform.h). Итого 8 страниц вместо 6.
-static seL4_CPtr shm_frames[8]; // Массив Capability для 8 страниц SHM
+// 9-я страница (Фаза 14, Milestone 8) — собственный staging-буфер
+// usb_driver'а (USB_SHM_STAGING_OFFSET, platform.h), тот же приём, что и
+// BLK_SHM_STAGING_OFFSET у blk_driver — отдельная страница вместо шаринга
+// с чужим staging, чтобы не повторить класс бага с GENET/BLK-пересечением.
+static seL4_CPtr shm_frames[9]; // Массив Capability для 9 страниц SHM
 
 // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (Фаза 9.B): каждый из четырёх мест, где root
 // читает .elf/текстовый файл целиком в память (SYS_EXEC, SYS_START_WIFI,
@@ -162,7 +166,7 @@ static char g_elf_load_buffer[1024 * 1024];
 // Вызывать после записи (перед тем, как другой процесс должен её увидеть)
 // и/или перед чтением (после того, как другой процесс мог что-то записать).
 static void flush_rootserver_shm() {
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         seL4_ARM_Page_CleanInvalidate_Data(shm_frames[i], 0, 4096);
     }
 }
@@ -217,6 +221,7 @@ constexpr int SHM_PAGE_WIFI_CONTROL   = 4; // Wi-Fi control-plane: SSID/PASS/VER
 constexpr int SHM_PAGE_WIFI_LINKSTATE = 5; // Wi-Fi link-state: LINK_STATE/MAC/REASON
 constexpr int SHM_PAGE_WIFI_MAILBOX   = 6; // Wi-Fi TX/RX data-мейлбокс + канарейка
 constexpr int SHM_PAGE_BLK_STAGING    = 7; // приватный staging-буфер blk_driver'а
+constexpr int SHM_PAGE_USB_STAGING    = 8; // приватный staging-буфер usb_driver'а (Фаза 14, Milestone 8)
 
 // Фаза 5.2 (least-privilege, см. situation.txt): раньше SYS_SHM_GET отдавал
 // ВСЕ страницы ЛЮБОМУ активному процессу (проверялся только pcbs[pid].active,
@@ -243,6 +248,11 @@ static uint32_t shm_pages_mask_for_role(int is_driver) {
         // Обычный пользовательский exec (254) остаётся fail-closed ниже —
         // Фаза 5 не ослабляется.
         case 253: return 0b00000001;
+        // Фаза 14 (Milestone 8): usb_driver получает СВОЙ VFS-диспетчер,
+        // зеркалящий blk_driver — нужна страница VFS(0, путь/данные, тот же
+        // протокол команд 110/112/.../120) + собственный staging(8, echo>
+        // и mv, зеркалит BLK_SHM_STAGING_OFFSET у blk_driver).
+        case 6: return 0b100000001;
         default: return 0;       // exec-процессы (254) и всё прочее — ни одной страницы по умолчанию (fail closed)
     }
 }
@@ -340,11 +350,37 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
 
     seL4_CPtr untyped_cap = alloc.get_untyped_cap(idx);
 
-    // Выравниваем waterMark до целевого адреса
+    // Выравниваем watermark до целевого адреса. Заполняем самыми
+    // крупными страницами, какие позволяет текущее выравнивание watermark'а
+    // (Восемнадцатая попытка, см. ROADMAP.md) — для 0x600000000 (высокое
+    // PCIe-окно U-Boot'а) разрыв от начала его Untyped-региона составляет
+    // 8GB; по 4KB это 2 миллиона retype-вызовов (гарантированный
+    // CSlot-exhaustion/зависание при загрузке — тот же класс бага, что
+    // уже ловили в Первой попытке, см. KernelRootCNodeSizeBits, только на
+    // 3 порядка хуже). seL4_ARM_HugePageObject (1GB) для device-памяти
+    // не имеет особых ограничений (Arch_isFrameType/Arch_createObject
+    // трактуют его наравне с SmallPage/LargePage, см. kernel/src/arch/
+    // arm/64/object/objecttype.c) — ядро само выравнивает свой
+    // внутренний free-pointer под размер объекта (kernel/src/object/
+    // untyped.c:alignedFreeRef), так что условие "watermark кратен
+    // размеру страницы" здесь просто выбирает самый эффективный шаг,
+    // не обходит никакую реальную проверку. Для уже существующих
+    // маленьких разрывов (UART/EMMC/WIFI_SDIO и т.п., все на
+    // невыровненных под 1GB/2MB адресах) условия ниже не сработают и
+    // поведение остаётся прежним (4KB-шаг, как раньше).
     while (untyped_watermarks[idx] < target_paddr) {
+        uint64_t remaining = target_paddr - untyped_watermarks[idx];
         seL4_CPtr dummy = alloc.alloc_slot();
-        seL4_Untyped_Retype(untyped_cap, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, dummy, 1);
-        untyped_watermarks[idx] += 4096;
+        if ((untyped_watermarks[idx] % (1ULL << 30)) == 0 && remaining >= (1ULL << 30)) {
+            seL4_Untyped_Retype(untyped_cap, seL4_ARM_HugePageObject, 0, root_cnode, 0, 0, dummy, 1);
+            untyped_watermarks[idx] += (1ULL << 30);
+        } else if ((untyped_watermarks[idx] % (1ULL << 21)) == 0 && remaining >= (1ULL << 21)) {
+            seL4_Untyped_Retype(untyped_cap, seL4_ARM_LargePageObject, 0, root_cnode, 0, 0, dummy, 1);
+            untyped_watermarks[idx] += (1ULL << 21);
+        } else {
+            seL4_Untyped_Retype(untyped_cap, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, dummy, 1);
+            untyped_watermarks[idx] += 4096;
+        }
     }
 
     seL4_CPtr frame = alloc.alloc_slot();
@@ -353,9 +389,14 @@ static seL4_CPtr alloc_device_frame(seL4_BootInfo *info, PsychAllocator &alloc, 
     return frame;
 }
 
-// 256 хватает с запасом: wifi_driver со своими статическими буферами прошивки/NVRAM
-// (~708KB) сам по себе требует ~180-200 отслеживаемых ELF-страничных фреймов.
-#define MAX_TRACKED_CAPS 256
+// Было 256 (хватало с запасом: wifi_driver со своими статическими буферами
+// прошивки/NVRAM, ~708KB, сам по себе требует ~180-200 отслеживаемых ELF-
+// страничных фреймов). Фаза 14 (USB): изначально планировался xHCI BAR на
+// 1MB (256 фрейм-кап) — живое железо показало, что реальный BAR всего 4KB
+// (см. RPI4_XHCI_SIZE, platform.h), так что фактическая потребность куда
+// скромнее (1 страница MMIO + ~23 DMA-страницы). Бюджет оставлен подня-
+// тым — запас на будущие фазы (класс-драйверам понадобится больше).
+#define MAX_TRACKED_CAPS 640
 
 struct CapTracker {
     seL4_CPtr caps[MAX_TRACKED_CAPS];
@@ -404,7 +445,7 @@ struct ProcessControlBlock {
 
     // --- НОВОЕ: Трекинг копий SHM для защиты от утечек ---
     bool has_shm;
-    seL4_CPtr shm_copies[8];
+    seL4_CPtr shm_copies[9];
 
     // Фаза 6.1 (SMP, см. ROADMAP.md): на каком ядре сейчас реально исполняется
     // этот процесс — проставляется при спавне (0 по умолчанию, 1 для
@@ -517,6 +558,15 @@ static bool is_admin_caller(seL4_Word pid) {
 // (в этом случае команды просто вернут код ошибки, а не зависнут).
 static bool g_wifi_driver_ready = false;
 
+// Фаза 14 (USB, xHCI) — тот же принцип, что g_wifi_driver_ready выше: usb_driver
+// компилируется в CPIO и всегда запущен (в отличие от wifi, у него нет
+// собственного start/stop), но НЕ входит в driver_ready[]/all_drivers_ready()
+// (см. ниже) — опциональная периферия (ROADMAP.md Фаза 8), загрузка не
+// должна ждать/виснуть, если ничего не воткнуто в USB. true — usb_driver
+// дошёл до своего SYS_DRIVER_READY (готов принимать SYS_USB_LIST), даже
+// если bring-up контроллера не нашёл ни одного устройства.
+static bool g_usb_driver_ready = false;
+
 // Фаза 12 (см. ROADMAP.md) — формат подписи: 4-байтовый magic + 64-байтовая
 // Ed25519-подпись, приклеенные в конец файла (см. tools/sign_elf/). Работает
 // одинаково для ELF-бинарников и текстовых конфигов (сама схема не смотрит
@@ -621,7 +671,7 @@ static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, se
 }
 
 // Фаза 6.1 (продолжение, см. ROADMAP.md): снимок нагрузки за короткое окно
-// (~300мс), общий для `top` (SYS_TOP_STATS) и `balance` (SYS_BALANCE) —
+// (~100мс), общий для `top` (SYS_TOP_STATS) и `balance` (SYS_BALANCE) —
 // вынесено в отдельную функцию, т.к. протокол измерения хрупкий (трижды
 // доводился через баги на живом железе, см. ROADMAP) и дублировать его
 // нельзя. См. подробности каждого шага в исходном месте использования
@@ -679,7 +729,7 @@ static void collect_load_snapshot(LoadSnapshot &snap, seL4_CPtr console_ep, seL4
     seL4_BenchmarkResetLog();
 
     seL4_SetMR(0, 8); // SYS_SLEEP_MS (см. shell.cpp/sys_sleep) — root как обычный клиент timer_ep
-    seL4_SetMR(1, 300);
+    seL4_SetMR(1, 100);
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 
     seL4_BenchmarkFinalizeLog();
@@ -734,6 +784,40 @@ static void collect_load_snapshot(LoadSnapshot &snap, seL4_CPtr console_ep, seL4
         snap.proc_util[i] = seL4_GetMR(BENCHMARK_TCB_UTILISATION);
     }
 }
+
+// Фаза 14 (USB, xHCI) — приватные DMA-страницы usb_driver'а (см.
+// PLAT_XHCI_*_VADDR в platform.h). Один параметр вместо ~10 отдельных
+// scalar-параметров spawn_process() (как для blk_dma_frame_param/
+// blk_dma_paddr_param) — у blk_driver таких страниц было только 2, у USB —
+// до 7 фиксированных структур плюс до USB_MAX_SCRATCHPAD_PAGES scratchpad-
+// страниц, отдельный параметр на каждую раздул бы и так огромный список
+// параметров spawn_process() ещё сильнее без всякой пользы.
+struct UsbDmaSetup {
+    seL4_CPtr dcbaa_frame = 0;          seL4_Word dcbaa_paddr = 0;
+    seL4_CPtr cmdring_frame = 0;        seL4_Word cmdring_paddr = 0;
+    seL4_CPtr erst_frame = 0;           seL4_Word erst_paddr = 0;
+    seL4_CPtr evtring_frame = 0;        seL4_Word evtring_paddr = 0;
+    // Фаза 15 (несколько накопителей, см. ROADMAP.md/план) — Device
+    // Context теперь по одной странице на КАЖДЫЙ xHCI Slot ID
+    // (USB_MAX_SLOTS_ENABLED), не единственная общая страница.
+    seL4_CPtr devctx_frame[USB_MAX_SLOTS_ENABLED] = {0};
+    seL4_Word devctx_paddr[USB_MAX_SLOTS_ENABLED] = {0};
+    seL4_CPtr inputctx_frame = 0;       seL4_Word inputctx_paddr = 0; // общий, транзитный — см. platform.h
+    seL4_CPtr scratchpad_arr_frame = 0; seL4_Word scratchpad_arr_paddr = 0;
+    int scratchpad_count = 0;
+    seL4_CPtr scratchpad_buf_frame[USB_MAX_SCRATCHPAD_PAGES] = {0};
+    seL4_Word scratchpad_buf_paddr[USB_MAX_SCRATCHPAD_PAGES] = {0};
+    // Фаза 15 — шесть per-device ресурсов (было: по одной странице каждый,
+    // единственное устройство; см. h/platform.h) — теперь по
+    // USB_MAX_DEVICES страниц каждый, индексируются "нашим" индексом
+    // устройства (0..USB_MAX_DEVICES-1), не Slot ID.
+    seL4_CPtr ep0_trring_frame[USB_MAX_DEVICES] = {0};     seL4_Word ep0_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr ctrl_buf_frame[USB_MAX_DEVICES] = {0};       seL4_Word ctrl_buf_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr bulkout_trring_frame[USB_MAX_DEVICES] = {0}; seL4_Word bulkout_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr bulkin_trring_frame[USB_MAX_DEVICES] = {0};  seL4_Word bulkin_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr cbw_csw_frame[USB_MAX_DEVICES] = {0};        seL4_Word cbw_csw_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr bounce_frame[USB_MAX_DEVICES] = {0};         seL4_Word bounce_paddr[USB_MAX_DEVICES] = {0};
+};
 
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
@@ -827,7 +911,43 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // обычный sys_write(1, ...) — caps_or_badges[1] уже
                          // generic, никаких изменений в самих утилитах не
                          // нужно (см. h/sys_client.h).
-                         int stdout_pipe_id = -1) {
+                         int stdout_pipe_id = -1,
+                         // Фаза 14 (USB, xHCI) — только для is_driver==6.
+                         // usb_cmd_recv_ep_param: raw endpoint, на котором
+                         // usb_driver слушает (root держит СВОЮ же копию
+                         // как send-сторону, см. usb_cmd_ep в main() —
+                         // root-опосредованный доступ, тот же приём, что
+                         // SYS_WIFI_STATUS/SYS_TOP_STATS, поэтому НИКАКОЙ
+                         // другой процесс не нуждается в отдельной send-
+                         // капе, в отличие от net/wifi). usb_dma_param —
+                         // см. UsbDmaSetup выше.
+                         seL4_CPtr usb_cmd_recv_ep_param = 0,
+                         const UsbDmaSetup *usb_dma_param = nullptr,
+                         // Пятнадцатая попытка (см. ROADMAP.md/platform.h
+                         // PLAT_PCIE_RC_MISC_PADDR) — фрейм под PCIe RC
+                         // MISC-регистры (outbound-window), usb_driver сам
+                         // прописывает окно 1 для трансляции BAR0 xHCI.
+                         seL4_CPtr pcie_rc_frame_param = 0,
+                         // Двадцать четвёртая попытка (см. ROADMAP.md/
+                         // platform.h PLAT_PCIE_ERR_PADDR) — фрейм под
+                         // PCIE_OUTB_ERR_* (диагностика AXI-ошибок исходящих
+                         // от моста транзакций, включая DMA устройства->RAM).
+                         seL4_CPtr pcie_err_frame_param = 0,
+                         // Milestone 9 (Фаза 14, закрытие) — клиентский
+                         // Call-капа на usb_driver'ов командный endpoint (та
+                         // же send-капа, что root держит как usb_cmd_ep) —
+                         // тот же приём, что blk_ep, но выдаётся ТОЛЬКО
+                         // shell(0) и доверенным /sbin(253) на call-сайтах
+                         // (см. план/ROADMAP.md), остальные ~5 спавнов не
+                         // трогаются (дефолт 0).
+                         seL4_CPtr usb_storage_ep_param = 0,
+                         // Milestone 11 (доп., по запросу пользователя) —
+                         // badged-копия usb_irq_ntfn (badge
+                         // USB_EVENT_HEARTBEAT, см. common.h) — читает
+                         // ТОЛЬКО timer_driver (is_driver==2), тот же
+                         // принцип, что extra_ntfn3_param (blk heartbeat)
+                         // выше, отдельный параметр — тот уже занят.
+                         seL4_CPtr usb_heartbeat_ntfn_param = 0) {
     
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -884,6 +1004,14 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_mmc_irq_handler = 18; // Фикс дедлока root<->blk_driver: собственная копия IRQHandler общей линии (только для blk_driver, см. mmc_irq_handler_param)
     seL4_Word local_vfs_mutex_ntfn = 19; // Фаза 6 (SMP): капа общего VFS-мьютекса (только для shell/net_driver/wifi_driver, см. vfs_mutex_ntfn_param)
     seL4_Word local_self_tcb = 20; // Фаза 6.1 (продолжение): собственная TCB-капа (только для uart/blk/net/wifi, is_driver 1/3/4/5)
+    seL4_Word local_usb_recv_ep = 21; // Фаза 14 (USB): usb_driver слушает на этом слоте (только для is_driver==6, см. usb_cmd_recv_ep_param)
+    // ВНИМАНИЕ: 22 занят local_stdout_pipe_ep (см. ниже, пайпинг /sbin-
+    // команд) — найдено при добавлении heartbeat-слота ниже: local_usb_
+    // storage_ep изначально тоже стоял на 22, что тихо ломало бы `cmd |
+    // other` для доверенных /sbin-команд (обе Mint на один слот, вторая
+    // упала бы, т.к. slot уже занят). 23/24 — свободны.
+    seL4_Word local_usb_storage_ep = 23; // Milestone 9: клиентская капа на usb_driver'ов VFS-диспетчер (только shell/253, см. usb_storage_ep_param)
+    seL4_Word local_usb_heartbeat_ntfn = 24; // Milestone 11: heartbeat-капа usb_driver'а (только для timer_driver, см. usb_heartbeat_ntfn_param)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
@@ -924,6 +1052,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (extra_ntfn3_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_extra_ntfn3, 8, root_cnode, extra_ntfn3_param, seL4_WordBits, seL4_AllRights), "Copy extra ntfn3 (blk heartbeat)");
     if (mmc_irq_handler_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_mmc_irq_handler, 8, root_cnode, mmc_irq_handler_param, seL4_WordBits, seL4_AllRights), "Copy mmc irq handler (blk self-ack)");
     if (vfs_mutex_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_vfs_mutex_ntfn, 8, root_cnode, vfs_mutex_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy vfs_mutex_ntfn");
+    if (usb_cmd_recv_ep_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_recv_ep, 8, root_cnode, usb_cmd_recv_ep_param, seL4_WordBits, seL4_AllRights), "Copy usb recv ep");
+    if (usb_storage_ep_param != 0) check_err(seL4_CNode_Mint(child_cnode, local_usb_storage_ep, 8, root_cnode, usb_storage_ep_param, seL4_WordBits, seL4_AllRights, pid), "Mint usb storage ep");
+    if (usb_heartbeat_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_heartbeat_ntfn, 8, root_cnode, usb_heartbeat_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy usb heartbeat ntfn");
 
     pcb.cspace = child_cnode;
     pcb.badged_ep = badged_ep; // Оставляем глобальный в pcb для нужд ядра
@@ -1075,7 +1206,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // /sbin-утилите (h/sys_client.h) уже общий по FD, менять её код не
     // нужно. -1 (по умолчанию) — обычный console_ep, как было всегда.
     if (stdout_pipe_id >= 0 && stdout_pipe_id < MAX_PIPES) {
-        constexpr seL4_Word local_stdout_pipe_ep = 22; // свободный слот, см. local_* выше (0-20 заняты)
+        constexpr seL4_Word local_stdout_pipe_ep = 22; // свободный слот, см. local_* выше (0-21, 23-24 заняты)
         seL4_Word pipe_badge = PIPE_BASE_BADGE + stdout_pipe_id;
         seL4_CNode_Mint(child_cnode, local_stdout_pipe_ep, 8, root_cnode, ep, seL4_WordBits, seL4_AllRights, pipe_badge);
         child_ipc_ptr->caps_or_badges[1] = local_stdout_pipe_ep;
@@ -1090,7 +1221,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // выше) — но тот же процесс теперь дополнительно читает термодатчик AVS
     // RO thermal, который MMIO-регистр как обычно, поэтому hw_frame для
     // timer_driver больше не всегда 0 (см. avs_frame выше).
-    if (hw_frame != 0 && (is_driver == 1 || is_driver == 2 || is_driver == 3 || is_driver == 4 || is_driver == 5)) { // Any driver with real MMIO
+    if (hw_frame != 0 && (is_driver == 1 || is_driver == 2 || is_driver == 3 || is_driver == 4 || is_driver == 5 || is_driver == 6)) { // Any driver with real MMIO
         seL4_CPtr drv_pud = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pd  = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pt  = alloc_and_track_cap(alloc, pcb);
@@ -1101,6 +1232,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         uintptr_t hw_vaddr = (is_driver == 1) ? PLAT_UART_VADDR :
                              (is_driver == 2) ? PLAT_AVS_VADDR :
                              (is_driver == 5) ? PLAT_WIFI_SDIO_VADDR :
+                             (is_driver == 6) ? PLAT_XHCI_VADDR : // Фаза 14 (USB) — собственное 2MB-окно, см. platform.h
                              ((is_driver == 3) ? PLAT_EMMC_VADDR : PLAT_GENET_VADDR);
 
         seL4_ARM_PageUpperDirectory_Map(drv_pud, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
@@ -1108,8 +1240,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         seL4_ARM_PageTable_Map(drv_pt, child_vspace, hw_vaddr, (seL4_ARM_VMAttributes)0);
 
         // EMMC2 умещается в одну страницу (0x100 байт регистров). GENET
-        // занимает целых 64KB (0x10000) — 16 страниц.
-        int num_pages = (is_driver == 4) ? 16 : 1;
+        // занимает целых 64KB (0x10000) — 16 страниц. xHCI (Фаза 14) —
+        // считается из PLAT_XHCI_SIZE (живое железо: реальный BAR 4KB, 1
+        // страница — см. platform.h, изначально ошибочно предполагали 1MB).
+        int num_pages = (is_driver == 6) ? (int)(PLAT_XHCI_SIZE / 4096) : (is_driver == 4) ? 16 : 1;
         for (int i = 0; i < num_pages; i++) {
             seL4_CPtr frame_child = alloc_and_track_cap(alloc, pcb);
             check_err(seL4_CNode_Copy(root_cnode, frame_child, seL4_WordBits, 
@@ -1157,6 +1291,60 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                                         seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Blk DMA Buf2 to Driver");
         }
 
+        // Фаза 14 (USB, xHCI) — приватные DMA-страницы usb_driver'а, все в
+        // ТОМ ЖЕ 2MB-окне, что PLAT_XHCI_VADDR выше (drv_pud/pd/pt для
+        // is_driver==6 уже создаются в этом же блоке) — тот же приём, что
+        // mbox_buf/blk_dma выше, просто на 7 фиксированных структур + до
+        // USB_MAX_SCRATCHPAD_PAGES scratchpad-страниц вместо одной-двух.
+        if (is_driver == 6 && usb_dma_param != nullptr) {
+            auto map_usb_dma = [&](seL4_CPtr frame, uintptr_t vaddr) {
+                if (frame == 0) return;
+                seL4_CPtr child_frame = alloc_and_track_cap(alloc, pcb);
+                check_err(seL4_CNode_Copy(root_cnode, child_frame, seL4_WordBits,
+                                          root_cnode, frame, seL4_WordBits, seL4_AllRights), "Copy USB DMA Frame Cap");
+                check_err(seL4_ARM_Page_Map(child_frame, child_vspace, vaddr,
+                                            seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map USB DMA Buf to Driver");
+            };
+            map_usb_dma(usb_dma_param->dcbaa_frame, PLAT_XHCI_DCBAA_VADDR);
+            map_usb_dma(usb_dma_param->cmdring_frame, PLAT_XHCI_CMDRING_VADDR);
+            map_usb_dma(usb_dma_param->erst_frame, PLAT_XHCI_ERST_VADDR);
+            map_usb_dma(usb_dma_param->evtring_frame, PLAT_XHCI_EVTRING_VADDR);
+            for (int i = 0; i < USB_MAX_SLOTS_ENABLED; i++) {
+                map_usb_dma(usb_dma_param->devctx_frame[i], PLAT_XHCI_DEVCTX_VADDR + (uintptr_t)i * 4096);
+            }
+            map_usb_dma(usb_dma_param->inputctx_frame, PLAT_XHCI_INPUTCTX_VADDR);
+            map_usb_dma(usb_dma_param->scratchpad_arr_frame, PLAT_XHCI_SCRATCHPAD_ARR_VADDR);
+            for (int i = 0; i < usb_dma_param->scratchpad_count && i < USB_MAX_SCRATCHPAD_PAGES; i++) {
+                map_usb_dma(usb_dma_param->scratchpad_buf_frame[i], PLAT_XHCI_SCRATCHPAD_BUF_VADDR + (uintptr_t)i * 4096);
+            }
+            // Фаза 15 — шесть per-device ресурсов, USB_MAX_DEVICES страниц каждый.
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->ep0_trring_frame[i], PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->ctrl_buf_frame[i], PLAT_XHCI_CTRL_BUF_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkout_trring_frame[i], PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkin_trring_frame[i], PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->cbw_csw_frame[i], PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bounce_frame[i], PLAT_XHCI_BOUNCE_VADDR + (uintptr_t)i * 4096);
+        }
+        // Пятнадцатая попытка — PCIe RC MISC-регистры, тот же приём, что
+        // mbox_regs_frame у timer_driver (одна страница, отдельный vaddr
+        // в ТОМ ЖЕ 2MB-окне usb_driver'а, drv_pud/pd/pt уже созданы выше).
+        if (is_driver == 6 && pcie_rc_frame_param != 0) {
+            seL4_CPtr pcie_rc_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, pcie_rc_child, seL4_WordBits,
+                                      root_cnode, pcie_rc_frame_param, seL4_WordBits, seL4_AllRights), "Copy PCIe RC Frame Cap");
+            check_err(seL4_ARM_Page_Map(pcie_rc_child, child_vspace, PLAT_PCIE_RC_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map PCIe RC Regs to Driver");
+        }
+        // Двадцать четвёртая попытка — PCIE_OUTB_ERR_* регистры, тот же
+        // приём, что PCIe RC MISC-регистры выше, отдельная страница/vaddr.
+        if (is_driver == 6 && pcie_err_frame_param != 0) {
+            seL4_CPtr pcie_err_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, pcie_err_child, seL4_WordBits,
+                                      root_cnode, pcie_err_frame_param, seL4_WordBits, seL4_AllRights), "Copy PCIe ERR Frame Cap");
+            check_err(seL4_ARM_Page_Map(pcie_err_child, child_vspace, PLAT_PCIE_ERR_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map PCIe ERR Regs to Driver");
+        }
+
         if (is_driver == 1) { // UART
             // UART driver является сервером для console_ep, он на нем слушает.
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
@@ -1172,6 +1360,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_HEARTBEAT_NTFN_CAP] = (extra_ntfn_param != 0) ? local_extra_ntfn : 0; // Фаза 4.5, см. common.h
             child_ipc_ptr->msg[BOOT_WIFI_HEARTBEAT_NTFN_CAP] = (extra_ntfn2_param != 0) ? local_extra_ntfn2 : 0; // Фаза 4.5 (Wi-Fi data-plane), см. common.h
             child_ipc_ptr->msg[BOOT_BLK_HEARTBEAT_NTFN_CAP] = (extra_ntfn3_param != 0) ? local_extra_ntfn3 : 0; // Фикс зависания blk_driver, см. common.h
+            child_ipc_ptr->msg[BOOT_USB_HEARTBEAT_NTFN_CAP] = (usb_heartbeat_ntfn_param != 0) ? local_usb_heartbeat_ntfn : 0; // Milestone 11 (доп.), см. common.h
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
@@ -1230,6 +1419,37 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
             // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
             child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
+        } else if (is_driver == 6) { // USB driver (Фаза 14, xHCI) — сервер для root (root-опосредованный SYS_USB_LIST), клиент консоли
+            child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
+            child_ipc_ptr->msg[BOOT_USB_EP] = local_usb_recv_ep;
+            // RPI4_XHCI_IRQ — собственная (не шаренная) SPI-линия, тот же
+            // приём, что у GENET (is_driver==4): настоящая IRQHandler-капа,
+            // usb_driver Ack'ает сам, без root-релея.
+            child_ipc_ptr->msg[BOOT_IRQ_EP] = local_irq_handler;
+            if (usb_dma_param != nullptr) {
+                child_ipc_ptr->msg[BOOT_USB_DCBAA_PADDR]          = usb_dma_param->dcbaa_paddr;
+                child_ipc_ptr->msg[BOOT_USB_CMDRING_PADDR]        = usb_dma_param->cmdring_paddr;
+                child_ipc_ptr->msg[BOOT_USB_ERST_PADDR]           = usb_dma_param->erst_paddr;
+                child_ipc_ptr->msg[BOOT_USB_EVTRING_PADDR]        = usb_dma_param->evtring_paddr;
+                // Фаза 15 — только БАЗА (paddr[0]) каждого multi-page
+                // ресурса; страницы гарантированно подряд (см. неразрывный
+                // retype-цикл выше) — usb_driver.cpp сам считает
+                // paddr(idx) = base + idx*4096, новых boot-IPC слотов не
+                // требуется.
+                child_ipc_ptr->msg[BOOT_USB_DEVCTX_PADDR]         = usb_dma_param->devctx_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_INPUTCTX_PADDR]       = usb_dma_param->inputctx_paddr;
+                child_ipc_ptr->msg[BOOT_USB_SCRATCHPAD_ARR_PADDR] = usb_dma_param->scratchpad_arr_paddr;
+                child_ipc_ptr->msg[BOOT_USB_SCRATCHPAD_COUNT]     = (seL4_Word)usb_dma_param->scratchpad_count;
+                for (int i = 0; i < usb_dma_param->scratchpad_count && i < USB_MAX_SCRATCHPAD_PAGES; i++) {
+                    child_ipc_ptr->msg[BOOT_USB_SCRATCHPAD_BUF0_PADDR + i] = usb_dma_param->scratchpad_buf_paddr[i];
+                }
+                child_ipc_ptr->msg[BOOT_USB_EP0_TRRING_PADDR]     = usb_dma_param->ep0_trring_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_CTRL_BUF_PADDR]       = usb_dma_param->ctrl_buf_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_BULKOUT_TRRING_PADDR] = usb_dma_param->bulkout_trring_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_BULKIN_TRRING_PADDR]  = usb_dma_param->bulkin_trring_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_CBW_CSW_PADDR]        = usb_dma_param->cbw_csw_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_BOUNCE_PADDR]         = usb_dma_param->bounce_paddr[0];
+            }
         }
 
     } else {
@@ -1245,6 +1465,13 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         if (is_driver == 0 || is_driver == 253) {
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
         }
+        // Milestone 9 (Фаза 14, закрытие) — та же капа, что BOOT_BLK_EP
+        // выше, но на usb_driver'ов VFS-диспетчер (см.
+        // usb_storage_ep_param). 0, если параметр не передан (остальные
+        // ~5 мест спавна) — client-код (sys_client.h/shell.cpp) обязан
+        // проверять на 0 перед использованием, тот же принцип, что и с
+        // BOOT_IRQ_EP/остальными опциональными капами.
+        child_ipc_ptr->msg[BOOT_USB_STORAGE_EP] = (usb_storage_ep_param != 0) ? local_usb_storage_ep : 0;
     }
 
     seL4_ARM_Page_Clean_Data(ipc_frame, 0, 4096);
@@ -1396,7 +1623,7 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     // Если процесс использовал SHM, уничтожаем копии Capabilities, 
     // чтобы вернуть слоты в аллокатор и отмапить память!
     if (meta.has_shm) {
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 9; i++) {
             if (meta.shm_copies[i] != 0) {
                 seL4_CNode_Delete(root_cnode, meta.shm_copies[i], seL4_WordBits);
                 alloc.free(meta.shm_copies[i]);
@@ -1684,6 +1911,13 @@ int main(int argc, char *argv[]) {
     // держим выключенным, пока не добавлена пошаговая диагностика и не
     // сделан повтор менее агрессивным (см. wifi_driver.cpp).
     constexpr bool RPI4_ENABLE_WIFI  = true;
+    // USB (Фаза 14, xHCI bring-up — см. ROADMAP.md): выключено по умолчанию.
+    // Совсем новый, ни разу не проверенный на живом железе код (первое
+    // включение — это и есть первая хардварная попытка, см. ROADMAP.md
+    // "Проверка", шаги 1-8) — держим выключенным, пока bring-up не пройден
+    // хотя бы до шага 4 (USBSTS.HCH гаснет). RPI4_ENABLE_WIFI выше сейчас
+    // true только ПОТОМУ, что уже прошёл этот путь раньше.
+    constexpr bool RPI4_ENABLE_USB   = true;
 
     // PLAT_MBOX_PADDR (0xfe00b000) физически МЕНЬШЕ mini-UART AUX (0xfe215000)
     // и лежит в том же untyped-регионе — должен аллоцироваться СТРОГО ДО
@@ -1736,6 +1970,23 @@ int main(int argc, char *argv[]) {
         seL4_ARM_Page_GetAddress_t blk_dma_addr_res2 = seL4_ARM_Page_GetAddress(blk_dma_frame2);
         blk_dma_paddr2 = (seL4_Word)blk_dma_addr_res2.paddr;
     }
+    // Пятнадцатая попытка (USB, продолжение Фазы 14, см. ROADMAP.md) — PCIe
+    // RC MISC-регистры (PLAT_PCIE_RC_MISC_PADDR = 0xfd504000) лежат в том
+    // же /scb untyped-регионе, что GENET (0xfd580000) и AVS (0xfd5d2000)
+    // ниже (см. platform.h: "шинные 0x7c000000..0x7fffffff — блок /scb:
+    // genet, pcie, xhci") — ФИЗИЧЕСКИ МЕНЬШЕ обоих, значит должен
+    // аллоцироваться СТРОГО ДО них (тот же watermark-приём, что и MBOX/
+    // UART/WIFI_SDIO/EMMC выше — см. проверку "target_paddr BEHIND
+    // watermark" в alloc_device_frame()).
+    seL4_CPtr pcie_rc_frame = 0;
+    seL4_CPtr pcie_err_frame = 0;
+    if (RPI4_ENABLE_USB) {
+        pcie_rc_frame = alloc_device_frame(info, alloc, PLAT_PCIE_RC_MISC_PADDR, root_cnode);
+        // PLAT_PCIE_ERR_PADDR (0xfd506000) > PLAT_PCIE_RC_MISC_PADDR
+        // (0xfd504000) — сохраняет монотонный порядок watermark'а того же
+        // /scb untyped-региона (см. alloc_device_frame()).
+        pcie_err_frame = alloc_device_frame(info, alloc, PLAT_PCIE_ERR_PADDR, root_cnode);
+    }
     if (RPI4_ENABLE_NET) {
         for (int i = 0; i < 16; i++) {
             genet_frames[i] = alloc_device_frame(info, alloc, PLAT_GENET_PADDR + (i * 4096), root_cnode);
@@ -1758,6 +2009,59 @@ int main(int argc, char *argv[]) {
         seL4_Untyped_Retype(low_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, mbox_buf_frame, 1);
         seL4_ARM_Page_GetAddress_t mbox_buf_addr_res = seL4_ARM_Page_GetAddress(mbox_buf_frame);
         mbox_buf_paddr = (seL4_Word)mbox_buf_addr_res.paddr;
+    }
+
+    // Фаза 14 (USB, xHCI) — MMIO-регион (256 4KB-страниц) + приватные DMA-
+    // страницы usb_driver'а. scratchpad_count здесь — это СКОЛЬКО страниц
+    // root РЕАЛЬНО выделил (всегда весь бюджет USB_MAX_SCRATCHPAD_PAGES,
+    // безусловно — root не может прочитать HCSPARAMS2 ДО спавна, чтобы
+    // выделить ровно нужное число; см. ROADMAP.md). usb_driver сам при
+    // старте читает РЕАЛЬНОЕ требование из HCSPARAMS2 и либо использует
+    // подмножество (real_N <= supplied), либо явно отказывается работать
+    // со scratchpad (real_N > supplied) — root просто даёт максимум, что
+    // может.
+    seL4_CPtr usb_xhci_frames[256] = {0};
+    UsbDmaSetup usb_dma;
+    if (RPI4_ENABLE_USB) {
+        for (int i = 0; i < (int)(PLAT_XHCI_SIZE / 4096); i++) {
+            usb_xhci_frames[i] = alloc_device_frame(info, alloc, PLAT_XHCI_PADDR + (uintptr_t)i * 4096, root_cnode);
+        }
+
+        auto alloc_usb_dma_page = [&](seL4_CPtr &frame_out, seL4_Word &paddr_out) {
+            frame_out = alloc.alloc_slot();
+            seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame_out, 1);
+            seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(frame_out);
+            paddr_out = (seL4_Word)res.paddr;
+        };
+        alloc_usb_dma_page(usb_dma.dcbaa_frame, usb_dma.dcbaa_paddr);
+        alloc_usb_dma_page(usb_dma.cmdring_frame, usb_dma.cmdring_paddr);
+        alloc_usb_dma_page(usb_dma.erst_frame, usb_dma.erst_paddr);
+        alloc_usb_dma_page(usb_dma.evtring_frame, usb_dma.evtring_paddr);
+        // Фаза 15 — по странице на КАЖДЫЙ xHCI Slot ID (не единственная
+        // общая страница, см. h/platform.h PLAT_XHCI_DEVCTX_VADDR).
+        for (int i = 0; i < USB_MAX_SLOTS_ENABLED; i++) {
+            alloc_usb_dma_page(usb_dma.devctx_frame[i], usb_dma.devctx_paddr[i]);
+        }
+        alloc_usb_dma_page(usb_dma.inputctx_frame, usb_dma.inputctx_paddr);
+        alloc_usb_dma_page(usb_dma.scratchpad_arr_frame, usb_dma.scratchpad_arr_paddr);
+        usb_dma.scratchpad_count = USB_MAX_SCRATCHPAD_PAGES;
+        for (int i = 0; i < USB_MAX_SCRATCHPAD_PAGES; i++) {
+            alloc_usb_dma_page(usb_dma.scratchpad_buf_frame[i], usb_dma.scratchpad_buf_paddr[i]);
+        }
+        // Фаза 15 — шесть per-device ресурсов, по USB_MAX_DEVICES страниц
+        // каждый (было: по одной, единственное устройство). Retype ВСЕХ
+        // страниц ОДНОГО ресурса идёт неразрывным циклом (тот же приём,
+        // что уже используется для shm_frames[]/scratchpad выше) — иначе
+        // между двумя retype'ами может вклиниться on-demand создание
+        // PUD/PD/PT (другой аллокатор), и физические страницы окажутся не
+        // подряд, а strided-адресация в usb_driver.cpp (base+idx*4096) на
+        // это рассчитывает.
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.ep0_trring_frame[i], usb_dma.ep0_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.ctrl_buf_frame[i], usb_dma.ctrl_buf_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkout_trring_frame[i], usb_dma.bulkout_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkin_trring_frame[i], usb_dma.bulkin_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.cbw_csw_frame[i], usb_dma.cbw_csw_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bounce_frame[i], usb_dma.bounce_paddr[i]);
     }
 
     // ВАЖНО: MMIO должен маппиться некэшируемым (Device memory), иначе CPU
@@ -1834,7 +2138,7 @@ int main(int argc, char *argv[]) {
     // "дырочный" (чужой/неинициализированный) физический адрес вместо
     // настоящей 2-й/3-й страницы SHM — net_driver читал свою страницу и
     // видел одни нули (см. ROADMAP.md 4.5, живой баг ethertype=0).
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         shm_frames[i] = alloc.alloc_slot();
         seL4_Error err = seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
                                              root_cnode, 0, 0, shm_frames[i], 1);
@@ -1843,7 +2147,7 @@ int main(int argc, char *argv[]) {
             while(1);
         }
     }
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         // Мапим эти физические фреймы в виртуальную память Rootserver'а —
         // ОБЯЗАТЕЛЬНО кэшируемой (seL4_ARM_Default_VMAttributes), в отличие
         // от map_frame_robust() ниже (та мапит некэшируемо ради когерентности
@@ -1943,6 +2247,44 @@ int main(int argc, char *argv[]) {
         seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_wake_ntfn, 1);
         seL4_CNode_Mint(root_cnode, wifi_wake_heartbeat_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_HEARTBEAT);
         seL4_CNode_Mint(root_cnode, wifi_wake_tx_ready_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_TX_READY);
+    }
+
+    // Фаза 14 (USB, xHCI) — командный endpoint (root-опосредованный доступ,
+    // см. SYS_USB_LIST: root сам держит usb_cmd_ep с полными правами и
+    // вызывает его напрямую, ни одному другому процессу send-копия не
+    // нужна — иначе, в отличие от net/wifi, никто, кроме root, с
+    // usb_driver не разговаривает) + IRQ-нотификация (RPI4_XHCI_IRQ —
+    // собственная линия, один источник событий, тот же паттерн, что у
+    // uart_ntfn/uart_irq_handler чуть ниже, но не разделяемая ни с кем).
+    seL4_CPtr usb_cmd_ep = 0;
+    seL4_CPtr usb_cmd_recv_ep = 0;
+    seL4_CPtr usb_irq_ntfn = 0;
+    seL4_CPtr usb_irq_handler = 0;
+    // Milestone 11 (доп., по запросу пользователя) — badged-копия
+    // usb_irq_ntfn (badge USB_EVENT_HEARTBEAT), отдаётся timer_driver'у
+    // (см. spawn_process(usb_heartbeat_ntfn_param) ниже) — тот же приём,
+    // что wifi_wake_heartbeat_badged/blk_heartbeat_badged: несколько
+    // бейджей с ОДНОГО объекта, seL4 сам OR'ит непотреблённые сигналы, так
+    // что usb_driver одним Recv видит и реальный XHCI IRQ, и heartbeat.
+    seL4_CPtr badged_usb_heartbeat_ntfn = 0;
+    if (RPI4_ENABLE_USB) {
+        usb_cmd_ep = alloc.alloc_slot();
+        usb_cmd_recv_ep = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, usb_cmd_ep, 1);
+        seL4_CNode_Copy(root_cnode, usb_cmd_recv_ep, seL4_WordBits,
+                        root_cnode, usb_cmd_ep, seL4_WordBits, seL4_CanRead);
+
+        seL4_CPtr badged_usb_irq_ntfn = alloc.alloc_slot();
+        usb_irq_ntfn = alloc.alloc_slot();
+        usb_irq_handler = alloc.alloc_slot();
+        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, usb_irq_ntfn, 1);
+        seL4_CNode_Mint(root_cnode, badged_usb_irq_ntfn, seL4_WordBits, root_cnode, usb_irq_ntfn, seL4_WordBits, seL4_AllRights, USB_EVENT_XHCI_IRQ);
+        check_err(seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_XHCI_IRQ, root_cnode, usb_irq_handler, seL4_WordBits), "IRQControl_Get(XHCI)");
+        check_err(seL4_IRQHandler_SetNotification(usb_irq_handler, badged_usb_irq_ntfn), "IRQHandler_SetNotification(xhci)");
+        check_err(seL4_IRQHandler_Ack(usb_irq_handler), "IRQHandler_Ack(xhci, initial)");
+
+        badged_usb_heartbeat_ntfn = alloc.alloc_slot();
+        seL4_CNode_Mint(root_cnode, badged_usb_heartbeat_ntfn, seL4_WordBits, root_cnode, usb_irq_ntfn, seL4_WordBits, seL4_AllRights, USB_EVENT_HEARTBEAT);
     }
 
     // Таймер (ARM generic timer) не MMIO-устройство и не генерирует IRQ,
@@ -2062,7 +2404,17 @@ int main(int argc, char *argv[]) {
     if (spawn_process("timer_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       2, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, timer_ntfn, timer_irq_handler, avs_frame,
                       nullptr, 0, 0, 0, 0, mbox_regs_frame, mbox_buf_frame, mbox_buf_paddr, badged_net_heartbeat_ntfn,
-                      0, 0, wifi_wake_heartbeat_badged, 0, 0, blk_heartbeat_badged) < 0) {
+                      0, 0, wifi_wake_heartbeat_badged, 0, 0, blk_heartbeat_badged,
+                      0, // mmc_irq_handler_param
+                      0, 0, // blk_dma_frame2_param, blk_dma_paddr2_param
+                      0, // vfs_mutex_ntfn_param (timer_driver не VFS-клиент)
+                      nullptr, -1, // cwd_payload, stdout_pipe_id
+                      0, nullptr, 0, 0, // usb_cmd_recv_ep_param .. pcie_err_frame_param (timer_driver не usb_driver)
+                      0, // usb_storage_ep_param (timer_driver не VFS-клиент)
+                      // Milestone 11 (доп.): heartbeat-капа usb_driver'а —
+                      // timer_driver сигналит её на том же тике, что и
+                      // net/wifi/blk (см. timer_driver.cpp).
+                      badged_usb_heartbeat_ntfn) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
@@ -2130,6 +2482,24 @@ int main(int argc, char *argv[]) {
     }
     }
 
+    if (RPI4_ENABLE_USB) {
+    // usb_driver (is_driver = 6, Фаза 14) — компилируется в CPIO и всегда
+    // запущен (нет собственного lifecycle start/stop, в отличие от wifi),
+    // но НЕ входит в driver_ready[]/all_drivers_ready() (см. выше) —
+    // опционален по определению (ROADMAP.md Фаза 8). blk_ep=0 — usb_driver
+    // не работает с диском (Phase 14 — только bring-up + перечисление, без
+    // класс-драйверов, см. ROADMAP.md).
+    if (spawn_process("usb_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                      6, console_ep, timer_ep, 0, console_ep, console_ep, console_ep, usb_irq_ntfn, usb_irq_handler, usb_xhci_frames[0],
+                      nullptr, // args_payload
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // net_cmd_recv_ep .. vfs_mutex_ntfn_param (18 params)
+                      nullptr, // cwd_payload
+                      -1, // stdout_pipe_id
+                      usb_cmd_recv_ep, &usb_dma, pcie_rc_frame, pcie_err_frame) < 0) {
+        uart_puts("PANIC: USB Driver failed to load!\n"); while(1);
+    }
+    }
+
     // Wi-Fi (is_driver = 5, Фаза 4) БОЛЬШЕ НЕ спавнится здесь при загрузке —
     // только по требованию, через "wifi start" в шелле (см. case
     // SYS_START_WIFI ниже). Ресурсы (wifi_cmd_ep/wifi_sdio_frame) уже
@@ -2146,7 +2516,11 @@ int main(int argc, char *argv[]) {
     if (spawn_process("shell", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       0, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, 0, 0, nullptr,
                       0, net_cmd_send_ep, 0, wifi_cmd_send_ep, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                      0, 0, 0, 0, vfs_mutex_ntfn) < 0) {
+                      0, 0, 0, 0, vfs_mutex_ntfn,
+                      nullptr, // cwd_payload
+                      -1, // stdout_pipe_id
+                      0, nullptr, 0, 0, // usb_cmd_recv_ep_param .. pcie_err_frame_param (shell не usb_driver)
+                      usb_cmd_ep) < 0) { // Milestone 9: shell получает VFS-доступ к /mnt/usb0
         uart_puts("PANIC: Shell failed to load!\n"); while(1);
     }
 
@@ -2763,7 +3137,15 @@ int main(int argc, char *argv[]) {
                                                 0, // blk_dma_paddr2_param
                                                 vfs_mutex_ntfn, // только реально используется при exec_is_driver==253, см. spawn_process
                                                 exec_cwd_payload,
-                                                exec_stdout_pipe_id);
+                                                exec_stdout_pipe_id,
+                                                0, // usb_cmd_recv_ep_param (exec'нутый /sbin — не usb_driver)
+                                                nullptr, // usb_dma_param
+                                                0, // pcie_rc_frame_param
+                                                0, // pcie_err_frame_param
+                                                // Milestone 9: только доверенные /sbin (253) получают
+                                                // VFS-доступ к /mnt/usb0 — тот же принцип, что и с
+                                                // VFS-мьютексом (vfs_mutex_ntfn) чуть выше.
+                                                (exec_is_driver == 253) ? usb_cmd_ep : 0);
                         // issuse.txt: запоминаем реальный путь на диске, чтобы
                         // watchdog мог перечитать этот же файл при аварийном
                         // респавне (см. ProcessControlBlock::path) — тут name
@@ -2868,7 +3250,7 @@ int main(int argc, char *argv[]) {
             // BENCHMARK_TOTAL_UTILISATION — общие такты периода на ядре
             // вызывающего (root, всегда ядро 0) — переиспользуем как общий
             // знаменатель для % на всех ядрах (период один и тот же для всех,
-            // частота одна и та же). Короткое окно (~300мс) вместо "с момента
+            // частота одна и та же). Короткое окно (~100мс) вместо "с момента
             // загрузки" — иначе на давно висящей системе load был бы
             // бессмысленным нулём.
             case SYS_TOP_STATS: {
@@ -3228,7 +3610,7 @@ int main(int argc, char *argv[]) {
                     // получают её при спавне, см. shm_pages_mask_for_role()) —
                     // тоже нигде не освобождалась при обычном выходе.
                     if (pcbs[sender_pid].has_shm) {
-                        for (int i = 0; i < 8; i++) {
+                        for (int i = 0; i < 9; i++) {
                             if (pcbs[sender_pid].shm_copies[i] != 0) {
                                 seL4_CNode_Delete(root_cnode, pcbs[sender_pid].shm_copies[i], seL4_WordBits);
                                 alloc.free(pcbs[sender_pid].shm_copies[i]);
@@ -3249,18 +3631,22 @@ int main(int argc, char *argv[]) {
 
             case SYS_DRIVER_READY: {
                 int drv = (sender_pid > 0) ? pcbs[sender_pid].is_driver : 0;
-                // Печатаем "ready" для ЛЮБОГО настоящего драйвера (1..5,
-                // включая wifi_driver — Фаза 4, Милстоун 4.1), чтобы он был
-                // виден в логе наравне с остальными. Но в driver_ready[]/
-                // all_drivers_ready() по-прежнему учитываются только 1..4 —
-                // wifi всё ещё экспериментальный (см. RPI4_ENABLE_WIFI), и
-                // зависание/провал его пробы не должно блокировать загрузку
-                // остальных модулей и шелла.
-                if (drv >= 1 && drv <= 5 && drv != 3) {
+                // Печатаем "ready" для ЛЮБОГО настоящего драйвера (1..6,
+                // включая wifi_driver — Фаза 4, Милстоун 4.1 — и usb_driver —
+                // Фаза 14), чтобы он был виден в логе наравне с остальными.
+                // Но в driver_ready[]/all_drivers_ready() по-прежнему
+                // учитываются только 1..4 — wifi всё ещё экспериментальный
+                // (см. RPI4_ENABLE_WIFI), USB опционален по определению
+                // (ROADMAP.md Фаза 8) — зависание/провал их пробы не должно
+                // блокировать загрузку остальных модулей и шелла.
+                if (drv >= 1 && drv <= 6 && drv != 3) {
                     uart_puts("[ROOT] "); uart_puts(pcbs[sender_pid].name); uart_puts(" ready.\n");
                 }
                 if (drv == 5) {
                     g_wifi_driver_ready = true;
+                }
+                if (drv == 6) {
+                    g_usb_driver_ready = true;
                 }
                 if (drv >= 1 && drv <= 4) {
                     driver_ready[drv] = true;
@@ -3329,13 +3715,13 @@ int main(int argc, char *argv[]) {
                 }
 
                 uintptr_t vaddr = pcbs[pid].vmap_bump_pointer;
-                pcbs[pid].vmap_bump_pointer += 0x8000; // Сдвигаем курсор на 32 КБ (8 страниц, см. shm_frames[8]) — фиксированный шаг для всех ролей, даже если реально маппится меньше страниц (см. маску ниже)
+                pcbs[pid].vmap_bump_pointer += 0x9000; // Сдвигаем курсор на 36 КБ (9 страниц, см. shm_frames[9]) — фиксированный шаг для всех ролей, даже если реально маппится меньше страниц (см. маску ниже)
 
                 // Отмечаем, что этот процесс взял SHM
                 pcbs[pid].has_shm = true;
                 bool success = true;
 
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < 9; i++) {
                     if (!(allowed_mask & (1u << i))) {
                         // Этой роли эта страница не положена (Фаза 5.2) — не
                         // мапим вообще, слот остаётся пустой дырой в VA-окне
@@ -3387,15 +3773,15 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (!success) {
-                    uart_puts("[ROOT] FATAL: Failed to dynamically map 32KB SHM!\n");
-                    for (int i = 0; i < 8; i++) {
+                    uart_puts("[ROOT] FATAL: Failed to dynamically map 36KB SHM!\n");
+                    for (int i = 0; i < 9; i++) {
                         if (pcbs[pid].shm_copies[i] != 0) {
                             seL4_CNode_Delete(root_cnode, pcbs[pid].shm_copies[i], seL4_WordBits);
                             alloc.free(pcbs[pid].shm_copies[i]);
                         }
                     }
                     pcbs[pid].has_shm = false;
-                    pcbs[pid].vmap_bump_pointer -= 0x8000;
+                    pcbs[pid].vmap_bump_pointer -= 0x9000;
                     seL4_SetMR(0, 0);
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                     break;
@@ -3536,6 +3922,27 @@ int main(int argc, char *argv[]) {
                 else status = 2;                          // готов принимать WIFI_CMD_*
                 seL4_SetMR(0, status);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_USB_LIST: { // Фаза 14 (USB) — root-опосредованный проброс к usb_driver,
+                                  // тот же приём, что seL4_Call(net_cmd_send_ep, ...) внутри
+                                  // collect_load_snapshot() выше. usb_driver гарантированно
+                                  // доходит до своего Recv-цикла за ограниченное время (весь
+                                  // bring-up — с таймаутами на каждый шаг, см. usb_driver.cpp/
+                                  // ROADMAP.md) — синхронный seL4_Call здесь безопасен.
+                if (usb_cmd_ep == 0) {
+                    seL4_SetMR(0, 0); // found=0 — USB выключен (RPI4_ENABLE_USB=false)
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                seL4_SetMR(0, 1); // 1 = USB_CMD_LIST (см. usb_driver.cpp)
+                seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_Word found = seL4_GetMR(0), vendor = seL4_GetMR(1), product = seL4_GetMR(2);
+                seL4_Word dclass = seL4_GetMR(3), dsub = seL4_GetMR(4), dproto = seL4_GetMR(5);
+                seL4_SetMR(0, found); seL4_SetMR(1, vendor); seL4_SetMR(2, product);
+                seL4_SetMR(3, dclass); seL4_SetMR(4, dsub); seL4_SetMR(5, dproto);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 6));
                 break;
             }
 

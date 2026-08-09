@@ -1,0 +1,26 @@
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index f6972af7..fee0d770 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -114,7 +114,20 @@ U_BOOT_DRIVER(xhci_pci) = {
+ 	.ops	= &xhci_usb_ops,
+ 	.plat_auto	= sizeof(struct xhci_pci_plat),
+ 	.priv_auto	= sizeof(struct xhci_ctrl),
+-	.flags	= DM_FLAG_OS_PREPARE | DM_FLAG_ALLOC_PRIV_DMA,
++	/*
++	 * Psych Ward OS (Фаза 14, USB/xHCI, см. ROADMAP.md): УБРАН
++	 * DM_FLAG_OS_PREPARE (был вместе с DM_FLAG_ALLOC_PRIV_DMA, которую
++	 * оставляем — она про выделение приватной DMA-памяти при probe, не
++	 * про remove). Патч pcie_brcmstb.c (см. tools/boot_fit/
++	 * pcie_no_os_prepare.patch) убрал этот же флаг у РОДИТЕЛЬСКОГО PCIe-
++	 * моста, но это НЕ помогло — оказалось, что именно ЭТОТ, дочерний
++	 * драйвер (сам VL805 xHCI, не мост) с тем же флагом реально вызывает
++	 * xhci_pci_remove()/xhci_deregister() перед bootm и глушит
++	 * контроллер сильнее, чем просто "мост потерял линию". Найдено на
++	 * живом железе: первое чтение xHCI CAPLENGTH вешало систему целиком
++	 * ДАЖЕ после патча моста — понадобился этот, второй патч.
++	 */
++	.flags	= DM_FLAG_ALLOC_PRIV_DMA,
+ };
+ 
+ static struct pci_device_id xhci_pci_supported[] = {

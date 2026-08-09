@@ -11,6 +11,7 @@
 
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/platform.h" // USB_MAX_DEVICES (Milestone A3, Фаза 15 — fetch_usb_volume_list())
 
 #define BOOT_BLK_EP 7 // см. тот же #define в shell.cpp
 
@@ -164,9 +165,61 @@ static void build_absolute_path(char* target, const char* arg, int max_len) {
     }
 }
 
+// Milestone A3 (Фаза 15, см. ROADMAP.md/план) — при нескольких
+// одновременно смонтированных USB-устройствах клиент больше не может
+// заранее знать имя (или имена) точек монтирования, поэтому маршрутизация
+// упростилась: клиент срезает только сам "/mnt" целиком (дешёвая
+// строковая проверка, без IPC), а какому конкретно устройству
+// принадлежит ведущий компонент остатка (имя тома) — решает СЕРВЕР
+// (usb_driver.cpp::resolve_device_by_path()). Путь ДОЛЖЕН быть уже
+// абсолютным (build_absolute_path()). Нулевой usb_storage_ep (untrusted
+// exec, is_driver==254 — см. main.cpp) — fail-closed на blk_ep, тот же
+// принцип, что и остальной least-privilege в этом проекте (см.
+// shm_pages_mask_for_role).
+static seL4_CPtr route_vfs_path(char *path, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (usb_storage_ep == 0) return blk_ep;
+    if (path[0] == '/' && path[1] == 'm' && path[2] == 'n' && path[3] == 't' && path[4] == '/') {
+        const char *remainder = path + 4; // остаётся "/<имя_тома>/..." — ведущий '/' уже здесь
+        int j = 0; while (remainder[j] != '\0') { path[j] = remainder[j]; j++; } path[j] = '\0';
+        return usb_storage_ep;
+    }
+    return blk_ep;
+}
+
+// Milestone A3 (Фаза 15) — заменяет fetch_usb_volume_name() (Milestone
+// 10, возвращал имя только ПЕРВОГО смонтированного устройства) —
+// USB_CMD_LIST_VOLUMES возвращает битовую маску смонтированных слотов +
+// имя КАЖДОГО (4 регистра на слот, 32 байта, тот же приём упаковки
+// строки в регистры, что уже использует sys_client_init() для cwd/имени
+// exec'а). ls.cpp зовёт это ОДИН раз при листинге "/mnt", печатает
+// "[DIR] <имя>" на каждый установленный бит.
+struct UsbVolumeList {
+    bool mounted[USB_MAX_DEVICES];
+    char name[USB_MAX_DEVICES][32];
+};
+
+static bool fetch_usb_volume_list(seL4_CPtr usb_storage_ep, UsbVolumeList &out) {
+    for (int i = 0; i < USB_MAX_DEVICES; i++) { out.mounted[i] = false; out.name[i][0] = '\0'; }
+    if (usb_storage_ep == 0) return false;
+    seL4_SetMR(0, 3); // USB_CMD_LIST_VOLUMES
+    seL4_MessageInfo_t reply = seL4_Call(usb_storage_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    if (seL4_MessageInfo_get_length(reply) < (seL4_Word)(1 + 4 * USB_MAX_DEVICES)) return false;
+    seL4_Word mask = seL4_GetMR(0);
+    bool any = false;
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        out.mounted[i] = (mask & (1u << i)) != 0;
+        seL4_Word *words = (seL4_Word*)out.name[i];
+        for (int w = 0; w < 4; w++) words[w] = seL4_GetMR(1 + i * 4 + w);
+        out.name[i][31] = '\0';
+        if (out.mounted[i]) any = true;
+    }
+    return any;
+}
+
 struct SysClientEnv {
     seL4_CPtr root_ep;
     seL4_CPtr blk_ep;
+    seL4_CPtr usb_storage_ep; // Milestone 9 — 0, если не выдан (см. main.cpp shm/cap-выдачу для is_driver!=0/253)
     char *shm;      // nullptr, если SHM не выдан (не доверенный exec)
     char arg_buffer[512];
     char *arg;      // nullptr, если аргументов не передали
@@ -178,6 +231,7 @@ static void sys_client_init(SysClientEnv &env) {
 
     env.root_ep = ipc->msg[BOOT_ROOT_EP];
     env.blk_ep  = ipc->msg[BOOT_BLK_EP];
+    env.usb_storage_ep = ipc->msg[BOOT_USB_STORAGE_EP]; // Milestone 9
     g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP];
 
     my_strlcpy(env.arg_buffer, (char*)&ipc->msg[0], (int)sizeof(env.arg_buffer));

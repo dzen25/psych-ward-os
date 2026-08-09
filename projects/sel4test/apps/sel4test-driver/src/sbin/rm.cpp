@@ -24,7 +24,8 @@ int main(int argc, char *argv[]) {
 
         char *shm = env.shm;
         build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
-        if (vfs_syscall(120, env.blk_ep) != 0) {
+        seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep); // Milestone 9
+        if (vfs_syscall(120, target_ep) != 0) {
             sys_puts(0, "rm: cannot remove '");
             sys_puts(0, start_of_arg);
             sys_puts(0, "': No such file or directory\n");

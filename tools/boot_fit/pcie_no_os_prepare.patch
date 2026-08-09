@@ -1,0 +1,25 @@
+diff --git a/drivers/pci/pcie_brcmstb.c b/drivers/pci/pcie_brcmstb.c
+index 1b03b0a7..7cfa874b 100644
+--- a/drivers/pci/pcie_brcmstb.c
++++ b/drivers/pci/pcie_brcmstb.c
+@@ -887,5 +887,19 @@ U_BOOT_DRIVER(pcie_brcm_base) = {
+ 	.remove			= brcm_pcie_remove,
+ 	.of_to_plat	= brcm_pcie_of_to_plat,
+ 	.priv_auto	= sizeof(struct brcm_pcie),
+-	.flags		= DM_FLAG_OS_PREPARE,
++	/*
++	 * Psych Ward OS (Фаза 14, USB/xHCI, см. ROADMAP.md): УБРАН
++	 * DM_FLAG_OS_PREPARE. Этот флаг заставлял U-Boot вызывать
++	 * brcm_pcie_remove() перед прыжком в ЛЮБУЮ ОС (не только явные USB-
++	 * команды) — remove() ассертит PERST# (держит VL805 в резете) и
++	 * выключает SerDes (PHY), т.е. физически рвёт линию PCIe. Наша ОС
++	 * читает xHCI по плоскому MMIO-алиасу напрямую, без собственной
++	 * PCIe-энумерации (см. ROADMAP.md) — рассчитывая на то, что линия,
++	 * поднятая U-Boot'ом (см. brcm_pcie_probe(), "PCIe BRCM: link up" в
++	 * логе), остаётся живой при передаче управления. Найдено на живом
++	 * железе: первое же чтение регистра xHCI зависало систему целиком
++	 * (шинный hang, не page fault) — ПОСЛЕ отключения CONFIG_USB_KEYBOARD/
++	 * USB_STORAGE/CMD_USB зависание осталось идентичным, что исключило
++	 * версию про usb_stop() и указало именно на DM_FLAG_OS_PREPARE.
++	 */
+ };

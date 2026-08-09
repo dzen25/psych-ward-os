@@ -16,6 +16,7 @@ constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
 constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежий/менее обкатанный компонент
 constexpr bool LOG_WIFI    = false;  // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
+constexpr bool LOG_USB     = false; // usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
 // абсолютные (с ведущего '/'), чтобы не зависеть от current_dir_cluster —
@@ -132,6 +133,90 @@ constexpr uintptr_t PLAT_WIFI_SDIO_PADDR = 0xfe300000ULL;
 // не так был сформирован именно тот, более ранний запрос.
 constexpr uintptr_t PLAT_MBOX_PADDR = 0xfe00b000ULL;             // страница, кратная 0x1000
 
+// USB (Фаза 14): xHCI-контроллер (VL805). НЕ плоский DTB-алиас
+// (0xfe9c0000/1MB, "generic-xhci") — живое железо показало, что этот
+// адрес больше не отвечает после того, как U-Boot реально проэнумерировал
+// PCI-шину. Реальный BAR0 — 0xC0000000 (см. RPI4_XHCI_PADDR ниже,
+// "pci bar 01.00.00" на живом железе, ROADMAP.md) — но это PCI-BUS-SIDE
+// адрес, НЕ CPU-физический: единственное DT-окно PCIe-моста (win=0)
+// транслирует его в 0x600000000 ("высокое" 64-битное PCIe-окно,
+// недоступное seL4). ПОПЫТКА перенацелить ЭТО САМОЕ (единственное) окно
+// через правку DT вызвала настоящий краш U-Boot (см. ROADMAP.md
+// "Тринадцатая попытка") — откачена. Пятнадцатая попытка: usb_driver САМ
+// добавил ВТОРОЕ outbound-окно (индекс 1, см. PLAT_PCIE_RC_MISC_PADDR/
+// usb_driver.cpp/step0_setup_outbound_window) уже ПОСЛЕ хендовера — окно
+// программируется УСПЕШНО (read-back регистров совпадает с расчётом), но
+// ПЕРВОЕ ЖЕ реальное чтение через него вызвало SError (асинхронный
+// внешний abort) -> фатальный halt ВСЕГО ядра (CONFIG_AARCH64_SERROR_IGNORE
+// выключен в этой сборке, см. kernel/src/arch/arm/64/traps.S/cur_el_serr;
+// halt() дополнительно маскирует SError перед печатью — kernel/src/arch/
+// arm/64/idle.c) — качественно другой (более тяжёлый) отказ, чем "мёртвые
+// нули" из Девятой-Двенадцатой попыток (тогда 0xC0000000-как-CPU-адрес
+// читал обычную RAM, вообще не касаясь PCIe — см. Попытку #8).
+//
+// JTAG-сессия (Шестнадцатая попытка, см. ROADMAP.md) ПОЙМАЛА реальный
+// SError под GDB на входе в lower_el_serr: ESR_EL1=0xbf000002
+// (EC=0x2F=SError, IDS=1, implementation-defined синдром=0x000002),
+// ELR_EL1 указывал внутрь seL4_Reply — abort пришёл АСИНХРОННО, не
+// синхронно с самим MMIO-чтением (ожидаемо для SError по архитектуре).
+// PCIE_MISC_PCIE_STATUS проверен ДО крашащего чтения — PHYLINKUP=1,
+// DL_ACTIVE=1 (линк жив, версия "ушёл в низкое энергопотребление" отпадает).
+//
+// Семнадцатая попытка: увеличенные PCIE_MISC_UBUS_TIMEOUT/
+// RC_CONFIG_RETRY_TIMEOUT (те же значения, что U-Boot ставит для
+// BCM2712) + подавление ошибок (PCIE_MISC_UBUS_CTRL ERR_DIS/DECERR_DIS,
+// read-back подтвердил применение) — SError ВСЁ РАВНО произошёл, та же
+// сигнатура. Гипотеза "просто короткий таймаут/неподавленная UBUS-
+// ошибка" ОПРОВЕРГНУТА живым тестом.
+//
+// Восемнадцатая попытка — ПРОРЫВ: диагностика boot-info (main.cpp)
+// показала, что 0x600000000 (ТО САМОЕ "высокое" 64-битное окно,
+// которое U-Boot САМ настроил и которое РЕАЛЬНО работает — см. "PCIe
+// BRCM: link up"/"USB XHCI 1.00" в каждом логе) ВСЕГДА БЫЛ доступен
+// seL4 как device Untyped (idx=25, покрывает [16GB, 32GB), isDevice=1) —
+// KernelPaddrUserTop для Cortex-A72 (kernel/src/arch/arm/config.cmake)
+// это 1<<44 (16TB), device Untyped создаются на ЛЮБОЙ незарезервированный
+// пробел ниже этой границы (kernel/src/kernel/boot.c:create_untypeds），
+// НЕ по списку конкретных устройств из DTB. Более ранняя проверка
+// (Попытка #8) была неполной — не архитектурный предел. Всё окно 1
+// (Пятнадцатая-Семнадцатая попытки) было НЕ НУЖНО: bus-адрес окна 0
+// (0xc0000000) РОВНО совпадает с BAR0 xHCI — значит нужный CPU-адрес
+// это просто 0x600000000 + 0. Используем ГОТОВОЕ окно U-Boot'а
+// напрямую, моста вообще не трогаем.
+//
+// Живой тест Восемнадцатой попытки: краша (SError) больше нет, но
+// CAPLENGTH/HCSPARAMS* читались как чистый 0x00000000 — ТРЕТИЙ, ранее не
+// встречавшийся паттерн (не крах, не классический PCI 0xFFFFFFFF). Причина
+// (Девятнадцатая попытка, см. ROADMAP.md): usb_driver.cpp всё ещё активно
+// (1) программировал ненужное окно 1 на ТОТ ЖЕ bus-диапазон 0xC0000000,
+// которым уже владеет окно 0, и (2) держал включённым
+// PCIE_MISC_UBUS_CTRL.DECERR_DIS (Семнадцатая попытка) — по определению
+// регистра это "подавлять decode error, возвращать 0 вместо него". Оба
+// источника шума удалены из usb_driver.cpp — следующее чтение через окно 0
+// должно быть честным (не подавленным) сигналом.
+constexpr uintptr_t PLAT_XHCI_PADDR = 0x600000000ULL;
+constexpr uintptr_t PLAT_XHCI_SIZE  = 0x1000ULL;
+constexpr int        PLAT_XHCI_IRQ  = 208;
+
+// Пятнадцатая попытка (продолжение) — физическая страница, покрывающая
+// группу регистров PCIE_MISC_CPU_2_PCIE_MEM_WIN0_* (0x400c..0x408f
+// от RPI4_PCIE_PADDR, см. ниже) одной 4KB-страницей — конкретные смещения/
+// маски см. в usb_driver.cpp (там же — почему НЕ переиспользуется формула
+// из заголовка U-Boot). RPI4_PCIE_PADDR определён ниже по файлу (числовое
+// значение продублировано здесь буквально, чтобы не тянуть forward-
+// declaration): 0xfd500000 + 0x4000 = 0xfd504000.
+constexpr uintptr_t PLAT_PCIE_RC_MISC_PADDR = 0xfd504000ULL;
+
+// Двадцать четвёртая попытка (см. ROADMAP.md) — регистры сообщения об
+// ошибках ИСХОДЯЩИХ (от моста НА AXI/UBUS, т.е. включая DMA устройства ->
+// RAM — направление, в котором сейчас HSE) транзакций: PCIE_OUTB_ERR_VALID/
+// ACC_INFO/MEM_CAUSE/MEM_ADDR_LO/HI (0x6004/0x600c/0x6020/0x6018/0x601c от
+// RPI4_PCIE_PADDR) — сверено с апстрим Linux (drivers/pci/controller/
+// pcie-brcmstb.c, brcm_pcie_dump_err()), U-Boot(наш) их не знает. Другая
+// страница, чем PLAT_PCIE_RC_MISC_PADDR (0xfd504000..0xfd504fff) —
+// 0xfd500000 + 0x6000 = 0xfd506000, требует отдельного фрейма/маппинга.
+constexpr uintptr_t PLAT_PCIE_ERR_PADDR = 0xfd506000ULL;
+
 // --- Виртуальные адреса, куда эти устройства маппятся в VSpace драйвера
 // (см. hw_vaddr в spawn_process(), main.cpp). Общие для всех процессов —
 // каждый драйвер видит свое устройство по одному и тому же литералу. ---
@@ -149,6 +234,91 @@ constexpr uintptr_t PLAT_AVS_VADDR          = 0x200019000ULL;
 constexpr uintptr_t PLAT_WIFI_SDIO_VADDR    = 0x20001a000ULL;
 constexpr uintptr_t PLAT_MBOX_VADDR         = 0x20001b000ULL;    // регистры mailbox (см. PLAT_MBOX_PADDR)
 constexpr uintptr_t PLAT_MBOX_BUF_VADDR     = 0x20001c000ULL;    // приватный некэшируемый буфер под property-tag запрос (см. main.cpp)
+
+// USB (Фаза 14) — отдельное, СОБСТВЕННОЕ 2MB-окно usb_driver'а (не тот же
+// регион, что UART/EMMC/GENET/... выше). Изначально рассчитывалось на 1MB
+// MMIO (см. RPI4_XHCI_SIZE выше — с тех пор исправлено на реальные 4KB,
+// живое железо показало другой BAR/размер) + ~23 4KB-страницы DMA — с
+// нынешним, ещё меньшим MMIO-окном запас по месту в 2MB стал ещё больше,
+// пересчитывать раскладку смысла нет. Вся структура usb_driver'а по-прежнему
+// укладывается в ОДНУ иерархию drv_pud/drv_pd/drv_pt (main.cpp), как у
+// остальных драйверов. Адрес — вне диапазонов, которые root временно
+// занимает СВОИМИ СОБСТВЕННЫМИ скользящими окнами (global_elf_temp_vaddr:
+// 0x200100000-0x200200000, global_ipc_temp_vaddr: 0x200800000-0x200900000,
+// main.cpp) — реальной коллизии не было бы (разные vspace/ASID), но
+// смущает при чтении, поэтому просто берём отдельный, ничем не занятый
+// диапазон.
+constexpr uintptr_t PLAT_XHCI_VADDR = 0x201000000ULL;             // xHCI MMIO (см. PLAT_XHCI_SIZE)
+constexpr uintptr_t PLAT_PCIE_RC_VADDR = 0x201001000ULL;          // PCIe RC MISC-регистры (см. PLAT_PCIE_RC_MISC_PADDR) — 1 страница сразу за xHCI MMIO, до DMA-страниц на 0x201100000 огромный запас
+constexpr uintptr_t PLAT_PCIE_ERR_VADDR = 0x201002000ULL;         // PCIE_OUTB_ERR_* (см. PLAT_PCIE_ERR_PADDR) — ещё одна страница сразу за PLAT_PCIE_RC_VADDR
+
+// Приватные некэшируемые DMA-страницы usb_driver'а, сразу после MMIO-окна
+// (0x201000000 + 0x100000 = 0x201100000), в ТОМ ЖЕ 2MB-окне — та же схема,
+// что PLAT_BLK_DMA_VADDR у blk_driver (по одной странице на структуру, без
+// общего "DMA-пула", см. ROADMAP.md). Каждый xHCI-ring segment — ровно одна
+// 4KB-страница (256 TRB по 16 байт), длинные ring'и наращиваются Link TRB,
+// а не многостраничным непрерывным DMA-регионом. Scratchpad — отдельный
+// диапазон подряд идущих страниц, число реально используемых читается из
+// HCSPARAMS2 в рантайме (см. USB_MAX_SCRATCHPAD_PAGES ниже).
+// Фаза 15 (несколько накопителей + Hub Class, см. ROADMAP.md/план) —
+// USB_MAX_DEVICES независимых "слотов" под накопители (обычные root-порты
+// + позже устройства за хабом), USB_MAX_SLOTS_ENABLED — xHCI Slot ID
+// budget (MaxSlotsEn), с запасом сверх USB_MAX_DEVICES под сами хабы (у
+// хаба тоже есть свой Slot ID, не только у устройств за ним).
+constexpr int USB_MAX_DEVICES        = 4;
+constexpr int USB_MAX_SLOTS_ENABLED  = 8;
+
+constexpr uintptr_t PLAT_XHCI_DCBAA_VADDR       = 0x201100000ULL; // Device Context Base Address Array
+constexpr uintptr_t PLAT_XHCI_CMDRING_VADDR     = 0x201101000ULL; // Command Ring, 1 сегмент
+constexpr uintptr_t PLAT_XHCI_ERST_VADDR        = 0x201102000ULL; // Event Ring Segment Table (ERST)
+constexpr uintptr_t PLAT_XHCI_EVTRING_VADDR     = 0x201103000ULL; // Event Ring, 1 сегмент
+// Device Context — БАЗА подряд идущих USB_MAX_SLOTS_ENABLED страниц (по
+// одной на xHCI Slot ID, см. devctx_paddr_for()/usb_driver.cpp) — раньше
+// был единственный слот (см. историю в ROADMAP.md), Фаза 15 требует по
+// странице на каждый одновременно активный Slot ID.
+constexpr uintptr_t PLAT_XHCI_DEVCTX_VADDR      = 0x201104000ULL; // + slot_id*0x1000, slot_id < USB_MAX_SLOTS_ENABLED
+constexpr uintptr_t PLAT_XHCI_INPUTCTX_VADDR    = 0x20110C000ULL; // Input Context — по-прежнему ОДИН общий (транзитный буфер, один слот единовременно)
+constexpr uintptr_t PLAT_XHCI_SCRATCHPAD_ARR_VADDR  = 0x20110D000ULL; // Scratchpad Buffer Array (указатели) — общий, контроллерный уровень
+constexpr uintptr_t PLAT_XHCI_SCRATCHPAD_BUF_VADDR  = 0x20110E000ULL; // первая из подряд идущих scratchpad-страниц (до USB_MAX_SCRATCHPAD_PAGES)
+// Девятнадцатая попытка (см. ROADMAP.md): живое железо (VL805) через
+// реальный HCSPARAMS2 запросило 0x1f (31) scratchpad-страниц — бюджет 16
+// оказался мал (явный, ожидаемый отказ по коду, не баг). Поднято до 32
+// (round-число, покрывает 31 с одной страницей запаса). CNode/IPC-бюджет
+// (MAX_TRACKED_CAPS=640, message-регистры BOOT_USB_SCRATCHPAD_BUF0_PADDR+i
+// в пределах страницы IPC-буфера, см. common.h/ROADMAP.md) — оба с большим
+// запасом, отдельно не пересчитывались.
+constexpr int         USB_MAX_SCRATCHPAD_PAGES       = 32; // бюджет этой фазы — см. ROADMAP.md; больше HCSPARAMS2 просит -> явный отказ, не динамический аллокатор
+// Последняя занятая scratchpad-страница: 0x20110E000 + 32*0x1000 =
+// 0x20112E000 — с большим запасом до конца 2MB-окна (0x2011FFFFF).
+
+// Фаза 14 (закрытие, Mass Storage), Milestone 1 — у EP0 раньше НЕ было
+// настоящего Transfer Ring (заглушка на Device Context). Фаза 15 —
+// КАЖДЫЙ из шести ресурсов ниже теперь БАЗА подряд идущих
+// USB_MAX_DEVICES страниц (по одной на "наш" индекс устройства, см.
+// ep0ring_vaddr()/ctrlbuf_vaddr()/... в usb_driver.cpp) вместо одной
+// общей страницы — несколько накопителей одновременно, у каждого свой
+// набор колец/буферов.
+constexpr uintptr_t PLAT_XHCI_EP0_TRRING_VADDR      = 0x201130000ULL; // + idx*0x1000, idx < USB_MAX_DEVICES
+
+// Milestone 2 — буфер данных control-transfer'ов на EP0 (GET_DESCRIPTOR
+// Device/Configuration и т.д.) — одна страница с избытком на устройство.
+constexpr uintptr_t PLAT_XHCI_CTRL_BUF_VADDR        = 0x201134000ULL; // + idx*0x1000
+
+// Milestone 4 — Transfer Ring'и bulk OUT/IN эндпоинтов Mass Storage
+// интерфейса (найдены в Milestone 3), активируются командой Configure
+// Endpoint. Тот же приём, что EP0 Transfer Ring — отдельная честная
+// страница на каждое кольцо КАЖДОГО устройства.
+constexpr uintptr_t PLAT_XHCI_BULKOUT_TRRING_VADDR  = 0x201138000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x20113C000ULL; // + idx*0x1000
+
+// Milestone 5 — Bulk-Only Transport: CBW(31 байт, offset 0)/CSW(13 байт,
+// offset 64, выровнено) в ОДНОЙ странице на устройство; отдельная
+// страница-"bounce" под данные SCSI-команд (INQUIRY/READ CAPACITY/
+// READ(10)/WRITE(10)) — тот же приём, что ctrlbuf() у EP0.
+constexpr uintptr_t PLAT_XHCI_CBW_CSW_VADDR         = 0x201140000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201144000ULL; // + idx*0x1000
+// Последняя занятая страница: 0x201144000 + (USB_MAX_DEVICES-1)*0x1000 —
+// с запасом до конца 2MB-окна (0x2011FFFFF).
 
 // --- Оффсеты/биты регистров VideoCore mailbox, считаются от MAILBOX_BASE
 // (см. PLAT_MBOX_PADDR — сама страница начинается на 0x880 раньше). ---
@@ -990,6 +1160,13 @@ constexpr uint32_t WIFI_SHM_CANARY_MAGIC  = 0xC0FFEEEEu;
 // link-state выше (Фаза 5.3, раскладка страниц пересчитана).
 constexpr uint32_t BLK_SHM_STAGING_OFFSET = 28672;
 
+// usb_driver'ов staging-буфер (Фаза 14, Milestone 8) — зеркалит
+// BLK_SHM_STAGING_OFFSET один-в-один: 9-я SHM-страница (32768-36863),
+// отдельная от blk_driver'овской (28672-32767), чтобы echo>/mv на
+// /mnt/usb0 не пересекались физической памятью с теми же операциями на
+// SD-карте (тот же класс бага, что уже чинили для GENET/BLK).
+constexpr uint32_t USB_SHM_STAGING_OFFSET = 32768;
+
 // BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
 // ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от
 // 16-байтного dcmd-заголовка на CONTROL(0)-канале (см. BCDC_DCMD_* выше).
@@ -1222,12 +1399,27 @@ constexpr int        RPI4_GENET_IRQ_B     = 190;                        // DT SP
 constexpr uintptr_t RPI4_GENET_MDIO_OFFSET = 0xe14ULL;                  // MDIO (PHY-регистры) внутри блока genet
 
 // --- USB host-контроллер (для клавиатуры/внешних накопителей помимо SD).
-// Реальный физический USB-хаб/хост на RPi4 — VL805 xHCI, который
-// firmware настраивает так, что регистры видны как плоский MMIO-блок
-// без необходимости поднимать сам PCIe (тот же трюк использует
-// U-Boot/Linux до полной инициализации PCIe-моста). ---
-constexpr uintptr_t RPI4_XHCI_PADDR = 0xfe9c0000ULL;                    // DT /scb/xhci@7e9c0000, "generic-xhci"
-constexpr uintptr_t RPI4_XHCI_SIZE  = 0x100000ULL;
+// Реальный физический USB-хаб/хост на RPi4 — VL805 xHCI, физически за
+// PCIe. ПЕРВОНАЧАЛЬНО предполагалось, что DTB-алиас "generic-xhci"
+// (0xfe9c0000, плоский MMIO-блок без PCIe-энумерации) остаётся живым и
+// после старта U-Boot — ЖИВОЕ ЖЕЛЕЗО ЭТО ОПРОВЕРГЛО (см. ROADMAP.md, Фаза
+// 14): как только U-Boot реально проэнумерировал PCI-шину (обязательный
+// побочный эффект штатного boot-device сканирования USB-накопителей),
+// старый алиас перестал отвечать на чтение (зависание всей системы на
+// шинном уровне). ВТОРОЙ слой находки: "сырой" BAR0 из PCI config space
+// (0xC0000000, см. "pci bar 01.00.00" в U-Boot) — это PCI-BUS-SIDE адрес,
+// а НЕ CPU-физический; DT `ranges` PCIe-узла транслирует его в
+// 0x600000000 (64-битное "высокое" PCIe-окно, вне видимости seL4 вообще).
+// ПОПЫТКА перенацелить (единственное) outbound-окно моста через правку DT
+// (на низкий CPU-адрес 0xfd600000) вызвала настоящий краш U-Boot на живом
+// железе — откачена (см. ROADMAP.md, "Тринадцатая попытка"). Пятнадцатая
+// попытка: PADDR ниже (0xC0000000, "сырой" PCI-bus-side BAR0) теперь
+// АКТИВНО ИСПОЛЬЗУЕТСЯ usb_driver'ом как источник (PCIE_ADDR) для
+// ВТОРОГО, самостоятельно прописываемого окна (индекс 1) — см.
+// PLAT_XHCI_PADDR/PLAT_PCIE_RC_MISC_PADDR выше и usb_driver.cpp. U-Boot
+// и DT в этой попытке не трогаются вообще. ---
+constexpr uintptr_t RPI4_XHCI_PADDR = 0xC0000000ULL;                    // PCI-bus-side BAR0 (не CPU-физический адрес!) — см. предупреждение выше
+constexpr uintptr_t RPI4_XHCI_SIZE  = 0x1000ULL;                        // подтверждено "pci bar" на живом железе — 4KB, не 1MB
 constexpr int        RPI4_XHCI_IRQ  = 208;                              // DT SPI 0xb0=176 -> GIC 176+32
 // Альтернатива/legacy — встроенный DWC2 OTG-контроллер (не используется,
 // т.к. реальный хост-путь идёт через xHCI выше; оставлено для справки).

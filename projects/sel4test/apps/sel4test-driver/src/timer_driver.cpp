@@ -396,6 +396,11 @@ int main(int argc, char *argv[]) {
     // гарантированно будит blk_driver's seL4_Wait независимо от того,
     // пришло ли реальное железное прерывание.
     seL4_CPtr blk_heartbeat_ntfn = ipc->msg[BOOT_BLK_HEARTBEAT_NTFN_CAP];
+    // Milestone 11 (доп., по запросу пользователя) — четвёртая badged-капа,
+    // тем же принципом: usb_driver опрашивает PORTSC на подключение/
+    // отключение флешки на каждом heartbeat-тике (Port Status Change Event
+    // на живом железе себя не показал надёжно, см. ROADMAP.md).
+    seL4_CPtr usb_heartbeat_ntfn = ipc->msg[BOOT_USB_HEARTBEAT_NTFN_CAP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -508,6 +513,7 @@ int main(int argc, char *argv[]) {
                 seL4_Signal(heartbeat_ntfn);
                 if (wifi_heartbeat_ntfn != 0) seL4_Signal(wifi_heartbeat_ntfn);
                 if (blk_heartbeat_ntfn != 0) seL4_Signal(blk_heartbeat_ntfn);
+                if (usb_heartbeat_ntfn != 0) seL4_Signal(usb_heartbeat_ntfn);
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
             rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);

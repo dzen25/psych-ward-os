@@ -65,6 +65,50 @@ enum BootIPCSlot {
     // в ядре всегда берётся от ВЫЗЫВАЮЩЕГО, не от того, чей TCB спрашивают
     // — root, вызывая с ядра 0, иначе всегда получал бы период ядра 0).
     BOOT_SELF_TCB_CAP            = 118,
+    // Фаза 14 (USB, xHCI) — usb_driver слушает команды шелла (тот же
+    // принцип, что BOOT_WIFI_EP/BOOT_NET_EP выше), плюс физические адреса
+    // приватных DMA-страниц (см. PLAT_XHCI_*_VADDR в platform.h — виртуальные
+    // адреса фиксированы на этапе компиляции, физические решает root при
+    // Retype в spawn_process() и передаёт здесь, та же схема, что
+    // BOOT_BLK_DMA_PADDR).
+    BOOT_USB_EP                       = 119,
+    BOOT_USB_DCBAA_PADDR              = 120,
+    BOOT_USB_CMDRING_PADDR            = 121,
+    BOOT_USB_ERST_PADDR               = 122,
+    BOOT_USB_EVTRING_PADDR            = 123,
+    BOOT_USB_DEVCTX_PADDR             = 124,
+    BOOT_USB_INPUTCTX_PADDR           = 125,
+    BOOT_USB_SCRATCHPAD_ARR_PADDR     = 126,
+    BOOT_USB_SCRATCHPAD_COUNT         = 127, // не капа — просто seL4_Word N (см. USB_MAX_SCRATCHPAD_PAGES)
+    BOOT_USB_SCRATCHPAD_BUF0_PADDR    = 128, // первый из N (<= USB_MAX_SCRATCHPAD_PAGES) подряд идущих слотов 128..(128+N-1)
+    // Фаза 14 (закрытие, Mass Storage) — Milestone 1: настоящий EP0 Transfer
+    // Ring (было: заглушка на Device Context, см. platform.h
+    // PLAT_XHCI_EP0_TRRING_VADDR). Первый свободный слот после
+    // scratchpad-диапазона (128..159).
+    BOOT_USB_EP0_TRRING_PADDR         = 160,
+    // Milestone 2 — буфер данных control-transfer'ов на EP0 (см.
+    // PLAT_XHCI_CTRL_BUF_VADDR/platform.h).
+    BOOT_USB_CTRL_BUF_PADDR           = 161,
+    // Milestone 4 — Transfer Ring'и bulk OUT/IN эндпоинтов (см.
+    // PLAT_XHCI_BULKOUT_TRRING_VADDR/PLAT_XHCI_BULKIN_TRRING_VADDR).
+    BOOT_USB_BULKOUT_TRRING_PADDR     = 162,
+    BOOT_USB_BULKIN_TRRING_PADDR      = 163,
+    // Milestone 5 — CBW/CSW-страница и SCSI-данные bounce-буфер (см.
+    // PLAT_XHCI_CBW_CSW_VADDR/PLAT_XHCI_BOUNCE_VADDR).
+    BOOT_USB_CBW_CSW_PADDR            = 164,
+    BOOT_USB_BOUNCE_PADDR             = 165,
+    // Milestone 9 — клиентский Call-капа на usb_driver'ов командный
+    // endpoint (та же send-капа, что root держит как usb_cmd_ep,
+    // см. main.cpp), для VFS-команд (110/112/.../120, Milestone 8) на
+    // /mnt/usb0. НЕ то же самое, что BOOT_USB_EP=119 — тот usb_driver сам
+    // слушает (CanRead-только копия). Выдаётся только shell(0) и
+    // доверенным /sbin(253), тот же принцип, что BOOT_BLK_EP.
+    BOOT_USB_STORAGE_EP               = 166,
+    // Milestone 11 (доп., по запросу пользователя) — badged-копия
+    // usb_irq_ntfn (badge USB_EVENT_HEARTBEAT, см. выше) — читает ТОЛЬКО
+    // timer_driver (is_driver==2), тот же принцип, что
+    // BOOT_BLK_HEARTBEAT_NTFN_CAP.
+    BOOT_USB_HEARTBEAT_NTFN_CAP        = 167,
 };
 
 // Фаза 9.A (см. ROADMAP.md): индекс msg[]-слова (НЕ капа, НЕ CNode-слот —
@@ -126,6 +170,22 @@ constexpr seL4_Word NET_EVENT_WIFI_RX   = 0x4000;
 // PID/пайп-бейджами my_ep САМОГО wifi_driver, никогда не с NET_EVENT_*.
 constexpr seL4_Word WIFI_EVENT_HEARTBEAT = 0x1000; // периодический опрос SDIO data-канала на входящие 802.11-кадры (см. BOOT_WIFI_HEARTBEAT_NTFN_CAP)
 constexpr seL4_Word WIFI_EVENT_TX_READY  = 0x2000; // net_driver положил кадр в TX-mailbox — разбудить сразу, не ждать heartbeat (см. BOOT_WIFI_TX_WAKE_CAP)
+
+// Фаза 14 (USB, xHCI) — собственный badge usb_driver'а (своё, не
+// пересекающееся с NET_EVENT_*/WIFI_EVENT_* пространство, тот же принцип).
+// Один источник (собственная, не шаренная SPI-линия — см. RPI4_XHCI_IRQ),
+// поэтому один бит, без OR нескольких источников, как у net_driver/
+// wifi_driver.
+constexpr seL4_Word USB_EVENT_XHCI_IRQ = 0x1000;
+// Milestone 11 (доп., по запросу пользователя) — периодический опрос
+// PORTSC на подключение/отключение (Port Status Change Event на живом
+// железе не подтвердился, см. ROADMAP.md — bulk-передача на "старом"
+// слоте после переподключения провалилась, т.е. асинхронная доставка
+// либо не пришла, либо обработка не успела до следующей команды).
+// Опрос — та же badged-нотификация usb_irq_ntfn, что и XHCI IRQ выше
+// (см. main.cpp), просто другой бит; timer_driver сигналит его на общем
+// heartbeat-тике (см. BOOT_USB_HEARTBEAT_NTFN_CAP).
+constexpr seL4_Word USB_EVENT_HEARTBEAT = 0x2000;
 
 // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (см. ROADMAP.md, зависание после `kill 1`):
 // клавиатурная нотификация uart_driver'а (badged-копия uart_ntfn,
@@ -299,6 +359,16 @@ constexpr seL4_Word SYS_CANCEL_PENDING_FOR_PID = 142;
 // как занятость, см. issuse.txt) — а через честный признак "давно не было
 // нового пользовательского ввода". Ответ: MR0=0 всегда.
 constexpr seL4_Word SYS_MARK_SHELL_ACTIVITY = 143;
+
+// Фаза 14 (USB, xHCI) — root-опосредованный запрос (тот же принцип, что
+// SYS_WIFI_STATUS/SYS_TOP_STATS: любой процесс зовёт это на своём обычном
+// syscall endpoint, root сам внутри синхронно вызывает usb_driver и
+// пересылает результат — см. collect_load_snapshot() для точно такого же
+// приёма). Данные (нашли ли устройство, vendor/product ID, класс) —
+// единственный слот этой фазы, умещаются прямо в message registers,
+// отдельная SHM-передача не нужна. Ответ: MR0=found(0/1), MR1=vendor_id,
+// MR2=product_id, MR3=device_class, MR4=device_subclass, MR5=device_protocol.
+constexpr seL4_Word SYS_USB_LIST = 144;
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

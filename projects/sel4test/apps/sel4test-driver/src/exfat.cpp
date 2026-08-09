@@ -671,9 +671,26 @@ bool exfat_init(EXFAT_Instance* fs, block_read_fn read_func, block_write_fn writ
 
     // Находим Allocation Bitmap (0x81) в корне — нужен для Этапа B
     // (аллокатор). Корень всегда честная FAT-цепочка (см. DirCursor).
+    //
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (Milestone 11, повторное монтирование при
+    // hot-plug) — этот `while (true)` (и вообще `dir_cursor_advance()` в
+    // ветке настоящей FAT-цепочки) НЕ был защищён от цикла, в отличие от
+    // free_fat_chain()/read_extent() в этом же файле (см.
+    // fat_chain_has_cycle()) — при повторном монтировании (в отличие от
+    // самого первого, boot-time) зависание случилось именно здесь.
+    // Подозрение: сразу после переподключения устройство/шина ещё не
+    // полностью "устаканились", и хотя бы одно чтение FAT вернуло не то,
+    // что должно — двойная защита: сначала честная проверка на цикл (как
+    // у остальных обходов FAT в этом файле), и жёсткий потолок итераций
+    // (тот же приём, что guard++ < 65536 у free_fat_chain) на случай ЛЮБОЙ
+    // другой причины, не только цикла — цикл здесь физически невозможен
+    // (return false вместо зависания), даже если гипотеза неверна.
+    if (fat_chain_has_cycle(fs, fs->root_cluster)) return false;
+
     DirCursor cur;
     dir_cursor_init(&cur, fs, fs->root_cluster, false, 0);
-    while (true) {
+    int guard = 0;
+    while (guard++ < 65536) {
         uint8_t* slot = dir_cursor_current(&cur);
         if (!slot) break;
         if (slot[0] == 0x00) break;
@@ -814,23 +831,34 @@ static void free_slot_data(EXFAT_Instance* fs, const ExfatSlot& slot) {
 // в отличие от read_extent/FAT32 здесь не нужно ходить по цепочке вообще,
 // сектора просто идут подряд.
 // ============================================================================
+// Батчинг по 8 секторов (4КБ) за вызов write_blocks() — тот же фикс и по
+// той же причине, что в exfat_mkdir() (см. комментарий там, Milestone 10,
+// найдено на живом железе с USB) — раньше по сектору за раз, что на
+// файле в несколько КБ означало соответствующее число отдельных
+// SCSI-транзакций подряд. Полные сектора пишутся ПРЯМО из буфера
+// вызывающего (без копирования — `data`/`len` у обоих бэкендов всегда
+// это whole-buffer staging-страница, см. exfat_write_file), паддинг
+// нулями нужен только для ПОСЛЕДНЕГО неполного сектора.
 static bool write_extent_data(EXFAT_Instance* fs, uint32_t first_cluster, const char* data, uint32_t len) {
     uint32_t sector = cluster_to_sector(fs, first_cluster);
     uint32_t remaining = len;
     const char* p = data;
-    char sector_buf[512];
+    static char pad_buf[512 * 8];
     while (remaining > 0) {
-        uint32_t chunk = remaining > EXFAT_SECTOR_SIZE ? EXFAT_SECTOR_SIZE : remaining;
-        const char* src = p;
-        if (chunk < EXFAT_SECTOR_SIZE) {
-            for (uint32_t i = 0; i < chunk; i++) sector_buf[i] = p[i];
-            for (uint32_t i = chunk; i < EXFAT_SECTOR_SIZE; i++) sector_buf[i] = 0;
-            src = sector_buf;
+        uint32_t full_sectors = remaining / EXFAT_SECTOR_SIZE;
+        if (full_sectors > 0) {
+            uint32_t chunk_sectors = full_sectors > 8 ? 8 : full_sectors;
+            if (!fs->write_blocks(sector, chunk_sectors, p)) return false;
+            uint32_t chunk_bytes = chunk_sectors * EXFAT_SECTOR_SIZE;
+            p += chunk_bytes;
+            remaining -= chunk_bytes;
+            sector += chunk_sectors;
+            continue;
         }
-        if (!fs->write_blocks(sector, 1, src)) return false;
-        p += chunk;
-        remaining -= chunk;
-        sector++;
+        for (uint32_t i = 0; i < remaining; i++) pad_buf[i] = p[i];
+        for (uint32_t i = remaining; i < EXFAT_SECTOR_SIZE; i++) pad_buf[i] = 0;
+        if (!fs->write_blocks(sector, 1, pad_buf)) return false;
+        remaining = 0;
     }
     return true;
 }
@@ -1062,11 +1090,28 @@ bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed) {
 
     // Новый кластер обнуляем целиком — валидный пустой каталог (0x00 =
     // конец) без единой реальной записи. В отличие от FAT32, "."/".." не нужны.
+    //
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (Milestone 10, USB) — тот же класс задержки,
+    // что уже чинили для hardware_emmc_read/write (см. blk_driver.cpp,
+    // "раньше здесь был цикл из отдельных CMD17/24 на КАЖДЫЙ сектор"):
+    // по СЕКТОРУ за раз на кластер в 128КБ (типичный для macOS-
+    // отформатированных exFAT-накопителей от 32ГБ, см. ROADMAP.md) — это
+    // 256 отдельных SCSI WRITE(10) round-trip'ов через USB bulk-эндпоинты
+    // подряд, и `mkdir` выглядел зависшим (не был — просто очень медленный).
+    // write_blocks() у ОБОИХ бэкендов (hardware_emmc_write/hardware_usb_write)
+    // и так уже поддерживает count>1 за вызов (see USB_MAX_SECTORS_PER_IO=8
+    // в usb_driver.cpp — тот же лимит, что здесь) — просто не
+    // использовался экфат-уровнем. batch по 8 секторов (4КБ) — на порядок
+    // меньше round-trip'ов.
     uint32_t sectors_per_cluster = 1u << fs->sectors_per_cluster_shift;
-    char zero_buf[512] = {0};
+    static char zero_buf[512 * 8] = {0};
     uint32_t sec = cluster_to_sector(fs, new_clus);
-    for (uint32_t s = 0; s < sectors_per_cluster; s++) {
-        if (!fs->write_blocks(sec + s, 1, zero_buf)) { bitmap_free_run(fs, new_clus, 1); return false; }
+    uint32_t remaining = sectors_per_cluster;
+    while (remaining > 0) {
+        uint32_t chunk = remaining > 8 ? 8 : remaining;
+        if (!fs->write_blocks(sec, chunk, zero_buf)) { bitmap_free_run(fs, new_clus, 1); return false; }
+        sec += chunk;
+        remaining -= chunk;
     }
 
     // DataLength = размер РЕАЛЬНО аллоцированного экстента (1 кластер), а не

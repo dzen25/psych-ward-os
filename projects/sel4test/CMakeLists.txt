@@ -16,7 +16,24 @@ find_package(elfloader-tool REQUIRED)
 # Set the roottask CNode size to be large enough for DTB, timer caps, etc
 # Note that this works for the platforms that we have at the moment, and may
 # need to be increased in the future
-set(KernelRootCNodeSizeBits 13 CACHE INTERNAL "")
+#
+# Фаза 14 (USB, xHCI, см. ROADMAP.md) — 13 (8192 слотов) НЕ ХВАТИЛО на
+# живом железе: alloc_device_frame() для xHCI (PADDR 0xfe9c0000) должен
+# "прошагать" физический пробел от предыдущего использованного адреса в
+# том же device-untyped регионе (EMMC2, 0xfe340000) — ~1650 страниц, КАЖДАЯ
+# безвозвратно съедает один CSlot (см. комментарий "target_paddr BEHIND
+# watermark" у alloc_device_frame() в main.cpp — это неотъемлемое свойство
+# seL4 Untyped Retype, не баг конкретно в нашем аллокаторе: ретайп из
+# Untyped всегда идёт от текущего free-offset вперёд, "перепрыгнуть" пробел
+# без материализации промежуточных объектов нельзя). PLAT_XHCI_PADDR —
+# самый высокий физический адрес среди всех устройств, что мы маппим, а
+# 1MB (256 страниц) самого xHCI BAR — дополнительная нагрузка сверху.
+# Живая ошибка была "Untyped Retype: Slot #0 in destination window
+# non-empty" сразу после "dropped to user space", ДО старта uart_driver
+# (root ещё не UART) — alloc_slot() тихо вернул 0 (OOM), Retype в слот 0
+# root_cnode закономерно провалился. Подняли с запасом на будущие фазы
+# (класс-драйверы потребуют ещё DMA-страниц).
+set(KernelRootCNodeSizeBits 15 CACHE INTERNAL "")
 
 sel4_import_kernel()
 

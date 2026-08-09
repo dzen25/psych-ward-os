@@ -801,14 +801,30 @@ static void build_absolute_path(char* target, const char* arg, int max_len) {
 
 static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
     vfs_lock();
-    
+
     seL4_SetMR(0, syscall_num);
     seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 1);
     seL4_Call(blk_ep, info);
-    
+
     int ret_val = seL4_GetMR(0);
     vfs_unlock();
     return ret_val;
+}
+
+// Milestone A3 (Фаза 15, см. ROADMAP.md/план) — 1:1 с route_vfs_path() в
+// h/sys_client.h. При нескольких одновременно смонтированных
+// USB-устройствах клиент больше не может заранее знать имя (или имена)
+// точек монтирования — срезает только "/mnt" целиком, дальше решает
+// СЕРВЕР (usb_driver.cpp::resolve_device_by_path()) по ведущему
+// компоненту остатка (имя тома).
+static seL4_CPtr route_vfs_path(char *path, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (usb_storage_ep == 0) return blk_ep;
+    if (path[0] == '/' && path[1] == 'm' && path[2] == 'n' && path[3] == 't' && path[4] == '/') {
+        const char *remainder = path + 4;
+        int j = 0; while (remainder[j] != '\0') { path[j] = remainder[j]; j++; } path[j] = '\0';
+        return usb_storage_ep;
+    }
+    return blk_ep;
 }
 
 // --- "Знакомые сети" Wi-Fi (Милстоун 4.4, см. wifi_driver.cpp) ---
@@ -995,6 +1011,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];        
     seL4_CPtr net_ep     = ipc->msg[BOOT_NET_EP];
     seL4_CPtr blk_ep     = ipc->msg[BOOT_BLK_EP];
+    seL4_CPtr usb_storage_ep = ipc->msg[BOOT_USB_STORAGE_EP]; // Milestone 9 (Фаза 14, закрытие) — маршрутизация /mnt/usb0
     seL4_CPtr wifi_ep    = ipc->msg[BOOT_WIFI_EP]; // Фаза 4, Милстоун 4.1 (см. wifi_driver.cpp)
     vfs_mutex_ep         = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
 
@@ -1939,28 +1956,50 @@ int main(int argc, char *argv[]) {
                     path = (char*)"/";
                 }
 
-                my_strcpy(shm_base, path);
+                // Milestone 9 (Фаза 14, закрытие, см. ROADMAP.md/план) —
+                // раньше cd была ЕДИНСТВЕННОЙ VFS-командой, которая слала
+                // СЫРОЙ arg на blk_ep напрямую, минуя build_absolute_path
+                // (полагаясь на серверное относительное резолвление внутри
+                // exfat_cd). Без вычисления ПОЛНОГО унифицированного
+                // абсолютного пути ЗАРАНЕЕ маршрутизация на границе точки
+                // монтирования (/mnt/usb0) невозможна — нужно знать, чем
+                // именно обслуживается путь, ДО того, как решать, на какой
+                // endpoint слать SYS_CD. target_abs вычисляется той же
+                // логикой, что раньше применялась ПОСЛЕ успеха (частные
+                // случаи "/" и ".." — чистая строковая операция, не
+                // затрагивает сервер, поэтому корректно работает и при
+                // выходе ИЗ /mnt/usb0 через "cd .." без какой-либо
+                // специальной маршрутизационной логики).
+                char target_abs[CWD_SIZE];
+                if (my_strcmp(path, "/") == 0) {
+                    my_strcpy(target_abs, "/");
+                } else if (my_strcmp(path, "..") == 0) {
+                    my_strlcpy(target_abs, current_working_dir, CWD_SIZE);
+                    int len = my_strlen(target_abs);
+                    if (len > 1) {
+                        len--;
+                        if (target_abs[len] == '/') len--;
+                        while (len > 0 && target_abs[len] != '/') len--;
+                        if (len == 0) my_strcpy(target_abs, "/");
+                        else target_abs[len] = '\0';
+                    }
+                } else {
+                    build_absolute_path(target_abs, path, CWD_SIZE);
+                }
+
+                char routed[CWD_SIZE];
+                my_strlcpy(routed, target_abs, CWD_SIZE);
+                seL4_CPtr target_ep = route_vfs_path(routed, blk_ep, usb_storage_ep);
+
+                my_strcpy(shm_base, routed);
                 vfs_lock();
                 seL4_SetMR(0, 118); // SYS_CD
-                seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 int ret = seL4_GetMR(0);
                 vfs_unlock();
 
                 if (ret == 0) {
-                    if (my_strcmp(path, "/") == 0) {
-                        my_strcpy(current_working_dir, "/");
-                    } else if (my_strcmp(path, "..") == 0) {
-                        int len = my_strlen(current_working_dir);
-                        if (len > 1) {
-                            len--;
-                            if (current_working_dir[len] == '/') len--;
-                            while (len > 0 && current_working_dir[len] != '/') len--;
-                            if (len == 0) my_strcpy(current_working_dir, "/");
-                            else current_working_dir[len] = '\0';
-                        }
-                    } else {
-                        build_absolute_path(current_working_dir, path, CWD_SIZE);
-                    }
+                    my_strlcpy(current_working_dir, target_abs, CWD_SIZE);
                 } else {
                     sys_puts(console_ep, "cd: ");
                     sys_puts(console_ep, path);
@@ -2102,13 +2141,14 @@ int main(int argc, char *argv[]) {
 
                     build_absolute_path(path_ptr, redir, 128);
                     my_strlcpy(text_ptr, arg, SHM_TOTAL_SIZE - 128);
-                    
+                    seL4_CPtr target_ep = route_vfs_path(path_ptr, blk_ep, usb_storage_ep); // Milestone 9
+
                     vfs_lock();
-                    seL4_SetMR(0, 113); 
-                    seL4_SetMR(1, my_strlen(arg)); 
-                    
+                    seL4_SetMR(0, 113);
+                    seL4_SetMR(1, my_strlen(arg));
+
                     seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2); // 2 регистра передано
-                    seL4_Call(blk_ep, msg);
+                    seL4_Call(target_ep, msg);
                     int ret_val = seL4_GetMR(0);
                     vfs_unlock();
                     if (ret_val != 0) {

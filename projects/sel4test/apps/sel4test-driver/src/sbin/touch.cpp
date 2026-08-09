@@ -25,7 +25,8 @@ int main(int argc, char *argv[]) {
 
         char *shm = env.shm;
         build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
-        int status = vfs_syscall(112, env.blk_ep);
+        seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep); // Milestone 9
+        int status = vfs_syscall(112, target_ep);
         if (status == 1) {
             sys_puts(0, "touch: '");
             sys_puts(0, start_of_arg);

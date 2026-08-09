@@ -9,8 +9,9 @@ int main(int argc, char *argv[]) {
 
     char *shm = env.shm;
     build_absolute_path(shm, env.arg, SHM_TOTAL_SIZE);
+    seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep); // Milestone 9
 
-    if (vfs_syscall(114, env.blk_ep) == 0) { // Файл прочитан в shm
+    if (vfs_syscall(114, target_ep) == 0) { // Файл прочитан в shm
         sys_puts(0, shm);
         sys_puts(0, "\n");
     } else {

@@ -22,64 +22,112 @@ UBOOT_DIR="${UBOOT_DIR:-$HOME/u-boot}"
 FIT_KEY_DIR="$ROOT/.fit-signing-key"
 BOOT_ITS_TEMPLATE="$ROOT/tools/boot_fit/boot.its.template"
 RPI_PATCH="$ROOT/tools/boot_fit/rpi_merge_signature.patch"
+PCIE_PATCH="$ROOT/tools/boot_fit/pcie_no_os_prepare.patch"
+XHCI_PATCH="$ROOT/tools/boot_fit/xhci_pci_no_os_prepare.patch"
 LOAD_CHAIN="$ROOT/load_chain"
 CROSS="aarch64-linux-gnu-"
 
 echo "=== Psych Ward OS: U-Boot + FIT/RSA secure boot (Фаза 13) ==="
 
+# Идемпотентное применение патча — общее для rpi.c (Фаза 13) и
+# pcie_brcmstb.c (Фаза 14, см. ниже): пробуем применить вперёд, если не
+# получилось — проверяем, не применён ли он УЖЕ (--reverse --check), и
+# только если ни то ни другое — падаем с понятной причиной вместо тихого
+# несоответствия исходников.
+apply_patch_idempotent() {
+    local patch="$1" desc="$2"
+    if ! git apply --check "$patch" 2>/dev/null; then
+        if git apply --reverse --check "$patch" 2>/dev/null; then
+            echo "      Патч ($desc) уже применён."
+        else
+            echo "!!! Патч $patch не применяется (ни вперёд, ни назад) —"
+            echo "!!! исходники U-Boot могли измениться. Разбирайтесь руками."
+            exit 1
+        fi
+    else
+        echo "      Применяю патч ($desc) ..."
+        git apply "$patch"
+    fi
+}
+
 # --- 1. RSA-ключ подписи загрузочного образа ---
 if [ ! -d "$FIT_KEY_DIR" ]; then
-    echo "[1/5] Ключ не найден — генерирую $FIT_KEY_DIR ..."
+    echo "[1/6] Ключ не найден — генерирую $FIT_KEY_DIR ..."
     mkdir -p "$FIT_KEY_DIR"
     openssl genpkey -algorithm RSA -out "$FIT_KEY_DIR/dev.key" \
         -pkeyopt rsa_keygen_bits:2048 -pkeyopt rsa_keygen_pubexp:65537
     openssl req -batch -new -x509 -key "$FIT_KEY_DIR/dev.key" \
         -out "$FIT_KEY_DIR/dev.crt" -days 36500 -subj /CN=psych-ward-os-boot-signing
 else
-    echo "[1/5] Ключ найден: $FIT_KEY_DIR"
+    echo "[1/6] Ключ найден: $FIT_KEY_DIR"
 fi
 
 # --- 2. Клонировать U-Boot, если ещё нет ---
 if [ ! -d "$UBOOT_DIR" ]; then
-    echo "[2/5] Клонирую U-Boot в $UBOOT_DIR ..."
+    echo "[2/6] Клонирую U-Boot в $UBOOT_DIR ..."
     git clone https://github.com/u-boot/u-boot.git "$UBOOT_DIR"
 elif [ ! -d "$UBOOT_DIR/.git" ]; then
     echo "!!! $UBOOT_DIR существует и не похож на git-репозиторий U-Boot."
     echo "!!! Прерываю — разберитесь руками или укажите другой путь через UBOOT_DIR=..."
     exit 1
 else
-    echo "[2/5] U-Boot уже склонирован: $UBOOT_DIR"
+    echo "[2/6] U-Boot уже склонирован: $UBOOT_DIR"
 fi
 
 # --- Патч board_fdt_blob_setup() (merge /signature в DTB прошивки, не
-# замена) — идемпотентно, проверяем через --reverse --check. ---
+# замена, Фаза 13) + два патча Фазы 14 (см. ROADMAP.md, живая находка про
+# зависание на первом же чтении xHCI): pcie_brcmstb.c и xhci-pci.c ОБА
+# зарегистрированы с DM_FLAG_OS_PREPARE (мост И само устройство xHCI по
+# отдельности) — U-Boot вызывает remove() обоих перед прыжком в наше ядро,
+# гася линию PCIe/останавливая контроллер; патча одного моста НЕ хватило,
+# нужны оба. ---
 (
     cd "$UBOOT_DIR"
-    if ! git apply --check "$RPI_PATCH" 2>/dev/null; then
-        if git apply --reverse --check "$RPI_PATCH" 2>/dev/null; then
-            echo "      Патч rpi.c уже применён."
-        else
-            echo "!!! Патч $RPI_PATCH не применяется (ни вперёд, ни назад) —"
-            echo "!!! исходники U-Boot могли измениться. Разбирайтесь руками."
-            exit 1
-        fi
-    else
-        echo "      Применяю патч rpi.c (merge /signature вместо замены DTB) ..."
-        git apply "$RPI_PATCH"
-    fi
+    apply_patch_idempotent "$RPI_PATCH" "rpi.c, merge /signature вместо замены DTB"
+    apply_patch_idempotent "$PCIE_PATCH" "pcie_brcmstb.c, убрать DM_FLAG_OS_PREPARE (мост)"
+    apply_patch_idempotent "$XHCI_PATCH" "xhci-pci.c, убрать DM_FLAG_OS_PREPARE (само устройство)"
 )
 
 # --- 3. Конфиг: базовый rpi_4_defconfig + всё нужное для Фазы 13.
 # Пересоздаётся с нуля при каждом запуске — предсказуемее, чем накапливать
 # правки поверх правок. CONFIG_OF_BOARD НЕ трогаем — остаётся включённым
 # (дефолт), DTB прошивки используется как обычно, см. дизайн выше. ---
-echo "[3/5] Настраиваю конфиг (rpi_4_defconfig + FIT_SIGNATURE/RSA) ..."
+echo "[3/6] Настраиваю конфиг (rpi_4_defconfig + FIT_SIGNATURE/RSA) ..."
 (
     cd "$UBOOT_DIR"
     make CROSS_COMPILE="$CROSS" rpi_4_defconfig
     ./scripts/config --enable FIT --enable FIT_SIGNATURE --enable RSA --enable RSA_VERIFY \
         --disable LEGACY_IMAGE_FORMAT --disable OF_OMIT_DTB \
         --set-str BOOTCOMMAND "setenv autostart yes; fatload mmc 0 0x20000000 boot.itb; bootm 0x20000000"
+    # Фаза 14 (USB, xHCI, см. ROADMAP.md) — финальная находка: "сырой" BAR0
+    # (0xC0000000, см. предыдущие диагностические попытки в истории этого
+    # файла/ROADMAP.md) — PCI-BUS-SIDE адрес, DT `ranges` PCIe-узла
+    # транслирует его в CPU-адрес 0x600000000 (недоступен seL4). Сам DTB
+    # на SD-карте (load_chain/bcm2711-rpi-4-b.dtb, НЕ этот U-Boot и не его
+    # BOOTCOMMAND) отредактирован fdtput'ом — outbound-окно перенацелено
+    # на 0xfd600000. U-Boot(host)/эта конфигурация тут больше ни при чём —
+    # никаких дополнительных патчей/диагностики в BOOTCOMMAND не требуется.
+    # ВРЕМЕННО (Фаза 14, см. ROADMAP.md): проверил в исходниках ядра seL4
+    # (Arch_createObject, kernel/src/arch/arm/64/object/objecttype.c) — там
+    # НЕТ зануления для обычных (non-reset) Frame-объектов, ни device, ни
+    # non-device. Значит "нули" в наших чтениях — не seL4. Sentinel-тест
+    # (тот же приём, что уже использовался в проекте для диагностики DMA):
+    # пишем 0xdeadbeef по 0xC0000000, сразу читаем обратно. "Прилипло" —
+    # обычная перезаписываемая память (адрес физически не ведёт к живым
+    # регистрам устройства). НЕ прилипло — это настоящее железо (read-only
+    # capability-регистры игнорируют запись).
+    # Фаза 14 (USB, xHCI, см. ROADMAP.md) — диагностика на живом железе
+    # (md.b/pci bar/echo-метки в BOOTCOMMAND, уже убраны) дала два вывода:
+    # (1) CONFIG_USB_KEYBOARD/USB_STORAGE/CMD_USB должны быть ВКЛЮЧЕНЫ
+    # (rpi_4_defconfig, дефолт) — именно xhci_pci.probe() (см.
+    # xhci_pci_init()) включает PCI Memory Space/Bus Master для VL805,
+    # без пробы устройство никогда не становится доступным по шине; (2)
+    # реальный BAR0 после PCI-энумерации U-Boot'а — 0xC0000000 (4KB), а НЕ
+    # задокументированный плоский алиас 0xfe9c0000/1MB — U-Boot'овский PCI
+    # auto-config назначает адрес динамически. Дальнейшая диагностика (сам
+    # md.b 0xfe9c0000 вешал уже сам U-Boot, до fatload/bootm) — теперь в
+    # main.cpp (root печатает дамп boot-info untyped list через
+    # seL4_DebugPutString, см. "[BRINGUP] Untyped list dump").
     # boot.itb грузится НЕ в 0x10000000 (то же самое место, куда bootm потом
     # копирует распакованный образ ядра, per load/entry в .its) — иначе
     # bootm пытается скопировать ядро поверх ещё не до конца разобранного
@@ -107,7 +155,7 @@ echo "[3/5] Настраиваю конфиг (rpi_4_defconfig + FIT_SIGNATURE/R
 
 # --- 4. Проход 1: чистая сборка БЕЗ ключа (нужна, чтобы получить валидный
 # u-boot.dtb, куда потом встраивается ключ) ---
-echo "[4/5] Собираю (проход 1/2, без ключа) ..."
+echo "[4/6] Собираю (проход 1/2, без ключа) ..."
 (
     cd "$UBOOT_DIR"
     rm -f dts/dt.dtb u-boot.dtb u-boot-dtb.bin u-boot.bin
@@ -130,7 +178,7 @@ rm -f "$dummy_its" "$dummy_data"
 
 # --- Проход 2: пересборка, чтобы обновлённый (уже с ключом) u-boot.dtb
 # реально попал в финальный u-boot.bin — один проход этого не даёт. ---
-echo "[4/5] Собираю (проход 2/2, с ключом) ..."
+echo "[4/6] Собираю (проход 2/2, с ключом) ..."
 (
     cd "$UBOOT_DIR"
     cp u-boot.dtb dts/dt.dtb
@@ -142,7 +190,7 @@ echo "[4/5] Собираю (проход 2/2, с ключом) ..."
 # лежит в СОБСТВЕННОМ (OF_SEPARATE) u-boot.dtb — то, что merge в DTB
 # прошивки на реальной плате сработает именно так, как задумано,
 # подтверждается только на живом железе (см. ROADMAP.md). ---
-echo "[5/5] Проверяю и копирую в load_chain/u-boot.bin ..."
+echo "[5/6] Проверяю и копирую в load_chain/u-boot.bin ..."
 (
     cd "$UBOOT_DIR"
     # Через переменную, не пайпом: fdtdump выводит весь dtb (там огромные
@@ -172,6 +220,45 @@ echo "[5/5] Проверяю и копирую в load_chain/u-boot.bin ..."
 )
 rm -f "$keygen_test_itb"
 cp "$UBOOT_DIR/u-boot.bin" "$LOAD_CHAIN/u-boot.bin"
+
+# --- 6. Патч bcm2711-rpi-4-b.dtb (Фаза 14, USB/xHCI, см. ROADMAP.md) ---
+# ВРЕМЕННО ОТКЛЮЧЕНО (см. ROADMAP.md, "Тринадцатая попытка"): этот шаг
+# перенаправлял PCIe outbound-окно на 0xfd600000/8MB (было 0x600000000/1GB,
+# недоступно seL4) — на живом железе это вызвало НАСТОЯЩИЙ краш САМОГО
+# U-Boot ("Error" handler, esr 0xbf000002, x0=0xfd600000/x1=0x00800000 —
+# ровно наши новые адрес/размер как аргументы упавшей функции) прямо на
+# "starting USB..." — хуже, чем просто "xHCI не отвечает". DTB на SD-карте
+# откачен обратно на 0x600000000/1GB (см. .bak-pre-pcie-ranges) — это
+# возвращает стабильную загрузку (без краша), но БЕЗ рабочего xHCI. Блок
+# ниже оставлен для истории/повторного включения ПОСЛЕ того, как будет
+# понятна настоящая причина краша (вероятно: адрес 0xfd600000 не замаплен
+# в собственных таблицах страниц U-Boot, либо PCI auto-config не
+# справляется с таким маленьким/таким расположенным окном) — НЕ
+# раскомментировать вслепую.
+: <<'DISABLED_PCIE_DTB_PATCH'
+echo "[6/6] Проверяю/патчу PCIe outbound-окно в bcm2711-rpi-4-b.dtb ..."
+DTB_FILE="$LOAD_CHAIN/bcm2711-rpi-4-b.dtb"
+DTB_PCIE_NODE="/scb/pcie@7d500000"
+DTB_RANGES_OLD="2000000 0 c0000000 6 0 0 40000000"
+DTB_RANGES_NEW="2000000 0 c0000000 0 fd600000 0 800000"
+if [ -f "$DTB_FILE" ]; then
+    current_ranges="$(fdtget -t x "$DTB_FILE" "$DTB_PCIE_NODE" ranges 2>/dev/null || true)"
+    if [ "$current_ranges" = "$DTB_RANGES_NEW" ]; then
+        echo "      Уже пропатчен (outbound-окно на 0xfd600000)."
+    elif [ "$current_ranges" = "$DTB_RANGES_OLD" ]; then
+        echo "      Переношу outbound-окно с 0x600000000 (недоступно seL4) на 0xfd600000 ..."
+        cp "$DTB_FILE" "$DTB_FILE.bak-pre-pcie-ranges"
+        fdtput -t x "$DTB_FILE" "$DTB_PCIE_NODE" ranges $DTB_RANGES_NEW
+    else
+        echo "!!! bcm2711-rpi-4-b.dtb: свойство 'ranges' PCIe-узла не совпадает ни со старым,"
+        echo "!!! ни с новым ожидаемым значением (сейчас: '$current_ranges') — DTB мог измениться"
+        echo "!!! (другая версия прошивки?). Разбирайтесь руками, не патчу вслепую."
+        exit 1
+    fi
+else
+    echo "      $DTB_FILE не найден — пропускаю (нечего патчить, load_chain ещё не разложен)."
+fi
+DISABLED_PCIE_DTB_PATCH
 
 echo
 echo "=== Готово: $LOAD_CHAIN/u-boot.bin собран, ключ встроен и проверен локально. ==="
