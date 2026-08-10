@@ -163,6 +163,8 @@ constexpr uint32_t TRB_TYPE_ENABLE_SLOT_CMD     = 9;
 constexpr uint32_t TRB_TYPE_DISABLE_SLOT_CMD    = 10;
 constexpr uint32_t TRB_TYPE_ADDRESS_DEVICE_CMD  = 11;
 constexpr uint32_t TRB_TYPE_CONFIGURE_ENDPOINT_CMD = 12; // Milestone 4
+constexpr uint32_t TRB_TYPE_RESET_ENDPOINT_CMD  = 14; // Фаза 8 (df) — восстановление bulk-эндпоинта после ошибки, xHCI 6.4.3.9
+constexpr uint32_t TRB_TYPE_SET_TR_DEQUEUE_CMD  = 16; // xHCI 6.4.3.10, идёт СРАЗУ после Reset Endpoint
 constexpr uint32_t TRB_TYPE_NO_OP_CMD           = 23;
 constexpr uint32_t TRB_TYPE_TRANSFER_EVENT      = 32;
 constexpr uint32_t TRB_TYPE_COMMAND_COMPLETION_EVENT = 33;
@@ -1934,6 +1936,64 @@ static bool step11_set_configuration(seL4_CPtr console_ep, int idx, uint8_t slot
     return true;
 }
 
+// Фаза 8 (df) — восстановление bulk-эндпоинта после ошибки/таймаута
+// передачи. НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: без этого после ПЕРВОГО же таймаута/
+// ошибки ВСЕ последующие bulk-передачи на этот эндпоинт (даже отправка
+// самого CBW) немедленно проваливались — устройство оставалось
+// зависшим до перезагрузки, ни один следующий df не восстанавливался
+// сам. Reset Endpoint (xHCI 6.4.3.9) снимает Halted-состояние
+// эндпоинта; Set TR Dequeue Pointer (6.4.3.10), СРАЗУ следом — переводит
+// аппаратный dequeue на ТЕКУЩУЮ программную позицию нашего кольца
+// (ring.enqueue_idx/pcs), иначе контроллер продолжит ждать TRB там, где
+// застрял. Best-effort: даже если сама команда вернёт не-успешный код
+// (например, эндпоинт и не был реально Halted) — не фатально, исходная
+// передача уже провалена в любом случае, хуже не станет.
+static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t dci, TrbRing &ring) {
+    // Живой Device Context ДО восстановления — dword0 бит[2:0] = Endpoint
+    // State (0=Disabled,1=Running,2=Halted,3=Stopped,4=Error). В Device
+    // Context (в отличие от Input Context) префикса Input Control Context
+    // нет — индекс контекста эндпоинта РАВЕН его DCI напрямую (Slot=0).
+    // НЕ гейтим LOG_USB — первая попытка восстановления не сработала на
+    // живом железе (см. ROADMAP.md/issuse.txt), это диагностический проход.
+    sys_puthex32(console_ep, "[USB]   DIAG восстановление: EP dword0 ДО reset = ", read_ctx_dword(devctx_vaddr_for(slot_id), dci, 0));
+    // USBSTS на таймауте показывал PCD=1 (Port Change Detect) — читаем
+    // живой PORTSC КОРНЕВОГО порта этого устройства, чтобы понять,
+    // реальный ли это дисконнект/link-событие, а не просто залипший,
+    // никогда не сбрасываемый RW1C-бит с более раннего события. Slot
+    // Context dword1 биты[23:16] (см. step7_address_device()/write_ctx_dword
+    // (inputctx(), 1, 1, (port << 16)) — НЕ биты[15:8], это исправление
+    // предыдущей попытки: там был байт из Max Exit Latency, не порт).
+    {
+        uint32_t root_port = (read_ctx_dword(devctx_vaddr_for(slot_id), 0, 1) >> 16) & 0xFFu;
+        if (root_port >= 1) {
+            uint32_t portsc = *reg32(g_op_base, XHCI_OP_PORTSC_BASE + (uintptr_t)(root_port - 1) * 0x10);
+            sys_puthex32(console_ep, "[USB]   DIAG восстановление: корневой порт = ", root_port);
+            sys_puthex32(console_ep, "[USB]   DIAG восстановление: PORTSC этого порта = ", portsc);
+        }
+    }
+
+    uint64_t cmd_paddr = enqueue_command_trb(0, 0,
+        trb_type(TRB_TYPE_RESET_ENDPOINT_CMD) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24));
+    uint8_t cc = 0, ret_slot = 0;
+    if (!wait_command_completion(console_ep, cmd_paddr, 500, cc, ret_slot)) {
+        sys_puts(console_ep, "[USB]   DIAG восстановление: Reset Endpoint не завершился за 500мс.\n");
+        return;
+    }
+    sys_puthex32(console_ep, "[USB]   DIAG восстановление: Reset Endpoint код завершения = ", cc);
+    sys_puthex32(console_ep, "[USB]   DIAG восстановление: EP dword0 после Reset Endpoint = ", read_ctx_dword(devctx_vaddr_for(slot_id), dci, 0));
+
+    uint64_t deq_addr = ring.dev_base + (uint64_t)ring.enqueue_idx * 16;
+    uint64_t param = (deq_addr & ~0xFull) | (ring.pcs & 1u); // DCS в бите 0, SCT=0 (без streams)
+    uint64_t cmd2_paddr = enqueue_command_trb(param, 0,
+        trb_type(TRB_TYPE_SET_TR_DEQUEUE_CMD) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24));
+    if (!wait_command_completion(console_ep, cmd2_paddr, 500, cc, ret_slot)) {
+        sys_puts(console_ep, "[USB]   DIAG восстановление: Set TR Dequeue Pointer не завершился за 500мс.\n");
+        return;
+    }
+    sys_puthex32(console_ep, "[USB]   DIAG восстановление: Set TR Dequeue Pointer код завершения = ", cc);
+    sys_puthex32(console_ep, "[USB]   DIAG восстановление: EP dword0 после Set TR Dequeue = ", read_ctx_dword(devctx_vaddr_for(slot_id), dci, 0));
+}
+
 // Milestone 5 (закрытие Фазы 14, см. ROADMAP.md/план) — одна bulk-передача
 // (Normal TRB) + ожидание её Transfer Event. ring — bulkout_ring или
 // bulkin_ring вызывающего устройства (g_usb_devices[idx].*), dci —
@@ -1950,10 +2010,12 @@ static bool bulk_transfer(seL4_CPtr console_ep, uint8_t slot_id, TrbRing &ring, 
     uint32_t residual = 0;
     if (!wait_transfer_completion(console_ep, trb_addr, 1000, cc, residual)) {
         sys_puts(console_ep, "[USB] ОШИБКА: bulk-передача не завершилась за 1с.\n");
+        recover_bulk_endpoint(console_ep, slot_id, dci, ring);
         return false;
     }
     if (cc != 1 && cc != 13) { // 13 = Short Packet, не ошибка
         sys_puthex32(console_ep, "[USB] ОШИБКА: bulk-передача завершилась с кодом ", cc);
+        recover_bulk_endpoint(console_ep, slot_id, dci, ring);
         return false;
     }
     actual_length = length - residual;
@@ -3042,6 +3104,30 @@ int main(int argc, char *argv[]) {
                 for (int w = 0; w < 4; w++) seL4_SetMR(1 + i * 4 + w, words[w]);
             }
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1 + 4 * USB_MAX_DEVICES));
+            continue;
+        }
+
+        // Фаза 8 (мониторинг ресурсов, `df`) — та же маска смонтированных
+        // слотов, что USB_CMD_LIST_VOLUMES, но на слот вместо одной строки
+        // имени пакуем имя(4 слова)+total_bytes(1)+free_bytes(1) — ОДИН
+        // атомарный вызов вместо двух round-trip'ов (имя отдельно,
+        // занятость отдельно), чтобы root не пришлось сопоставлять два
+        // снимка состояния, которое может измениться между вызовами
+        // (устройство отмонтировалось между первым и вторым запросом).
+        if (seL4_MessageInfo_get_length(info) >= 1 && seL4_GetMR(0) == 4 /* USB_CMD_GET_ALL_SPACE */) {
+            seL4_Word mask = 0;
+            for (int i = 0; i < USB_MAX_DEVICES; i++) if (g_usb_devices[i].storage_mounted) mask |= (1u << i);
+            seL4_SetMR(0, mask);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                seL4_Word *words = (seL4_Word*)g_usb_devices[i].volume_name;
+                int base = 1 + i * 6;
+                for (int w = 0; w < 4; w++) seL4_SetMR(base + w, words[w]);
+                uint64_t total = 0, free_bytes = 0;
+                if (g_usb_devices[i].storage_mounted) exfat_free_space(&g_usb_devices[i].fs, &total, &free_bytes);
+                seL4_SetMR(base + 4, (seL4_Word)total);
+                seL4_SetMR(base + 5, (seL4_Word)free_bytes);
+            }
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1 + 6 * USB_MAX_DEVICES));
             continue;
         }
 

@@ -370,5 +370,23 @@ constexpr seL4_Word SYS_MARK_SHELL_ACTIVITY = 143;
 // MR2=product_id, MR3=device_class, MR4=device_subclass, MR5=device_protocol.
 constexpr seL4_Word SYS_USB_LIST = 144;
 
+// Фаза 8 (мониторинг ресурсов) — `free`. Root-обслуживаемый, БЕЗ похода к
+// драйверам (счётчик g_ram_bytes_used/g_ram_bytes_total уже живёт в
+// main.cpp) — тот же SHM-текстовый приём, что SYS_TOP_STATS. Ответ:
+// MR0=0, текст в rootserver_shm_base.
+constexpr seL4_Word SYS_FREE_STATS = 145;
+
+// Фаза 8 — `df`, ОДИН SD-накопитель (blk_driver.cpp), добавлена в тот же
+// каскад cmd==110/112/.../120. Ответ: MR0=total_bytes, MR1=free_bytes
+// (seL4_Word 64-битный на AArch64 — uint64_t умещается в одно слово).
+constexpr seL4_Word SYS_GET_FS_SPACE = 146;
+
+// Фаза 8 — `df`, root-опосредованный агрегатор (тот же приём, что
+// SYS_USB_LIST): зовёт blk_ep с SYS_GET_FS_SPACE и (если включён)
+// usb_cmd_ep с локальной командой USB_CMD_GET_ALL_SPACE (см.
+// usb_driver.cpp), собирает текстовую таблицу в rootserver_shm_base.
+// Ответ: MR0=0, текст в SHM.
+constexpr seL4_Word SYS_DF_STATS = 147;
+
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

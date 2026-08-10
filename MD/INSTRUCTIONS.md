@@ -1,6 +1,6 @@
 # Psych Ward OS — RPi4: инструкции по сборке
 
-Все команды сборки и настройки хост-окружения для порта на Raspberry Pi 4 — в одном месте. Зачем и почему — в [README.md](README.md) и [ROADMAP.md](ROADMAP.md); здесь только команды. **Разделы идут в порядке выполнения на новой машине** — сверху вниз.
+Все команды сборки и настройки хост-окружения для порта на Raspberry Pi 4 — в одном месте. Зачем и почему — в [README.md](../README.md) и [ROADMAP.md](ROADMAP.md); здесь только команды. **Разделы идут в порядке выполнения на новой машине** — сверху вниз.
 
 ---
 
@@ -30,7 +30,7 @@ sudo apt install -y device-tree-compiler u-boot-tools minicom openssl
 - `minicom` (или `screen`/`picocom`) — serial-консоль к плате через USB-UART переходник.
 - `openssl` — генерация RSA-ключа подписи загрузочного образа (Фаза 13). Обычно уже стоит в системе, но лучше не полагаться на это.
 
-Репозиторий `repo` (Google) — нужен для `repo sync` (см. ниже), общий инструмент и для этого репозитория, и (отдельно) для тестовой прошивки — [load_chain_test/INSTRUCTIONS.md](load_chain_test/INSTRUCTIONS.md):
+Репозиторий `repo` (Google) — нужен для `repo sync` (см. ниже), общий инструмент и для этого репозитория, и (отдельно) для тестовой прошивки — [load_chain_test/INSTRUCTIONS.md](../load_chain_test/INSTRUCTIONS.md):
 
 ```bash
 mkdir -p ~/.bin && curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 <details>
 <summary><b>🔨 Тестовая прошивка (sel4test hello-world, Фаза 1.3)</b></summary>
 
-Полностью отдельный, самодостаточный цикл (свой repo sync, свой venv, своя сборка U-Boot без Фазы 13, своя разметка карты) — специально вынесен из этого файла, чтобы не путаться с основной прошивкой ниже. Всё — от зависимостей до проверки на живом железе — в [load_chain_test/INSTRUCTIONS.md](load_chain_test/INSTRUCTIONS.md).
+Полностью отдельный, самодостаточный цикл (свой repo sync, свой venv, своя сборка U-Boot без Фазы 13, своя разметка карты) — специально вынесен из этого файла, чтобы не путаться с основной прошивкой ниже. Всё — от зависимостей до проверки на живом железе — в [load_chain_test/INSTRUCTIONS.md](../load_chain_test/INSTRUCTIONS.md).
 
 Необязательный, но рекомендуемый шаг: если этот образ (от seL4 Foundation, без единой строчки кода `psych-ward-os`) не грузится на вашем железе/карте/проводах — проблема гарантированно в тулчейне, а не в шагах ниже. Дальше можно сразу перейти к следующему разделу.
 
@@ -225,7 +225,7 @@ ninja
 - Партиция 1 (`BOOT`, FAT32) — `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`, `config.txt`, `u-boot.bin`, `boot.itb` (подписанный образ ядра, Фаза 13 — `boot.scr` больше не используется), `overlays/`.
 - Партиция 2 (`RPI`, exFAT) — `bin/`, `sbin/`, `etc/`, `conf/`, `service/`, `root/`.
 
-Обе готовые структуры лежат в [`load_chain/`](load_chain) этого репозитория.
+Обе готовые структуры лежат в [`load_chain/`](../load_chain) этого репозитория.
 
 ### Разметка (macOS)
 

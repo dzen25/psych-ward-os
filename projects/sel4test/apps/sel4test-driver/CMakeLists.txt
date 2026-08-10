@@ -164,7 +164,7 @@ target_link_libraries(test_app sel4 sel4runtime muslc)
 # musllibc (обнаружено по факту: CMake ругался на цикл зависимостей через
 # muslc_gen). Имя файла результата сборки от имени цели НЕ зависит — при
 # копировании в load_chain переименовываем в <tool>.elf сами.
-set(PSYCH_SBIN_TOOLS ps kill taskset top balance ls cat touch rm mv mkdir usb)
+set(PSYCH_SBIN_TOOLS ps kill taskset top balance ls cat touch rm mv mkdir usb df free)
 foreach(tool ${PSYCH_SBIN_TOOLS})
     add_executable(sb_${tool} src/sbin/${tool}.cpp)
     target_include_directories(sb_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")

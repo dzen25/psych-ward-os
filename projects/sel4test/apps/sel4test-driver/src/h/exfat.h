@@ -40,12 +40,29 @@ struct EXFAT_Instance {
     // Найдены при монтировании обходом корневого каталога
     uint32_t bitmap_cluster;         // FirstCluster записи 0x81
     uint32_t bitmap_size_bytes;      // DataLength записи 0x81 (== ceil(cluster_count/8))
+
+    // Фаза 8 (`df`) — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: полный обход Allocation
+    // Bitmap на КАЖДЫЙ вызов `df` (сотни SCSI-транзакций подряд на USB)
+    // валил bulk-передачи после нескольких вызовов подряд, на РАЗНЫХ
+    // устройствах — не баг конкретной флешки, а просто нагрузка. Так этого
+    // не делает ни одна настоящая ОС: Linux `df`/statfs() читает кэш
+    // свободных блоков, который ФС-драйвер поддерживает в памяти
+    // инкрементально, диск трогается только при монтировании. Здесь то же
+    // самое: одноразовый скан в exfat_init(), дальше bitmap_set_bit()
+    // инкрементально поддерживает счётчик при каждой аллокации/освобождении
+    // — exfat_free_space() больше не делает I/O вообще.
+    uint32_t free_clusters_hint;
 };
 
 // --- API файловой системы (сигнатуры зеркалируют fat32.h нарочно —
 // blk_driver.cpp переключается заменой имён вызовов, не переписыванием) ---
 
 bool exfat_init(EXFAT_Instance* fs, block_read_fn read_func, block_write_fn write_func);
+
+// Фаза 8 (мониторинг ресурсов, `df`) — read-only обход Allocation Bitmap,
+// тот же приём, что bitmap_alloc_run() в exfat.cpp, но только считает
+// occupied-биты, ничего не резервирует.
+bool exfat_free_space(EXFAT_Instance* fs, uint64_t* out_total_bytes, uint64_t* out_free_bytes);
 
 bool exfat_format_dir_listing(EXFAT_Instance* fs, uint32_t dir_cluster, char* out_buffer, uint32_t max_len);
 

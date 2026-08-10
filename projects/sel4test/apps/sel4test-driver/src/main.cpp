@@ -198,16 +198,240 @@ static int append_udec_width(char *buf, uint64_t val, int width) {
     return pad + n;
 }
 
+// Фаза 8 (`df`) — ширина колонки должна считаться в ВИДИМЫХ символах, не
+// байтах: кириллица в UTF-8 — 2 байта на символ, а строки заголовков df
+// ("ИСПОЛЬЗ", "СВОБОДНО" и т.д.) первыми в этом файле смешали кириллицу с
+// паддингом по ширине — на живом железе это давало сдвиг колонок (паддинг
+// считался на N байт короче видимой строки, N = число кириллических
+// символов). Байты-продолжения UTF-8 (0x80-0xBF) не считаются отдельным
+// символом.
+static int utf8_visual_len(const char *s) {
+    int chars = 0;
+    for (int i = 0; s[i]; i++) if (((unsigned char)s[i] & 0xC0) != 0x80) chars++;
+    return chars;
+}
+
 // Та же логика, но для строк (заголовки столбцов и "?" на месте
 // отсутствующих данных) — чтобы заголовок и значения выравнивались по
-// одной и той же ширине колонки.
+// одной и той же ширине колонки. Паддинг считается по utf8_visual_len(),
+// копируются же ВСЕ байты строки как есть.
 static int append_str_width(char *buf, const char *s, int width) {
-    int n = 0;
-    while (s[n]) n++;
-    int pad = (width > n) ? (width - n) : 0;
+    int nbytes = 0;
+    while (s[nbytes]) nbytes++;
+    int pad = (width > utf8_visual_len(s)) ? (width - utf8_visual_len(s)) : 0;
     for (int i = 0; i < pad; i++) buf[i] = ' ';
-    for (int i = 0; i < n; i++) buf[pad + i] = s[i];
-    return pad + n;
+    for (int i = 0; i < nbytes; i++) buf[pad + i] = s[i];
+    return pad + nbytes;
+}
+
+// Фаза 8 (`df`) — тот же приём, что append_str_width(), но выравнивание
+// СЛЕВА (паддинг пробелами СПРАВА) — колонки "имя тома"/"точка
+// монтирования" в df прижаты влево, а не вправо, как числовые столбцы.
+static int append_str_left_width(char *buf, const char *s, int width) {
+    int n = 0;
+    while (s[n]) { buf[n] = s[n]; n++; }
+    int pad = (width > utf8_visual_len(s)) ? (width - utf8_visual_len(s)) : 0;
+    for (int i = 0; i < pad; i++) buf[n + i] = ' ';
+    return n + pad;
+}
+
+// Фаза 8 (`df -h`) — человекочитаемый размер (степени 1024), без float —
+// целочисленное масштабирование. НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: раньше дробная
+// часть показывалась ВСЕГДА ("28.8G") — 5 символов, вылезает за отведённые
+// в таблице 4 и ломает выравнивание всех строк. Реальный coreutils `df -h`
+// показывает дробную часть, ТОЛЬКО когда целая часть однозначная (6.3G, но
+// 80G/233G без точки) — так значение всегда укладывается в ≤4 символа
+// (3 цифры/2 цифры+точка+цифра + буква суффикса). buf НЕ нуль-
+// терминируется (тот же контракт, что у append_udec).
+static int append_human_size(char *buf, uint64_t bytes) {
+    static const char suffixes[] = {'B', 'K', 'M', 'G', 'T'};
+    int idx = 0;
+    uint64_t divisor = 1;
+    while (bytes / divisor >= 1024 && idx < 4) { divisor *= 1024; idx++; }
+    uint64_t value = bytes / divisor;
+    if (value >= 1000 && idx < 4) { divisor *= 1024; idx++; value = bytes / divisor; } // не более 3 цифр в целой части
+
+    int n;
+    if (idx > 0 && value < 10) {
+        uint64_t frac = ((bytes - value * divisor) * 10) / divisor;
+        n = append_udec(buf, value);
+        buf[n++] = '.';
+        buf[n++] = (char)('0' + frac);
+    } else {
+        n = append_udec(buf, value);
+    }
+    buf[n++] = suffixes[idx];
+    return n;
+}
+
+// Фаза 8 (`df`) — одна строка таблицы, общая для SD и каждого USB-тома
+// (см. case SYS_DF_STATS ниже). human=true — единицы как у `df -h` в
+// Linux (append_human_size), иначе — целые МиБ, как раньше.
+static int df_format_row(char *buf, const char *name, uint64_t total_bytes,
+                          uint64_t free_bytes, const char *mount, bool human) {
+    uint64_t used_bytes = (total_bytes > free_bytes) ? (total_bytes - free_bytes) : 0;
+    int use_pct = (total_bytes > 0) ? (int)((used_bytes * 100) / total_bytes) : 0;
+
+    // Позиции колонок скопированы с реального `df -h` (coreutils) —
+    // пользователь прислал точный образец, см. case SYS_DF_STATS ниже.
+    int offset = 0;
+    offset += append_str_left_width(buf + offset, name, 29);
+
+    char tmp[24];
+    int n;
+
+    n = human ? append_human_size(tmp, total_bytes) : append_udec(tmp, total_bytes / (1024 * 1024));
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 4);
+
+    buf[offset++] = ' '; buf[offset++] = ' ';
+    n = human ? append_human_size(tmp, used_bytes) : append_udec(tmp, used_bytes / (1024 * 1024));
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 4);
+
+    buf[offset++] = ' ';
+    n = human ? append_human_size(tmp, free_bytes) : append_udec(tmp, free_bytes / (1024 * 1024));
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 5);
+
+    buf[offset++] = ' ';
+    offset += append_udec_width(buf + offset, (uint64_t)use_pct, 3);
+    buf[offset++] = '%';
+
+    buf[offset++] = ' ';
+    offset += append_str_left_width(buf + offset, mount, 0); // 0 = без паддинга, последняя колонка
+    buf[offset++] = '\n';
+    buf[offset] = '\0';
+    return offset;
+}
+
+// Фаза 8 (мониторинг ресурсов, `free`) — учёт RAM, выданной из
+// normal_untyped. seL4-контекст: seL4_CNode_Revoke/Delete при завершении
+// процесса освобождает КЭПЫ, но НЕ возвращает память самому untyped'у
+// (простого bump-allocator'а, здесь нет per-процессного under-untyped) —
+// used-память в этой ОС монотонно растёт за сессию, каждый спавн процесса
+// навсегда откусывает кусок RAM. g_ram_bytes_total считается один раз при
+// выборе normal_untyped/low_untyped (см. main() ниже), g_ram_bytes_used
+// растёт по мере ram_retype()-вызовов.
+static uint64_t g_ram_bytes_used = 0;
+static uint64_t g_ram_bytes_total = 0;
+
+// issuse.txt (найдено при реализации free) — раньше ВСЯ RAM-аллокация шла
+// из ОДНОГО (самого большого) untyped-региона; seL4 отдаёт RAM не единым
+// блоком, а набором выровненных по степени двойки блоков (buddy-разбиение
+// физических диапазонов из boot info) — на этой плате самый большой блок
+// оказался ровно 1024 МиБ, хотя физической RAM 3.9 GiB. Остальные блоки
+// поменьше реально существуют в info->untypedList[], просто раньше никем
+// не трогались. g_ram_pool[0] — тот же normal_untyped, что и раньше (см.
+// main(), заполнение пула) — типовой путь не меняется, остальные записи —
+// запасные блоки, в которые ram_retype() переходит, когда текущий кап
+// исчерпан (seL4_NotEnoughMemory). low_untyped (VideoCore mbox, <1ГиБ) в
+// пул НЕ входит — отдельный, как и раньше.
+struct RamPoolEntry { seL4_CPtr cap; uint64_t size; };
+constexpr int RAM_POOL_MAX = 32;
+static RamPoolEntry g_ram_pool[RAM_POOL_MAX];
+static int g_ram_pool_count = 0;
+static int g_ram_pool_idx = 0; // текущая позиция марша — только вперёд, назад не возвращается (untyped bump-allocator ничего не отдаёт обратно)
+
+// Реальный размер объекта в байтах по типу — те же *Bits-константы,
+// которыми оперирует сам kernel при retype (см. sel4/sel4_arch/constants.h),
+// не захардкоженные числа. BIT()-макрос из libutils сюда не тянем (main.cpp
+// его нигде больше не использует) — просто явный сдвиг 1ULL. Покрывает
+// ровно те типы, что встречаются в вызовах ram_retype() ниже.
+// if/else, а не switch — на этой конфигурации seL4 несколько ARM
+// page-table-типов (PageTable/PageDirectory/PageUpperDirectory) физически
+// совпадают по значению (все объекты уровней трансляции — одна и та же
+// 4КиБ-страница), что ломает switch (duplicate case value); if-цепочка с
+// такими же дублирующимися значениями компилируется нормально.
+static uint64_t object_size_bytes(seL4_Word type, seL4_Word size_bits) {
+    if (type == seL4_TCBObject)          return 1ULL << seL4_TCBBits;
+    if (type == seL4_EndpointObject)     return 1ULL << seL4_EndpointBits;
+    if (type == seL4_NotificationObject) return 1ULL << seL4_NotificationBits;
+    if (type == seL4_CapTableObject)     return 1ULL << (size_bits + seL4_SlotBits);
+    if (type == seL4_ARM_SmallPageObject ||
+        type == seL4_ARM_PageTableObject ||
+        type == seL4_ARM_PageDirectoryObject ||
+        type == seL4_ARM_PageUpperDirectoryObject ||
+        type == seL4_ARM_PageGlobalDirectoryObject)
+        return 1ULL << seL4_PageBits;
+    return 0; // неизвестный тип — не считаем
+}
+
+// issuse.txt п.3 — переиспользуемые RAM-арены для /sbin-команд (обычный
+// exec, is_driver 253/254 — см. SYS_EXEC-диспетчер ниже). Устраняет
+// монотонный рост Used в `free`: вместо retype напрямую из общего пула
+// (который никогда не отдаёт память назад), команда получает выделенный
+// Untyped-регион; на выходе (SYS_EXIT/SYS_KILL/generic_recover_process)
+// не удаляем объекты по одному, а делаем seL4_CNode_Revoke НАД САМОЙ
+// АРЕНОЙ — это и уничтожает все её объекты, и (в отличие от revoke
+// дочернего объекта) сбрасывает free index арены на 0, так что капа
+// арены реально переиспользуется для следующей команды. Драйверы/
+// сервисы/shell — НЕ участвуют (g_current_arena выставляется только
+// вокруг конкретного вызова spawn_process() для команд), их retype идут
+// через тот же ram_retype(), просто с g_current_arena==0 — поведение не
+// меняется ни на бит.
+static seL4_CPtr g_current_arena = 0; // 0 = обычный путь через g_ram_pool, как раньше
+static uint64_t g_current_arena_bytes = 0; // сколько байт ТЕКУЩАЯ арена уже отдала — для точного отката g_ram_bytes_used при освобождении
+
+constexpr uint8_t CMD_ARENA_SIZE_BITS = 20; // 1 МиБ — самый большой сегодняшний /sbin-бинарник ~120КБ + ~48КБ фикс. оверхед (CNode/VSpace/стек/IPC), запас ×5
+constexpr int CMD_ARENA_POOL_MAX = 16; // одновременно работающих команд реально 1-2, с большим запасом (конвейеры)
+static seL4_CPtr g_cmd_arena_free[CMD_ARENA_POOL_MAX]; // стек свободных (уже созданных, сейчас не используемых) арен
+static int g_cmd_arena_free_count = 0;
+static int g_cmd_arena_created_count = 0; // сколько арен вообще когда-либо ретайпнуто из глобального пула — растёт лениво, никогда не уменьшается
+
+// Обёртка над seL4_Untyped_Retype — на seL4_NoError прибавляет байты в
+// g_ram_bytes_used. ВСЕ вызовы retype от normal_untyped в этом файле идут
+// через неё (вызовы через low_untyped — device-память для драйверов — НЕ
+// учитываются, это не RAM "используемая процессами"). Параметр `untyped`
+// намеренно ИГНОРИРУЕТСЯ (оставлен в сигнатуре, чтобы ни один из 46
+// сайтов вызова не менять) — реальный кап берётся из g_current_arena (если
+// выставлена — см. выше) либо из g_ram_pool по g_ram_pool_idx: на
+// g_ram_pool[0] (тот же normal_untyped, что раньше был единственным
+// вариантом) типовой путь побайтово не меняется; если он исчерпан
+// (seL4_NotEnoughMemory), переходим на следующий блок пула и повторяем
+// retype ТОЙ ЖЕ команды — вызывающий код ничего не замечает, кроме того
+// что теперь может получить успех там, где раньше был бы отказ.
+static inline seL4_Error ram_retype(seL4_CPtr /*untyped, игнорируется*/, seL4_Word type, seL4_Word size_bits,
+                                     seL4_CPtr root, seL4_Word node_index, seL4_Word node_depth,
+                                     seL4_Word slot, seL4_Word num_objects) {
+    if (g_current_arena != 0) {
+        seL4_Error err = seL4_Untyped_Retype(g_current_arena, type, size_bits, root, node_index, node_depth, slot, num_objects);
+        if (err == seL4_NoError) {
+            uint64_t bytes = object_size_bytes(type, size_bits) * num_objects;
+            g_ram_bytes_used += bytes;
+            g_current_arena_bytes += bytes;
+            return err;
+        }
+        if (err != seL4_NotEnoughMemory) return err; // настоящая ошибка — возвращаем как есть
+        // Арена неожиданно переполнена (не должно случаться при 1МиБ и
+        // сегодняшних размерах бинарников) — честно откатываемся на общий
+        // пул этим же вызовом, не роняем спавн молча.
+    }
+    while (g_ram_pool_idx < g_ram_pool_count) {
+        seL4_Error err = seL4_Untyped_Retype(g_ram_pool[g_ram_pool_idx].cap, type, size_bits,
+                                              root, node_index, node_depth, slot, num_objects);
+        if (err == seL4_NoError) {
+            g_ram_bytes_used += object_size_bytes(type, size_bits) * num_objects;
+            return err;
+        }
+        if (err != seL4_NotEnoughMemory) return err; // настоящая ошибка — не "кончилось место", не лечим переходом на другой блок
+        g_ram_pool_idx++; // текущий блок исчерпан НАВСЕГДА — пробуем следующий
+    }
+    return seL4_NotEnoughMemory;
+}
+
+// Приобретение/освобождение переиспользуемой арены — см. блок выше.
+// alloc/root_cnode передаются явно (те же параметры, что уже есть в
+// main()/spawn_process(), никакого нового глобального состояния для них).
+static seL4_CPtr acquire_cmd_arena(PsychAllocator &alloc, seL4_CPtr root_cnode) {
+    if (g_cmd_arena_free_count > 0) return g_cmd_arena_free[--g_cmd_arena_free_count];
+    if (g_cmd_arena_created_count >= CMD_ARENA_POOL_MAX) return 0; // пул арен исчерпан — вызывающий откатится на общий путь
+    seL4_CPtr arena_slot = alloc.alloc_slot();
+    if (arena_slot == 0) return 0;
+    if (ram_retype(0, seL4_UntypedObject, CMD_ARENA_SIZE_BITS, root_cnode, 0, 0, arena_slot, 1) != seL4_NoError) return 0;
+    g_cmd_arena_created_count++;
+    return arena_slot;
+}
+static void release_cmd_arena(seL4_CPtr root_cnode, seL4_CPtr arena_cap) {
+    seL4_CNode_Revoke(root_cnode, arena_cap, seL4_WordBits); // уничтожает все объекты арены И сбрасывает её free index на 0
+    if (g_cmd_arena_free_count < CMD_ARENA_POOL_MAX) g_cmd_arena_free[g_cmd_arena_free_count++] = arena_cap;
 }
 
 // Индексы SHM-страниц (Фаза 5.3) — используются в shm_pages_mask_for_role()/
@@ -465,6 +689,16 @@ struct ProcessControlBlock {
     // но для wifi_driver/init.conf-сервисов они РАЗНЫЕ, см. spawn-сайты).
     // Пусто ("") — процесс встроен в CPIO (drivers/shell), respawn как раньше.
     char path[64];
+
+    // issuse.txt п.3 — переиспользуемая RAM-арена (см. acquire_cmd_arena()/
+    // release_cmd_arena() выше), только для обычных /sbin-команд
+    // (is_driver 253/254, см. SYS_EXEC-диспетчер). 0 — арена не
+    // использовалась (драйверы/сервисы/shell, или пул арен был исчерпан на
+    // момент спавна) — освобождать нечего. arena_bytes_used — сколько
+    // байт РЕАЛЬНО насчитано в g_ram_bytes_used через эту арену, чтобы
+    // откатить счётчик точно при освобождении (не всю ёмкость арены).
+    seL4_CPtr cmd_arena = 0;
+    uint64_t arena_bytes_used = 0;
 };
 
 // --- UNIX PIPES SUBSYSTEM ---
@@ -645,17 +879,17 @@ static bool map_frame_robust(PsychAllocator &alloc, ProcessControlBlock &pcb, se
         // Если каталог уже существует (например, PGD[0]), seL4 вернет DeleteFirst (8). Мы ИГНОРИРУЕМ эту ошибку.
 
         seL4_CPtr pud = alloc_and_track_cap(alloc, pcb);
-        if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, pud, 1) == seL4_NoError) {
+        if (ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, pud, 1) == seL4_NoError) {
             seL4_ARM_PageUpperDirectory_Map(pud, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
         seL4_CPtr pd = alloc_and_track_cap(alloc, pcb);
-        if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pd, 1) == seL4_NoError) {
+        if (ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pd, 1) == seL4_NoError) {
             seL4_ARM_PageDirectory_Map(pd, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
         seL4_CPtr pt = alloc_and_track_cap(alloc, pcb);
-        if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1) == seL4_NoError) {
+        if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1) == seL4_NoError) {
             seL4_ARM_PageTable_Map(pt, vspace, vaddr, (seL4_ARM_VMAttributes)0);
         }
 
@@ -980,7 +1214,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     // 1. Создаем локальный CSpace (8 бит = 256 слотов)
     seL4_CPtr child_cnode = alloc_and_track_cap(alloc, pcb);
-    seL4_Untyped_Retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1);
+    ram_retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1);
 
     seL4_CPtr badged_ep = alloc_and_track_cap(alloc, pcb);
     seL4_CNode_Mint(root_cnode, badged_ep, seL4_WordBits, 
@@ -1084,11 +1318,11 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr child_pt  = alloc_and_track_cap(alloc, pcb);
     seL4_CPtr child_pt2 = alloc_and_track_cap(alloc, pcb); // Вторая таблица для потоков
 
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1); // Выделяем объект
+    ram_retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1); // Выделяем объект
 
     seL4_ARM_ASIDPool_Assign(seL4_CapInitThreadASIDPool, child_vspace);
     seL4_ARM_PageUpperDirectory_Map(child_pud, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes);
@@ -1122,7 +1356,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             
             for (uint64_t page = page_start; page < page_end; page += 4096) {
                 seL4_CPtr frame = alloc_and_track_cap(alloc, pcb);
-                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1);
+                ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1);
                 
                 // Используем скользящее окно!
                 seL4_ARM_Page_Map(frame, root_vspace, elf_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
@@ -1163,10 +1397,10 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr stack_frames[STACK_PAGES];
     for (int i = 0; i < STACK_PAGES; i++) {
         stack_frames[i] = alloc_and_track_cap(alloc, pcb);
-        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frames[i], 1);
+        ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frames[i], 1);
     }
     seL4_CPtr ipc_frame = alloc_and_track_cap(alloc, pcb);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
+    ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
 
     uintptr_t ipc_temp_vaddr = global_ipc_temp_vaddr;
     global_ipc_temp_vaddr += 0x1000;
@@ -1225,9 +1459,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         seL4_CPtr drv_pud = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pd  = alloc_and_track_cap(alloc, pcb);
         seL4_CPtr drv_pt  = alloc_and_track_cap(alloc, pcb);
-        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, drv_pud, 1), "Retype Drv PUD");
-        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
-        check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
+        check_err(ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, drv_pud, 1), "Retype Drv PUD");
+        check_err(ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, drv_pd, 1), "Retype Drv PD");
+        check_err(ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, drv_pt, 1), "Retype Drv PT");
 
         uintptr_t hw_vaddr = (is_driver == 1) ? PLAT_UART_VADDR :
                              (is_driver == 2) ? PLAT_AVS_VADDR :
@@ -1486,7 +1720,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr tcb = alloc_and_track_cap(alloc, pcb);
     pcb.tcb = tcb;
     pcb.vspace = child_vspace;
-    seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1);
+    ram_retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1);
 
     // Фаза 6.1 (продолжение, см. ROADMAP.md): собственная TCB-капа — только
     // uart/blk/net/wifi (is_driver 1/3/4/5), см. BOOT_SELF_TCB_CAP выше.
@@ -1620,7 +1854,18 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     
     pcbs[pid].cap_tracker.count = 0;
 
-    // Если процесс использовал SHM, уничтожаем копии Capabilities, 
+    // issuse.txt п.3 — освобождение RAM-арены (см. ram_retype()/
+    // acquire_cmd_arena() выше), тот же приём, что в SYS_EXIT/SYS_KILL —
+    // watchdog-респавн /sbin-команды (редкий случай, но встречается,
+    // см. комментарий у ProcessControlBlock::path).
+    if (pcbs[pid].cmd_arena != 0) {
+        release_cmd_arena(root_cnode, pcbs[pid].cmd_arena);
+        g_ram_bytes_used -= pcbs[pid].arena_bytes_used;
+        pcbs[pid].cmd_arena = 0;
+        pcbs[pid].arena_bytes_used = 0;
+    }
+
+    // Если процесс использовал SHM, уничтожаем копии Capabilities,
     // чтобы вернуть слоты в аллокатор и отмапить память!
     if (meta.has_shm) {
         for (int i = 0; i < 9; i++) {
@@ -1879,19 +2124,53 @@ int main(int argc, char *argv[]) {
     seL4_CPtr normal_untyped = alloc.get_untyped_cap(normal_idx);
     seL4_CPtr low_untyped = have_low_untyped ? alloc.get_untyped_cap(low_idx) : normal_untyped;
 
+    // issuse.txt (найдено при реализации `free`) — заполняем пул ВСЕХ
+    // non-device untyped-регионов, не только самого большого (см.
+    // RamPoolEntry/g_ram_pool/ram_retype() выше). Слот 0 — ТОТ ЖЕ
+    // normal_untyped, что и раньше был единственным вариантом (типовой
+    // путь побайтово не меняется). low_idx (mbox, <1ГиБ) сознательно
+    // исключён — остаётся отдельным нишевым случаем, как и раньше.
+    g_ram_pool[0].cap = normal_untyped;
+    g_ram_pool[0].size = 1ULL << max_size_bits;
+    g_ram_pool_count = 1;
+    for (size_t i = 0; i < num_untyped && g_ram_pool_count < RAM_POOL_MAX; i++) {
+        if (info->untypedList[i].isDevice) continue;
+        if (i == normal_idx) continue;
+        if (have_low_untyped && i == low_idx) continue;
+        g_ram_pool[g_ram_pool_count].cap = alloc.get_untyped_cap(i);
+        g_ram_pool[g_ram_pool_count].size = 1ULL << info->untypedList[i].sizeBits;
+        g_ram_pool_count++;
+    }
+    // Сортировка по убыванию размера — крупные блоки расходуются раньше
+    // мелких, меньше фрагментации для больших объектов (например CNode).
+    // Пул маленький, разовая цена при загрузке — простой insertion sort.
+    // g_ram_pool[0] уже гарантированно максимален по построению — сортировка
+    // его с места не сдвинет.
+    for (int i = 1; i < g_ram_pool_count; i++) {
+        RamPoolEntry key = g_ram_pool[i];
+        int j = i - 1;
+        while (j >= 0 && g_ram_pool[j].size < key.size) {
+            g_ram_pool[j + 1] = g_ram_pool[j];
+            j--;
+        }
+        g_ram_pool[j + 1] = key;
+    }
+    g_ram_bytes_total = 0;
+    for (int i = 0; i < g_ram_pool_count; i++) g_ram_bytes_total += g_ram_pool[i].size;
+
     memset(pcbs, 0, sizeof(pcbs));
     next_pid = 1;
     memset(shm_regions, 0, sizeof(shm_regions));
 
     seL4_CPtr pmd = alloc.alloc_slot();
     seL4_CPtr pt = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pmd, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, pmd, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt, 1);
 
     // ИСПРАВЛЕНИЕ: Создаем и мапим дополнительную таблицу страниц (Page Table)
     // для временного окна IPC, которое было перемещено на новый адрес.
     seL4_CPtr pt_ipc_temp = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt_ipc_temp, 1);
+    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, pt_ipc_temp, 1);
 
     // --- ВРЕМЕННО (hw bring-up на живой плате): гранулярные флаги на каждый
     // драйвер (см. platform.h, ROADMAP.md Фаза 3). Все три теперь портированы
@@ -1955,7 +2234,7 @@ int main(int argc, char *argv[]) {
         // физический адрес нужен только для программирования
         // EMMC_ADMA_SYSADDR_OFFSET (см. platform.h/blk_driver.cpp).
         blk_dma_frame = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, blk_dma_frame, 1);
+        ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, blk_dma_frame, 1);
         seL4_ARM_Page_GetAddress_t blk_dma_addr_res = seL4_ARM_Page_GetAddress(blk_dma_frame);
         blk_dma_paddr = (seL4_Word)blk_dma_addr_res.paddr;
 
@@ -1966,7 +2245,7 @@ int main(int argc, char *argv[]) {
         // только под дескриптор, мапится в blk_driver сразу за первой
         // (PLAT_BLK_DMA_VADDR + 0x1000, тот же 2MB-регион, PUD/PD/PT уже есть).
         blk_dma_frame2 = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, blk_dma_frame2, 1);
+        ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, blk_dma_frame2, 1);
         seL4_ARM_Page_GetAddress_t blk_dma_addr_res2 = seL4_ARM_Page_GetAddress(blk_dma_frame2);
         blk_dma_paddr2 = (seL4_Word)blk_dma_addr_res2.paddr;
     }
@@ -2029,7 +2308,7 @@ int main(int argc, char *argv[]) {
 
         auto alloc_usb_dma_page = [&](seL4_CPtr &frame_out, seL4_Word &paddr_out) {
             frame_out = alloc.alloc_slot();
-            seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame_out, 1);
+            ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame_out, 1);
             seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(frame_out);
             paddr_out = (seL4_Word)res.paddr;
         };
@@ -2120,8 +2399,8 @@ int main(int argc, char *argv[]) {
 
     seL4_CPtr ep = alloc.alloc_slot();
     seL4_CPtr med_ep = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, ep, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, med_ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, med_ep, 1);
 
     // --- ПРАВИЛЬНОЕ ВЫДЕЛЕНИЕ SHM (Из обычной ОЗУ, а не из Device Memory) ---
     // ВАЖНО: retype ВСЕХ 6 страниц идёт ОТДЕЛЬНЫМ, ничем не прерываемым
@@ -2140,7 +2419,7 @@ int main(int argc, char *argv[]) {
     // видел одни нули (см. ROADMAP.md 4.5, живой баг ethertype=0).
     for (int i = 0; i < 9; i++) {
         shm_frames[i] = alloc.alloc_slot();
-        seL4_Error err = seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
+        seL4_Error err = ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
                                              root_cnode, 0, 0, shm_frames[i], 1);
         if (err != seL4_NoError) {
             uart_puts("[ROOT] FATAL: Failed to allocate normal RAM for SHM!\n");
@@ -2176,15 +2455,15 @@ int main(int argc, char *argv[]) {
                                                     seL4_AllRights, seL4_ARM_Default_VMAttributes);
         if (shm_map_err == seL4_FailedLookup) {
             seL4_CPtr shm_pud = alloc.alloc_slot();
-            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, shm_pud, 1) == seL4_NoError) {
+            if (ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, shm_pud, 1) == seL4_NoError) {
                 seL4_ARM_PageUpperDirectory_Map(shm_pud, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
             }
             seL4_CPtr shm_pd = alloc.alloc_slot();
-            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, shm_pd, 1) == seL4_NoError) {
+            if (ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, shm_pd, 1) == seL4_NoError) {
                 seL4_ARM_PageDirectory_Map(shm_pd, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
             }
             seL4_CPtr shm_pt = alloc.alloc_slot();
-            if (seL4_Untyped_Retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, shm_pt, 1) == seL4_NoError) {
+            if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, shm_pt, 1) == seL4_NoError) {
                 seL4_ARM_PageTable_Map(shm_pt, root_vspace, shm_vaddr, seL4_ARM_Default_VMAttributes);
             }
             shm_map_err = seL4_ARM_Page_Map(shm_frames[i], root_vspace, shm_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
@@ -2204,10 +2483,10 @@ int main(int argc, char *argv[]) {
     seL4_CPtr wifi_cmd_ep = 0;
     seL4_CPtr wifi_cmd_recv_ep = 0;
     seL4_CPtr wifi_cmd_send_ep = 0;
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, console_ep, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, timer_ep, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, blk_ep, 1);
-    seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, net_cmd_ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, console_ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, timer_ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, blk_ep, 1);
+    ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, net_cmd_ep, 1);
     seL4_CNode_Copy(root_cnode, net_cmd_recv_ep, seL4_WordBits,
                     root_cnode, net_cmd_ep, seL4_WordBits, seL4_CanRead);
     seL4_CNode_Copy(root_cnode, net_cmd_send_ep, seL4_WordBits,
@@ -2226,7 +2505,7 @@ int main(int argc, char *argv[]) {
         wifi_cmd_ep = alloc.alloc_slot();
         wifi_cmd_recv_ep = alloc.alloc_slot();
         wifi_cmd_send_ep = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, wifi_cmd_ep, 1);
+        ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, wifi_cmd_ep, 1);
         seL4_CNode_Copy(root_cnode, wifi_cmd_recv_ep, seL4_WordBits,
                         root_cnode, wifi_cmd_ep, seL4_WordBits, seL4_CanRead);
         seL4_CNode_Copy(root_cnode, wifi_cmd_send_ep, seL4_WordBits,
@@ -2244,7 +2523,7 @@ int main(int argc, char *argv[]) {
         wifi_wake_ntfn = alloc.alloc_slot();
         wifi_wake_heartbeat_badged = alloc.alloc_slot();
         wifi_wake_tx_ready_badged = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_wake_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_wake_ntfn, 1);
         seL4_CNode_Mint(root_cnode, wifi_wake_heartbeat_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_HEARTBEAT);
         seL4_CNode_Mint(root_cnode, wifi_wake_tx_ready_badged, seL4_WordBits, root_cnode, wifi_wake_ntfn, seL4_WordBits, seL4_AllRights, WIFI_EVENT_TX_READY);
     }
@@ -2270,14 +2549,14 @@ int main(int argc, char *argv[]) {
     if (RPI4_ENABLE_USB) {
         usb_cmd_ep = alloc.alloc_slot();
         usb_cmd_recv_ep = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, usb_cmd_ep, 1);
+        ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, usb_cmd_ep, 1);
         seL4_CNode_Copy(root_cnode, usb_cmd_recv_ep, seL4_WordBits,
                         root_cnode, usb_cmd_ep, seL4_WordBits, seL4_CanRead);
 
         seL4_CPtr badged_usb_irq_ntfn = alloc.alloc_slot();
         usb_irq_ntfn = alloc.alloc_slot();
         usb_irq_handler = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, usb_irq_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, usb_irq_ntfn, 1);
         seL4_CNode_Mint(root_cnode, badged_usb_irq_ntfn, seL4_WordBits, root_cnode, usb_irq_ntfn, seL4_WordBits, seL4_AllRights, USB_EVENT_XHCI_IRQ);
         check_err(seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_XHCI_IRQ, root_cnode, usb_irq_handler, seL4_WordBits), "IRQControl_Get(XHCI)");
         check_err(seL4_IRQHandler_SetNotification(usb_irq_handler, badged_usb_irq_ntfn), "IRQHandler_SetNotification(xhci)");
@@ -2294,7 +2573,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr uart_ntfn = alloc.alloc_slot();
     seL4_CPtr badged_uart_ntfn = alloc.alloc_slot(); 
     seL4_CPtr uart_irq_handler = alloc.alloc_slot();
-    seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, uart_ntfn, 1);
+    ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, uart_ntfn, 1);
     seL4_CNode_Mint(root_cnode, badged_uart_ntfn, seL4_WordBits, root_cnode, uart_ntfn, seL4_WordBits, seL4_AllRights, UART_KBD_IRQ_BADGE);
     seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_UART_IRQ, root_cnode, uart_irq_handler, seL4_WordBits);
     seL4_IRQHandler_SetNotification(uart_irq_handler, badged_uart_ntfn); 
@@ -2322,7 +2601,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr genet_irq_handler = alloc.alloc_slot();
     seL4_CPtr net_wifi_rx_badged = 0;
     if (RPI4_ENABLE_NET) {
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, net_event_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, net_event_ntfn, 1);
         seL4_CNode_Mint(root_cnode, badged_genet_rx_ntfn, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_GENET_RX);
         seL4_CNode_Mint(root_cnode, badged_net_heartbeat_ntfn, seL4_WordBits, root_cnode, net_event_ntfn, seL4_WordBits, seL4_AllRights, NET_EVENT_HEARTBEAT);
         check_err(seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_GENET_IRQ_A, root_cnode, genet_irq_handler, seL4_WordBits), "IRQControl_Get(GENET_IRQ_A)");
@@ -2355,7 +2634,7 @@ int main(int argc, char *argv[]) {
     if (RPI4_ENABLE_BLK) {
         blk_irq_ntfn = alloc.alloc_slot();
         blk_heartbeat_badged = alloc.alloc_slot();
-        check_err(seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, blk_irq_ntfn, 1), "Retype blk_irq_ntfn");
+        check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, blk_irq_ntfn, 1), "Retype blk_irq_ntfn");
         check_err(seL4_CNode_Mint(root_cnode, blk_heartbeat_badged, seL4_WordBits, root_cnode, blk_irq_ntfn, seL4_WordBits, seL4_AllRights, BLK_HEARTBEAT_BADGE), "Mint blk_heartbeat_badged");
     }
 
@@ -2374,7 +2653,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr vfs_mutex_ntfn = 0;
     if (RPI4_ENABLE_BLK) {
         vfs_mutex_ntfn = alloc.alloc_slot();
-        check_err(seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, vfs_mutex_ntfn, 1), "Retype vfs_mutex_ntfn");
+        check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, vfs_mutex_ntfn, 1), "Retype vfs_mutex_ntfn");
         seL4_Signal(vfs_mutex_ntfn);
     }
 
@@ -2388,7 +2667,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr badged_timer_ntfn = alloc.alloc_slot();
     seL4_CPtr timer_irq_handler = alloc.alloc_slot();
     if (RPI4_ENABLE_TIMER) {
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, timer_ntfn, 1);
         seL4_CNode_Mint(root_cnode, badged_timer_ntfn, seL4_WordBits, root_cnode, timer_ntfn, seL4_WordBits, seL4_AllRights, TIMER_IRQ_BADGE);
         // ВРЕМЕННО (отладка живого зависания sleep, см. ROADMAP.md 4.5): эти
         // три вызова раньше не проверялись (как и у UART) — заворачиваем в
@@ -2437,7 +2716,7 @@ int main(int argc, char *argv[]) {
         seL4_CPtr mmc_shared_irq_ntfn = alloc.alloc_slot();
         seL4_CPtr mmc_shared_irq_badged = alloc.alloc_slot();
         mmc_shared_irq_handler = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, mmc_shared_irq_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, mmc_shared_irq_ntfn, 1);
         seL4_CNode_Mint(root_cnode, mmc_shared_irq_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, IRQ_MMC_SHARED_BADGE);
         seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_WIFI_SDIO_IRQ, root_cnode, mmc_shared_irq_handler, seL4_WordBits);
         seL4_IRQHandler_SetNotification(mmc_shared_irq_handler, mmc_shared_irq_badged);
@@ -2455,7 +2734,7 @@ int main(int argc, char *argv[]) {
         // "wifi start", сам notification-объект переживает рестарты
         // процесса без пересоздания.
         wifi_irq_ntfn = alloc.alloc_slot();
-        seL4_Untyped_Retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_irq_ntfn, 1);
+        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, wifi_irq_ntfn, 1);
     }
 
     if (RPI4_ENABLE_BLK) {
@@ -2590,7 +2869,7 @@ int main(int argc, char *argv[]) {
                 
                 // ИСПРАВЛЕНО: Используем alloc_and_track_cap, чтобы избежать утечки памяти при смерти процесса
                 seL4_CPtr frame = alloc_and_track_cap(alloc, pcbs[sender_pid]);
-                check_err(seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1), "Pager Frame");
+                check_err(ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1), "Pager Frame");
                 
                 uintptr_t page_aligned = addr & ~0xFFFULL;
                 check_err(seL4_ARM_Page_Map(frame, pcbs[sender_pid].vspace, page_aligned, seL4_AllRights, seL4_ARM_Default_VMAttributes), "Pager Map");
@@ -2892,7 +3171,7 @@ int main(int argc, char *argv[]) {
                 pcb.cspace = pcbs[sender_pid].cspace;
 
                 seL4_CPtr new_tcb = alloc_and_track_cap(alloc, pcb);
-                seL4_Untyped_Retype(normal_untyped, seL4_TCBObject, seL4_TCBBits, root_cnode, 0, 0, new_tcb, 1);
+                ram_retype(normal_untyped, seL4_TCBObject, seL4_TCBBits, root_cnode, 0, 0, new_tcb, 1);
 
                 // --- ГЕНЕРАЦИЯ УНИКАЛЬНОГО БЕЙДЖА ПОТОКА ---
                 seL4_Word thread_badge = (sender_pid << 16) | new_pid;
@@ -2908,7 +3187,7 @@ int main(int argc, char *argv[]) {
                                 root_cnode, thread_badged_ep, seL4_WordBits, seL4_AllRights);
 
                 seL4_CPtr ipc_frame = alloc_and_track_cap(alloc, pcb);
-                seL4_Untyped_Retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
+                ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
                 
                 static uintptr_t clone_temp_vaddr = 0x2001C0000ULL; 
                 uintptr_t temp_window = clone_temp_vaddr;
@@ -3106,17 +3385,34 @@ int main(int argc, char *argv[]) {
                     exec_stdout_pipe_id = (int)seL4_GetMR(17);
                 }
 
-                uart_puts("[ROOT] Fetching ELF from disk: ");
-                uart_puts(app_name_and_args);
-                uart_puts("...\n");
+                if (LOG_ROOT) {
+                    uart_puts("[ROOT] Fetching ELF from disk: ");
+                    uart_puts(app_name_and_args);
+                    uart_puts("...\n");
+                }
 
                 int elf_size = load_elf_from_disk(blk_ep, app_name_and_args, g_elf_load_buffer);
                 int new_pid = -1;
 
                 if (elf_size > 0) {
-                    uart_puts("[ROOT] ELF loaded successfully! Spawning...\n");
+                    if (LOG_ROOT) uart_puts("[ROOT] ELF loaded successfully! Spawning...\n");
                     elf_t elf;
                     if (elf_newFile(g_elf_load_buffer, elf_size, &elf) == 0) {
+                        // issuse.txt п.3 — переиспользуемая RAM-арена для обычных
+                        // команд (см. ram_retype()/acquire_cmd_arena() выше).
+                        // Пул арен исчерпан (>16 одновременно) или
+                        // ретайп самой арены не удался — cmd_arena_for_this_spawn
+                        // остаётся 0, g_current_arena НЕ выставляется, спавн идёт
+                        // обычным путём через общий пул, как раньше (деградация,
+                        // не отказ).
+                        seL4_CPtr cmd_arena_for_this_spawn = 0;
+                        if (exec_is_driver == 253 || exec_is_driver == 254) {
+                            cmd_arena_for_this_spawn = acquire_cmd_arena(alloc, root_cnode);
+                            if (cmd_arena_for_this_spawn != 0) {
+                                g_current_arena = cmd_arena_for_this_spawn;
+                                g_current_arena_bytes = 0;
+                            }
+                        }
                         new_pid = spawn_process(app_name_and_args, g_elf_load_buffer, elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
                                                 shm_frames[0], exec_is_driver, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
                                                 0, 0, 0, args, 0, net_cmd_send_ep,
@@ -3154,6 +3450,24 @@ int main(int argc, char *argv[]) {
                         if (new_pid > 0) {
                             strncpy(pcbs[new_pid].path, app_name_and_args, 63);
                             pcbs[new_pid].path[63] = '\0';
+                        }
+                        // issuse.txt п.3 — арена приобреталась ДО spawn_process()
+                        // (см. выше), g_current_arena нужно погасить в любом
+                        // случае (успех/провал), иначе она "утечёт" в следующий,
+                        // никак не связанный retype где-то ещё в главном цикле.
+                        if (cmd_arena_for_this_spawn != 0) {
+                            g_current_arena = 0;
+                            if (new_pid > 0) {
+                                pcbs[new_pid].cmd_arena = cmd_arena_for_this_spawn;
+                                pcbs[new_pid].arena_bytes_used = g_current_arena_bytes;
+                            } else {
+                                // spawn_process не дошёл до конца — то немногое,
+                                // что успело ретайпнуться в арену (если успело),
+                                // всё равно чистим, арену возвращаем в свободный
+                                // стек для следующей попытки.
+                                release_cmd_arena(root_cnode, cmd_arena_for_this_spawn);
+                                g_ram_bytes_used -= g_current_arena_bytes;
+                            }
                         }
                     } else {
                         new_pid = -2; // Invalid ELF
@@ -3533,10 +3847,28 @@ int main(int argc, char *argv[]) {
                         seL4_TCB_UnbindNotification(pcbs[target_pid].tcb);
                     }
                         pcbs[target_pid].active = false;
-                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].badged_ep, seL4_WordBits);
-                        seL4_CNode_Delete(root_cnode, pcbs[target_pid].tcb, seL4_WordBits);
-                        if (pcbs[target_pid].vspace != root_vspace) {
-                            seL4_CNode_Delete(root_cnode, pcbs[target_pid].vspace, seL4_WordBits);
+                        // issuse.txt п.3 (тот же баг, что чинили для SYS_EXIT, см.
+                        // комментарий там же): удалять только 3 конкретные капы
+                        // (badged_ep/tcb/vspace) БЕЗ полного цикла по cap_tracker
+                        // течёт ещё сильнее, чем чинили для SYS_EXIT — child_cnode,
+                        // страницы ELF/стека/IPC у обычной /sbin-команды тут вообще
+                        // не освобождались. Тот же паттерн, что SYS_EXIT/
+                        // generic_recover_process().
+                        for (int i = 0; i < pcbs[target_pid].cap_tracker.count; i++) {
+                            seL4_CPtr cap_to_free = pcbs[target_pid].cap_tracker.caps[i];
+                            seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+                            seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
+                            alloc.free(cap_to_free);
+                        }
+                        pcbs[target_pid].cap_tracker.count = 0;
+                        // issuse.txt п.3 — освобождение RAM-арены (см.
+                        // ram_retype()/acquire_cmd_arena() выше), тот же приём,
+                        // что в SYS_EXIT ниже.
+                        if (pcbs[target_pid].cmd_arena != 0) {
+                            release_cmd_arena(root_cnode, pcbs[target_pid].cmd_arena);
+                            g_ram_bytes_used -= pcbs[target_pid].arena_bytes_used;
+                            pcbs[target_pid].cmd_arena = 0;
+                            pcbs[target_pid].arena_bytes_used = 0;
                         }
                     }
                     seL4_SetMR(0, 0);
@@ -3605,6 +3937,21 @@ int main(int argc, char *argv[]) {
                         alloc.free(cap_to_free);
                     }
                     pcbs[sender_pid].cap_tracker.count = 0;
+
+                    // issuse.txt п.3 — освобождение RAM-арены (см.
+                    // ram_retype()/acquire_cmd_arena() выше): вместо того, чтобы
+                    // память навсегда оставалась занятой (как выше — revoke/
+                    // delete по одной капе НЕ возвращает физическую память
+                    // родительскому untyped'у), для команд, спавненных через
+                    // арену, делаем revoke САМОЙ АРЕНЫ — сбрасывает её free
+                    // index на 0, капа возвращается в свободный стек для
+                    // следующей команды.
+                    if (pcbs[sender_pid].cmd_arena != 0) {
+                        release_cmd_arena(root_cnode, pcbs[sender_pid].cmd_arena);
+                        g_ram_bytes_used -= pcbs[sender_pid].arena_bytes_used;
+                        pcbs[sender_pid].cmd_arena = 0;
+                        pcbs[sender_pid].arena_bytes_used = 0;
+                    }
 
                     // Та же течь для SHM-копии (is_driver==253 /sbin-утилиты
                     // получают её при спавне, см. shm_pages_mask_for_role()) —
@@ -3943,6 +4290,107 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(0, found); seL4_SetMR(1, vendor); seL4_SetMR(2, product);
                 seL4_SetMR(3, dclass); seL4_SetMR(4, dsub); seL4_SetMR(5, dproto);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 6));
+                break;
+            }
+
+            case SYS_FREE_STATS: { // Фаза 8 (мониторинг ресурсов) — `free`, см. common.h.
+                                    // Все данные уже в g_ram_bytes_used/g_ram_bytes_total —
+                                    // похода к драйверам не нужно, тот же SHM-текстовый
+                                    // приём, что SYS_TOP_STATS выше.
+                int active_procs = 1; // rootserver (тот же учёт, что `ps`/`top`)
+                for (int i = 1; i < 256; i++) if (pcbs[i].active) active_procs++;
+
+                uint64_t total_mb = g_ram_bytes_total / (1024 * 1024);
+                uint64_t used_mb = g_ram_bytes_used / (1024 * 1024);
+                uint64_t free_mb = (g_ram_bytes_total > g_ram_bytes_used) ? (g_ram_bytes_total - g_ram_bytes_used) / (1024 * 1024) : 0;
+
+                char *shm = rootserver_shm_base;
+                int offset = 0;
+
+                strcpy(shm, "Total:  "); offset = strlen(shm);
+                offset += append_udec_width(shm + offset, total_mb, 6);
+                strcpy(shm + offset, " МиБ\n"); offset = strlen(shm);
+
+                strcpy(shm + offset, "Used:   "); offset = strlen(shm);
+                offset += append_udec_width(shm + offset, used_mb, 6);
+                strcpy(shm + offset, " МиБ\n"); offset = strlen(shm);
+
+                strcpy(shm + offset, "Free:   "); offset = strlen(shm);
+                offset += append_udec_width(shm + offset, free_mb, 6);
+                strcpy(shm + offset, " МиБ\n"); offset = strlen(shm);
+
+                strcpy(shm + offset, "Процессов активно: "); offset = strlen(shm);
+                offset += append_udec(shm + offset, (uint64_t)active_procs);
+                strcpy(shm + offset, "\n"); offset = strlen(shm);
+
+                flush_rootserver_shm();
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            case SYS_DF_STATS: { // Фаза 8 (мониторинг ресурсов) — `df`[-h], см. common.h.
+                                  // Root-опосредованный агрегатор: SD-карта (blk_ep,
+                                  // синхронный seL4_Call — тот же приём безопасности,
+                                  // что у SYS_USB_LIST выше) + все смонтированные тома
+                                  // за usb_driver'ом (usb_cmd_ep, если USB включён).
+                                  // MR1 (см. sbin/df.cpp) — 1, если передан флаг -h.
+                seL4_Word human = (seL4_MessageInfo_get_length(recv_info) >= 2) ? seL4_GetMR(1) : 0;
+
+                char *shm = rootserver_shm_base;
+                int offset = 0;
+
+                // Заголовок и позиции колонок — 1-в-1 с реальным `df -h`
+                // (coreutils), см. df_format_row() выше. Английские
+                // подписи не просто стиль — на чисто-ASCII байты и
+                // видимые символы совпадают всегда, никакой UTF-8-ширины
+                // считать не нужно (кириллица была не только некрасивой,
+                // но и источником самого бага с шириной колонок).
+                offset += append_str_left_width(shm + offset, "Filesystem", 29);
+                offset += append_str_width(shm + offset, "Size", 4);
+                strcpy(shm + offset, "  "); offset += 2;
+                offset += append_str_width(shm + offset, "Used", 4);
+                strcpy(shm + offset, " "); offset += 1;
+                offset += append_str_width(shm + offset, "Avail", 5);
+                strcpy(shm + offset, " "); offset += 1;
+                offset += append_str_width(shm + offset, "Use%", 4);
+                strcpy(shm + offset, " "); offset += 1;
+                strcpy(shm + offset, "Mounted on\n"); offset = strlen(shm);
+
+                seL4_SetMR(0, SYS_GET_FS_SPACE);
+                seL4_Call(blk_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                uint64_t sd_total = seL4_GetMR(0), sd_free = seL4_GetMR(1);
+                offset += df_format_row(shm + offset, "/ (SD)", sd_total, sd_free, "/", human != 0);
+
+                if (usb_cmd_ep != 0) {
+                    seL4_SetMR(0, 4); // 4 = USB_CMD_GET_ALL_SPACE, см. usb_driver.cpp
+                    seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+                    seL4_Word mask = seL4_GetMR(0);
+                    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                        if (!(mask & (1u << i))) continue;
+                        char name[32];
+                        seL4_Word *words = (seL4_Word*)name;
+                        int base = 1 + i * 6;
+                        for (int w = 0; w < 4; w++) words[w] = seL4_GetMR(base + w);
+                        name[31] = '\0';
+                        uint64_t total = seL4_GetMR(base + 4);
+                        uint64_t free_bytes = seL4_GetMR(base + 5);
+
+                        char mnt[40];
+                        int mlen = 0;
+                        const char *prefix = "/mnt/";
+                        while (prefix[mlen]) { mnt[mlen] = prefix[mlen]; mlen++; }
+                        int k = 0;
+                        while (name[k] && mlen < (int)sizeof(mnt) - 1) { mnt[mlen++] = name[k++]; }
+                        mnt[mlen] = '\0';
+
+                        offset += df_format_row(shm + offset, name, total, free_bytes, mnt, human != 0);
+                    }
+                }
+
+                flush_rootserver_shm();
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 

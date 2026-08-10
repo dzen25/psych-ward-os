@@ -10,13 +10,14 @@ constexpr char DHCP_HOSTNAME[] = "SeL4-CrouN";
 // ошибки/предупреждения печатаются всегда, независимо от этих флагов.
 // Включайте по одному, когда реально отлаживаете конкретный драйвер на
 // живом железе — не держите все разом, иначе лог захламляется. ---
-constexpr bool LOG_BRINGUP = false; // main.cpp: alloc_device_frame() дампы найденных untyped-регионов
+constexpr bool LOG_BRINGUP = false;     // main.cpp: alloc_device_frame() дампы найденных untyped-регионов
 constexpr bool LOG_UART    = false;
 constexpr bool LOG_TIMER   = false;
-constexpr bool LOG_BLK     = false; // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
-constexpr bool LOG_NET     = false;  // net_driver.cpp — самый свежий/менее обкатанный компонент
-constexpr bool LOG_WIFI    = false;  // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
-constexpr bool LOG_USB     = false; // usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
+constexpr bool LOG_BLK     = false;     // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
+constexpr bool LOG_NET     = false;     // net_driver.cpp — самый свежий/менее обкатанный компонент
+constexpr bool LOG_WIFI    = false;     // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
+constexpr bool LOG_USB     = false;     // usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
+constexpr bool LOG_ROOT    = false;     // main.cpp: "Fetching ELF from disk / ELF loaded successfully! Spawning..." на каждый спавн /sbin-команды (SYS_EXEC/init.conf) — рутинный шум при обычной работе шелла
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
 // абсолютные (с ведущего '/'), чтобы не зависеть от current_dir_cluster —

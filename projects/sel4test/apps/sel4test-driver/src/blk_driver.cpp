@@ -865,6 +865,14 @@ int main(int argc, char *argv[]) {
         }
 
 
+        else if (cmd == SYS_GET_FS_SPACE) { // Фаза 8 (мониторинг ресурсов, `df`), см. h/common.h
+            uint64_t total = 0, free_bytes = 0;
+            exfat_free_space(&g_file_system, &total, &free_bytes);
+            seL4_SetMR(0, (seL4_Word)total);
+            seL4_SetMR(1, (seL4_Word)free_bytes);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+        }
+
         else if (cmd == SYS_BENCHMARK_RESET_LOCAL) { // Фаза 6.1 (продолжение, см. ROADMAP.md)
             seL4_BenchmarkResetLog();
             seL4_SetMR(0, 0);

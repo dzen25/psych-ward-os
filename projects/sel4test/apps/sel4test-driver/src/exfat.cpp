@@ -631,6 +631,11 @@ bool exfat_cd(EXFAT_Instance* fs, const char* path) {
     return true;
 }
 
+// Фаза 8 (`df`) — определена ниже (Этап B, рядом с остальным битовым
+// аллокатором), нужна уже здесь в exfat_init() для одноразового скана
+// при монтировании.
+static uint32_t count_free_clusters(EXFAT_Instance* fs);
+
 // ============================================================================
 // === МОНТИРОВАНИЕ ===
 // ============================================================================
@@ -704,6 +709,12 @@ bool exfat_init(EXFAT_Instance* fs, block_read_fn read_func, block_write_fn writ
         if (!dir_cursor_advance(&cur)) break;
     }
 
+    // Фаза 8 (`df`) — единственный ПОЛНЫЙ проход по битмапу за всю жизнь
+    // монтирования, см. free_clusters_hint в h/exfat.h. Только если битмап
+    // вообще найден (bitmap_cluster!=0) — иначе (не должно случаться на
+    // валидном exFAT) hint остаётся 0, как и cluster_count-независимые поля.
+    fs->free_clusters_hint = (fs->bitmap_cluster >= 2) ? count_free_clusters(fs) : 0;
+
     return true;
 }
 
@@ -741,9 +752,19 @@ static bool bitmap_set_bit(EXFAT_Instance* fs, uint32_t cluster, bool value) {
     if (!bitmap_sector_for_byte(fs, byte_index, &sector, &byte_in_sector)) return false;
     char buf[512];
     if (!fs->read_blocks(sector, 1, buf)) return false;
+    // Фаза 8 (`df`) — free_clusters_hint поддерживается инкрементально
+    // ИМЕННО здесь: это единственная точка, через которую проходят ВСЕ
+    // аллокации/освобождения кластеров (bitmap_alloc_run/bitmap_free_run/
+    // free_fat_chain). Сверяем с РЕАЛЬНЫМ предыдущим значением бита (не
+    // слепо -1/+1 на каждый вызов) — устойчиво к теоретическому повторному
+    // set/clear уже установленного бита.
+    bool was_set = (buf[byte_in_sector] & (1 << (bit_index % 8))) != 0;
     if (value) buf[byte_in_sector] = (char)(buf[byte_in_sector] | (1 << (bit_index % 8)));
     else buf[byte_in_sector] = (char)(buf[byte_in_sector] & ~(1 << (bit_index % 8)));
-    return fs->write_blocks(sector, 1, buf);
+    if (!fs->write_blocks(sector, 1, buf)) return false;
+    if (value && !was_set) { if (fs->free_clusters_hint > 0) fs->free_clusters_hint--; }
+    else if (!value && was_set) { fs->free_clusters_hint++; }
+    return true;
 }
 
 static void bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t num_clusters) {
@@ -791,6 +812,84 @@ static uint32_t bitmap_alloc_run(EXFAT_Instance* fs, uint32_t num_clusters) {
         }
     }
     return 0;
+}
+
+// Фаза 8 (`df`) — read-only обход, считает occupied-биты по всему
+// битмапу. НЕ переиспользует bitmap_sector_for_byte() (та на КАЖДЫЙ вызов
+// заново идёт по цепочке FAT от fs->bitmap_cluster — O(k) на вызов, где k —
+// номер кластера битмапа; сходит с рук bitmap_alloc_run() выше только
+// потому, что тот почти всегда останавливается в первых же байтах —
+// свободный кластер на не заполненном диске находится сразу). Здесь нужен
+// ПОЛНЫЙ проход до конца битмапа — тот же O(k) на КАЖДЫЙ байт даёт
+// O(k^2) суммарно, на живом железе это оказалось настоящим зависанием
+// (весь root заблокирован в seL4_Call к blk_driver, пока тот крутится в
+// этом цикле). Курсор ниже продвигается по цепочке ИНКРЕМЕНТАЛЬНО, тот же
+// приём, что уже использует DirCursor выше — O(1) амортизированно на байт.
+//
+// Читает батчами по 8 секторов (4КБ), а не по одному — на живом железе
+// одиночные USB bulk round-trip'ы подряд на КАЖДЫЙ сектор битмапа
+// (для крупной флешки — сотни подряд) валили "USB Transaction Error"/
+// таймауты; тот же класс проблемы уже чинили для write_blocks() при записи
+// каталогов (см. комментарий у USB_MAX_SECTORS_PER_IO ниже по файлу,
+// Milestone 10) — read_blocks() у обоих бэкендов (EMMC/USB) точно так же
+// поддерживает count>1 за вызов, просто не был использован здесь.
+// Вызывается РОВНО ОДИН РАЗ за жизнь монтирования — из exfat_init(), см.
+// forward-декларацию выше и free_clusters_hint в h/exfat.h. Дальше счётчик
+// поддерживается инкрементально в bitmap_set_bit(), сюда обход битмапа
+// больше не возвращается.
+static uint32_t count_free_clusters(EXFAT_Instance* fs) {
+    uint32_t sectors_per_cluster = 1u << fs->sectors_per_cluster_shift;
+    uint32_t occupied = 0;
+
+    uint32_t cur_cluster = fs->bitmap_cluster;
+    uint32_t sector_in_cluster = 0;
+    char sector_buf[512 * 8]; // тот же батч, что USB_MAX_SECTORS_PER_IO
+    uint32_t sectors_loaded = 0; // сколько СЕКТОРОВ валидно лежит в sector_buf
+    uint32_t sector_base_byte = 0; // byte_index, соответствующий началу sector_buf
+
+    for (uint32_t byte_index = 0; byte_index < fs->bitmap_size_bytes; byte_index++) {
+        if (byte_index >= sector_base_byte + sectors_loaded * EXFAT_SECTOR_SIZE) {
+            sector_in_cluster += sectors_loaded;
+            sector_base_byte += sectors_loaded * EXFAT_SECTOR_SIZE;
+            while (sector_in_cluster >= sectors_per_cluster) {
+                sector_in_cluster -= sectors_per_cluster;
+                uint32_t next = fat_get_entry(fs, cur_cluster);
+                if (!exfat_cluster_has_next(next)) { sectors_loaded = 0; goto done; } // цепочка кончилась раньше bitmap_size_bytes — не должно случаться, честно останавливаемся
+                cur_cluster = next;
+            }
+
+            uint32_t remaining_bytes = fs->bitmap_size_bytes - sector_base_byte;
+            uint32_t chunk = (remaining_bytes + EXFAT_SECTOR_SIZE - 1) / EXFAT_SECTOR_SIZE;
+            if (chunk > 8) chunk = 8;
+            if (chunk > sectors_per_cluster - sector_in_cluster) chunk = sectors_per_cluster - sector_in_cluster;
+            if (chunk == 0 || !fs->read_blocks(cluster_to_sector(fs, cur_cluster) + sector_in_cluster, chunk, sector_buf)) {
+                sectors_loaded = 0;
+                goto done;
+            }
+            sectors_loaded = chunk;
+        }
+        uint8_t byte_val = (uint8_t)sector_buf[byte_index - sector_base_byte];
+        for (int b = 0; b < 8; b++) {
+            if (byte_index * 8u + (uint32_t)b >= fs->cluster_count) break; // паддинг-биты за реальным числом кластеров не считаем
+            if (byte_val & (1 << b)) occupied++;
+        }
+    }
+done:
+    return (fs->cluster_count > occupied) ? (fs->cluster_count - occupied) : 0;
+}
+
+// Фаза 8 (`df`) — БЕЗ дискового I/O: total/free берутся из cluster_count
+// (известен с монтирования) и free_clusters_hint (см. h/exfat.h — считан
+// один раз в exfat_init(), дальше инкрементально поддерживается в
+// bitmap_set_bit()). Раньше здесь был полный проход по битмапу НА КАЖДЫЙ
+// вызов — см. count_free_clusters() выше и историю в issuse.txt/ROADMAP.md
+// про USB-таймауты после нескольких `df` подряд.
+bool exfat_free_space(EXFAT_Instance* fs, uint64_t* out_total_bytes, uint64_t* out_free_bytes) {
+    if (!fs || fs->bitmap_cluster < 2) return false;
+    uint64_t bytes_per_cluster = (uint64_t)EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
+    *out_total_bytes = (uint64_t)fs->cluster_count * bytes_per_cluster;
+    *out_free_bytes = (uint64_t)fs->free_clusters_hint * bytes_per_cluster;
+    return true;
 }
 
 // Освобождает ЧУЖЕРОДНУЮ (NoFatChain=0) цепочку по-старому — обходом FAT,
