@@ -67,7 +67,13 @@ bool exfat_free_space(EXFAT_Instance* fs, uint64_t* out_total_bytes, uint64_t* o
 bool exfat_format_dir_listing(EXFAT_Instance* fs, uint32_t dir_cluster, char* out_buffer, uint32_t max_len);
 
 bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read);
-bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer);
+// out_copied (может быть nullptr) — issuse.txt №56: сколько байт реально
+// скопировано (до nul-терминатора в out_buffer это не учитывает — сам
+// out_buffer '\0'-терминирован ВСЕГДА, даже если в файле встретился
+// нулевой байт раньше конца — вызывающий может сравнить out_copied со
+// strlen(out_buffer), чтобы отличить "весь файл текстовый" от "файл
+// бинарный/оборван на первом нулевом байте").
+bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied = nullptr);
 
 // out_existed (может быть nullptr) — при true уже существовал, ничего не
 // создавалось (в отличие от возврата false = реальная ошибка).
@@ -85,4 +91,8 @@ uint32_t exfat_resolve_parent(EXFAT_Instance* fs, const char* full_path, char* o
 
 // Ищет запись с именем target_name внутри dir_cluster, возвращает её первый
 // кластер (или 0xFFFFFFFF, если не найдена).
-uint32_t exfat_find_in_dir(EXFAT_Instance* fs, uint32_t dir_cluster, const char* target_name);
+// out_is_dir (может быть nullptr) — issuse.txt №36: раньше не было
+// способа отличить "нашли каталог" от "нашли обычный файл" по
+// возвращаемому cluster'у — ls на файле обходил его содержимое как
+// таблицу каталога.
+uint32_t exfat_find_in_dir(EXFAT_Instance* fs, uint32_t dir_cluster, const char* target_name, bool* out_is_dir = nullptr);

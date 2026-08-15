@@ -661,9 +661,40 @@ struct ProcessControlBlock {
     // сохранения через респавн, что у двух полей выше: капа timer_driver'а
     // на heartbeat-badge blk_driver'а (BLK_HEARTBEAT_BADGE).
     seL4_CPtr blk_heartbeat_badged;
+    // Фаза 3b — та же логика: капа timer_driver'а на BLK_LIVENESS_TICK_BADGE
+    // (см. common.h) — переживает респавн timer_driver'а так же, как поле выше.
+    seL4_CPtr blk_liveness_tick_badged;
     // Фикс дедлока root<->blk_driver (см. common.h/BOOT_MMC_IRQ_HANDLER_CAP)
     // — собственная копия IRQHandler'а, тоже переживает респавн.
     seL4_CPtr mmc_irq_handler;
+    // issuse.txt №8 — VideoCore mailbox (только is_driver==2, timer_driver)
+    // должен пережить респавн так же, как остальные HW-профили выше.
+    seL4_CPtr mbox_regs_frame;
+    seL4_CPtr mbox_buf_frame;
+    seL4_Word mbox_buf_paddr;
+    // issuse.txt №65 — приватные некэшируемые DMA-страницы blk_driver'а
+    // (только is_driver==3) для ADMA2-дескрипторов (hardware_emmc_read/
+    // write отказывают немедленно, если эти адреса нулевые, см.
+    // blk_driver.cpp) — тот же класс потери, что у mbox выше, просто для
+    // ДРУГОГО драйвера; найдено на живом железе — respawn/`recover
+    // blk_driver` рвал EMMC-чтение полностью (даже сектор 0), exFAT-mount
+    // проваливался, ВСЕ /sbin-команды переставали находиться.
+    seL4_CPtr blk_dma_frame;
+    seL4_Word blk_dma_paddr;
+    seL4_CPtr blk_dma_frame2;
+    seL4_Word blk_dma_paddr2;
+    // Фаза 3b плана "Сигналы драйверам" (heartbeat-watchdog) — та же логика
+    // сохранения через респавн, что у полей выше: badged-копия
+    // mmc_shared_irq_ntfn (DRIVER_LIVENESS_*_BADGE), которой САМ этот процесс
+    // сигналит root'у "я жив" (только is_driver 3/4/5/6). Без сохранения
+    // здесь респавненный драйвер молча терял бы автомониторинг навсегда —
+    // тот же класс потери, что уже был у mbox/blk_dma выше (issuse.txt №8/№65).
+    seL4_CPtr liveness_ntfn_badged;
+    // issuse.txt №6 — vaddr, выданный ПЕРВЫМ SYS_SHM_GET этого процесса.
+    // Повторный вызов (например shell-команда `shm`, вызываемая уже ПОСЛЕ
+    // автоматического SHM_GET при старте в sys_client_init()) отдаёт его же
+    // повторно вместо повторного минта/маппинга поверх старых капов.
+    uintptr_t shm_vaddr;
 
     CapTracker cap_tracker;
 
@@ -801,6 +832,26 @@ static bool g_wifi_driver_ready = false;
 // если bring-up контроллера не нашёл ни одного устройства.
 static bool g_usb_driver_ready = false;
 
+// Фаза 3b плана "Сигналы драйверам" (heartbeat-watchdog) — индекс всюду
+// ниже = is_driver (1=uart,2=timer,3=blk,4=net,5=wifi,6=usb; 0 неисп.).
+// Мониторятся ТОЛЬКО 3/4/5/6 — uart без heartbeat-тика, timer не может
+// обнаружить собственное зависание через тик, который сам же производит
+// (см. план). last_seen — метка SYS_GET_UPTIME (мс) последнего полученного
+// liveness-сигнала от процесса; 0 = ещё ни разу не приходил (свежеспавненный
+// — см. spawn_process(), где last_seen[is_driver] сбрасывается в 0 при
+// каждом (ре)спавне, без какого-либо IPC — см. живой урок про дедлок
+// загрузки там же). auto_restart — включён ли автотриггер для этого
+// driver'а; дефолт false для всех — единственный источник true теперь
+// load_auto_restart_config() (Фаза 4, читает /etc/auto_restart, fail-closed
+// если файла нет). timeout — стартовые цифры калибровки, НЕ измеренный факт
+// (см. план) — особенно wifi: 15-30с легально занимает один connect/scan
+// (hw-подтверждено: реальный `wifi scan` ~30с не вызвал ложного
+// срабатывания), драйвер физически не может ответить heartbeat'ом мимо
+// этого; таймаут должен быть заведомо больше худшего легального случая.
+static seL4_Word g_driver_last_seen_ms[7] = {0, 0, 0, 0, 0, 0, 0};
+static bool g_auto_restart_enabled[7] = {false, false, false, false, false, false, false};
+static constexpr seL4_Word WATCHDOG_TIMEOUT_MS[7] = {0, 0, 0, 3000, 5000, 45000, 5000};
+
 // Фаза 12 (см. ROADMAP.md) — формат подписи: 4-байтовый magic + 64-байтовая
 // Ed25519-подпись, приклеенные в конец файла (см. tools/sign_elf/). Работает
 // одинаково для ELF-бинарников и текстовых конфигов (сама схема не смотрит
@@ -812,7 +863,14 @@ static bool g_usb_driver_ready = false;
 constexpr unsigned char SIG_MAGIC[4] = { 'P', 'W', 'S', 'G' };
 constexpr uint32_t SIG_TRAILER_SIZE = 68; // 4 (magic) + 64 (подпись)
 
-static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {    char* shm = rootserver_shm_base;
+// Общий цикл чтения файла с диска через blk_ep (SYS_READ_FILE, чанками
+// через SHM) — вынесен из load_elf_from_disk() ниже, чтобы
+// load_text_config_from_disk() (см. там же) не дублировал эту логику
+// (offset-цикл + два flush_rootserver_shm(), см. их комментарии) один в
+// один. -1 — ошибка чтения/файл не найден; иначе — сколько байт реально
+// прочитано (может быть 0 для пустого файла).
+static int read_file_raw_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {
+    char* shm = rootserver_shm_base;
     uint32_t total_read = 0;
 
     while (1) {
@@ -838,22 +896,57 @@ static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load
         memcpy(load_buffer + total_read, shm, bytes_read);
         total_read += bytes_read;
     }
+    return (int)total_read;
+}
+
+static int load_elf_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {
+    int total_read = read_file_raw_from_disk(blk_ep, filename, load_buffer);
+    if (total_read < 0) return -1;
 
     // Проверка подписи (Фаза 12) — fail-closed: нет валидного трейлера —
     // файл не используется, точка. Никаких исключений "для старых
-    // неподписанных файлов" — иначе вся схема тривиально обходится.
-    if (total_read <= SIG_TRAILER_SIZE ||
+    // неподписанных файлов" — иначе вся схема тривиально обходится. Это
+    // касается ТОЛЬКО настоящего исполняемого кода (/sbin, /service, любой
+    // SYS_EXEC target) — для простых текстовых конфигов из /etc см.
+    // load_text_config_from_disk() ниже, у неё намеренно другая модель.
+    if ((uint32_t)total_read <= SIG_TRAILER_SIZE ||
         memcmp(load_buffer + total_read - SIG_TRAILER_SIZE, SIG_MAGIC, 4) != 0) {
         uart_puts("[SIG] отсутствует подпись, отказ: "); uart_puts(filename); uart_puts("\n");
         return -1;
     }
-    uint32_t data_len = total_read - SIG_TRAILER_SIZE;
+    uint32_t data_len = (uint32_t)total_read - SIG_TRAILER_SIZE;
     const unsigned char *signature = (const unsigned char*)(load_buffer + data_len + 4);
     if (crypto_ed25519_check(signature, OS_PUBLIC_KEY, (const unsigned char*)load_buffer, data_len) != 0) {
         uart_puts("[SIG] ПОДПИСЬ НЕВЕРНА, исполнение отклонено: "); uart_puts(filename); uart_puts("\n");
         return -1;
     }
     return data_len;
+}
+
+// По просьбе пользователя (2026-08-16) — /etc-конфиги (init.conf,
+// auto_restart и любые будущие) читаются КАК ЕСТЬ, без Ed25519-подписи:
+// приватный ключ подписи существует только на машине разработчика —
+// требовать подпись для файлов, которые должны быть редактируемы прямо на
+// устройстве (touch/echo>файл, в будущем — полноценный редактор), было бы
+// противоречием самой их цели. НЕ путать с load_elf_from_disk() выше — та
+// ВСЕГДА fail-closed на отсутствие подписи, намеренно, для настоящего
+// исполняемого кода. Осознанное ослабление защиты Фазы 12 ИМЕННО для этих
+// мест вызова — оба потребителя (start_init_services()/
+// load_auto_restart_config()) разбирают содержимое только как текст
+// (имя/путь/приоритет/ядро либо булев переключатель по точному совпадению
+// имени драйвера), ничего из прочитанного не исполняется и не попадает
+// на файловую систему как путь без отдельной, всё ещё подписанной
+// проверки — риск подмены ограничен "заставить систему запустить/не
+// перезапустить то, что и так уже есть на диске и само по себе всё ещё
+// проверяется своей подписью", не произвольным исполнением кода.
+static int load_text_config_from_disk(seL4_CPtr blk_ep, const char* filename, char* load_buffer) {
+    // Не null-терминируем здесь — тот же контракт, что у load_elf_from_disk()
+    // выше: оба вызывающих (start_init_services()/load_auto_restart_config())
+    // уже сами проверяют границу буфера и терминируют ПОСЛЕ этой проверки
+    // (см. их же код) — терминировать здесь, до этой проверки, рисковало бы
+    // записью на 1 байт за пределами буфера вызывающего, если total_read
+    // ровно равен его размеру.
+    return read_file_raw_from_disk(blk_ep, filename, load_buffer);
 }
 
 // Умная функция маппинга (Самовосстанавливающееся дерево VSpace)
@@ -1053,6 +1146,32 @@ struct UsbDmaSetup {
     seL4_CPtr bounce_frame[USB_MAX_DEVICES] = {0};         seL4_Word bounce_paddr[USB_MAX_DEVICES] = {0};
 };
 
+// issuse.txt (найдено на живом железе 2026-08-10, при hw-проверке фикса
+// №8): generic_recover_process() респавнил usb_driver (kill/crash), но НЕ
+// передавал ни usb_cmd_recv_ep, ни usb_dma (весь набор xHCI DMA-страниц:
+// DCBAA/Command Ring/ERST/Event Ring/Device Context/Input Context/
+// scratchpad/per-device EP0-TRB-кольца/CBW-CSW/bounce), ни PCIe RC MISC/
+// ERR-фреймы — все они были ЛОКАЛЬНЫМИ переменными main(), невидимыми из
+// generic_recover_process() (тот же класс бага, что и №8 с VideoCore
+// mailbox, просто для usb_driver — на порядок больше состояния). На
+// живом железе это вызывало ДЕТЕРМИНИРОВАННЫЙ крах уже на первой
+// аппаратной операции нового процесса (step0_check_link(),
+// usb_driver.cpp:730, читает PLAT_PCIE_RC_VADDR — страница просто не
+// замаплена) — и, что хуже, крах-респавн зацикливался (новый процесс
+// падает на той же строке, watchdog его снова респавнит, снова падает...)
+// вплоть до полного зависания платы, потребовавшего физической
+// перезагрузки. Все эти объекты аллоцируются РОВНО ОДИН РАЗ при загрузке
+// и живут вечно (main() никогда не возвращается, root_cnode-капы,
+// которые они держат, никогда не revoke'ятся при крахе ЧУЖОГО процесса)
+// — поэтому вместо дублирования полей в PCB (как для mbox) просто
+// поднимаем те же самые переменные до file-scope: main() продолжает
+// инициализировать их как раньше (тела циклов/lambda не менялись), но
+// теперь generic_recover_process() тоже может их прочитать напрямую.
+static UsbDmaSetup usb_dma;
+static seL4_CPtr pcie_rc_frame = 0;
+static seL4_CPtr pcie_err_frame = 0;
+static seL4_CPtr usb_cmd_recv_ep = 0;
+
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
                          seL4_CPtr shm_frame_root, int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep,
@@ -1181,8 +1300,22 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // ТОЛЬКО timer_driver (is_driver==2), тот же
                          // принцип, что extra_ntfn3_param (blk heartbeat)
                          // выше, отдельный параметр — тот уже занят.
-                         seL4_CPtr usb_heartbeat_ntfn_param = 0) {
-    
+                         seL4_CPtr usb_heartbeat_ntfn_param = 0,
+                         // Фаза 3b плана "Сигналы драйверам" — badged-копия
+                         // root'ового mmc_shared_irq_ntfn (DRIVER_LIVENESS_*_
+                         // BADGE), которой ЭТОТ процесс сам сигналит root'у
+                         // "я жив" на heartbeat-тике — читают ТОЛЬКО is_driver
+                         // 3/4/5/6 (blk/net/wifi/usb), обычное копирование
+                         // capability, не TCB-bind (тот же принцип, что и
+                         // остальные *_ntfn_param выше).
+                         seL4_CPtr liveness_ntfn_param = 0,
+                         // Фаза 3b — badged-копия blk_liveness_tick_ntfn
+                         // (badge BLK_LIVENESS_TICK_BADGE) — читает ТОЛЬКО
+                         // timer_driver (is_driver==2), чтобы периодически
+                         // сигналить её рядом с net/wifi/blk/usb-heartbeat
+                         // (см. BOOT_BLK_LIVENESS_TICK_NTFN_CAP/common.h).
+                         seL4_CPtr blk_liveness_tick_param = 0) {
+
     char *elf_file = elf_data;
     if (!elf_file) {
         unsigned long archive_len = _cpio_archive_end - _cpio_archive;
@@ -1246,6 +1379,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // упала бы, т.к. slot уже занят). 23/24 — свободны.
     seL4_Word local_usb_storage_ep = 23; // Milestone 9: клиентская капа на usb_driver'ов VFS-диспетчер (только shell/253, см. usb_storage_ep_param)
     seL4_Word local_usb_heartbeat_ntfn = 24; // Milestone 11: heartbeat-капа usb_driver'а (только для timer_driver, см. usb_heartbeat_ntfn_param)
+    seL4_Word local_liveness_ntfn = 25; // Фаза 3b: капа-"я жив" (только для is_driver 3/4/5/6, см. liveness_ntfn_param)
+    seL4_Word local_blk_liveness_tick = 26; // Фаза 3b: тик для blk_driver (только для timer_driver, см. blk_liveness_tick_param)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
@@ -1287,6 +1422,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (mmc_irq_handler_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_mmc_irq_handler, 8, root_cnode, mmc_irq_handler_param, seL4_WordBits, seL4_AllRights), "Copy mmc irq handler (blk self-ack)");
     if (vfs_mutex_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_vfs_mutex_ntfn, 8, root_cnode, vfs_mutex_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy vfs_mutex_ntfn");
     if (usb_cmd_recv_ep_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_recv_ep, 8, root_cnode, usb_cmd_recv_ep_param, seL4_WordBits, seL4_AllRights), "Copy usb recv ep");
+    if (liveness_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_liveness_ntfn, 8, root_cnode, liveness_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy liveness ntfn");
+    if (blk_liveness_tick_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_blk_liveness_tick, 8, root_cnode, blk_liveness_tick_param, seL4_WordBits, seL4_AllRights), "Copy blk liveness tick ntfn");
     if (usb_storage_ep_param != 0) check_err(seL4_CNode_Mint(child_cnode, local_usb_storage_ep, 8, root_cnode, usb_storage_ep_param, seL4_WordBits, seL4_AllRights, pid), "Mint usb storage ep");
     if (usb_heartbeat_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_heartbeat_ntfn, 8, root_cnode, usb_heartbeat_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy usb heartbeat ntfn");
 
@@ -1305,7 +1442,41 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.net_wifi_rx_badged = net_wifi_rx_badged_param;
     pcb.wifi_tx_wake_badged = net_wifi_tx_wake_param;
     pcb.blk_heartbeat_badged = extra_ntfn3_param;
+    pcb.blk_liveness_tick_badged = blk_liveness_tick_param; // Фаза 3b
     pcb.mmc_irq_handler = mmc_irq_handler_param;
+    // issuse.txt №8 — раньше НЕ сохранялись, respawn timer_driver передавал
+    // сюда захардкоженные 0,0,0 (см. generic_recover_process()), молча теряя
+    // VideoCore mailbox навсегда (DVFS/cpufreq переставал работать без единой
+    // ошибки в логе).
+    pcb.mbox_regs_frame = mbox_regs_frame;
+    pcb.mbox_buf_frame = mbox_buf_frame_param;
+    pcb.mbox_buf_paddr = mbox_buf_paddr_param;
+    // issuse.txt №65 — тот же приём, для DMA-страниц blk_driver'а.
+    pcb.blk_dma_frame = blk_dma_frame_param;
+    pcb.blk_dma_paddr = blk_dma_paddr_param;
+    pcb.blk_dma_frame2 = blk_dma_frame2_param;
+    pcb.blk_dma_paddr2 = blk_dma_paddr2_param;
+    // Фаза 3b — см. поле в struct ProcessControlBlock выше.
+    pcb.liveness_ntfn_badged = liveness_ntfn_param;
+    // Фаза 3b — сбрасываем last_seen на "ещё не проверялся" (0) при каждом
+    // (ре)спавне. НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: первая версия синхронно звала
+    // timer_ep здесь (SYS_GET_UPTIME), чтобы получить настоящее "сейчас" —
+    // это ДЕДЛОК при первом же спавне blk_driver во время линейной загрузки:
+    // root (внутри spawn_process()) ждёт ответа от timer_driver, а
+    // timer_driver в этот самый момент сам блокирован на seL4_Call(root_ep,
+    // SYS_DRIVER_READY) внутри СВОЕГО старта (см. timer_driver.cpp) — root
+    // ещё не дошёл до главного цикла, чтобы этот вызов обработать. Простой
+    // сброс в 0 не нуждается ни в каком IPC и достаточен: скан таймаутов
+    // (см. главный цикл ниже) уже пропускает last_seen==0 как "ещё не
+    // проверялся" — драйвер просто не проверяется, пока не придёт его
+    // первый настоящий heartbeat-тик (обычно в пределах ~20мс), который и
+    // выставит last_seen в реальное "сейчас". Важно для РЕСПАВНА конкретно:
+    // без сброса last_seen[is_driver] осталось бы старым (просроченным)
+    // значением от УБИТОГО экземпляра, и скан немедленно попытался бы
+    // "восстановить" ещё не успевший ответить свежий процесс повторно.
+    if (is_driver == 3 || is_driver == 4 || is_driver == 5 || is_driver == 6) {
+        g_driver_last_seen_ms[is_driver] = 0;
+    }
 
     elf_t elf;
     elf_newFile(elf_file, elf_size, &elf);
@@ -1416,14 +1587,34 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_IPCBuffer *child_ipc_ptr = (seL4_IPCBuffer *)(ipc_temp_vaddr + 2048);
     
     // === STARTUP PAYLOAD ===
+    // issuse.txt №61: раньше strcpy без проверки длины — args_payload/
+    // cwd_payload длиннее своей зоны затирали соседнюю зону, а при
+    // достаточной длине — и boot-капы на msg[100+]. Граница проверяется
+    // здесь же, а не полагается на инвариант вызывающего.
+    // issuse.txt №30 (расследование, найдено на живом железе): было
+    // 63 символа — `touch /root/<51 символ>` создавал файл КОРОЧЕ на 10
+    // символов, потому что клиентские буферы упаковки (shell.cpp
+    // exec_payload/app_name_and_args ниже) были ЕЩЁ теснее (64 байта на
+    // "/sbin/<cmd>.elf " + сам аргумент). Расширено до 127 символов —
+    // msg[0..15] (16 слов), безопасный запас ДО EXEC_CWD_MSG_SLOT=16, не
+    // трогая её вообще; msg[7] (BOOT_BLK_EP) внутри этой зоны — но
+    // перезаписывается СВОИМ правильным значением НИЖЕ по этой же
+    // функции (после этого блока), так что временная порча его байт
+    // здесь не наблюдаема снаружи (тот же инвариант, что уже был при 63).
     if (args_payload && args_payload[0] != '\0') {
-        strcpy((char*)&child_ipc_ptr->msg[0], args_payload);
+        size_t args_len = strlen(args_payload);
+        if (args_len > 127) args_len = 127;
+        memcpy((char*)&child_ipc_ptr->msg[0], args_payload, args_len);
+        ((char*)&child_ipc_ptr->msg[0])[args_len] = '\0';
     }
     // Фаза 9.A (см. ROADMAP.md/EXEC_CWD_MSG_SLOT): cwd вызывающего шелла для
     // доверенных /sbin-утилит — отдельный слот, не пересекается ни с
     // args_payload (msg[0..7]) выше, ни с boot-капами (100+) ниже.
     if (cwd_payload && cwd_payload[0] != '\0') {
-        strcpy((char*)&child_ipc_ptr->msg[EXEC_CWD_MSG_SLOT], cwd_payload);
+        size_t cwd_len = strlen(cwd_payload);
+        if (cwd_len > 63) cwd_len = 63;
+        memcpy((char*)&child_ipc_ptr->msg[EXEC_CWD_MSG_SLOT], cwd_payload, cwd_len);
+        ((char*)&child_ipc_ptr->msg[EXEC_CWD_MSG_SLOT])[cwd_len] = '\0';
     }
 
     // ИСПРАВЛЕНИЕ: Мы не можем передавать Capability из CSpace ядра напрямую.
@@ -1595,6 +1786,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_WIFI_HEARTBEAT_NTFN_CAP] = (extra_ntfn2_param != 0) ? local_extra_ntfn2 : 0; // Фаза 4.5 (Wi-Fi data-plane), см. common.h
             child_ipc_ptr->msg[BOOT_BLK_HEARTBEAT_NTFN_CAP] = (extra_ntfn3_param != 0) ? local_extra_ntfn3 : 0; // Фикс зависания blk_driver, см. common.h
             child_ipc_ptr->msg[BOOT_USB_HEARTBEAT_NTFN_CAP] = (usb_heartbeat_ntfn_param != 0) ? local_usb_heartbeat_ntfn : 0; // Milestone 11 (доп.), см. common.h
+            child_ipc_ptr->msg[BOOT_BLK_LIVENESS_TICK_NTFN_CAP] = (blk_liveness_tick_param != 0) ? local_blk_liveness_tick : 0; // Фаза 3b, см. common.h
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
@@ -1620,6 +1812,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_MMC_IRQ_HANDLER_CAP] = (mmc_irq_handler_param != 0) ? local_mmc_irq_handler : 0;
             // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
             child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
+            // Фаза 3b: капа-"я жив" — см. common.h/BOOT_BLK_LIVENESS_NTFN_CAP.
+            child_ipc_ptr->msg[BOOT_BLK_LIVENESS_NTFN_CAP] = (liveness_ntfn_param != 0) ? local_liveness_ntfn : 0;
         } else if (is_driver == 4) { // Net driver - клиент консоли, таймера и blk (журнал net_udp.log)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_TIMER_EP] = local_timer_ep;
@@ -1637,6 +1831,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
             // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
             child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
+            // Фаза 3b: капа-"я жив" — см. common.h/BOOT_NET_LIVENESS_NTFN_CAP.
+            child_ipc_ptr->msg[BOOT_NET_LIVENESS_NTFN_CAP] = (liveness_ntfn_param != 0) ? local_liveness_ntfn : 0;
         } else if (is_driver == 5) { // Wi-Fi driver (Фаза 4) - сервер для шелла, клиент консоли и blk (Милстоун 4.2: чтение прошивки/NVRAM с SD)
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_WIFI_EP] = local_wifi_recv_ep;
@@ -1653,6 +1849,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_VFS_MUTEX_NTFN_CAP] = (vfs_mutex_ntfn_param != 0) ? local_vfs_mutex_ntfn : 0;
             // Фаза 6.1 (продолжение): собственная TCB-капа — см. common.h/BOOT_SELF_TCB_CAP.
             child_ipc_ptr->msg[BOOT_SELF_TCB_CAP] = local_self_tcb;
+            // Фаза 3b: капа-"я жив" — см. common.h/BOOT_WIFI_LIVENESS_NTFN_CAP.
+            child_ipc_ptr->msg[BOOT_WIFI_LIVENESS_NTFN_CAP] = (liveness_ntfn_param != 0) ? local_liveness_ntfn : 0;
         } else if (is_driver == 6) { // USB driver (Фаза 14, xHCI) — сервер для root (root-опосредованный SYS_USB_LIST), клиент консоли
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
             child_ipc_ptr->msg[BOOT_USB_EP] = local_usb_recv_ep;
@@ -1684,6 +1882,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 child_ipc_ptr->msg[BOOT_USB_CBW_CSW_PADDR]        = usb_dma_param->cbw_csw_paddr[0];
                 child_ipc_ptr->msg[BOOT_USB_BOUNCE_PADDR]         = usb_dma_param->bounce_paddr[0];
             }
+            // Фаза 3b: капа-"я жив" — см. common.h/BOOT_USB_LIVENESS_NTFN_CAP.
+            child_ipc_ptr->msg[BOOT_USB_LIVENESS_NTFN_CAP] = (liveness_ntfn_param != 0) ? local_liveness_ntfn : 0;
         }
 
     } else {
@@ -1906,9 +2106,41 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
                                     meta.irq_ntfn, meta.irq_handler, meta.hw_frame,
                                     nullptr, meta.net_cmd_recv_ep, meta.net_cmd_send_ep,
                                     meta.wifi_cmd_recv_ep, meta.wifi_cmd_send_ep,
-                                    0, 0, 0, 0, 0, 0, 0,
+                                    // issuse.txt №8 — раньше здесь были захардкожены 0,0,0
+                                    // (mbox_regs_frame/mbox_buf_frame_param/mbox_buf_paddr_param),
+                                    // теряя VideoCore mailbox timer_driver'а при каждом respawn.
+                                    meta.mbox_regs_frame, meta.mbox_buf_frame, meta.mbox_buf_paddr,
+                                    0,       // extra_ntfn_param (heartbeat->net_driver, только собственный респавн timer_driver — не восстанавливается здесь)
+                                    // issuse.txt №65 — раньше здесь тоже были захардкожены 0,0
+                                    // (blk_dma_frame_param/blk_dma_paddr_param) — respawn
+                                    // blk_driver терял приватные DMA-страницы, hardware_emmc_
+                                    // read/write отказывали немедленно (g_blk_dma_paddr==0),
+                                    // exFAT не мог перемонтироваться, все /sbin-команды
+                                    // переставали находиться.
+                                    meta.blk_dma_frame, meta.blk_dma_paddr,
+                                    0,       // extra_ntfn2_param (heartbeat->wifi_driver, аналогично extra_ntfn_param)
                                     meta.net_wifi_rx_badged, meta.wifi_tx_wake_badged, meta.blk_heartbeat_badged,
-                                    meta.mmc_irq_handler);
+                                    meta.mmc_irq_handler,
+                                    meta.blk_dma_frame2, meta.blk_dma_paddr2, // issuse.txt №65 — вторая DMA-страница (multi-block ADMA2-дескриптор), тот же баг
+                                    0,       // vfs_mutex_ntfn_param
+                                    nullptr, // cwd_payload
+                                    -1,      // stdout_pipe_id
+                                    // issuse.txt (найдено на живом железе 2026-08-10) — usb_driver
+                                    // (is_driver==6) respawn: раньше сюда не передавалось НИЧЕГО
+                                    // из xHCI DMA-состояния (usb_cmd_recv_ep/usb_dma/PCIe RC-
+                                    // фреймы) — детерминированный крах-цикл на первой же
+                                    // аппаратной операции нового процесса, вплоть до зависания
+                                    // платы. Для остальных типов процессов эти 4 параметра
+                                    // безвредны — spawn_process читает их только при is_driver==6.
+                                    usb_cmd_recv_ep, &usb_dma, pcie_rc_frame, pcie_err_frame,
+                                    0,       // usb_storage_ep_param
+                                    0,       // usb_heartbeat_ntfn_param
+                                    // Фаза 3b — обе капы watchdog'а переживают
+                                    // респавн так же, как остальные HW-профили
+                                    // выше (тот же класс потери, что issuse.txt
+                                    // №8/№65, если бы не сохранялись).
+                                    meta.liveness_ntfn_badged,
+                                    meta.blk_liveness_tick_badged);
 
         if (new_pid > 0) {
             // path не приходит через spawn_process (и так огромный список
@@ -1956,7 +2188,7 @@ static void start_init_services(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &
                                  seL4_CPtr blk_ep, seL4_CPtr console_ep, seL4_CPtr timer_ep,
                                  seL4_CPtr net_cmd_send_ep, seL4_CPtr vfs_mutex_ntfn) {
     static char conf_buf[16384];
-    int conf_len = load_elf_from_disk(blk_ep, "/etc/init.conf", conf_buf);
+    int conf_len = load_text_config_from_disk(blk_ep, "/etc/init.conf", conf_buf);
     if (conf_len <= 0) {
         uart_puts("[ROOT] init.conf не найден — автозапуск сервисов пропущен.\n");
         return;
@@ -2070,6 +2302,166 @@ static void start_init_services(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &
 
         line = has_more ? newline + 1 : nullptr;
     }
+}
+
+// Фаза 4 плана "Сигналы драйверам" — /etc/auto_restart.conf: одно имя драйвера
+// на строку (должно точно совпадать с pcbs[].name — "blk_driver"/
+// "net_driver"/"wifi_driver"/"usb_driver"), #-комментарии/пустые строки
+// пропускаются, тот же токенайзер-стиль, что start_init_services() выше, но
+// проще (нет path/priority/core — только имя). Гейтит ТОЛЬКО автоматический
+// heartbeat-триггер (g_auto_restart_enabled[], см. главный цикл выше) — НЕ
+// затрагивает SYS_KILL/SYS_RECOVER/SYS_DRIVER_SIGNAL, те остаются доступны
+// admin-вызывающему всегда, независимо от этого файла. Fail-closed: файл не
+// найден/не читается -> ВСЕ 4 флага остаются false (обнуляются здесь же,
+// перед попыткой чтения) — без файла НИКАКОГО автовосстановления по
+// таймауту, только свежая сборка со свежим load_chain включает эту защиту
+// (см. план). Читается один раз, из той же точки, что start_init_services()
+// (case SYS_DRIVER_READY, all_drivers_ready() && !init_services_started).
+static void load_auto_restart_config(seL4_CPtr blk_ep) {
+    g_auto_restart_enabled[3] = false;
+    g_auto_restart_enabled[4] = false;
+    g_auto_restart_enabled[5] = false;
+    g_auto_restart_enabled[6] = false;
+
+    static char conf_buf[4096];
+    int conf_len = load_text_config_from_disk(blk_ep, "/etc/auto_restart.conf", conf_buf);
+    if (conf_len <= 0) {
+        uart_puts("[ROOT] auto_restart не найден — автовосстановление драйверов по heartbeat выключено.\n");
+        return;
+    }
+    if (conf_len >= (int)sizeof(conf_buf)) conf_len = sizeof(conf_buf) - 1;
+    conf_buf[conf_len] = '\0';
+
+    char *line = conf_buf;
+    while (line) {
+        char *newline = line;
+        while (*newline && *newline != '\n') newline++;
+        bool has_more = (*newline == '\n');
+        *newline = '\0';
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+
+        if (*p == '\0' || *p == '#') {
+            line = has_more ? newline + 1 : nullptr;
+            continue;
+        }
+
+        char *name = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r') p++;
+        *p = '\0';
+
+        int matched_driver = -1;
+        if (strcmp(name, "blk_driver") == 0) matched_driver = 3;
+        else if (strcmp(name, "net_driver") == 0) matched_driver = 4;
+        else if (strcmp(name, "wifi_driver") == 0) matched_driver = 5;
+        else if (strcmp(name, "usb_driver") == 0) matched_driver = 6;
+
+        if (matched_driver != -1) {
+            g_auto_restart_enabled[matched_driver] = true;
+            uart_puts("[ROOT] auto_restart: включено для "); uart_puts(name); uart_puts("\n");
+        } else {
+            uart_puts("[ROOT] auto_restart: неизвестное имя драйвера, пропускаю: "); uart_puts(name); uart_puts("\n");
+        }
+
+        line = has_more ? newline + 1 : nullptr;
+    }
+}
+
+// План "Сигналы драйверам" — тела SYS_STOP_WIFI/SYS_START_WIFI вынесены
+// в отдельные функции (были инлайн в своих case-блоках), чтобы новый
+// SYS_DRIVER_SIGNAL мог переиспользовать уже hw-проверенный
+// kill+respawn-путь wifi_driver'а вместо параллельного механизма — у
+// wifi_driver's bring-up нет факторизованной init-функции (вся
+// orchestration зависимостей probe→bus-width→backplane→sdpcm вморожена
+// в main()), поэтому "restart" для него — это по-прежнему stop+start,
+// не лёгкий сигнал. Логика 1:1 со старыми case-блоками, только реплай
+// теперь один раз у вызывающего (было несколько ранних seL4_Reply()
+// внутри — семантика та же, просто общий путь ответа).
+static void root_stop_wifi_driver(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc,
+                                   seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                                   seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
+                                   seL4_Word *out_status) {
+    int target_pid = -1;
+    for (int i = 1; i < 256; i++) {
+        if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { target_pid = i; break; }
+    }
+    if (target_pid == -1) {
+        *out_status = (seL4_Word)-1; // не запущен
+        return;
+    }
+    generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                            shm_frame_root, console_ep, timer_ep, blk_ep, /*respawn=*/false);
+    g_wifi_driver_ready = false;
+    // Фаза 4.5.3 (Wi-Fi data-plane): гасим link-state в SHM-мейлбоксе,
+    // чтобы net_driver увидел wifi-интерфейс down в течение одного
+    // тика, а не ждал, пока сам wifi_driver (уже убитый) это сделает.
+    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_OFFSET) = 0;
+    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_REASON_OFFSET) = WIFI_LINK_REASON_SYS_STOP_WIFI; // диагностика живого бага, см. platform.h
+    flush_rootserver_shm(); // иначе запись может годами остаться в dirty-кэше root'а и не долететь до RAM, а net_driver читает эту страницу некэшируемо (см. flush_rootserver_shm())
+    *out_status = 0;
+}
+
+static void root_start_wifi_driver(seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc,
+                                    seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
+                                    seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
+                                    seL4_CPtr wifi_wake_ntfn, seL4_CPtr wifi_irq_ntfn, seL4_CPtr wifi_sdio_frame,
+                                    seL4_CPtr wifi_cmd_recv_ep, seL4_CPtr net_wifi_rx_badged, seL4_CPtr vfs_mutex_ntfn,
+                                    seL4_CPtr wifi_liveness_ntfn, // Фаза 3b: капа-"я жив" (см. common.h/DRIVER_LIVENESS_WIFI_BADGE)
+                                    seL4_Word *out_status) {
+    int existing_pid = -1;
+    for (int i = 1; i < 256; i++) {
+        if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { existing_pid = i; break; }
+    }
+    if (existing_pid != -1) {
+        *out_status = 1; // уже запущен
+        return;
+    }
+    if (wifi_cmd_recv_ep == 0) {
+        *out_status = (seL4_Word)-1; // не скомпилирован (RPI4_ENABLE_WIFI=false)
+        return;
+    }
+    g_wifi_driver_ready = false;
+    // Фаза 9.B (см. ROADMAP.md): wifi_driver теперь грузится С ДИСКА
+    // (/service/wifi.elf), а не из встроенного в образ CPIO-архива —
+    // тот же принцип, что /sbin/*.elf и /service/balancer.elf, просто
+    // без общего init.conf-парсера: is_driver==5 несёт СВОЙ, гораздо
+    // более богатый набор capability (SDIO MMIO, heartbeat/RX-badge и
+    // т.д.), который generic-парсер init.conf не понимает — это
+    // специфика именно этого драйвера, отдельный путь.
+    int wifi_elf_size = load_elf_from_disk(blk_ep, "/service/wifi.elf", g_elf_load_buffer);
+    if (wifi_elf_size <= 0) {
+        uart_puts("[ROOT] /service/wifi.elf не найден на диске.\n");
+        *out_status = (seL4_Word)-1;
+        return;
+    }
+    elf_t wifi_elf;
+    if (elf_newFile(g_elf_load_buffer, wifi_elf_size, &wifi_elf) != 0) {
+        uart_puts("[ROOT] /service/wifi.elf: битый ELF.\n");
+        *out_status = (seL4_Word)-1;
+        return;
+    }
+    // wifi_irq_ntfn передаётся ДЕВЯТЫМ параметром (irq_handler слот) —
+    // тот же приём, что у blk_irq_ntfn: обычная capability на
+    // нотификацию, не настоящий IRQHandler (см. is_driver==5 блок выше
+    // и common.h/SYS_WIFI_IRQ_ACK). wifi_wake_ntfn идёт irq_ntfn-
+    // параметром (TCB-bind) — то же самое место, где uart/timer/net
+    // получают свою нотификацию (Фаза 4.5, Wi-Fi data-plane, см.
+    // common.h/WIFI_EVENT_HEARTBEAT|WIFI_EVENT_TX_READY).
+    int new_pid = spawn_process("wifi_driver", g_elf_load_buffer, wifi_elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frame_root,
+                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
+                                0, 0, wifi_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, net_wifi_rx_badged,
+                                0, 0, 0, 0, 0, vfs_mutex_ntfn,
+                                nullptr, -1, 0, nullptr, 0, 0, 0, 0, // cwd_payload .. usb_heartbeat_ntfn_param (не для wifi_driver)
+                                wifi_liveness_ntfn); // Фаза 3b: капа-"я жив"
+    // issuse.txt: путь на диске для аварийного респавна (name здесь и
+    // так "wifi_driver" — короткое имя для поиска процесса, path —
+    // отдельно).
+    if (new_pid > 0) {
+        strncpy(pcbs[new_pid].path, "/service/wifi.elf", 63);
+        pcbs[new_pid].path[63] = '\0';
+    }
+    *out_status = new_pid > 0 ? 0 : (seL4_Word)-1;
 }
 
 int main(int argc, char *argv[]) {
@@ -2257,8 +2649,9 @@ int main(int argc, char *argv[]) {
     // аллоцироваться СТРОГО ДО них (тот же watermark-приём, что и MBOX/
     // UART/WIFI_SDIO/EMMC выше — см. проверку "target_paddr BEHIND
     // watermark" в alloc_device_frame()).
-    seL4_CPtr pcie_rc_frame = 0;
-    seL4_CPtr pcie_err_frame = 0;
+    // pcie_rc_frame/pcie_err_frame теперь file-scope globals (issuse.txt,
+    // см. комментарий у их объявления, найдено на живом железе) — не
+    // передекларируем здесь, просто присваиваем.
     if (RPI4_ENABLE_USB) {
         pcie_rc_frame = alloc_device_frame(info, alloc, PLAT_PCIE_RC_MISC_PADDR, root_cnode);
         // PLAT_PCIE_ERR_PADDR (0xfd506000) > PLAT_PCIE_RC_MISC_PADDR
@@ -2300,7 +2693,8 @@ int main(int argc, char *argv[]) {
     // со scratchpad (real_N > supplied) — root просто даёт максимум, что
     // может.
     seL4_CPtr usb_xhci_frames[256] = {0};
-    UsbDmaSetup usb_dma;
+    // usb_dma теперь file-scope global (см. комментарий у её объявления) —
+    // не передекларируем здесь, просто заполняем через тот же alloc_usb_dma_page.
     if (RPI4_ENABLE_USB) {
         for (int i = 0; i < (int)(PLAT_XHCI_SIZE / 4096); i++) {
             usb_xhci_frames[i] = alloc_device_frame(info, alloc, PLAT_XHCI_PADDR + (uintptr_t)i * 4096, root_cnode);
@@ -2536,7 +2930,8 @@ int main(int argc, char *argv[]) {
     // собственная линия, один источник событий, тот же паттерн, что у
     // uart_ntfn/uart_irq_handler чуть ниже, но не разделяемая ни с кем).
     seL4_CPtr usb_cmd_ep = 0;
-    seL4_CPtr usb_cmd_recv_ep = 0;
+    // usb_cmd_recv_ep теперь file-scope global (см. комментарий у её
+    // объявления) — не передекларируем здесь, просто присваиваем ниже.
     seL4_CPtr usb_irq_ntfn = 0;
     seL4_CPtr usb_irq_handler = 0;
     // Milestone 11 (доп., по запросу пользователя) — badged-копия
@@ -2638,6 +3033,22 @@ int main(int argc, char *argv[]) {
         check_err(seL4_CNode_Mint(root_cnode, blk_heartbeat_badged, seL4_WordBits, root_cnode, blk_irq_ntfn, seL4_WordBits, seL4_AllRights, BLK_HEARTBEAT_BADGE), "Mint blk_heartbeat_badged");
     }
 
+    // Фаза 3b плана "Сигналы драйверам" — см. common.h/BLK_LIVENESS_TICK_BADGE:
+    // ПОЛНОСТЬЮ ОТДЕЛЬНЫЙ от blk_irq_ntfn объект (сознательно НЕ переиспользуем
+    // его — тот разделяет общую линию EMMC2/Wi-Fi SDIO, см. комментарий у
+    // константы). TCB-bind на blk_driver (через пустовавший irq_ntfn-параметр
+    // его spawn_process(), см. ниже) + одна badged-копия для timer_driver, той
+    // же схемой, что и остальные heartbeat-капы выше. Создаётся здесь (до
+    // спавна timer_driver) по той же причине, что net_event_ntfn/blk_irq_ntfn.
+    seL4_CPtr blk_liveness_tick_ntfn = 0;
+    seL4_CPtr blk_liveness_tick_badged = 0;
+    if (RPI4_ENABLE_BLK) {
+        blk_liveness_tick_ntfn = alloc.alloc_slot();
+        blk_liveness_tick_badged = alloc.alloc_slot();
+        check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, blk_liveness_tick_ntfn, 1), "Retype blk_liveness_tick_ntfn");
+        check_err(seL4_CNode_Mint(root_cnode, blk_liveness_tick_badged, seL4_WordBits, root_cnode, blk_liveness_tick_ntfn, seL4_WordBits, seL4_AllRights, BLK_LIVENESS_TICK_BADGE), "Mint blk_liveness_tick_badged");
+    }
+
     // Фаза 6 (SMP, см. ROADMAP.md/common.h): общий мьютекс на нотификации
     // для VFS-прокси staging области в SHM (офсет 4096, см. shell.cpp/
     // vfs_lock, net_driver.cpp/net_vfs_lock, wifi_driver.cpp/wifi_vfs_lock).
@@ -2693,7 +3104,11 @@ int main(int argc, char *argv[]) {
                       // Milestone 11 (доп.): heartbeat-капа usb_driver'а —
                       // timer_driver сигналит её на том же тике, что и
                       // net/wifi/blk (см. timer_driver.cpp).
-                      badged_usb_heartbeat_ntfn) < 0) {
+                      badged_usb_heartbeat_ntfn,
+                      0, // liveness_ntfn_param (Фаза 3b, timer_driver сам не мониторится)
+                      // Фаза 3b: тик для blk_driver — timer_driver сигналит
+                      // её на том же общем heartbeat-тике (см. timer_driver.cpp).
+                      blk_liveness_tick_badged) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
@@ -2712,6 +3127,15 @@ int main(int argc, char *argv[]) {
     // релеит обоим процессам, каждый сам проверяет свой статусный регистр.
     seL4_CPtr wifi_irq_ntfn = 0;
     seL4_CPtr mmc_shared_irq_handler = 0;
+    // Фаза 3b плана "Сигналы драйверам" — badged-копии ЭТОГО ЖЕ
+    // mmc_shared_irq_ntfn (см. common.h/DRIVER_LIVENESS_*_BADGE), которыми
+    // blk/net/wifi/usb сами сигналят root'у "я жив". Объявлены здесь (не
+    // внутри if-блока ниже), потому что нужны позже, в отдельных spawn_
+    // process()-вызовах blk/net/usb и в root_start_wifi_driver().
+    seL4_CPtr blk_liveness_badged = 0;
+    seL4_CPtr net_liveness_badged = 0;
+    seL4_CPtr wifi_liveness_badged = 0;
+    seL4_CPtr usb_liveness_badged = 0;
     if (RPI4_ENABLE_BLK) {
         seL4_CPtr mmc_shared_irq_ntfn = alloc.alloc_slot();
         seL4_CPtr mmc_shared_irq_badged = alloc.alloc_slot();
@@ -2722,6 +3146,21 @@ int main(int argc, char *argv[]) {
         seL4_IRQHandler_SetNotification(mmc_shared_irq_handler, mmc_shared_irq_badged);
         check_err(seL4_TCB_BindNotification(seL4_CapInitThreadTCB, mmc_shared_irq_ntfn), "Bind shared MMC IRQ to root");
         seL4_IRQHandler_Ack(mmc_shared_irq_handler);
+
+        // Фаза 3b — см. объявления blk_liveness_badged и др. выше. Root
+        // держит ЕДИНСТВЕННЫЙ TCB-bind на mmc_shared_irq_ntfn (см. факт в
+        // плане) — новые бейджи ТОЛЬКО как дополнительные badged-копии ТОГО
+        // ЖЕ объекта, не новый bind. Минтим все 4 сразу здесь, пока объект
+        // ещё в области видимости — используются позже при спавне
+        // соответствующих драйверов и в root_start_wifi_driver().
+        blk_liveness_badged = alloc.alloc_slot();
+        net_liveness_badged = alloc.alloc_slot();
+        wifi_liveness_badged = alloc.alloc_slot();
+        usb_liveness_badged = alloc.alloc_slot();
+        seL4_CNode_Mint(root_cnode, blk_liveness_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, DRIVER_LIVENESS_BLK_BADGE);
+        seL4_CNode_Mint(root_cnode, net_liveness_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, DRIVER_LIVENESS_NET_BADGE);
+        seL4_CNode_Mint(root_cnode, wifi_liveness_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, DRIVER_LIVENESS_WIFI_BADGE);
+        seL4_CNode_Mint(root_cnode, usb_liveness_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, DRIVER_LIVENESS_USB_BADGE);
 
         // blk_irq_ntfn (нотификация, которой root будит именно blk_driver на
         // событие с общей линии) теперь создаётся ВЫШЕ, до спавна timer_driver
@@ -2745,9 +3184,15 @@ int main(int argc, char *argv[]) {
     // на нотификацию в cspace процесса (тот же spawn_process-механизм, что
     // копирует IRQHandler для UART — семантика объекта ему не важна).
     if (spawn_process("blk_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, 0, blk_irq_ntfn, emmc_frame,
+                      3, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep,
+                      // Фаза 3b: irq_ntfn-параметр у blk_driver раньше был 0
+                      // (без TCB-bind) — теперь TCB-bind на выделенный тик
+                      // liveness-watchdog'а (см. common.h/BLK_LIVENESS_TICK_BADGE).
+                      blk_liveness_tick_ntfn, blk_irq_ntfn, emmc_frame,
                       nullptr, 0, 0, 0, 0, 0, 0, 0, 0, blk_dma_frame, blk_dma_paddr,
-                      0, 0, 0, 0, mmc_shared_irq_handler, blk_dma_frame2, blk_dma_paddr2) < 0) {
+                      0, 0, 0, 0, mmc_shared_irq_handler, blk_dma_frame2, blk_dma_paddr2,
+                      0, nullptr, -1, 0, nullptr, 0, 0, 0, 0, // vfs_mutex_ntfn_param .. usb_heartbeat_ntfn_param (не для blk_driver)
+                      blk_liveness_badged) < 0) { // Фаза 3b: капа-"я жив"
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
     }
@@ -2756,7 +3201,9 @@ int main(int argc, char *argv[]) {
     if (spawn_process("net_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
                       4, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, net_event_ntfn, genet_irq_handler, genet_frames[0], nullptr,
                       net_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, wifi_wake_tx_ready_badged,
-                      0, 0, 0, 0, vfs_mutex_ntfn) < 0) {
+                      0, 0, 0, 0, vfs_mutex_ntfn,
+                      nullptr, -1, 0, nullptr, 0, 0, 0, 0, // cwd_payload .. usb_heartbeat_ntfn_param (не для net_driver)
+                      net_liveness_badged) < 0) { // Фаза 3b: капа-"я жив"
         uart_puts("PANIC: Net Driver failed to load!\n"); while(1);
     }
     }
@@ -2774,7 +3221,10 @@ int main(int argc, char *argv[]) {
                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // net_cmd_recv_ep .. vfs_mutex_ntfn_param (18 params)
                       nullptr, // cwd_payload
                       -1, // stdout_pipe_id
-                      usb_cmd_recv_ep, &usb_dma, pcie_rc_frame, pcie_err_frame) < 0) {
+                      usb_cmd_recv_ep, &usb_dma, pcie_rc_frame, pcie_err_frame,
+                      0, // usb_storage_ep_param (не для usb_driver самого)
+                      0, // usb_heartbeat_ntfn_param (не для usb_driver самого)
+                      usb_liveness_badged) < 0) { // Фаза 3b: капа-"я жив"
         uart_puts("PANIC: USB Driver failed to load!\n"); while(1);
     }
     }
@@ -2811,7 +3261,24 @@ int main(int argc, char *argv[]) {
         // Ожидаем прерывание, сообщение IPC или fault
         seL4_MessageInfo_t recv_info = seL4_Recv(ep, &sender_badge);
 
-        if (sender_badge == IRQ_MMC_SHARED_BADGE) {
+        // Фаза 3a плана "Сигналы драйверам" — было "== IRQ_MMC_SHARED_BADGE"
+        // (готовим почву под Фазу 3b: будущие watchdog-бейджи на ЭТОМ ЖЕ
+        // mmc_shared_irq_ntfn, ≥0x10000, будут ОРиться с этим при
+        // одновременной сигнализации — голое "==" перестало бы видеть MMC-
+        // часть комбинированного бейджа). ВАЖНО, найдено ДО прошивки при
+        // проверке плана: IRQ_MMC_SHARED_BADGE=2000 (0x7D0) — НЕ одиночный
+        // бит, а {4,6,7,8,9,10}, и sender_badge здесь делят PID клиентов
+        // (1-255) и бейджи пайпов (PIPE_BASE_BADGE..+MAX_PIPES=1000-1015) —
+        // оба диапазона побитово ПЕРЕСЕКАЮТСЯ с 2000 (напр. PID=16: "16 & 2000"
+        // = 16 != 0). Голое "&" без нижней границы перехватывало бы такие
+        // вызовы клиентов как MMC/Wi-Fi SDIO IRQ — зависший навсегда без
+        // ответа звонок, тот же класс бага, что уже вызывал катастрофический
+        // регресс (см. комментарий ниже). PID (макс 255) и pipe-диапазон
+        // (1000-1015) гарантированно ниже 2000 — этой нижней границы
+        // достаточно, чтобы отличить их ото всех текущих и будущих (Фаза 3b)
+        // нотификационных бейджей mmc_shared_irq_ntfn. Для ЛЮБОГО сегодня
+        // возможного sender_badge поведение идентично старому "==".
+        if (sender_badge >= IRQ_MMC_SHARED_BADGE && (sender_badge & IRQ_MMC_SHARED_BADGE)) {
             // Общий IRQ EMMC2/Wi-Fi SDIO (см. common.h) — root не читает
             // регистры контроллеров сам, просто будит blk_driver; тот
             // проверяет свой статусный бит и, если это не он, просто снова
@@ -2832,6 +3299,57 @@ int main(int argc, char *argv[]) {
             // явного запроса от blk_driver, когда бит уже гарантированно снят.
             if (blk_irq_ntfn != 0) seL4_Signal(blk_irq_ntfn);
             if (wifi_irq_ntfn != 0) seL4_Signal(wifi_irq_ntfn);
+            continue;
+        }
+
+        // Фаза 3b плана "Сигналы драйверам" — Направление Б: blk/net/wifi/
+        // usb сами сигналят root'у "я жив" (см. common.h/DRIVER_LIVENESS_*_
+        // BADGE, все ≥0x10000 — тот же guard "sender_badge >= порог", что
+        // уже применён у IRQ_MMC_SHARED_BADGE выше в Фазе 3a, отличает их от
+        // PID (1-255) и pipe-бейджей (1000-1015)). Отдельный
+        // ROOT_WATCHDOG_TICK_BADGE от timer_driver сознательно НЕ заведён —
+        // timer_driver спавнится ДО mmc_shared_irq_ntfn (см. факты плана),
+        // вместо этого сам поток liveness-сигналов от МОНИТОРИМЫХ драйверов
+        // служит достаточно частым regular tick для скана таймаутов
+        // (~20мс, пока жив хотя бы один из четырёх) — единственный пробел:
+        // если ВСЕ 4 зависнут в один и тот же момент, скан не запустится, но
+        // это уже за пределами того, что heartbeat-автовосстановление
+        // способно исправить в принципе (ручной driver/recover не зависят
+        // от этого скана и остаются доступны всегда).
+        if (sender_badge >= DRIVER_LIVENESS_BLK_BADGE) {
+            seL4_SetMR(0, 4); // SYS_GET_UPTIME
+            seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+            seL4_Word watchdog_now_ms = seL4_GetMR(0);
+            if (sender_badge & DRIVER_LIVENESS_BLK_BADGE)  g_driver_last_seen_ms[3] = watchdog_now_ms;
+            if (sender_badge & DRIVER_LIVENESS_NET_BADGE)  g_driver_last_seen_ms[4] = watchdog_now_ms;
+            if (sender_badge & DRIVER_LIVENESS_WIFI_BADGE) g_driver_last_seen_ms[5] = watchdog_now_ms;
+            if (sender_badge & DRIVER_LIVENESS_USB_BADGE)  g_driver_last_seen_ms[6] = watchdog_now_ms;
+
+            for (int wd_driver = 3; wd_driver <= 6; wd_driver++) {
+                if (!g_auto_restart_enabled[wd_driver]) continue;
+                if (g_driver_last_seen_ms[wd_driver] == 0) continue; // ещё ни разу не спавнился/не инициализирован
+                if (watchdog_now_ms - g_driver_last_seen_ms[wd_driver] < WATCHDOG_TIMEOUT_MS[wd_driver]) continue;
+
+                int wd_target_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && pcbs[i].is_driver == wd_driver) { wd_target_pid = i; break; }
+                }
+                // Нет активного процесса с таким is_driver — либо ещё не
+                // заспавнен (wifi_driver до "wifi start"), либо уже в
+                // процессе респавна кем-то другим — пропускаем тихо, не
+                // ошибка. last_seen НЕ сбрасываем — если/когда драйвер
+                // появится, spawn_process() сам переинициализирует его.
+                if (wd_target_pid == -1) continue;
+
+                uart_puts("[WATCHDOG] Heartbeat timeout for is_driver="); uart_putdec(wd_driver);
+                uart_puts(" (PID "); uart_putdec(wd_target_pid); uart_puts(") — auto-recovering.\n");
+                generic_recover_process(wd_target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
+                                        shm_frames[0], console_ep, timer_ep, blk_ep);
+                // last_seen для этого is_driver будет переинициализирован
+                // самим spawn_process() внутри generic_recover_process()
+                // выше (см. блок "инициализируем last_seen" там) — здесь
+                // ничего вручную поправлять не нужно.
+            }
             continue;
         }
 
@@ -2946,6 +3464,20 @@ int main(int argc, char *argv[]) {
                 // 1. СРАЗУ СПАСАЕМ ВХОДНЫЕ ДАННЫЕ!
                 seL4_Word requested_fd = seL4_GetMR(1);
                 seL4_CPtr child_cspace = pcbs[sender_pid].cspace;
+
+                // issuse.txt №10 — requested_fd раньше использовался как сырой
+                // индекс CSlot'а без проверки против зарезервированных boot-
+                // слотов (0-24, см. local_console_ep/local_timer_ep/.../
+                // local_usb_heartbeat_ntfn выше в spawn_process()). Единственный
+                // легитимный вызывающий (shell.cpp:1332) всегда шлёт ровно
+                // PIPE_FD_SLOT — любое другое значение либо ошибка клиента,
+                // либо попытка перезаписать чужой boot-слот (диск/консоль/
+                // таймер и т.п.) чужой pipe-капой.
+                if (requested_fd != PIPE_FD_SLOT) {
+                    seL4_SetMR(0, -1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
 
                 int pipe_id = -1;
                 for (int i = 0; i < MAX_PIPES; i++) {
@@ -3317,14 +3849,19 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_EXEC: {
-                char app_name_and_args[64] = {0};
+                // issuse.txt №30 (расследование) — было 64 байта (8
+                // регистров MR1-8), см. подробный разбор у STARTUP
+                // PAYLOAD/spawn_process() выше. Теперь 24 регистра
+                // (MR1-24, 192 байта) — с запасом покрывает "/sbin/<cmd>.elf "
+                // + аргумент до 127 символов (реальный предел ниже по
+                // цепочке, см. args_len в spawn_process()).
+                char app_name_and_args[256] = {0};
 
-                // Распаковываем 64 байта (8 регистров) из MR1 - MR8
                 uint64_t* name_ptr = (uint64_t*)app_name_and_args;
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < 24; i++) {
                     name_ptr[i] = seL4_GetMR(i + 1);
                 }
-                app_name_and_args[63] = '\0'; // Защита
+                app_name_and_args[255] = '\0'; // Защита
 
                 // Отделяем имя приложения от аргументов
                 char* args = app_name_and_args;
@@ -3360,29 +3897,31 @@ int main(int argc, char *argv[]) {
                 int exec_is_driver = (is_trusted_sbin && is_admin_caller(sender_pid)) ? 253 : 254;
 
                 // Фаза 9.A (продолжение, найдено на живом железе): cwd
-                // вызывающего шелла для доверенной /sbin-утилиты — MR9-16
-                // (тот же приём упаковки 8 регистров, что и путь+аргументы
-                // выше), если шелл их передал (length>=17). НЕ через общую
-                // VFS SHM — см. EXEC_CWD_MSG_SLOT/common.h, там его затирает
+                // вызывающего шелла для доверенной /sbin-утилиты — MR25-32
+                // (сдвинуто с MR9-16 после расширения app_name_and_args до
+                // 24 регистров, см. issuse.txt №30 выше), если шелл их
+                // передал (length>=33). НЕ через общую VFS SHM — см.
+                // EXEC_CWD_MSG_SLOT/common.h, там его затирает
                 // load_elf_from_disk() ниже (читает файл через ту же
                 // физическую страницу).
                 char exec_cwd_payload[64] = {0};
-                if (seL4_MessageInfo_get_length(recv_info) >= 17) {
+                if (seL4_MessageInfo_get_length(recv_info) >= 33) {
                     uint64_t* cwd_ptr = (uint64_t*)exec_cwd_payload;
                     for (int i = 0; i < 8; i++) {
-                        cwd_ptr[i] = seL4_GetMR(i + 9);
+                        cwd_ptr[i] = seL4_GetMR(i + 25);
                     }
                     exec_cwd_payload[63] = '\0';
                 }
 
-                // issuse.txt (пайпинг для /sbin-команд): MR17 = pipe_id, если
+                // issuse.txt (пайпинг для /sbin-команд): MR33 = pipe_id
+                // (сдвинуто с MR17, см. issuse.txt №30 у cwd выше), если
                 // шелл спавнит эту команду как ЛЕВУЮ часть конвейера (см.
                 // SYS_PIPE/case 20 — вызывающий получает pipe_id оттуда и
-                // передаёт сюда без изменений). -1 (нет MR17) — обычный
+                // передаёт сюда без изменений). -1 (нет MR33) — обычный
                 // exec, stdout на console_ep, как всегда.
                 int exec_stdout_pipe_id = -1;
-                if (seL4_MessageInfo_get_length(recv_info) >= 18) {
-                    exec_stdout_pipe_id = (int)seL4_GetMR(17);
+                if (seL4_MessageInfo_get_length(recv_info) >= 34) {
+                    exec_stdout_pipe_id = (int)seL4_GetMR(33);
                 }
 
                 if (LOG_ROOT) {
@@ -3870,6 +4409,20 @@ int main(int argc, char *argv[]) {
                             pcbs[target_pid].cmd_arena = 0;
                             pcbs[target_pid].arena_bytes_used = 0;
                         }
+                        // issuse.txt №5 — та же течь SHM-копий, что чинили для
+                        // SYS_EXIT (см. комментарий там же): kill обычной
+                        // /sbin-команды, получившей SHM (is_driver==253), не
+                        // освобождал shm_copies[9] вообще.
+                        if (pcbs[target_pid].has_shm) {
+                            for (int i = 0; i < 9; i++) {
+                                if (pcbs[target_pid].shm_copies[i] != 0) {
+                                    seL4_CNode_Delete(root_cnode, pcbs[target_pid].shm_copies[i], seL4_WordBits);
+                                    alloc.free(pcbs[target_pid].shm_copies[i]);
+                                    pcbs[target_pid].shm_copies[i] = 0;
+                                }
+                            }
+                            pcbs[target_pid].has_shm = false;
+                        }
                     }
                     seL4_SetMR(0, 0);
                 } else {
@@ -4010,6 +4563,10 @@ int main(int argc, char *argv[]) {
                         init_services_started = true;
                         start_init_services(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
                                              blk_ep, console_ep, timer_ep, net_cmd_send_ep, vfs_mutex_ntfn);
+                        // Фаза 4 плана "Сигналы драйверам" — та же точка,
+                        // тот же гейт "ровно один раз, когда FAT32 уже
+                        // смонтирован" (см. load_auto_restart_config()).
+                        load_auto_restart_config(blk_ep);
                     }
 
                     // Отпускаем shell, ждавший на SYS_WAIT_ALL_DRIVERS_READY — ОТДЕЛЬНЫМ
@@ -4043,6 +4600,24 @@ int main(int argc, char *argv[]) {
                 if (pid <= 0 || pid >= 256 || !pcbs[pid].active) {
                     seL4_SetMR(0, 0);
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                // issuse.txt №6 — раньше повторный SYS_SHM_GET безусловно
+                // проходил весь путь ниже заново: новый vaddr из bump-
+                // pointer'а, новые frame_copy-капы поверх shm_copies[9] — капы
+                // ПЕРВОГО вызова просто терялись (их не освобождает ни этот
+                // путь, ни SYS_EXIT/SYS_KILL/generic_recover_process(), они
+                // смотрят только на ТЕКУЩИЙ snapshot). Единственный живой
+                // повторный вызывающий — shell-команда `shm` (после
+                // автоматического SHM_GET в sys_client_init()) — ожидает
+                // рабочий доступ к ТОЙ ЖЕ памяти, а не новую область, так что
+                // просто отдаём уже выданный vaddr повторно, идемпотентно.
+                if (pcbs[pid].has_shm) {
+                    seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(shm_frames[0]);
+                    seL4_SetMR(0, pcbs[pid].shm_vaddr);
+                    seL4_SetMR(1, res.paddr);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
                     break;
                 }
 
@@ -4135,6 +4710,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 // Успех! Возвращаем адреса драйверу
+                pcbs[pid].shm_vaddr = vaddr; // issuse.txt №6 — для идемпотентного повтора выше
                 seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(shm_frames[0]);
                 seL4_SetMR(0, vaddr);
                 seL4_SetMR(1, res.paddr);
@@ -4143,8 +4719,18 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_RECOVER: {
+                // issuse.txt №3 — в отличие от SYS_KILL (та же власть над
+                // чужим процессом — форс-респавн вместо suspend), здесь не
+                // было проверки прав вызывающего вообще: любой exec'нутый
+                // процесс, даже недоверенный (is_driver==254), мог форсировать
+                // респавн любого процесса по имени.
+                if (!is_admin_caller(sender_pid)) {
+                    seL4_SetMR(0, (seL4_Word)-2);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
                 char driver_name[32] = {0}; // Заполняем нулями
-                
+
                 // Читаем 32 байта (4 регистра по 8 байт) напрямую из сообщения ядра!
                 // MR0 занят номером системного вызова (117)
                 uint64_t* name_ptr = (uint64_t*)driver_name;
@@ -4173,87 +4759,120 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            case SYS_DRIVER_SIGNAL: {
+                // План "Сигналы драйверам" — лёгкая альтернатива
+                // generic_recover_process() для случая "драйвер жив,
+                // просто нужно переинициализировать железо". Структура
+                // 1:1 с SYS_RECOVER выше (admin-check + поиск по имени),
+                // разница — вместо kill+respawn форвардим сигнал НА
+                // командный endpoint самого драйвера, он обрабатывает
+                // сам, без потери капабилити.
+                if (!is_admin_caller(sender_pid)) {
+                    seL4_SetMR(0, (seL4_Word)-2);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                char sig_driver_name[32] = {0};
+                uint64_t* sig_name_ptr = (uint64_t*)sig_driver_name;
+                sig_name_ptr[0] = seL4_GetMR(1);
+                sig_name_ptr[1] = seL4_GetMR(2);
+                sig_name_ptr[2] = seL4_GetMR(3);
+                sig_name_ptr[3] = seL4_GetMR(4);
+                sig_driver_name[31] = '\0';
+                seL4_Word sig = seL4_GetMR(5);
+
+                // wifi_driver: bring-up не факторизован в вызываемую
+                // функцию (см. план) — "сигнал" здесь это уже
+                // hw-проверенный kill+respawn путь (root_stop_wifi_driver/
+                // root_start_wifi_driver), а не форвард на её endpoint.
+                if (strcmp(sig_driver_name, "wifi_driver") == 0) {
+                    seL4_Word status = (seL4_Word)-3;
+                    if (sig == DRIVER_SIGNAL_STOP) {
+                        root_stop_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                               console_ep, timer_ep, blk_ep, &status);
+                    } else if (sig == DRIVER_SIGNAL_START) {
+                        root_start_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                                console_ep, timer_ep, blk_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame,
+                                                wifi_cmd_recv_ep, net_wifi_rx_badged, vfs_mutex_ntfn, wifi_liveness_badged, &status);
+                    } else if (sig == DRIVER_SIGNAL_RESTART) {
+                        seL4_Word stop_status = (seL4_Word)-1;
+                        root_stop_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                               console_ep, timer_ep, blk_ep, &stop_status);
+                        root_start_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                                console_ep, timer_ep, blk_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame,
+                                                wifi_cmd_recv_ep, net_wifi_rx_badged, vfs_mutex_ntfn, wifi_liveness_badged, &status);
+                    }
+                    seL4_SetMR(0, status);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                int sig_target_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, sig_driver_name) == 0) { sig_target_pid = i; break; }
+                }
+                if (sig_target_pid == -1) {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                // Фаза 5 (опционально, см. план) — uart/timer подключены
+                // последними: STOP/START есть у обоих, RESTART у обоих —
+                // заглушка (нечего переинициализировать, см. сами
+                // драйверы). timer_driver — единственный источник
+                // SYS_SLEEP_MS/heartbeat для всей системы; STOP там
+                // печатает явное предупреждение сама (см. timer_driver.cpp)
+                // — здесь, на уровне маршрутизации, никаких дополнительных
+                // ограничений не вводим (admin-check выше уже отсекает
+                // untrusted-вызывающих).
+                seL4_CPtr sig_target_ep = 0;
+                switch (pcbs[sig_target_pid].is_driver) {
+                    case 1: sig_target_ep = console_ep; break;
+                    case 2: sig_target_ep = timer_ep; break;
+                    case 3: sig_target_ep = blk_ep; break;
+                    case 4: sig_target_ep = net_cmd_send_ep; break;
+                    case 6: sig_target_ep = usb_cmd_ep; break;
+                    default: sig_target_ep = 0; break;
+                }
+                if (sig_target_ep == 0) {
+                    seL4_SetMR(0, (seL4_Word)-3);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+
+                seL4_SetMR(0, SYS_DRIVER_SIGNAL);
+                seL4_SetMR(1, sig);
+                seL4_Call(sig_target_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                seL4_Word sig_driver_status = seL4_GetMR(0);
+                seL4_SetMR(0, sig_driver_status);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
             // Ручной жизненный цикл Wi-Fi (см. common.h — почему wifi_driver
             // больше не спавнится при загрузке). Все три сисколла ниже не
             // принимают имя процесса — рутсервер и так знает, что речь про
             // "wifi_driver" (единственный процесс с этим именем).
             case SYS_START_WIFI: {
-                int existing_pid = -1;
-                for (int i = 1; i < 256; i++) {
-                    if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { existing_pid = i; break; }
-                }
-                if (existing_pid != -1) {
-                    seL4_SetMR(0, 1); // уже запущен
-                } else if (wifi_cmd_recv_ep == 0) {
-                    seL4_SetMR(0, (seL4_Word)-1); // не скомпилирован (RPI4_ENABLE_WIFI=false)
-                } else {
-                    g_wifi_driver_ready = false;
-                    // Фаза 9.B (см. ROADMAP.md): wifi_driver теперь грузится
-                    // С ДИСКА (/service/wifi.elf), а не из встроенного в
-                    // образ CPIO-архива — тот же принцип, что /sbin/*.elf и
-                    // /service/balancer.elf, просто без общего init.conf-
-                    // парсера: is_driver==5 несёт СВОЙ, гораздо более богатый
-                    // набор capability (SDIO MMIO, heartbeat/RX-badge и
-                    // т.д.), который generic-парсер init.conf не понимает —
-                    // это специфика именно этого драйвера, отдельный путь.
-                    int wifi_elf_size = load_elf_from_disk(blk_ep, "/service/wifi.elf", g_elf_load_buffer);
-                    if (wifi_elf_size <= 0) {
-                        uart_puts("[ROOT] /service/wifi.elf не найден на диске.\n");
-                        seL4_SetMR(0, (seL4_Word)-1);
-                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                        break;
-                    }
-                    elf_t wifi_elf;
-                    if (elf_newFile(g_elf_load_buffer, wifi_elf_size, &wifi_elf) != 0) {
-                        uart_puts("[ROOT] /service/wifi.elf: битый ELF.\n");
-                        seL4_SetMR(0, (seL4_Word)-1);
-                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
-                        break;
-                    }
-                    // wifi_irq_ntfn передаётся ДЕВЯТЫМ параметром (irq_handler
-                    // слот) — тот же приём, что у blk_irq_ntfn: обычная
-                    // capability на нотификацию, не настоящий IRQHandler (см.
-                    // is_driver==5 блок выше и common.h/SYS_WIFI_IRQ_ACK).
-                    // wifi_wake_ntfn идёт irq_ntfn-параметром (TCB-bind) — то
-                    // же самое место, где uart/timer/net получают свою
-                    // нотификацию (Фаза 4.5, Wi-Fi data-plane, см. common.h/
-                    // WIFI_EVENT_HEARTBEAT|WIFI_EVENT_TX_READY).
-                    int new_pid = spawn_process("wifi_driver", g_elf_load_buffer, wifi_elf_size, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
-                                                5, console_ep, timer_ep, blk_ep, console_ep, console_ep, console_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame, nullptr,
-                                                0, 0, wifi_cmd_recv_ep, 0, 0, 0, 0, 0, 0, 0, 0, net_wifi_rx_badged,
-                                                0, 0, 0, 0, 0, vfs_mutex_ntfn);
-                    // issuse.txt: путь на диске для аварийного респавна (name
-                    // здесь и так "wifi_driver" — короткое имя для поиска
-                    // процесса, см. SYS_STOP_WIFI ниже, path — отдельно).
-                    if (new_pid > 0) {
-                        strncpy(pcbs[new_pid].path, "/service/wifi.elf", 63);
-                        pcbs[new_pid].path[63] = '\0';
-                    }
-                    seL4_SetMR(0, new_pid > 0 ? 0 : (seL4_Word)-1);
-                }
+                // Тело вынесено в root_start_wifi_driver() (см. план
+                // "Сигналы драйверам") — переиспользуется и новым
+                // SYS_DRIVER_SIGNAL для wifi_driver.
+                seL4_Word status = (seL4_Word)-1;
+                root_start_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                        console_ep, timer_ep, blk_ep, wifi_wake_ntfn, wifi_irq_ntfn, wifi_sdio_frame,
+                                        wifi_cmd_recv_ep, net_wifi_rx_badged, vfs_mutex_ntfn, wifi_liveness_badged, &status);
+                seL4_SetMR(0, status);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
 
             case SYS_STOP_WIFI: {
-                int target_pid = -1;
-                for (int i = 1; i < 256; i++) {
-                    if (pcbs[i].active && strcmp(pcbs[i].name, "wifi_driver") == 0) { target_pid = i; break; }
-                }
-                if (target_pid == -1) {
-                    seL4_SetMR(0, (seL4_Word)-1); // не запущен
-                } else {
-                    generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
-                                            shm_frames[0], console_ep, timer_ep, blk_ep, /*respawn=*/false);
-                    g_wifi_driver_ready = false;
-                    // Фаза 4.5.3 (Wi-Fi data-plane): гасим link-state в SHM-мейлбоксе,
-                    // чтобы net_driver увидел wifi-интерфейс down в течение одного
-                    // тика, а не ждал, пока сам wifi_driver (уже убитый) это сделает.
-                    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_OFFSET) = 0;
-                    *(uint32_t*)(rootserver_shm_base + WIFI_SHM_LINK_STATE_REASON_OFFSET) = WIFI_LINK_REASON_SYS_STOP_WIFI; // диагностика живого бага, см. platform.h
-                    flush_rootserver_shm(); // иначе запись может годами остаться в dirty-кэше root'а и не долететь до RAM, а net_driver читает эту страницу некэшируемо (см. flush_rootserver_shm())
-                    seL4_SetMR(0, 0);
-                }
+                // Тело вынесено в root_stop_wifi_driver() — см. комментарий у SYS_START_WIFI выше.
+                seL4_Word status = (seL4_Word)-1;
+                root_stop_wifi_driver(ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
+                                       console_ep, timer_ep, blk_ep, &status);
+                seL4_SetMR(0, status);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
             }
@@ -4417,6 +5036,12 @@ int main(int argc, char *argv[]) {
                 uint32_t data_len = seL4_GetMR(2);
                 if (path_len > 63) path_len = 63;
                 if (data_len > 100) data_len = 100; // тот же запас на кадр, что у sys_puts/остальных чанкованных syscall'ов
+                // issuse.txt №4 — 63+100 клэмпы по отдельности не мешали сумме
+                // 3+path_len+data_len доходить до 166, читая seL4_GetMR() за
+                // границей seL4_MsgMaxLength=120 (соседние поля IPC-буфера).
+                if (3 + path_len + data_len > seL4_MsgMaxLength) {
+                    data_len = (path_len + 3 <= seL4_MsgMaxLength) ? (seL4_MsgMaxLength - 3 - path_len) : 0;
+                }
 
                 char path[64];
                 for (uint32_t i = 0; i < path_len; i++) path[i] = (char)seL4_GetMR(3 + i);

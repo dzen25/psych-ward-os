@@ -6,6 +6,11 @@ int main(int argc, char *argv[]) {
     sys_client_init(env);
 
     if (!env.arg) { sys_puts(0, "Usage: kill <pid>\n"); sys_exit(env.root_ep); return 1; }
+    if (!is_all_digits(env.arg)) { // issuse.txt №54
+        sys_puts(0, "kill: pid must be a non-negative number\n");
+        sys_exit(env.root_ep);
+        return 1;
+    }
 
     seL4_SetMR(0, 102); // SYS_KILL
     seL4_SetMR(1, simple_atoi(env.arg));

@@ -23,6 +23,15 @@ static uint64_t g_cntfrq = 0; // читается один раз в main(), с�
 // --- Глобальные переменные ---
 static char* g_shm_vaddr = nullptr;
 static EXFAT_Instance g_file_system;
+// План "Сигналы драйверам" — SYS_DRIVER_SIGNAL(STOP) гейтит всю
+// остальную бизнес-логику диспетчера (см. main(), самое начало цикла);
+// START/RESTART сбрасывают обратно в false.
+static bool g_blk_stopped = false;
+// Фаза 3b плана "Сигналы драйверам" — капа, которой САМ blk_driver сигналит
+// root'у "я жив" (badge DRIVER_LIVENESS_BLK_BADGE), на каждом полученном
+// BLK_LIVENESS_TICK_BADGE (см. main() ниже). 0, если root её не выдал
+// (не должно случаться, но main() уже гейтит на 0 своей стороной).
+static seL4_CPtr g_blk_liveness_ntfn = 0;
 
 // Глобальные переменные EMMC2 (см. h/platform.h — регистровая карта SDHCI)
 static volatile uint32_t* g_emmc_base = nullptr;
@@ -545,6 +554,16 @@ bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
 // достаточно найти КАНДИДАТА по типу байта, монтирование само откажет на
 // невалидном содержимом.
 static void find_exfat_partition(seL4_CPtr console_ep) {
+    // План "Сигналы драйверам" (найдено на живом железе, SYS_DRIVER_SIGNAL
+    // RESTART) — hardware_emmc_read() сама прибавляет g_partition_start_sector
+    // к номеру сектора (см. её реализацию). При ПОВТОРНОМ вызове этой
+    // функции (после первого успешного монтирования) g_partition_start_sector
+    // уже ненулевой — "чтение сектора 0" реально читало начало УЖЕ
+    // найденного exFAT-раздела (его VBR, не MBR физического диска), отсюда
+    // ложное "MBR found but no partition with type 0x07". Явный сброс
+    // перед чтением — единственный надёжный способ снова прочитать ФИЗИЧЕСКИЙ
+    // сектор 0, вне зависимости от того, первый это вызов или нет.
+    g_partition_start_sector = 0;
     uint8_t sector0[512];
     if (!hardware_emmc_read(0, 1, sector0)) {
         sys_puts(console_ep, "[BLK] WARNING: couldn't read sector 0 to detect partition table.\n");
@@ -570,6 +589,61 @@ static void find_exfat_partition(seL4_CPtr console_ep) {
     sys_puts(console_ep, "[BLK] WARNING: MBR found but no partition with type 0x07 (exFAT) — карта размечена по-старому (одна FAT32-партиция)?\n");
 }
 
+// План "Сигналы драйверам" — монтирование exFAT вынесено из main() в
+// отдельную вызываемую функцию (была вморожена в тело main() до цикла),
+// чтобы SYS_DRIVER_SIGNAL(RESTART) могла позвать её повторно вместе с
+// emmc_init() без убийства процесса. Логика 1:1 с прежним инлайном.
+static bool blk_mount_exfat(seL4_CPtr console_ep) {
+    // Ищем реальное начало exFAT-раздела (см. комментарий у
+    // find_exfat_partition()) до монтирования, иначе exfat_init() прочитает
+    // не тот сектор.
+    find_exfat_partition(console_ep);
+
+    if (exfat_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
+        if (LOG_BLK) {
+            sys_puts(console_ep, "[BLK] exFAT mounted.\n");
+            sys_puthex32(console_ep, "[BLK][exFAT] fat_offset_sectors  = ", g_file_system.fat_offset_sectors);
+            sys_puthex32(console_ep, "[BLK][exFAT] fat_length_sectors  = ", g_file_system.fat_length_sectors);
+            sys_puthex32(console_ep, "[BLK][exFAT] cluster_heap_offset = ", g_file_system.cluster_heap_offset);
+            sys_puthex32(console_ep, "[BLK][exFAT] root_cluster        = ", g_file_system.root_cluster);
+            sys_puthex32(console_ep, "[BLK][exFAT] bitmap_cluster      = ", g_file_system.bitmap_cluster);
+        }
+
+        // Этап B (см. план — запись ещё не реализована, exfat_mkdir() пока
+        // всегда возвращает false): каталоги /root/bin/sbin/etc/service/conf/*
+        // на этом этапе НЕ создаются автоматически — карту нужно подготовить
+        // с ними вручную (Finder/diskutil) до первой загрузки, пока Этап B
+        // не реализован. Вызовы оставлены — они безопасно no-op'ают (false
+        // молча игнорируется, как и раньше игнорировалось "уже существует"),
+        // заработают сами по себе, как только exfat_mkdir получит реализацию.
+        exfat_mkdir(&g_file_system, USER_ROOT_DIR);
+        exfat_mkdir(&g_file_system, "/bin");
+        exfat_mkdir(&g_file_system, "/sbin");
+        exfat_mkdir(&g_file_system, "/etc");
+        exfat_mkdir(&g_file_system, "/service");
+        exfat_mkdir(&g_file_system, "/conf");
+        exfat_mkdir(&g_file_system, "/conf/wifi_conf");
+        exfat_mkdir(&g_file_system, "/conf/balancer_conf");
+        exfat_mkdir(&g_file_system, "/conf/logger_conf");
+
+        if (exfat_cd(&g_file_system, USER_ROOT_DIR)) {
+            if (LOG_BLK) {
+                sys_puts(console_ep, "[BLK] cwd set to ");
+                sys_puts(console_ep, USER_ROOT_DIR);
+                sys_puts(console_ep, "\n");
+            }
+        } else {
+            sys_puts(console_ep, "[BLK] WARNING: couldn't cd into ");
+            sys_puts(console_ep, USER_ROOT_DIR);
+            sys_puts(console_ep, ", staying at exFAT root.\n");
+        }
+        return true;
+    } else {
+        sys_puts(console_ep, "[BLK] exFAT mount failed.\n");
+        return false;
+    }
+}
+
 // ==========================================
 // ГЛАВНАЯ ФУНКЦИЯ БЛОЧНОГО ДРАЙВЕРА
 // ==========================================
@@ -591,6 +665,7 @@ int main(int argc, char *argv[]) {
     g_mmc_irq_handler = ipc->msg[BOOT_MMC_IRQ_HANDLER_CAP]; // фикс дедлока — см. notify_root_irq_handled()
     g_blk_dma_paddr = ipc->msg[BOOT_BLK_DMA_PADDR]; // Фаза 4.5/ADMA2, см. blk_dma_buf()/blk_dma_desc() выше
     g_blk_dma2_paddr = ipc->msg[BOOT_BLK_DMA2_PADDR]; // фикс задержки — вторая страница, см. blk_dma_desc()
+    g_blk_liveness_ntfn = ipc->msg[BOOT_BLK_LIVENESS_NTFN_CAP]; // Фаза 3b, см. main.cpp
     g_cntfrq = read_cntfrq(); // ДО emmc_init() — emmc_wait_irpt_bit() уже использует g_cntfrq для таймаута
 
     if (my_ep == 0) {
@@ -631,53 +706,10 @@ int main(int argc, char *argv[]) {
     }
     if (LOG_BLK) sys_puts(console_ep, "[BLK] EMMC2 initialized.\n");
 
-    // 2.5. Ищем реальное начало exFAT-раздела (см. комментарий у
-    // find_exfat_partition()) до монтирования, иначе exfat_init() прочитает
-    // не тот сектор.
-    find_exfat_partition(console_ep);
-
-    // 3. Монтируем Файловую Систему!
-    if (exfat_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
-        if (LOG_BLK) {
-            sys_puts(console_ep, "[BLK] exFAT mounted.\n");
-            sys_puthex32(console_ep, "[BLK][exFAT] fat_offset_sectors  = ", g_file_system.fat_offset_sectors);
-            sys_puthex32(console_ep, "[BLK][exFAT] fat_length_sectors  = ", g_file_system.fat_length_sectors);
-            sys_puthex32(console_ep, "[BLK][exFAT] cluster_heap_offset = ", g_file_system.cluster_heap_offset);
-            sys_puthex32(console_ep, "[BLK][exFAT] root_cluster        = ", g_file_system.root_cluster);
-            sys_puthex32(console_ep, "[BLK][exFAT] bitmap_cluster      = ", g_file_system.bitmap_cluster);
-        }
-
-        // Этап B (см. план — запись ещё не реализована, exfat_mkdir() пока
-        // всегда возвращает false): каталоги /root/bin/sbin/etc/service/conf/*
-        // на этом этапе НЕ создаются автоматически — карту нужно подготовить
-        // с ними вручную (Finder/diskutil) до первой загрузки, пока Этап B
-        // не реализован. Вызовы оставлены — они безопасно no-op'ают (false
-        // молча игнорируется, как и раньше игнорировалось "уже существует"),
-        // заработают сами по себе, как только exfat_mkdir получит реализацию.
-        exfat_mkdir(&g_file_system, USER_ROOT_DIR);
-        exfat_mkdir(&g_file_system, "/bin");
-        exfat_mkdir(&g_file_system, "/sbin");
-        exfat_mkdir(&g_file_system, "/etc");
-        exfat_mkdir(&g_file_system, "/service");
-        exfat_mkdir(&g_file_system, "/conf");
-        exfat_mkdir(&g_file_system, "/conf/wifi_conf");
-        exfat_mkdir(&g_file_system, "/conf/balancer_conf");
-        exfat_mkdir(&g_file_system, "/conf/logger_conf");
-
-        if (exfat_cd(&g_file_system, USER_ROOT_DIR)) {
-            if (LOG_BLK) {
-                sys_puts(console_ep, "[BLK] cwd set to ");
-                sys_puts(console_ep, USER_ROOT_DIR);
-                sys_puts(console_ep, "\n");
-            }
-        } else {
-            sys_puts(console_ep, "[BLK] WARNING: couldn't cd into ");
-            sys_puts(console_ep, USER_ROOT_DIR);
-            sys_puts(console_ep, ", staying at exFAT root.\n");
-        }
-    } else {
-        sys_puts(console_ep, "[BLK] exFAT mount failed.\n");
-    }
+    // 2.5/3. Монтируем файловую систему (см. blk_mount_exfat() выше —
+    // теперь отдельная функция, чтобы SYS_DRIVER_SIGNAL(RESTART) могла
+    // позвать её повторно).
+    blk_mount_exfat(console_ep);
 
     // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (см. ROADMAP.md/issuse.txt — "Spurious
     // interrupt!" после КАЖДОЙ команды, задевающей диск, без всякого
@@ -726,10 +758,53 @@ int main(int argc, char *argv[]) {
         seL4_Word sender_badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &sender_badge);
 
+        // Фаза 3b плана "Сигналы драйверам" — ЧИСТО notification-пробуждение
+        // (badge, MR0 не несёт настоящего сообщения — см. тот же паттерн у
+        // net_driver.cpp/badge&NET_EVENT_*), проверяется ДО чтения cmd,
+        // БЕЗУСЛОВНО (даже если g_blk_stopped — сигнал живости обязан идти
+        // независимо от STOP, драйвер жив в любом случае). Единственный
+        // источник этого бейджа — timer_driver, единственный бейдж на этом
+        // ОТДЕЛЬНОМ (не разделяемом ни с чем, см. common.h) объекте.
+        if (sender_badge == BLK_LIVENESS_TICK_BADGE) {
+            if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
+            continue;
+        }
+
         seL4_Word cmd = seL4_GetMR(0);
 
+        // План "Сигналы драйверам" — проверяется БЕЗУСЛОВНО, ДО
+        // stopped-гейта ниже: сигнал обязан доходить, даже если драйвер
+        // уже остановлен (иначе STOP необратим без full respawn).
+        if (cmd == SYS_DRIVER_SIGNAL) {
+            seL4_Word sig = seL4_GetMR(1);
+            if (sig == DRIVER_SIGNAL_STOP) {
+                g_blk_stopped = true;
+            } else if (sig == DRIVER_SIGNAL_START) {
+                g_blk_stopped = false;
+            } else if (sig == DRIVER_SIGNAL_RESTART) {
+                // Повторный вызов уже факторизованных init-функций (см.
+                // main() ниже) — без убийства процесса, без потери
+                // капабилити. Непроверено на железе: emmc_init()/
+                // blk_mount_exfat() штатно вызываются РОВНО один раз при
+                // старте, безопасность ПОВТОРНОГО вызова на уже живом
+                // контроллере — гипотеза, не факт (см. план), первая
+                // hw-проверка обязана это подтвердить.
+                emmc_init((void*)PLAT_EMMC_VADDR, console_ep);
+                blk_mount_exfat(console_ep);
+                g_blk_stopped = false;
+            }
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+        if (g_blk_stopped) {
+            seL4_SetMR(0, (seL4_Word)-1); // остановлен сигналом STOP — см. SYS_DRIVER_SIGNAL выше
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+
         if (cmd == 110) { // SYS_LS
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
 
             uint32_t dir_cluster;
@@ -737,7 +812,7 @@ int main(int argc, char *argv[]) {
                 dir_cluster = g_file_system.current_dir_cluster;
                 if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
             } else {
-                char basename[64];
+                char basename[256]; // issuse.txt №42
                 uint32_t parent_clus = exfat_resolve_parent(&g_file_system, path, basename);
                 if (parent_clus == 0xFFFFFFFF) {
                     my_strcpy(g_shm_vaddr, "ls: path not found\n");
@@ -748,7 +823,16 @@ int main(int argc, char *argv[]) {
                 if (basename[0] == '\0') {
                     dir_cluster = parent_clus;
                 } else {
-                    dir_cluster = exfat_find_in_dir(&g_file_system, parent_clus, basename);
+                    bool is_dir = false;
+                    dir_cluster = exfat_find_in_dir(&g_file_system, parent_clus, basename, &is_dir);
+                    // issuse.txt №36: раньше ls на обычном файле обходил его
+                    // содержимое как таблицу каталога вместо явной ошибки.
+                    if (dir_cluster != 0xFFFFFFFF && !is_dir) {
+                        my_strcpy(g_shm_vaddr, "ls: not a directory\n");
+                        seL4_SetMR(0, 0);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        continue;
+                    }
                 }
             }
 
@@ -774,7 +858,7 @@ int main(int argc, char *argv[]) {
             // ОЧЕНЬ ВАЖНО: Сейчас в SHM (g_shm_vaddr) лежит строковое имя файла,
             // которое передал Rootserver. Мы обязаны скопировать его себе на стек,
             // потому что функция exfat_read_file перезапишет SHM бинарными данными ELF-файла!
-            char filename[64];
+            char filename[256]; // issuse.txt №42
             my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
 
             bool success = exfat_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
@@ -790,7 +874,7 @@ int main(int argc, char *argv[]) {
         }
 
         else if (cmd == 112) { // SYS_TOUCH
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем имя файла со стека
             bool existed = false;
             if (exfat_create_file(&g_file_system, path, &existed)) seL4_SetMR(0, existed ? 1 : 0); // 1 = уже существовал, ничего не создали
@@ -799,7 +883,7 @@ int main(int argc, char *argv[]) {
         }
 
         else if (cmd == 113) { // SYS_WRITE_FILE (echo > file)
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем путь
             uint32_t len = seL4_GetMR(1);
             // len приходит от клиента IPC и не должна превышать размер safe_text_buf
@@ -821,17 +905,23 @@ int main(int argc, char *argv[]) {
         }
 
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
-            
+
             // Читаем напрямую в SHM, чтобы shell мог сразу это распечатать
-            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr)) seL4_SetMR(0, 0);
-            else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            uint32_t copied = 0;
+            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr, &copied)) {
+                seL4_SetMR(0, 0);
+                seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            } else {
+                seL4_SetMR(0, -1);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            }
         }
 
         else if (cmd == 120) { // SYS_RM
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_delete_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
@@ -839,7 +929,7 @@ int main(int argc, char *argv[]) {
         }
 
         else if (cmd == 116) { // SYS_RENAME (mv)
-            char old_p[32], new_p[32];
+            char old_p[256], new_p[256]; // issuse.txt №35/№42: было 32, обрезало длинные имена
             my_strlcpy(old_p, g_shm_vaddr, sizeof(old_p));
             my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p)); // Ожидаем новое имя по смещению 128
             if (exfat_rename_file(&g_file_system, old_p, new_p)) seL4_SetMR(0, 0);
@@ -848,7 +938,7 @@ int main(int argc, char *argv[]) {
         }
 
         else if (cmd == 117) { // SYS_MKDIR
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             bool existed = false;
             if (exfat_mkdir(&g_file_system, path, &existed)) seL4_SetMR(0, 0);
@@ -857,7 +947,7 @@ int main(int argc, char *argv[]) {
         }
         
         else if (cmd == 118) { // SYS_CD
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_cd(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);

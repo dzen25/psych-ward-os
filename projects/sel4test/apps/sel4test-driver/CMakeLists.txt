@@ -172,6 +172,14 @@ foreach(tool ${PSYCH_SBIN_TOOLS})
     target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
 endforeach()
 
+set(PSYCH_TEST_TOOLS holdshm proxytest recovertest)
+foreach(tool ${PSYCH_TEST_TOOLS})
+    add_executable(sb_${tool} src/tests/${tool}.cpp)
+    target_include_directories(sb_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+    target_link_options(sb_${tool} PRIVATE "-static")
+    target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
+endforeach()
+
 # Фаза 9.B (см. ROADMAP.md): фоновые сервисы для автозапуска из
 # /etc/init.conf (см. src/service/) — тот же паттерн сборки, что sb_*/
 # test_app выше. Префикс svc_ по той же причине, что sb_ у команд.

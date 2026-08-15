@@ -58,7 +58,13 @@ struct ExfatBootSector {
 #pragma pack(pop)
 
 static uint32_t cluster_to_sector(EXFAT_Instance* fs, uint32_t clus) {
-    if (clus < 2) clus = (fs->root_cluster >= 2) ? fs->root_cluster : 2;
+    // issuse.txt №39: clus за пределами реальной кучи (испорченное
+    // FirstCluster/запись FAT с диска) раньше уходило прямо в
+    // (clus-2)*sectors_per_cluster без проверки — на переполнении 32-бит
+    // это заворачивается в произвольный маленький сектор, который потом
+    // используется как есть в hardware_emmc_read/write. Тот же fallback,
+    // что уже применяется ниже для clus<2 — на root_cluster.
+    if (clus < 2 || clus - 2 >= fs->cluster_count) clus = (fs->root_cluster >= 2) ? fs->root_cluster : 2;
     return fs->cluster_heap_offset + (clus - 2) * (1u << fs->sectors_per_cluster_shift);
 }
 
@@ -68,6 +74,12 @@ static uint32_t cluster_to_sector(EXFAT_Instance* fs, uint32_t clus) {
 static bool exfat_cluster_has_next(uint32_t v) { return v >= 2 && v != 0xFFFFFFFF && v != 0xFFFFFFF7; }
 
 static uint32_t fat_get_entry(EXFAT_Instance* fs, uint32_t cluster) {
+    // issuse.txt №39: cluster с диска (не своё вычисленное значение) может
+    // быть испорчено — без проверки byte_offset = cluster*4 может уйти
+    // сколь угодно далеко за реальную FAT-область. 0xFFFFFFFF — тот же
+    // сентинел, что уже возвращается на сбое чтения ниже, безопасно
+    // трактуется exfat_cluster_has_next() как "нет продолжения".
+    if (cluster < 2 || cluster - 2 >= fs->cluster_count) return 0xFFFFFFFF;
     uint32_t byte_offset = cluster * 4;
     uint32_t fat_sector = fs->fat_offset_sectors + (byte_offset / EXFAT_SECTOR_SIZE);
     uint32_t sector_offset = byte_offset % EXFAT_SECTOR_SIZE;
@@ -82,6 +94,7 @@ static uint32_t fat_get_entry(EXFAT_Instance* fs, uint32_t cluster) {
 // свои собственные экстенты (NoFatChain=1) в FAT не участвуют вообще, см.
 // bitmap_alloc_run ниже.
 static bool fat_set_entry(EXFAT_Instance* fs, uint32_t cluster, uint32_t value) {
+    if (cluster < 2 || cluster - 2 >= fs->cluster_count) return false; // issuse.txt №39
     uint32_t byte_offset = cluster * 4;
     uint32_t fat_sector = fs->fat_offset_sectors + (byte_offset / EXFAT_SECTOR_SIZE);
     uint32_t sector_offset = byte_offset % EXFAT_SECTOR_SIZE;
@@ -126,6 +139,10 @@ struct DirCursor {
     int slot_in_sector;         // 0..15
     char sector_buf[512];
     bool sector_loaded;
+    // issuse.txt №38: счётчик шагов по FAT-цепочке (только для
+    // no_fat_chain=false — root/чужеродные фрагментированные каталоги) —
+    // см. dir_cursor_advance() ниже.
+    uint32_t fat_chain_steps;
 };
 
 static void dir_cursor_init(DirCursor* c, EXFAT_Instance* fs, uint32_t first_cluster, bool no_fat_chain, uint64_t byte_length) {
@@ -139,6 +156,7 @@ static void dir_cursor_init(DirCursor* c, EXFAT_Instance* fs, uint32_t first_clu
     c->sector_in_cluster = 0;
     c->slot_in_sector = 0;
     c->sector_loaded = false;
+    c->fat_chain_steps = 0;
 }
 
 // Указатель на текущий 32-байтный слот (внутри c->sector_buf) или nullptr,
@@ -170,6 +188,16 @@ static bool dir_cursor_advance(DirCursor* c) {
         c->cur_cluster = c->first_cluster + c->clusters_visited;
         return c->clusters_visited < c->max_clusters;
     }
+    // issuse.txt №38: цепочка корня проверяется на цикл ОДИН раз при
+    // монтировании (fat_chain_has_cycle), но любой другой NoFatChain=0
+    // каталог (фрагментированный, например созданный чужой ОС) никогда не
+    // проверялся — а полноценный fat_chain_has_cycle() на КАЖДЫЙ advance()
+    // был бы O(n²) на весь скан каталога. Дешёвая альтернатива — просто
+    // ограничить общее число шагов по цепочке (тот же приём, что уже есть
+    // в free_fat_chain/fat_chain_has_cycle): зацикленная/чрезмерно длинная
+    // цепочка обрывает скан как честный конец каталога вместо зависания
+    // blk_driver навсегда.
+    if (++c->fat_chain_steps > 65536) { c->cur_cluster = 0; return false; }
     uint32_t next = fat_get_entry(c->fs, c->cur_cluster);
     if (!exfat_cluster_has_next(next)) { c->cur_cluster = 0; return false; }
     c->cur_cluster = next;
@@ -227,6 +255,14 @@ struct ExfatDirEntry {
     bool end_of_dir;
     char name[256];
     int name_len;
+    // issuse.txt №41: true, если хотя бы один код UTF-16 имени был вне
+    // Latin-1 (>0xFF) и заменён на '?' при декодировании — см.
+    // exfat_next_dir_entry(). Такое имя НЕЛЬЗЯ использовать для поиска
+    // совпадения (exfat_dir_scan) — разные исходные Unicode-имена могут
+    // схлопнуться в одинаковую '?'-строку, что раньше приводило к тому,
+    // что cat/rm/mv по такому "коллизионному" имени могли попасть не в
+    // тот файл. ls всё равно показывает такие имена (as-is, с '?').
+    bool has_lossy_chars;
     bool is_dir;
     uint32_t first_cluster;
     uint64_t data_length;
@@ -247,6 +283,7 @@ struct ExfatDirEntry {
 static bool exfat_next_dir_entry(DirCursor* cur, ExfatDirEntry* out) {
     out->got_entry = false;
     out->end_of_dir = false;
+    out->has_lossy_chars = false;
     while (true) {
         uint8_t* slot = dir_cursor_current(cur);
         if (!slot) { out->end_of_dir = true; return false; }
@@ -264,7 +301,15 @@ static bool exfat_next_dir_entry(DirCursor* cur, ExfatDirEntry* out) {
 
         if (!dir_cursor_advance(cur)) { out->end_of_dir = true; return false; }
         uint8_t* se = dir_cursor_current(cur);
-        if (!se || se[0] != 0xC0) { out->end_of_dir = true; return false; } // повреждённый набор записей
+        // issuse.txt №40: раньше один испорченный набор записей (0x85 без
+        // ожидаемого 0xC0 следом) трактовался как конец ВСЕГО каталога —
+        // все валидные файлы дальше в сыром потоке байт становились
+        // невидимыми. Теперь просто пропускаем этот единственный слот и
+        // продолжаем поиск следующей 0x85-записи (внешний while(true) сам
+        // досканирует вперёд байт за байтом — тот же путь, что уже
+        // обрабатывает entry_type != 0x85 ниже).
+        if (!se) { out->end_of_dir = true; return false; } // курсор реально кончился — это честный конец
+        if (se[0] != 0xC0) continue; // повреждённый набор записей — пропускаем, не конец каталога
 
         uint8_t name_length = se[3];
         uint32_t first_cluster = (uint32_t)se[20] | ((uint32_t)se[21] << 8) | ((uint32_t)se[22] << 16) | ((uint32_t)se[23] << 24);
@@ -274,24 +319,35 @@ static bool exfat_next_dir_entry(DirCursor* cur, ExfatDirEntry* out) {
 
         int name_len_out = 0;
         int remaining_name_entries = secondary_count - 1;
-        bool ok = true;
+        // issuse.txt №40: различаем "курсор реально кончился" (exhausted —
+        // честный конец каталога) от "запись continuation битая/не 0xC1"
+        // (corrupted — пропускаем только этот набор, каталог не кончился).
+        bool exhausted = false;
+        bool corrupted = false;
         for (int k = 0; k < remaining_name_entries; k++) {
-            if (!dir_cursor_advance(cur)) { ok = false; break; }
+            if (!dir_cursor_advance(cur)) { exhausted = true; break; }
             uint8_t* ne = dir_cursor_current(cur);
-            if (!ne || ne[0] != 0xC1) { ok = false; break; }
+            if (!ne) { exhausted = true; break; }
+            if (ne[0] != 0xC1) { corrupted = true; break; }
             for (int ci = 0; ci < 15 && name_len_out < (int)name_length && name_len_out < 255; ci++) {
                 uint16_t code = (uint16_t)(ne[2 + ci * 2] | (ne[2 + ci * 2 + 1] << 8));
                 // ASCII-only проект (см. issuse.txt/ROADMAP.md) — код за пределами
                 // Latin-1 заменяем на '?' вместо падения; на практике не встречается.
-                out->name[name_len_out++] = (code != 0 && code <= 0xFF) ? (char)code : '?';
+                if (code != 0 && code <= 0xFF) {
+                    out->name[name_len_out++] = (char)code;
+                } else {
+                    out->name[name_len_out++] = '?';
+                    out->has_lossy_chars = true; // issuse.txt №41 — это имя нельзя использовать для сопоставления
+                }
             }
         }
         out->name[name_len_out] = '\0';
         out->name_len = name_len_out;
 
-        bool advanced = dir_cursor_advance(cur); // не критично, если false — следующий вызов увидит end_of_dir
+        if (exhausted) { out->end_of_dir = true; return false; }
+        if (corrupted) continue; // issuse.txt №40 — пропускаем битый набор записей, не конец каталога
 
-        if (!ok) { out->end_of_dir = true; return false; }
+        bool advanced = dir_cursor_advance(cur); // не критично, если false — следующий вызов увидит end_of_dir
 
         (void)advanced;
         out->got_entry = true;
@@ -329,6 +385,11 @@ static bool exfat_dir_scan(EXFAT_Instance* fs, uint32_t dir_cluster, bool dir_no
     ExfatDirEntry e;
     while (exfat_next_dir_entry(&cur, &e)) {
         if (e.name_len != target_len) continue;
+        // issuse.txt №41: имя с потерянными (не-Latin-1) символами не
+        // может достоверно сопоставляться ни с каким запросом — разные
+        // исходные Unicode-имена могут схлопнуться в одинаковую '?'-
+        // строку, совпадение по ней рискует попасть не в тот файл.
+        if (e.has_lossy_chars) continue;
         bool match = true;
         for (int i = 0; i < target_len; i++) {
             if (ascii_upcase(e.name[i]) != ascii_upcase(target_name[i])) { match = false; break; }
@@ -352,7 +413,11 @@ static bool exfat_dir_scan(EXFAT_Instance* fs, uint32_t dir_cluster, bool dir_no
 // exFAT не хранит "."/".." — резолвим их ТЕКСТОМ (стек компонентов) ДО
 // обхода диска; сам обход диска после этого идёт только вперёд, как в FAT32.
 // ============================================================================
-static void exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, char* out_normalized, int out_size) {
+// issuse.txt №43: возвращает false, если путь глубже MAX_COMPONENTS
+// уровней вложенности — раньше лишние компоненты молча отбрасывались,
+// и вызывающий получал ДРУГОЙ (более короткий) нормализованный путь без
+// единой ошибки, рискуя выполнить операцию не над тем файлом/каталогом.
+static bool exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, char* out_normalized, int out_size) {
     char raw[256];
     int rp = 0;
     if (input_path[0] != '/') {
@@ -363,15 +428,22 @@ static void exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, cha
     for (int i = 0; input_path[i] && rp < 254; i++) raw[rp++] = input_path[i];
     raw[rp] = '\0';
 
-    char components[16][64];
+    constexpr int MAX_COMPONENTS = 16;
+    // issuse.txt №66 (расследование) — было [64]: comp[] ниже принимает до
+    // 255 символов (issuse.txt №42), my_strcpy(components[depth], comp) без
+    // проверки границы — перезапись стека для ЛЮБОГО компонента пути
+    // длиннее 63 символов. Не подтверждено как причина №66 (тестовое имя —
+    // 52 символа, короче 64), но это реальное переполнение независимо от
+    // этого — исправляем на тот же лимит, что и остальные exFAT-имена.
+    char components[MAX_COMPONENTS][256];
     int depth = 0;
     const char* p = raw;
     while (*p) {
         while (*p == '/') p++;
         if (!*p) break;
-        char comp[64];
+        char comp[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
         int clen = 0;
-        while (*p && *p != '/' && clen < 63) comp[clen++] = *p++;
+        while (*p && *p != '/' && clen < 255) comp[clen++] = *p++;
         comp[clen] = '\0';
         // Обрезаем пробелы В КОНЦЕ компонента (issuse.txt п.1): под FAT32/8.3
         // конечный пробел в имени незаметно проглатывался space-padding'ом
@@ -384,7 +456,8 @@ static void exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, cha
         if (clen == 0) continue;
         if (my_strcmp(comp, ".") == 0) continue;
         if (my_strcmp(comp, "..") == 0) { if (depth > 0) depth--; continue; }
-        if (depth < 16) { my_strcpy(components[depth], comp); depth++; }
+        if (depth >= MAX_COMPONENTS) return false; // issuse.txt №43: путь слишком глубокий — ошибка, не тихая обрезка
+        my_strcpy(components[depth], comp); depth++;
     }
 
     int pos = 0;
@@ -394,11 +467,12 @@ static void exfat_normalize_path(EXFAT_Instance* fs, const char* input_path, cha
         for (int j = 0; components[i][j] && pos < out_size - 1; j++) out_normalized[pos++] = components[i][j];
     }
     out_normalized[pos] = '\0';
+    return true;
 }
 
 uint32_t exfat_resolve_parent(EXFAT_Instance* fs, const char* full_path, char* out_basename) {
     char normalized[256];
-    exfat_normalize_path(fs, full_path, normalized, sizeof(normalized));
+    if (!exfat_normalize_path(fs, full_path, normalized, sizeof(normalized))) return 0xFFFFFFFF; // issuse.txt №43
 
     uint32_t current_clus = fs->root_cluster;
     bool current_no_chain = false;
@@ -408,10 +482,10 @@ uint32_t exfat_resolve_parent(EXFAT_Instance* fs, const char* full_path, char* o
     while (*p == '/') p++;
 
     out_basename[0] = '\0';
-    char token[64];
+    char token[256]; // issuse.txt №42
     while (*p) {
         int i = 0;
-        while (*p && *p != '/' && i < 63) token[i++] = *p++;
+        while (*p && *p != '/' && i < 255) token[i++] = *p++;
         token[i] = '\0';
         while (*p == '/') p++;
 
@@ -435,13 +509,14 @@ uint32_t exfat_resolve_parent(EXFAT_Instance* fs, const char* full_path, char* o
     return current_clus;
 }
 
-uint32_t exfat_find_in_dir(EXFAT_Instance* fs, uint32_t dir_cluster, const char* target_name) {
+uint32_t exfat_find_in_dir(EXFAT_Instance* fs, uint32_t dir_cluster, const char* target_name, bool* out_is_dir) {
     bool no_chain; uint64_t len;
     resolve_dir_extent(fs, dir_cluster, &no_chain, &len);
 
     ExfatSlot slot;
     if (!exfat_dir_scan(fs, dir_cluster, no_chain, len, target_name, &slot) || !slot.found) return 0xFFFFFFFF;
 
+    if (out_is_dir) *out_is_dir = slot.is_dir;
     if (slot.is_dir) cache_dir_extent(fs, slot.first_cluster, slot.no_fat_chain, slot.data_length);
     return slot.first_cluster;
 }
@@ -552,7 +627,7 @@ static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_
 
 bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read) {
     *bytes_read = 0;
-    char basename[64];
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, filename, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -572,8 +647,8 @@ bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer,
     return true;
 }
 
-bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer) {
-    char basename[64];
+bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied) {
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -583,12 +658,17 @@ bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer
     ExfatSlot slot;
     if (!exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) || !slot.found || slot.is_dir) return false;
 
-    if (slot.data_length == 0 || slot.first_cluster < 2) { out_buffer[0] = '\0'; return true; }
+    if (slot.data_length == 0 || slot.first_cluster < 2) {
+        out_buffer[0] = '\0';
+        if (out_copied) *out_copied = 0;
+        return true;
+    }
     uint32_t size = (uint32_t)slot.data_length;
     if (size > 4000) size = 4000;
 
     uint32_t copied = read_extent(fs, slot.first_cluster, slot.no_fat_chain, 0, out_buffer, size);
     out_buffer[copied] = '\0';
+    if (out_copied) *out_copied = copied;
     return true;
 }
 
@@ -602,7 +682,7 @@ bool exfat_cd(EXFAT_Instance* fs, const char* path) {
     }
 
     char normalized[256];
-    exfat_normalize_path(fs, path, normalized, sizeof(normalized));
+    if (!exfat_normalize_path(fs, path, normalized, sizeof(normalized))) return false; // issuse.txt №43
 
     uint32_t current_clus = fs->root_cluster;
     bool current_no_chain = false;
@@ -610,10 +690,10 @@ bool exfat_cd(EXFAT_Instance* fs, const char* path) {
 
     const char* p = normalized;
     while (*p == '/') p++;
-    char token[64];
+    char token[256]; // issuse.txt №42
     while (*p) {
         int i = 0;
-        while (*p && *p != '/' && i < 63) token[i++] = *p++;
+        while (*p && *p != '/' && i < 255) token[i++] = *p++;
         token[i] = '\0';
         while (*p == '/') p++;
 
@@ -767,8 +847,16 @@ static bool bitmap_set_bit(EXFAT_Instance* fs, uint32_t cluster, bool value) {
     return true;
 }
 
-static void bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t num_clusters) {
-    for (uint32_t i = 0; i < num_clusters; i++) bitmap_set_bit(fs, first_cluster + i, false);
+// issuse.txt №45: возвращает false, если хотя бы один bitmap_set_bit()
+// провалился (сбой чтения/записи сектора битмапа) — раньше возврат
+// bitmap_set_bit() полностью игнорировался, вызывающий не мог узнать,
+// что часть кластеров осталась помечена занятой навсегда.
+static bool bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t num_clusters) {
+    bool ok = true;
+    for (uint32_t i = 0; i < num_clusters; i++) {
+        if (!bitmap_set_bit(fs, first_cluster + i, false)) ok = false;
+    }
+    return ok;
 }
 
 // Ищет и резервирует пробег из num_clusters подряд идущих свободных
@@ -789,6 +877,12 @@ static uint32_t bitmap_alloc_run(EXFAT_Instance* fs, uint32_t num_clusters) {
 
     for (uint32_t c = 2; ; c++) {
         uint32_t bit_index = c - 2;
+        // issuse.txt №37: bitmap_size_bytes = ceil(cluster_count/8) — до 7
+        // паддинг-битов последнего байта не соответствуют реальным
+        // кластерам. count_free_clusters() уже эту границу учитывает,
+        // здесь её не было вообще — аллокатор мог выдать кластер за
+        // пределами реальной кучи.
+        if (bit_index >= fs->cluster_count) break;
         uint32_t byte_index = bit_index / 8;
         if (byte_index >= fs->bitmap_size_bytes) break;
 
@@ -896,31 +990,41 @@ bool exfat_free_space(EXFAT_Instance* fs, uint64_t* out_total_bytes, uint64_t* o
 // снимая и запись FAT, и бит в битмапе для каждого кластера. Собственные
 // (NoFatChain=1) экстенты освобождаются напрямую через bitmap_free_run —
 // в FAT они не участвуют вообще, трогать там нечего.
+// issuse.txt №45: возвращает false, если хотя бы один bitmap_set_bit()
+// в цепочке провалился — раньше результат bitmap_set_bit() тут вообще не
+// проверялся.
 static bool free_fat_chain(EXFAT_Instance* fs, uint32_t start_cluster) {
     if (fat_chain_has_cycle(fs, start_cluster)) return false;
     uint32_t cluster = start_cluster;
     int guard = 0;
+    bool ok = true;
     while (cluster >= 2 && guard++ < 65536) {
         uint32_t next = fat_get_entry(fs, cluster);
         fat_set_entry(fs, cluster, 0);
-        bitmap_set_bit(fs, cluster, false);
+        if (!bitmap_set_bit(fs, cluster, false)) ok = false;
         if (!exfat_cluster_has_next(next)) break;
         cluster = next;
     }
-    return true;
+    return ok;
 }
 
 // Освобождает данные существующей записи (файла или каталога) — общий шаг
 // для перезаписи/удаления/переименования поверх существующего имени.
-static void free_slot_data(EXFAT_Instance* fs, const ExfatSlot& slot) {
-    if (slot.first_cluster < 2) return;
+// issuse.txt №45: теперь возвращает bool (было void) — false означает,
+// что часть кластеров НЕ была реально освобождена на диске (сбой I/O),
+// то есть навсегда останется занятой/недоступной. Сама запись каталога
+// при этом уже удалена/переписана вызывающим ДО или ПОСЛЕ этого вызова
+// независимо от результата — здесь только учёт кластеров, откатывать
+// операцию уже поздно и незачем (см. вызывающих ниже).
+static bool free_slot_data(EXFAT_Instance* fs, const ExfatSlot& slot) {
+    if (slot.first_cluster < 2) return true;
     if (slot.no_fat_chain) {
         uint32_t bpc = EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
         uint32_t n = (uint32_t)((slot.data_length + bpc - 1) / bpc);
         if (n == 0) n = 1; // директории хранят размер СВОЕГО аллоцированного экстента, см. exfat_mkdir
-        bitmap_free_run(fs, slot.first_cluster, n);
+        return bitmap_free_run(fs, slot.first_cluster, n);
     } else {
-        free_fat_chain(fs, slot.first_cluster);
+        return free_fat_chain(fs, slot.first_cluster);
     }
 }
 
@@ -1110,7 +1214,7 @@ static bool exfat_mark_entry_deleted(DirCursor entry_cursor, int secondary_count
 // ============================================================================
 bool exfat_create_file(EXFAT_Instance* fs, const char* path, bool* out_existed) {
     if (out_existed) *out_existed = false;
-    char basename[64];
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -1127,7 +1231,7 @@ bool exfat_create_file(EXFAT_Instance* fs, const char* path, bool* out_existed) 
 }
 
 bool exfat_write_file(EXFAT_Instance* fs, const char* path, const char* text, uint32_t len) {
-    char basename[64];
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -1171,7 +1275,7 @@ bool exfat_write_file(EXFAT_Instance* fs, const char* path, const char* text, ui
 
 bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed) {
     if (out_existed) *out_existed = false;
-    char basename[64];
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -1225,7 +1329,7 @@ bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed) {
 }
 
 bool exfat_delete_file(EXFAT_Instance* fs, const char* path) {
-    char basename[64];
+    char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
 
@@ -1264,9 +1368,20 @@ bool exfat_rename_file(EXFAT_Instance* fs, const char* old_path, const char* new
     ExfatSlot existing;
     if (exfat_dir_scan(fs, new_parent, new_parent_no_chain, new_parent_len, new_basename, &existing) && existing.found) return false;
 
-    uint16_t attrs = slot.is_dir ? 0x10 : 0x20;
-    if (!exfat_write_entry_set(fs, new_parent, new_parent_no_chain, new_parent_len, new_basename, attrs, slot.first_cluster, slot.data_length, slot.no_fat_chain)) {
+    // issuse.txt №44: раньше сначала писали НОВУЮ запись, потом удаляли
+    // старую — если удаление старой проваливалось (например временный
+    // сбой записи), обе записи оставались живыми и указывали на ОДНУ и
+    // ту же цепочку кластеров: последующий rm любой из них освободил бы
+    // кластеры, на которые всё ещё ссылается уцелевшая запись (активное
+    // повреждение при следующем чтении/записи через неё). Меняем порядок:
+    // сначала удаляем старую запись, потом пишем новую — при сбое второго
+    // шага файл временно "теряется" (запись удалена, новая не создана),
+    // но это безопаснее дублирования/алиасинга — кластеры остаются
+    // консистентно принадлежащими ровно одной (уже несуществующей) записи,
+    // а не двум одновременно.
+    if (!exfat_mark_entry_deleted(slot.entry_start, slot.secondary_count)) {
         return false;
     }
-    return exfat_mark_entry_deleted(slot.entry_start, slot.secondary_count);
+    uint16_t attrs = slot.is_dir ? 0x10 : 0x20;
+    return exfat_write_entry_set(fs, new_parent, new_parent_no_chain, new_parent_len, new_basename, attrs, slot.first_cluster, slot.data_length, slot.no_fat_chain);
 }

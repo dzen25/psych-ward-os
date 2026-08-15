@@ -254,6 +254,7 @@ struct UsbBulkEndpoints {
     uint8_t bulk_out_max_burst = 0; // из SS Endpoint Companion Descriptor, 0 если не SuperSpeed
     uint8_t bulk_in_max_burst = 0;
     uint8_t config_value = 0;       // bConfigurationValue — нужен для SET_CONFIGURATION (Milestone 4)
+    uint8_t interface_num = 0;      // bInterfaceNumber Mass Storage интерфейса — нужен для BOT Reset (issuse.txt №14)
 };
 
 // Milestone 6 — найденная ёмкость устройства (см. step14_read_capacity).
@@ -1298,7 +1299,14 @@ constexpr uint8_t USB_DESC_TYPE_SS_HUB          = 0x2A; // Milestone B5 (доп.
 static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, uint8_t slot_id, uint32_t port_speed, bool is_hub = false) {
     if (LOG_USB) sys_puts(console_ep, "[USB] Шаг 9: GET_DESCRIPTOR(Configuration).\n");
     volatile uint8_t *buf = ctrlbuf_vaddr(idx);
-    constexpr uint32_t BUF_LEN = 512;
+    // issuse.txt №16: ctrlbuf_vaddr() выделяет ЦЕЛУЮ страницу (4096 байт,
+    // см. PLAT_XHCI_CTRL_BUF_VADDR/idx*4096) на устройство, но раньше
+    // читалось (и парсилось) только первые 512 — у составного/
+    // многоинтерфейсного устройства с полной цепочкой дескрипторов длиннее
+    // 512 байт интерфейсы/эндпоинты дальше этой границы никогда не
+    // разбирались. Память уже выделена и замаплена — используем всю
+    // страницу, без второго запроса.
+    constexpr uint32_t BUF_LEN = 4096;
     for (uint32_t i = 0; i < BUF_LEN; i++) buf[i] = 0;
 
     UsbBulkEndpoints &bulk_eps = g_usb_devices[idx].bulk_eps;
@@ -1347,6 +1355,7 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
             // bulk, поэтому для is_hub считаем интерфейс "целевым" всегда.
             in_target_interface = is_hub || (if_class == USB_CLASS_MASS_STORAGE && if_subclass == USB_SUBCLASS_SCSI
                                     && if_protocol == USB_PROTOCOL_BOT);
+            if (in_target_interface && !is_hub) bulk_eps.interface_num = if_num; // нужен для BOT Reset (issuse.txt №14)
             if (in_target_interface && !is_hub) {
                 if (LOG_USB) sys_puts(console_ep, "[USB]     Mass Storage / SCSI Transparent / Bulk-Only Transport — то, что нужно.\n");
             }
@@ -1461,6 +1470,19 @@ static void step_hub_enumerate(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
 // простаивала бы); фактический опрос данных с него — Milestone B4.
 static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
     UsbDeviceSlot &dev = g_usb_devices[idx];
+
+    // issuse.txt №18: hub_int_ep_addr==0 (дескриптор хаба не дал interrupt
+    // IN endpoint — нестандартный/необычный хаб) раньше молча проваливался
+    // в ТОТ ЖЕ путь (Configure Endpoint только с A0, без единого DCI),
+    // который сам комментарий выше документирует как ПОДТВЕРЖДЁННО битый
+    // (Slot State остаётся Addressed несмотря на успешный код завершения
+    // команды) — отказываем сразу, с понятной причиной, вместо повторения
+    // уже известного бага молча.
+    if (dev.hub_int_ep_addr == 0) {
+        sys_puts(console_ep, "[USB]   ОШИБКА (хаб): не найден interrupt IN endpoint статуса портов в дескрипторе — Configure Endpoint только со Slot'ом не переводит Slot State в Configured (см. issuse.txt №18), хаб не поддержан.\n");
+        return false;
+    }
+
     uint32_t portsc = *reg32(g_op_base, XHCI_OP_PORTSC_BASE + (uintptr_t)(dev.port - 1) * 0x10);
     uint32_t port_speed = (portsc >> 10) & 0xF;
 
@@ -2026,6 +2048,32 @@ constexpr uint32_t BOT_CBW_SIGNATURE = 0x43425355u; // "USBC"
 constexpr uint32_t BOT_CSW_SIGNATURE = 0x53425355u; // "USBS"
 static uint32_t g_cbw_tag = 1; // инкрементируется на каждую команду, сверяется с dCSWTag
 
+// issuse.txt №14 — Bulk-Only Mass Storage Reset (class-специфичный запрос,
+// bmRequestType=0x21 Host-to-Device|Class|Interface, bRequest=0xFF, без
+// данных, см. "USB Mass Storage Class — Bulk-Only Transport" spec, §3.1)
+// + Clear Feature(ENDPOINT_HALT) на обоих bulk-эндпоинтах (bmRequestType=
+// 0x02 Host-to-Device|Standard|Endpoint, bRequest=0x01, wValue=0
+// ENDPOINT_HALT, wIndex=адрес эндпоинта, см. USB 2.0 spec 9.4.1/Table 9-6).
+// По спеке BOT это единственный штатный способ ресинхронизировать
+// состояние устройства после CSW status=2 (Phase Error) — xHCI-уровневый
+// recover_bulk_endpoint() (см. выше) чинит только зависшее TRB-кольцо
+// контроллера, но не знает о протоколе BOT самого устройства. Best-effort:
+// вызывается уже на заведомо ошибочном пути (Phase Error), поэтому если
+// сам reset тоже не удастся — хуже не станет, просто честно логируем.
+static void bot_reset_recovery(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    sys_puts(console_ep, "[USB]   CSW Phase Error — выполняю Bulk-Only Mass Storage Reset.\n");
+    if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x21, 0xFF, 0, dev.bulk_eps.interface_num)) {
+        sys_puts(console_ep, "[USB]   ОШИБКА: Bulk-Only Mass Storage Reset не удался.\n");
+    }
+    if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x02, 0x01, 0, dev.bulk_eps.bulk_out_addr)) {
+        sys_puts(console_ep, "[USB]   ОШИБКА: Clear Feature(HALT) на bulk OUT не удался.\n");
+    }
+    if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x02, 0x01, 0, dev.bulk_eps.bulk_in_addr)) {
+        sys_puts(console_ep, "[USB]   ОШИБКА: Clear Feature(HALT) на bulk IN не удался.\n");
+    }
+}
+
 // Milestone 5 — один SCSI-обмен через Bulk-Only Transport: CBW (31 байт,
 // bulk OUT) -> опциональная Data-стадия (bulk IN/OUT, направление данных,
 // НЕ CBW/CSW — у тех направление фиксировано спекой BOT) -> CSW (13 байт,
@@ -2080,8 +2128,22 @@ static bool scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const u
         return false;
     }
     if (csw_tag != tag) {
-        sys_puts(console_ep, "[USB]   ПРЕДУПРЕЖДЕНИЕ: CSW tag не совпадает с CBW (устройство перепутало ответы?).\n");
+        // issuse.txt №13: раньше это было только предупреждением — csw_status
+        // из ЧУЖОГО (несовпадающего tag) CSW всё равно применялся к текущей
+        // команде. Несовпадение tag означает, что этому CSW вообще нельзя
+        // доверять (например хвостовой CSW предыдущей команды после
+        // таймаута/восстановления bulk-эндпоинта) — честная ошибка
+        // транспорта, а не просто диагностика.
+        sys_puts(console_ep, "[USB]   ОШИБКА: CSW tag не совпадает с CBW (устройство перепутало ответы?).\n");
+        return false;
     }
+    // issuse.txt №14 — csw_status=2 (Phase Error) требует по спеке BOT
+    // полного reset-восстановления, иначе состояние устройства остаётся
+    // рассинхронизированным для ВСЕХ последующих команд, не только этой.
+    // Транспорт этого вызова формально успешен (CSW честно получен) —
+    // csw_status=2 возвращается вызывающему как есть (уже трактуется им
+    // как ошибка), reset — побочный эффект для БУДУЩИХ команд.
+    if (csw_status == 2) bot_reset_recovery(console_ep, idx, slot_id);
     return true;
 }
 
@@ -2240,6 +2302,10 @@ static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t coun
         return false;
     }
     if (csw_status != 0) return false;
+    // issuse.txt №11: short packet (actual < запрошенного) означало бы, что
+    // хвост bounce-буфера — не свежие данные с устройства, а мусор
+    // предыдущего вызова; раньше это молча копировалось наружу.
+    if (actual != count * 512u) return false;
     my_memcpy(buffer, (const void*)bounce_vaddr(idx), (int)(count * 512u));
     return true;
 }
@@ -2268,7 +2334,10 @@ static bool hardware_usb_rw_generic_write(int idx, uint32_t sector, uint32_t cou
                        count * 512u, actual, csw_status)) {
         return false;
     }
-    return csw_status == 0;
+    // issuse.txt №11: симметрично чтению — если устройство приняло меньше
+    // байт, чем запрошено, это не полноценная успешная запись, даже если
+    // CSW status формально 0.
+    return csw_status == 0 && actual == count * 512u;
 }
 
 // exfat.h фиксирует сигнатуру block_read_fn/block_write_fn без параметра
@@ -2492,7 +2561,13 @@ static int first_mounted_device_idx() {
 static int resolve_device_by_path(char *path) {
     if (path[0] != '/') return -1;
     int end = 1;
-    while (path[end] != '\0' && path[end] != '/') end++;
+    // issuse.txt №17: раньше без верхней границы — если SHM-страница
+    // заполнена край в край без нулевого байта (баг/неисправный клиент),
+    // сканирование уходило за пределы замапленной страницы в
+    // немаппированную память. 512 — с большим запасом относительно
+    // реальных путей (том + подпуть), хорошо укладывается в любую
+    // реальную SHM-страницу этого проекта.
+    while (path[end] != '\0' && path[end] != '/' && end < 511) end++;
     int name_len = end - 1;
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
         if (!g_usb_devices[i].storage_mounted) continue;
@@ -2744,6 +2819,18 @@ static void unmount_usb_storage(seL4_CPtr console_ep, int idx) {
     dev.in_use = false;
     dev.hub_num_ports = 0;
     dev.hub_pwr_on_to_pwr_good = 0;
+    // issuse.txt №12: раньше топология хаба НЕ сбрасывалась — если этот
+    // слот раньше был устройством ЗА хабом (behind_hub=true), а потом
+    // переиспользовался под НОВОЕ устройство в корневом порту,
+    // step7_address_device()/step10_configure_endpoints() строили Route
+    // String и multi-TT флаги из этих устаревших полей, ломая Address
+    // Device для устройства, которое вообще не за хабом.
+    dev.behind_hub = false;
+    dev.parent_hub_idx = -1;
+    dev.parent_hub_slot_id = 0;
+    dev.parent_port_number = 0;
+    dev.parent_multi_tt = false;
+    dev.parent_tt_think_time = 0;
     dev.volume_name[0]='u'; dev.volume_name[1]='s'; dev.volume_name[2]='b'; dev.volume_name[3]=(char)('0'+idx); dev.volume_name[4]='\0';
 }
 
@@ -2781,6 +2868,11 @@ static void handle_port_status_change(seL4_CPtr console_ep, uint8_t port) {
 // run_bring_up() (см. poll_ports_for_hotplug() ниже, вызывается из
 // главного цикла на каждый heartbeat-тик) — кэшируем один раз здесь.
 static uint32_t g_max_ports = 0;
+
+// План "Сигналы драйверам" — SYS_DRIVER_SIGNAL(STOP) гейтит VFS-командную
+// цепочку (cmd 110-120) в главном цикле ниже; хот-плаг/heartbeat-обработка
+// продолжает идти как обычно (симметрично net_driver.cpp).
+static bool g_usb_stopped = false;
 
 // Фаза 15 (Milestone A2) — раньше останавливался на ПЕРВОМ успехе (одно
 // устройство архитектурно); теперь честно обходит ВСЕ CCS=1 порты, чтобы
@@ -2911,6 +3003,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     g_console_ep = console_ep; // Milestone 7 — hardware_usb_read/write берут его отсюда (сигнатура block_read_fn фиксирована)
     seL4_CPtr usb_cmd_ep = ipc->msg[BOOT_USB_EP];
+    seL4_CPtr liveness_ntfn = ipc->msg[BOOT_USB_LIVENESS_NTFN_CAP]; // Фаза 3b плана "Сигналы драйверам", см. main.cpp
     g_cntfrq = read_cntfrq();
 
     g_dcbaa_paddr          = ipc->msg[BOOT_USB_DCBAA_PADDR];
@@ -3027,6 +3120,9 @@ int main(int argc, char *argv[]) {
         seL4_MessageInfo_t info = seL4_Recv(usb_cmd_ep, &badge);
 
         if (badge & USB_EVENT_HEARTBEAT) {
+            // Фаза 3b плана "Сигналы драйверам" — "я жив", БЕЗУСЛОВНО (даже
+            // если g_usb_stopped — см. тот же принцип в blk_driver.cpp).
+            if (liveness_ntfn != 0) seL4_Signal(liveness_ntfn);
             if (++heartbeat_tick_count >= USB_HOTPLUG_POLL_EVERY_N_TICKS) {
                 heartbeat_tick_count = 0;
                 poll_ports_for_hotplug(console_ep);
@@ -3064,6 +3160,68 @@ int main(int argc, char *argv[]) {
             }
             update_erdp();
             seL4_IRQHandler_Ack(ipc->msg[BOOT_IRQ_EP]);
+            continue;
+        }
+
+        // План "Сигналы драйверам" — проверяется БЕЗУСЛОВНО, до какого-либо
+        // g_usb_stopped гейта ниже: сигнал обязан доходить, даже если
+        // драйвер уже остановлен (иначе STOP необратим без full respawn).
+        if (seL4_MessageInfo_get_length(info) >= 1 && seL4_GetMR(0) == SYS_DRIVER_SIGNAL) {
+            seL4_Word sig = seL4_GetMR(1);
+            if (sig == DRIVER_SIGNAL_STOP) {
+                g_usb_stopped = true;
+            } else if (sig == DRIVER_SIGNAL_START) {
+                g_usb_stopped = false;
+            } else if (sig == DRIVER_SIGNAL_RESTART) {
+                // Найдено на живом железе (первая hw-проверка Фазы 2):
+                // гипотеза "xhci_controller_init()+enumerate идемпотентны"
+                // была НЕВЕРНА — g_usb_devices[]-слоты, оставшиеся
+                // in_use/storage_mounted от ДО-restart сессии, не
+                // освобождались. HCRST внутри run_bring_up() убивает ВСЕ
+                // xHCI Slot ID на контроллере, но find_free_device_slot()
+                // всё равно считал старый слот занятым и монтировал то же
+                // физическое устройство в ДРУГОЙ слот с НОВЫМ slot_id —
+                // resolve_device_by_path() по имени тома находил ПЕРВЫЙ
+                // (старый, с невалидным после HCRST slot_id) слот, и
+                // bulk_transfer() дальше слал доорбелл несуществующему
+                // слоту — timeout, а последующее Reset Endpoint/Set TR
+                // Dequeue Pointer падали с Context State Error (0x13),
+                // потому что сам Slot Context был Disabled. Фикс: тем же
+                // путём, что и hot-unplug (unmount_usb_storage(), уже
+                // hw-проверенная функция) освобождаем ВСЕ занятые слоты
+                // ДО run_bring_up() — накопители И хабы (in_use покрывает
+                // оба, см. её же комментарий), пока контроллер ещё в
+                // ДО-restart состоянии и Disable Slot имеет шанс дойти
+                // штатно (после HCRST это уже не нужно — слоты и так мертвы).
+                for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                    if (g_usb_devices[i].in_use) unmount_usb_storage(console_ep, i);
+                }
+                int found_count = run_bring_up(console_ep);
+                if (LOG_USB) sys_puthex32(console_ep, "[USB] Bring-up (signal RESTART) завершён: перечислено устройств = ", (uint32_t)found_count);
+                g_usb_stopped = false;
+            }
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+        if (g_usb_stopped && seL4_MessageInfo_get_length(info) >= 1 &&
+            (seL4_GetMR(0) == 110 || seL4_GetMR(0) == 112 || seL4_GetMR(0) == 113 ||
+             seL4_GetMR(0) == 114 || seL4_GetMR(0) == 116 || seL4_GetMR(0) == 117 ||
+             seL4_GetMR(0) == 118 || seL4_GetMR(0) == 119 || seL4_GetMR(0) == 120)) {
+            // Остановлен сигналом STOP — гейтим ТОЛЬКО VFS-командную
+            // цепочку (110-120), как в плане; USB_CMD_LIST/LIST_VOLUMES/
+            // GET_ALL_SPACE (1/3/4) — безобидный readonly-опрос статуса
+            // g_usb_devices[], не трогает железо, отвечаем как обычно.
+            // cmd==119 (SYS_READ_FILE) отдельно — у него wire-формат
+            // ответа 2 слова (status, bytes_read), как в ветке
+            // dispatch_idx<0 ниже.
+            if (seL4_GetMR(0) == 119) {
+                seL4_SetMR(0, (seL4_Word)-1); seL4_SetMR(1, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            } else {
+                seL4_SetMR(0, (seL4_Word)-1);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            }
             continue;
         }
 
@@ -3199,7 +3357,7 @@ int main(int argc, char *argv[]) {
         EXFAT_Instance &fs = g_usb_devices[dispatch_idx >= 0 ? dispatch_idx : 0].fs;
 
         if (cmd == 110) { // SYS_LS
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
 
             uint32_t dir_cluster;
@@ -3207,7 +3365,7 @@ int main(int argc, char *argv[]) {
                 dir_cluster = fs.current_dir_cluster;
                 if (dir_cluster == 0) dir_cluster = fs.root_cluster;
             } else {
-                char basename[64];
+                char basename[256]; // issuse.txt №42
                 uint32_t parent_clus = exfat_resolve_parent(&fs, path, basename);
                 if (parent_clus == 0xFFFFFFFF) {
                     my_strcpy(g_shm_vaddr, "ls: path not found\n");
@@ -3218,7 +3376,16 @@ int main(int argc, char *argv[]) {
                 if (basename[0] == '\0') {
                     dir_cluster = parent_clus;
                 } else {
-                    dir_cluster = exfat_find_in_dir(&fs, parent_clus, basename);
+                    bool is_dir = false;
+                    dir_cluster = exfat_find_in_dir(&fs, parent_clus, basename, &is_dir);
+                    // issuse.txt №36: раньше ls на обычном файле обходил его
+                    // содержимое как таблицу каталога вместо явной ошибки.
+                    if (dir_cluster != 0xFFFFFFFF && !is_dir) {
+                        my_strcpy(g_shm_vaddr, "ls: not a directory\n");
+                        seL4_SetMR(0, 0);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        continue;
+                    }
                 }
             }
 
@@ -3238,7 +3405,7 @@ int main(int argc, char *argv[]) {
             uint32_t offset = seL4_GetMR(1);
             uint32_t bytes_read = 0;
 
-            char filename[64];
+            char filename[256]; // issuse.txt №42
             my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
 
             bool success = exfat_read_file(&fs, filename, g_shm_vaddr, offset, &bytes_read);
@@ -3253,7 +3420,7 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         }
         else if (cmd == 112) { // SYS_TOUCH
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             bool existed = false;
             if (exfat_create_file(&fs, path, &existed)) seL4_SetMR(0, existed ? 1 : 0);
@@ -3261,7 +3428,7 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 113) { // SYS_WRITE_FILE (echo > file) — RPI4_USB_ALLOW_WRITE=false, см. hardware_usb_write()
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             uint32_t len = seL4_GetMR(1);
             if (len > 4096) len = 4096;
@@ -3275,22 +3442,28 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
 
-            if (exfat_read_text_file(&fs, path, g_shm_vaddr)) seL4_SetMR(0, 0);
-            else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            uint32_t copied = 0;
+            if (exfat_read_text_file(&fs, path, g_shm_vaddr, &copied)) {
+                seL4_SetMR(0, 0);
+                seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            } else {
+                seL4_SetMR(0, (seL4_Word)-1);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            }
         }
         else if (cmd == 120) { // SYS_RM
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_delete_file(&fs, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 116) { // SYS_RENAME (mv)
-            char old_p[32], new_p[32];
+            char old_p[256], new_p[256]; // issuse.txt №35/№42: было 32, обрезало длинные имена
             my_strlcpy(old_p, g_shm_vaddr, sizeof(old_p));
             my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p));
             if (exfat_rename_file(&fs, old_p, new_p)) seL4_SetMR(0, 0);
@@ -3298,7 +3471,7 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 117) { // SYS_MKDIR
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             bool existed = false;
             if (exfat_mkdir(&fs, path, &existed)) seL4_SetMR(0, 0);
@@ -3306,7 +3479,7 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 118) { // SYS_CD
-            char path[64];
+            char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_cd(&fs, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);

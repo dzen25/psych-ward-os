@@ -3,23 +3,57 @@
 #include "h/platform.h"
 #include <stdint.h>
 
-// ИСПРАВЛЕНО: Переменные для очереди вывода вынесены в глобальную область видимости файла.
-// Общий буфер для асинхронной отправки в железо
-#define TX_BUFFER_SIZE 4096
-static char tx_buffer[TX_BUFFER_SIZE];
-static volatile int tx_head = 0;
-static volatile int tx_tail = 0;
+// issuse.txt №29: раньше здесь был мёртвый код — tx_buffer/flush_buffer()
+// (асинхронная очередь на отправку в железо) и line_buffers/
+// line_buffer_pos (буфер строки на клиента), задуманные для отложенного
+// SYS_FLUSH. Ни в line_buffers, ни в tx_buffer НИКТО ничего не писал —
+// SYS_PUTS всегда шёл напрямую в железо через uart_putc_wrapped()
+// (busy-wait на TX_EMPTY, см. ниже), так что к моменту ответа на
+// SYS_PUTS данные УЖЕ на проводе — "флашить" в буфере просто нечего.
+// SYS_FLUSH оставлен ниже как честный no-op (мгновенный ответ) —
+// shell.cpp его по-прежнему зовёт, менять клиентский код не нужно.
+#define MAX_CLIENTS 256 // верхняя граница валидного PID (см. проверку sender_pid ниже) — не связано с удалённым line_buffers
 
-// ИДЕАЛЬНОЕ РЕШЕНИЕ: Буферы для каждой строки от каждого процесса (мультиплексирование)
-#define MAX_CLIENTS 256
-#define LINE_BUFFER_SIZE 256
-static char line_buffers[MAX_CLIENTS][LINE_BUFFER_SIZE];
-static int line_buffer_pos[MAX_CLIENTS] = {0};
-
-// Глобальные указатели на регистры для функции flush_buffer (mini-UART, см. platform.h)
+// Глобальные указатели на регистры (mini-UART, см. platform.h)
 static volatile seL4_Uint32 *uart_io = nullptr;
 static volatile seL4_Uint32 *uart_lsr = nullptr;
 static char* shm_vaddr = nullptr;
+
+// Фаза 5 плана "Сигналы драйверам" (опционально, последняя фаза) —
+// SYS_DRIVER_SIGNAL(STOP) гейтит SYS_PUTS (молча "проглатывает" — не
+// пишет в железо, но ВСЕГДА отвечает, чтобы не повесить вызывающего,
+// см. тот же принцип у blk_driver.cpp) и SYS_READ (немедленный -1 вместо
+// отложенного reply — не оставляем читателя висеть, пока STOP активен).
+// RESTART — заглушка (см. main() ниже): uart_io/uart_lsr/IRQ уже
+// настроены один раз при спавне, переинициализировать нечего.
+static bool g_uart_stopped = false;
+
+// issuse.txt №30 — раньше kbd_buffer/head/tail были локальными в main(),
+// недоступными из uart_putc() ниже. Подняты до file-scope, чтобы
+// uart_putc() могла вычитывать RX ПРЯМО ВНУТРИ своего busy-wait на
+// TX_EMPTY (см. uart_drain_rx() и её вызовы в uart_putc()) — иначе байты,
+// пришедшие ПОКА мы ждём отправки эха предыдущего символа, копятся в
+// крошечном АППАРАТНОМ RX FIFO мини-UART и теряются НЕОБРАТИМО ещё до
+// того, как мы вообще вернёмся в seL4_Recv() и увидим IRQ-нотификацию —
+// софтовый 128-слотовый kbd_buffer тут бессилен, физический байт уже
+// затёрт на уровне контроллера. Живое подтверждение: `touch` с длинным
+// (51 символ) именем создал файл с именем короче на 10 символов — без
+// какого-либо конкурентного большого вывода в этот момент, просто эхо
+// быстро вставленной длинной строки уже создавало нужное окно.
+static char g_kbd_buffer[128];
+static int g_kbd_head = 0, g_kbd_tail = 0;
+
+// Общий с IRQ-веткой в main() код вычитывания FIFO — вызывается И оттуда
+// (после реальной IRQ-нотификации), И из uart_putc() (см. выше). Дважды
+// вызвать подряд без новых байт безопасно — while сам ничего не найдёт.
+static void uart_drain_rx() {
+    while ((*uart_lsr) & AUX_MU_LSR_RX_READY) {
+        char c = *uart_io;
+        int next_head = (g_kbd_head + 1) % 128;
+        if (next_head == g_kbd_tail) break; // буфер полон — честно отбрасываем, не рассинхронизируем head/tail
+        g_kbd_buffer[g_kbd_head] = c; g_kbd_head = next_head;
+    }
+}
 
 static inline seL4_IPCBuffer* get_local_ipc() {
     seL4_Word tls_addr;
@@ -32,10 +66,10 @@ void __assert_fail(const char *assertion, const char *file, int line, const char
 
 static void uart_putc(char c) {
     if (c == '\n') {
-        while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY));
+        while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY)) uart_drain_rx();
         *uart_io = '\r';
     }
-    while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY));
+    while (!((*uart_lsr) & AUX_MU_LSR_TX_EMPTY)) uart_drain_rx();
     *uart_io = c;
 }
 
@@ -118,17 +152,6 @@ static void uart_putc_wrapped(char ch) {
     if (!is_continuation) g_word_cols++;
 }
 
-static void flush_buffer() {
-    // Записываем столько, сколько влезает в FIFO прямо сейчас.
-    // Эта операция неблокирующая: если FIFO полон, цикл немедленно
-    // завершится, и драйвер вернется к ожиданию новых событий.
-    // Остаток данных будет отправлен на следующей итерации.
-    while (tx_tail != tx_head && ((*uart_lsr) & AUX_MU_LSR_TX_EMPTY)) {
-        *uart_io = tx_buffer[tx_tail];
-        tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
-    }
-}
-
 int main(int argc, char *argv[]) {
     // 2. Достаем настоящий адрес буфера
     seL4_IPCBuffer *ipc = get_local_ipc();
@@ -154,7 +177,12 @@ int main(int argc, char *argv[]) {
 
     uart_io  = (volatile seL4_Uint32*)(PLAT_UART_VADDR + AUX_MU_IO_OFFSET);
     uart_lsr = (volatile seL4_Uint32*)(PLAT_UART_VADDR + AUX_MU_LSR_OFFSET);
-    char kbd_buffer[128]; int head = 0, tail = 0;
+    // issuse.txt №30 — kbd_buffer/head/tail теперь file-scope globals
+    // (g_kbd_buffer/g_kbd_head/g_kbd_tail, см. их объявление выше) —
+    // не передекларируем здесь, просто используем те же имена локально
+    // через ссылки для минимального диффа в остальном коде функции.
+    char (&kbd_buffer)[128] = g_kbd_buffer;
+    int &head = g_kbd_head, &tail = g_kbd_tail;
 
     seL4_SetMR(0, SYS_DRIVER_READY);
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
@@ -181,18 +209,11 @@ int main(int argc, char *argv[]) {
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
 
         if (badge == UART_KBD_IRQ_BADGE) {
-            // Прерывание от клавиатуры
-            while ((*uart_lsr) & AUX_MU_LSR_RX_READY) {
-                char c = *uart_io;
-                int next_head = (head + 1) % 128;
-                if (next_head == tail) {
-                    // Буфер полон — читатель не успевает вычитывать. Отбрасываем
-                    // символ вместо того, чтобы затирать непрочитанные данные и
-                    // рассинхронизировать head/tail.
-                    break;
-                }
-                kbd_buffer[head] = c; head = next_head;
-            }
+            // Прерывание от клавиатуры — общий с uart_putc() drain (см.
+            // issuse.txt №30 у объявления uart_drain_rx() выше). Обычно
+            // здесь уже нечего вычитывать (uart_putc() успела всё забрать
+            // по дороге) — цикл внутри просто сразу ничего не найдёт.
+            uart_drain_rx();
             seL4_IRQHandler_Ack(irq_ep);
 
             if (pending_reader && head != tail) {
@@ -216,6 +237,30 @@ int main(int argc, char *argv[]) {
             // Сообщение IPC от клиента. Badge - это PID отправителя.
             seL4_Word sender_pid = badge;
             seL4_Word sys = seL4_GetMR(0);
+
+            // Фаза 5 плана "Сигналы драйверам" — проверяется БЕЗУСЛОВНО,
+            // ДО проверки валидности sender_pid ниже (root форвардит через
+            // свою badge=0 копию console_ep — та же ситуация, что уже
+            // описана у SYS_BENCHMARK_*/SYS_CANCEL_PENDING_FOR_PID ниже, и
+            // ДО stopped-гейта в самих ветках — сигнал обязан доходить,
+            // даже если уже остановлен).
+            if (sys == SYS_DRIVER_SIGNAL) {
+                seL4_Word sig = seL4_GetMR(1);
+                if (sig == DRIVER_SIGNAL_STOP) {
+                    g_uart_stopped = true;
+                } else if (sig == DRIVER_SIGNAL_START) {
+                    g_uart_stopped = false;
+                } else if (sig == DRIVER_SIGNAL_RESTART) {
+                    // Заглушка (см. план) — uart_io/uart_lsr/IRQ-нотификация
+                    // настроены один раз при спавне и не деградируют со
+                    // временем, переинициализировать нечего; RESTART для
+                    // uart_driver эквивалентен START.
+                    g_uart_stopped = false;
+                }
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                continue;
+            }
 
             // SYS_BENCHMARK_RESET_LOCAL/FINALIZE_LOCAL — единственные команды,
             // которые шлёт САМ root (см. collect_load_snapshot() в main.cpp)
@@ -242,7 +287,16 @@ int main(int argc, char *argv[]) {
 
             if (sys == 8) { // SYS_PUTS
                 int len = seL4_MessageInfo_get_length(info) - 1;
-                
+
+                // Фаза 5 — остановлен сигналом STOP: молча не пишем в
+                // железо, но ВСЕГДА отвечаем (см. sys_write() — вызывающий
+                // не проверяет статус, только ждёт сам факт ответа; без
+                // Reply здесь он завис бы навсегда).
+                if (g_uart_stopped) {
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                    continue;
+                }
+
                 if (len > 0) {
                     // НОВЫЙ UNIX-WAY: Строка пришла в регистрах (от sys_write)
                     for (int i = 0; i < len; i++) {
@@ -272,16 +326,17 @@ int main(int argc, char *argv[]) {
                 uart_flush_word();
 
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
-            } else if (sys == 9) { // SYS_FLUSH 
-                for (int i = 0; i < line_buffer_pos[sender_pid]; i++) {
-                    int next_head = (tx_head + 1) % TX_BUFFER_SIZE;
-                    if (next_head == tx_tail) break; 
-                    tx_buffer[tx_head] = line_buffers[sender_pid][i];
-                    tx_head = next_head;
-                }
-                line_buffer_pos[sender_pid] = 0;
+            } else if (sys == 9) { // SYS_FLUSH — issuse.txt №29: честный no-op, см. комментарий в начале файла
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             } else if (sys == 6) { // SYS_READ
+                // Фаза 5 — остановлен: честное "нет данных" немедленно,
+                // вместо откладывания reply на неопределённый срок (тот же
+                // принцип, что у SYS_PUTS выше — не вешаем вызывающего).
+                if (g_uart_stopped) {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    continue;
+                }
                 if (head != tail) {
                     seL4_SetMR(0, kbd_buffer[tail]); tail = (tail + 1) % 128;
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -326,8 +381,6 @@ int main(int argc, char *argv[]) {
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             }
         }
-
-        flush_buffer();
     }
 
     return 0;

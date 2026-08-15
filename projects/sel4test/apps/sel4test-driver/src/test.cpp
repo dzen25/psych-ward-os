@@ -46,7 +46,12 @@ static void sys_exit(seL4_CPtr root_ep) {
 static seL4_Word sys_proxy_write_file(seL4_CPtr root_ep, const char* path, const char* data, uint32_t data_len) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     uint32_t path_len = 0; while (path[path_len] && path_len < 63) path_len++;
-    if (data_len > 100) data_len = 100;
+    // issuse.txt №60: msg[] вмещает ровно 120 слов (seL4_MsgMaxLength), а
+    // msg[0..2] уже заняты опкодом/path_len/data_len — 3+path_len+data_len
+    // не должно уходить дальше msg[119], иначе запись (и следом сама длина
+    // сообщения) уезжает в соседние поля seL4_IPCBuffer за msg[].
+    uint32_t max_data_len = (117 > path_len) ? (117 - path_len) : 0;
+    if (data_len > max_data_len) data_len = max_data_len;
 
     ipc->msg[0] = 136; // SYS_PROXY_WRITE_FILE
     ipc->msg[1] = path_len;

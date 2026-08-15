@@ -12,29 +12,38 @@ int main(int argc, char *argv[]) {
     }
     char* p = env.arg;
 
-    char old_name[32];
-    int i = 0;
-    while (*p != ' ' && *p != '\0' && i < 31) {
-        old_name[i++] = *p++;
+    // issuse.txt №50/№53: next_token() (h/sys_client.h) вместо ручного
+    // посимвольного разбора — понимает "имя в кавычках" как один
+    // аргумент. issuse.txt №53: локальные копии на 128 байт (весь env.arg
+    // целиком ограничен ~63 байтами на уровне boot-IPC, см. common.h/
+    // main.cpp spawn_process — с большим запасом, без практической
+    // обрезки). issuse.txt №48: третий токен — явная ошибка "too many
+    // arguments", а не молчаливое отбрасывание.
+    char* old_tok = next_token(&p);
+    if (!old_tok) {
+        sys_puts(0, "mv: missing file operand\n");
+        sys_exit(env.root_ep);
+        return 1;
     }
-    old_name[i] = '\0';
+    char old_name[128];
+    my_strlcpy(old_name, old_tok, sizeof(old_name));
 
-    while (*p == ' ') p++;
-
-    if (*p == '\0') {
+    char* new_tok = next_token(&p);
+    if (!new_tok) {
         sys_puts(0, "mv: missing destination file operand after '");
         sys_puts(0, old_name);
         sys_puts(0, "'\n");
         sys_exit(env.root_ep);
         return 1;
     }
+    char new_name[128];
+    my_strlcpy(new_name, new_tok, sizeof(new_name));
 
-    char new_name[32];
-    i = 0;
-    while (*p != ' ' && *p != '\0' && i < 31) {
-        new_name[i++] = *p++;
+    if (next_token(&p) != nullptr) {
+        sys_puts(0, "mv: too many arguments\n");
+        sys_exit(env.root_ep);
+        return 1;
     }
-    new_name[i] = '\0';
 
     char *shm = env.shm;
     build_absolute_path(shm, old_name, 128);

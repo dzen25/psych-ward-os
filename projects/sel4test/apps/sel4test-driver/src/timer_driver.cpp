@@ -154,6 +154,22 @@ static uint32_t g_cpufreq_min_hz    = 0;
 static uint32_t g_cpufreq_max_hz    = 0;
 static bool     g_cpufreq_is_low    = false; // текущее состояние губернатора (гистерезис, см. SYS_CPUFREQ_GOVERNOR_TICK)
 
+// Фаза 5 плана "Сигналы драйверам" (опционально, последняя фаза,
+// проведена только "для единообразия" — см. план). timer_driver —
+// ЕДИНСТВЕННЫЙ источник SYS_SLEEP_MS/heartbeat для ВСЕЙ системы,
+// включая heartbeat-watchdog Фазы 3b (blk/net/wifi/usb теряют СВОЙ
+// собственный тик, если timer_driver стоит) — STOP здесь реально
+// опасен, НЕ ищем случая его применять. Гейтит: (1) НОВЫЕ SYS_SLEEP_MS
+// (немедленный отказ вместо регистрации), (2) периодическую сигнализацию
+// heartbeat'а net/wifi/blk/usb (включая новый liveness-тик blk_driver'а,
+// Фаза 3b) — уже ЗАРЕГИСТРИРОВАННЫЕ pending-sleep'ы, SYS_GET_TIME/
+// SYS_GET_UPTIME/SYS_GET_TEMP/SYS_MBOX_PROBE/SYS_SET_TIME_OFFSET и
+// подписка (SYS_TIMER_HEARTBEAT_SUBSCRIBE) продолжают работать как
+// обычно — иначе STOP сломал бы и мой же Фазы-3b watchdog-скан (он сам
+// зовёт SYS_GET_UPTIME) заодно с `date`/`uptime`/`temp` в шелле, что уже
+// перебор для функции, которую и так не рекомендуется использовать.
+static bool g_timer_stopped = false;
+
 static inline uint32_t mbox_reg_read(uintptr_t off) { return *(volatile uint32_t*)(PLAT_MBOX_VADDR + off); }
 static inline void mbox_reg_write(uintptr_t off, uint32_t val) { *(volatile uint32_t*)(PLAT_MBOX_VADDR + off) = val; }
 
@@ -401,6 +417,13 @@ int main(int argc, char *argv[]) {
     // отключение флешки на каждом heartbeat-тике (Port Status Change Event
     // на живом железе себя не показал надёжно, см. ROADMAP.md).
     seL4_CPtr usb_heartbeat_ntfn = ipc->msg[BOOT_USB_HEARTBEAT_NTFN_CAP];
+    // Фаза 3b плана "Сигналы драйверам" — пятая badged-капа, но на
+    // ПОЛНОСТЬЮ ОТДЕЛЬНОМ объекте (не badged-копия blk_heartbeat_ntfn
+    // выше — тот делит объект с общей линией EMMC2/Wi-Fi SDIO, см.
+    // common.h/BLK_LIVENESS_TICK_BADGE). Единственная цель — разбудить
+    // blk_driver's главный диспетчер-цикл (TCB-bind, см. main.cpp), чтобы
+    // тот мог сам сигналить root'у "я жив" (heartbeat-watchdog).
+    seL4_CPtr blk_liveness_tick_ntfn = ipc->msg[BOOT_BLK_LIVENESS_TICK_NTFN_CAP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -509,11 +532,17 @@ int main(int argc, char *argv[]) {
                     pending_sleeps[i].active = false;
                 }
             }
-            if (heartbeat_enabled && now >= next_heartbeat_deadline) {
+            // Фаза 5 — остановлен: не сигналим НИКОМУ (net/wifi/blk/usb
+            // heartbeat, включая liveness-тик Фазы 3b), но deadline
+            // намеренно НЕ трогаем — на первом же тике после START условие
+            // "now >= next_heartbeat_deadline" всё ещё истинно, будильник
+            // догонит ровно один раз, без шторма пропущенных сигналов.
+            if (heartbeat_enabled && !g_timer_stopped && now >= next_heartbeat_deadline) {
                 seL4_Signal(heartbeat_ntfn);
                 if (wifi_heartbeat_ntfn != 0) seL4_Signal(wifi_heartbeat_ntfn);
                 if (blk_heartbeat_ntfn != 0) seL4_Signal(blk_heartbeat_ntfn);
                 if (usb_heartbeat_ntfn != 0) seL4_Signal(usb_heartbeat_ntfn);
+                if (blk_liveness_tick_ntfn != 0) seL4_Signal(blk_liveness_tick_ntfn); // Фаза 3b
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
             rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
@@ -524,6 +553,32 @@ int main(int argc, char *argv[]) {
 
         // Обработка запросов от процессов (SYS_GET_TIME / SYS_GET_UPTIME)
         seL4_Word sys = seL4_GetMR(0);
+
+        // Фаза 5 плана "Сигналы драйверам" — проверяется БЕЗУСЛОВНО, ДО
+        // stopped-гейта ниже (сигнал обязан доходить в любом случае). STOP
+        // печатает явное предупреждение прямо здесь — самое надёжное
+        // место поймать вызывающего, у которого действительно вот-вот
+        // встанет вся система, зависящая от времени.
+        if (sys == SYS_DRIVER_SIGNAL) {
+            seL4_Word sig = seL4_GetMR(1);
+            if (sig == DRIVER_SIGNAL_STOP) {
+                g_timer_stopped = true;
+                sys_puts(console_ep, "[TIMER] ВНИМАНИЕ: STOP получен — новые SYS_SLEEP_MS и heartbeat "
+                                      "(DHCP/ARP/ping-таймауты, watchdog Фазы 3b и т.д. у ДРУГИХ драйверов) "
+                                      "остановлены. Используйте 'driver timer_driver start' как можно скорее.\n");
+            } else if (sig == DRIVER_SIGNAL_START) {
+                g_timer_stopped = false;
+            } else if (sig == DRIVER_SIGNAL_RESTART) {
+                // Заглушка (см. план) — физический таймер/IRQ настроены
+                // один раз при спавне, переинициализировать нечего;
+                // RESTART для timer_driver эквивалентен START.
+                g_timer_stopped = false;
+            }
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+
         if (sys == 3) { // SYS_GET_TIME: мс "с эпохи" (аптайм + NTP-коррекция)
             seL4_Int64 corrected = (seL4_Int64)uptime_ms + ntp_offset_seconds * 1000;
             seL4_SetMR(0, (seL4_Word)corrected);
@@ -546,6 +601,14 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(0, variant); // -1 = не ответил ни на один вариант адреса
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else if (sys == 8) { // SYS_SLEEP_MS: событийный sleep (Фаза 4.5, см. shell.cpp sys_sleep())
+            // Фаза 5 — остановлен: тот же немедленный отказ, что и "все
+            // слоты заняты" ниже (звонящий уже умеет это обрабатывать, не
+            // вводим новую семантику).
+            if (g_timer_stopped) {
+                seL4_SetMR(0, (seL4_Word)-1);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                continue;
+            }
             int slot = -1;
             for (int i = 0; i < MAX_PENDING_SLEEPS; i++) { if (!pending_sleeps[i].active) { slot = i; break; } }
             if (slot < 0) {

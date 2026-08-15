@@ -276,7 +276,9 @@ constexpr seL4_Word NET_IFACE_WIFI  = 1;
 // net_driver.cpp). Числа здесь ДОЛЖНЫ совпадать с net_driver.cpp.
 static inline uint32_t net_mailbox_ready_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4200 : 4060; }
 static inline uint32_t net_mailbox_dns_ip_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4208 : 4064; }
-static inline uint32_t net_mailbox_ping_stats_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4216 : 4068; }
+// issuse.txt №24: см. 1:1-копию в net_driver.cpp — было 4068 (перекрывало
+// 8-байтовую запись dns_ip на 4064-4071), перенесено на 4104.
+static inline uint32_t net_mailbox_ping_stats_offset(seL4_Word iface) { return (iface == NET_IFACE_WIFI) ? 4216 : 4104; }
 
 // По просьбе пользователя — без явного `-W` шелл сам выбирает интерфейс:
 // GENET, если у него реально есть IP (dhcp_bound), иначе Wi-Fi, если есть у
@@ -618,10 +620,15 @@ static void print_localtime(seL4_CPtr console_ep, seL4_Word epoch_ms, int tz_off
 // клиентский busy-poll (sys_get_time() в цикле с seL4_Yield()) — теперь
 // обычный блокирующий IPC-вызов, timer_driver сам спит на реальном IRQ
 // физического таймера и отвечает по дедлайну.
-static void sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
+// issuse.txt №31: возвращает false, если timer_driver отказал (все
+// MAX_PENDING_SLEEPS слотов заняты — отвечает -1 сразу, не взводя сон)
+// — раньше это MR0 вообще не читался, и sleep-команда безусловно
+// печатала "Woke up!", даже если реально проспала 0мс.
+static bool sys_sleep(seL4_CPtr timer_ep, seL4_Word ms) {
     seL4_SetMR(0, 8); // 8 = SYS_SLEEP_MS
     seL4_SetMR(1, ms);
     seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    return (int)seL4_GetMR(0) != -1;
 }
 
 static void sys_recover(const char* driver_name) {
@@ -638,6 +645,25 @@ static void sys_recover(const char* driver_name) {
 
     // Передаем 5 регистров (1 для номера сисколла + 4 для имени)
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 5));
+}
+
+// План "Сигналы драйверам" — лёгкая альтернатива sys_recover() (kill+
+// full-respawn) для случая "драйвер жив, просто переинициализировать
+// железо". 1:1 упаковка с sys_recover(), плюс MR5=тип сигнала. Возврат
+// MR0: 0=ok, -1=не найден, -2=admin-check не прошёл, -3=не поддержано.
+static int sys_driver_signal(seL4_CPtr root_ep, const char* driver_name, int sig) {
+    char safe_name[32] = {0};
+    my_strncpy(safe_name, driver_name, 31);
+
+    seL4_SetMR(0, 148); // SYS_DRIVER_SIGNAL
+    uint64_t* name_ptr = (uint64_t*)safe_name;
+    for (int i = 0; i < 4; i++) {
+        seL4_SetMR(i + 1, name_ptr[i]);
+    }
+    seL4_SetMR(5, (seL4_Word)sig);
+
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 6));
+    return (int)seL4_GetMR(0);
 }
 
 // Ручной жизненный цикл Wi-Fi (см. common.h SYS_START_WIFI/SYS_STOP_WIFI/
@@ -734,13 +760,19 @@ static void sys_exit(seL4_CPtr root_ep) {
     while(1) seL4_Yield();
 }
 
-static int sys_shm_get(seL4_CPtr root_ep, int shm_id, seL4_Word vaddr) {
+static seL4_Word sys_shm_get(seL4_CPtr root_ep, int shm_id, seL4_Word vaddr) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     ipc->msg[0] = 107; // SYS_SHM_GET
     ipc->msg[1] = shm_id;
     ipc->msg[2] = vaddr;
     seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 3));
-    return (int)seL4_GetMR(0);
+    // issuse.txt №64 — было int (усекает 64-битный vaddr на верхних битах,
+    // на этой платформе пока безвредно чисто по значениям, но некорректно
+    // по типу); реальный протокол SYS_SHM_GET отвечает 0 ТОЛЬКО при ошибке
+    // и настоящим vaddr (не статус-кодом) при успехе — см. правку ниже,
+    // единственный вызывающий (команда `shm`) раньше трактовал это ровно
+    // наоборот.
+    return seL4_GetMR(0);
 }
 
 static int sys_getpid(seL4_CPtr root_ep) {
@@ -759,9 +791,12 @@ static char current_working_dir[CWD_SIZE] = "/root";
 static char arg_buffer[512];
 
 // История команд — только в оперативной памяти (кольцевой буфер), сбрасывается
-// при перезапуске shell. Размер строки (64) совпадает с буфером cmd[] в main().
+// при перезапуске shell. Размер строки (256) совпадает с буфером cmd[] в
+// main() — issuse.txt №30 (расследование): было 64, "touch <57-символьное
+// имя>" (63 символа всей строки) обрезался на последнем символе (см.
+// if (i >= 63) continue ниже).
 #define CMD_HISTORY_SIZE 400
-static char cmd_history[CMD_HISTORY_SIZE][64];
+static char cmd_history[CMD_HISTORY_SIZE][256];
 static int cmd_history_count = 0;
 static int cmd_history_head = 0; // индекс слота для следующей записи
 
@@ -779,6 +814,55 @@ static const char *history_get(int distance_back) {
     return cmd_history[idx];
 }
 
+// issuse.txt №57: раньше ".." резолвилась только когда весь аргумент cd
+// был буквально ".." (ручной разбор в обработчике cd) — "foo/.." или
+// "../foo" проваливались в обычную конкатенацию ниже без какой-либо
+// нормализации. normalize_absolute_path() резолвит "." и ".." в ЛЮБОМ
+// месте уже собранного абсолютного пути, единообразно для cd/echo>/
+// touch/rm/mkdir/cat/mv (все идут через build_absolute_path). Путь
+// длиннее SCRATCH (с большим запасом относительно реальных CWD_SIZE=64/
+// длины командной строки) просто не нормализуется — старое поведение,
+// не хуже, чем было.
+static void normalize_absolute_path(char* target, int max_len) {
+    constexpr int SCRATCH = 512;
+    if ((int)my_strlen(target) >= SCRATCH) return;
+
+    char src[SCRATCH];
+    my_strlcpy(src, target, SCRATCH);
+
+    constexpr int MAX_COMPONENTS = 64;
+    int starts[MAX_COMPONENTS];
+    int lens[MAX_COMPONENTS];
+    int n = 0;
+
+    int i = 1; // после ведущего '/'
+    while (src[i] != '\0') {
+        while (src[i] == '/') i++;
+        if (src[i] == '\0') break;
+        int start = i;
+        while (src[i] != '\0' && src[i] != '/') i++;
+        int len = i - start;
+        if (len == 1 && src[start] == '.') {
+            // "." — сам текущий каталог, пропускаем компонент
+        } else if (len == 2 && src[start] == '.' && src[start + 1] == '.') {
+            if (n > 0) n--; // ".." — подняться на уровень выше
+        } else if (n < MAX_COMPONENTS) {
+            starts[n] = start; lens[n] = len; n++;
+        }
+    }
+
+    char out[SCRATCH];
+    int w = 0;
+    out[w++] = '/';
+    for (int c = 0; c < n; c++) {
+        if (c > 0) out[w++] = '/';
+        for (int k = 0; k < lens[c] && w < SCRATCH - 1; k++) out[w++] = src[starts[c] + k];
+    }
+    out[w] = '\0';
+
+    my_strlcpy(target, out, max_len);
+}
+
 // max_len - полный размер буфера target (включая место под '\0').
 // Результат всегда '\0'-терминирован в пределах [0, max_len); при
 // переполнении путь молча обрезается, но выхода за границы буфера не происходит.
@@ -786,17 +870,18 @@ static void build_absolute_path(char* target, const char* arg, int max_len) {
     if (max_len <= 0) return;
     if (arg[0] == '/') {
         my_strlcpy(target, arg, max_len); // Уже абсолютный
-        return;
+    } else {
+        int len = my_strlcpy(target, current_working_dir, max_len);
+        if (len > 0 && target[len - 1] != '/' && len + 1 < max_len) {
+            target[len] = '/';
+            target[len + 1] = '\0';
+            len++;
+        }
+        if (len < max_len - 1) {
+            my_strlcpy(target + len, arg, max_len - len);
+        }
     }
-    int len = my_strlcpy(target, current_working_dir, max_len);
-    if (len > 0 && target[len - 1] != '/' && len + 1 < max_len) {
-        target[len] = '/';
-        target[len + 1] = '\0';
-        len++;
-    }
-    if (len < max_len - 1) {
-        my_strlcpy(target + len, arg, max_len - len);
-    }
+    normalize_absolute_path(target, max_len);
 }
 
 static int vfs_syscall(int syscall_num, seL4_CPtr blk_ep) {
@@ -1128,15 +1213,21 @@ int main(int argc, char *argv[]) {
         sys_puts(console_ep, prompt);
         sys_flush(console_ep); // <--- СБРОС: чтобы prompt появился мгновенно!
         
-        char cmd[64]; int i = 0;
+        char cmd[256]; int i = 0;
         int cur = 0;             // позиция курсора внутри cmd, 0..i (стрелки влево/вправо двигают её)
         int hist_nav = 0;        // 0 = не листаем историю; иначе "N команд назад от последней"
-        char saved_line[64];     // то, что было набрано до первого Up — восстанавливается по Down
+        char saved_line[256];     // то, что было набрано до первого Up — восстанавливается по Down
         saved_line[0] = '\0';
 
         // 2. Читаем ввод: печатные символы (вставка по курсору), Backspace,
         // и ANSI-стрелки ESC '[' 'A'/'B'/'C'/'D' (up/down/right/left).
-        while (i < 63) {
+        // issuse.txt №49: раньше цикл выходил по `i < 63` САМ, не считав
+        // Enter — обрезанная команда выполнялась немедленно, а оставшиеся
+        // непрочитанными байты (включая сам Enter) утекали в чтение
+        // СЛЕДУЮЩЕГО приглашения. Теперь выход — только по Enter; при
+        // заполненном буфере новые печатные символы просто съедаются
+        // (см. ветку ниже), не переполняя cmd[] и не оставляя хвост.
+        while (true) {
             char c = sys_read_blocking(console_ep);
 
             if (c == '\r' || c == '\n') { sys_puts(console_ep, "\n"); break; }
@@ -1201,6 +1292,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (c >= 32 && c <= 126) {
+                if (i >= 255) continue; // issuse.txt №49/№30: буфер полон — символ съедаем, не вставляем
                 hist_nav = 0;
                 for (int k = i; k > cur; k--) cmd[k] = cmd[k - 1];
                 cmd[cur] = c;
@@ -1234,15 +1326,32 @@ int main(int argc, char *argv[]) {
             char *pipe_sym = cmd_ptr;
             while (*pipe_sym && *pipe_sym != '|') pipe_sym++;
             
-            char cmd2[64];
+            // issuse.txt №30 — было cmd2[64] с НЕограниченным my_strcpy из
+            // cmd (теперь 256 байт) — переполнение стека для длинной
+            // правой части конвейера. Расширено согласованно + ограничено.
+            char cmd2[256];
             cmd2[0] = '\0';
-            
+
             if (*pipe_sym == '|') {
                 *pipe_sym = '\0'; // Отрезаем левую команду
                 char *right_cmd = pipe_sym + 1;
                 while (*right_cmd == ' ') right_cmd++; // Убираем пробелы
-                my_strcpy(cmd2, right_cmd);
-                
+                my_strlcpy(cmd2, right_cmd, (int)sizeof(cmd2));
+
+                // issuse.txt №51: конвейер поддерживает ровно ОДИН '|'
+                // (grep справа, см. ниже). Второй '|' раньше молча
+                // становился частью буквального паттерна grep вместо
+                // честной ошибки — "ls | grep foo | grep bar" искал
+                // подстроку "foo | grep bar" и почти никогда ничего не
+                // находил, без единого объяснения почему.
+                bool second_pipe = false;
+                for (char *q = cmd2; *q; q++) { if (*q == '|') { second_pipe = true; break; } }
+                if (second_pipe) {
+                    sys_puts(console_ep, "shell: only a single '|' is supported (one pipe stage)\n");
+                    is_piping = false;
+                    continue;
+                }
+
                 // Убираем пробел в конце левой команды
                 char *left_end = pipe_sym - 1;
                 while (left_end >= cmd_ptr && *left_end == ' ') {
@@ -1418,8 +1527,13 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "sleep") == 0) {
                 seL4_Word ms = arg ? (seL4_Word)simple_atoi(arg) : 3000; // без аргумента — 3с по умолчанию
                 sys_puts(console_ep, "Sleeping "); sys_putdec(ms); sys_puts(console_ep, " ms...\n");
-                sys_sleep(timer_ep, ms);
-                sys_puts(console_ep, "Woke up!\n");
+                if (sys_sleep(timer_ep, ms)) {
+                    sys_puts(console_ep, "Woke up!\n");
+                } else {
+                    // issuse.txt №31: все слоты сна timer_driver заняты —
+                    // вернулись сразу, реально не проспав ни мс.
+                    sys_puts(console_ep, "sleep: timer_driver busy (all sleep slots taken), did not actually sleep.\n");
+                }
             }
 
             else if (my_strcmp(cmd_ptr, "ping") == 0) {
@@ -2026,16 +2140,18 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                char safe_name[64] = {0};
-                my_strncpy(safe_name, arg, 63);
+                // issuse.txt №30 — согласовано с MR-транспортом SYS_EXEC
+                // (см. main.cpp/shell.cpp комментарии у issuse.txt №30).
+                char safe_name[192] = {0};
+                my_strncpy(safe_name, arg, 191);
 
                 seL4_SetMR(0, 100); // SYS_EXEC
                 uint64_t* name_ptr = (uint64_t*)safe_name;
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < 24; i++) {
                     seL4_SetMR(i + 1, name_ptr[i]);
                 }
-                
-                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 9);
+
+                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 25);
                 seL4_Call(root_ep, msg);
                 
                 int pid = (int)seL4_GetMR(0);
@@ -2073,15 +2189,21 @@ int main(int argc, char *argv[]) {
                 if (*text == ' ') { *text = '\0'; text++; }
                 
                 int shm_id = simple_atoi(id_str);
-                seL4_Word vaddr = 0x580000 + (shm_id * 4096); 
-                
-                int res = sys_shm_get(root_ep, shm_id, vaddr);
-                if (res != 0) {
+                // issuse.txt №64 — было ДВЕ ошибки: (1) проверка `res != 0`
+                // трактовала успех (сервер отвечает настоящим vaddr, всегда
+                // ненулевым) как провал, и наоборот; (2) разыменовывался
+                // захардкоженный `0x580000 + id*4096`, а не адрес, который
+                // РЕАЛЬНО вернул сервер (актуальный протокол — единственный
+                // per-process регион, shm_id сервером игнорируется). Теперь
+                // используем настоящий возвращённый vaddr, 0 — единственный
+                // легитимный признак ошибки.
+                seL4_Word res = sys_shm_get(root_ep, shm_id, 0);
+                if (res == 0) {
                     sys_puts(console_ep, "Failed to map Shared Memory.\n");
                     continue;
                 }
-                
-                char *shm_ptr = (char*)vaddr;
+
+                char *shm_ptr = (char*)res;
 
                 if (my_strcmp(op, "read") == 0) {
                     sys_puts(console_ep, "SHM Content:\n");
@@ -2095,6 +2217,41 @@ int main(int argc, char *argv[]) {
                 } else {
                     sys_puts(console_ep, "Operation must be 'read' or 'write'.\n");
                 }
+            }
+
+            else if (my_strcmp(cmd_ptr, "recover") == 0) {
+                // issuse.txt №3 (тестовый хук) — sys_recover() уже была
+                // реализована (использовалась только внутренне для
+                // net_driver, см. выше), просто не была подключена как
+                // видимая команда. Даёт способ штатно проверить, что
+                // admin-путь (shell, is_driver==0) по-прежнему проходит
+                // is_admin_caller() в SYS_RECOVER после фикса №3.
+                if (!arg) { sys_puts(console_ep, "Usage: recover <process_name>\n"); continue; }
+                char *name = next_token(&arg);
+                sys_recover(name);
+                sys_puts(console_ep, "Recover request sent.\n");
+            }
+
+            else if (my_strcmp(cmd_ptr, "driver") == 0) {
+                // План "Сигналы драйверам" — лёгкая альтернатива
+                // recover'у (kill+full-respawn): stop/start/restart без
+                // убийства процесса, пока драйвер жив и отвечает.
+                static const char *DRIVER_USAGE = "Usage: driver <name> <stop|start|restart>\n";
+                if (!arg) { sys_puts(console_ep, DRIVER_USAGE); continue; }
+                char *name = next_token(&arg);
+                char *op = arg ? next_token(&arg) : nullptr;
+                if (!name || !op) { sys_puts(console_ep, DRIVER_USAGE); continue; }
+                int sig;
+                if (my_strcmp(op, "stop") == 0) sig = 0;
+                else if (my_strcmp(op, "start") == 0) sig = 1;
+                else if (my_strcmp(op, "restart") == 0) sig = 2;
+                else { sys_puts(console_ep, DRIVER_USAGE); continue; }
+                int status = sys_driver_signal(root_ep, name, sig);
+                if (status == 0) sys_puts(console_ep, "Signal sent, driver acknowledged.\n");
+                else if (status == -1) sys_puts(console_ep, "driver: process not found.\n");
+                else if (status == -2) sys_puts(console_ep, "driver: permission denied.\n");
+                else if (status == -3) sys_puts(console_ep, "driver: signal not supported for this driver yet.\n");
+                else { sys_puts(console_ep, "driver: unexpected status\n"); }
             }
 
             else if (my_strcmp(cmd_ptr, "pid") == 0) {
@@ -2119,8 +2276,8 @@ int main(int argc, char *argv[]) {
                     redir++;       // Сдвигаемся на начало пути к файлу
                     
                     // Пропускаем пробелы после '>'
-                    while (*redir == ' ') redir++; 
-                    
+                    while (*redir == ' ') redir++;
+
                     // Убираем пробелы в конце самого текста (перед '>')
                     char *text_end = arg;
                     while (*text_end != '\0') text_end++;
@@ -2129,12 +2286,33 @@ int main(int argc, char *argv[]) {
                         *text_end = '\0';
                         text_end--;
                     }
-                    
+
                     if (*redir == '\0') {
                         sys_puts(console_ep, "Parse error: expected file path after '>'\n");
                         continue;
                     }
-                    
+
+                    // issuse.txt №55: путь назначения — ОДИН токен, а не
+                    // "всё, что осталось после '>'". Раньше сюда шёл
+                    // целиком остаток строки (с пробелами/лишними словами),
+                    // и "echo hi > my file.txt" пыталось создать файл,
+                    // буквально названный "my file.txt".
+                    {
+                        char *path_end = redir;
+                        while (*path_end && *path_end != ' ') path_end++;
+                        bool has_trailing = false;
+                        if (*path_end == ' ') {
+                            char *p = path_end;
+                            while (*p == ' ') p++;
+                            has_trailing = (*p != '\0');
+                            *path_end = '\0';
+                        }
+                        if (has_trailing) {
+                            sys_puts(console_ep, "echo: too many arguments after '>' (expected a single path)\n");
+                            continue;
+                        }
+                    }
+
                     char *shm = shm_base;
                     char *path_ptr = shm;
                     char *text_ptr = shm + 128; // Текст кладем со смещением!
@@ -2166,7 +2344,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, recover, driver (stop/start/restart), exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);
@@ -2198,7 +2376,25 @@ int main(int argc, char *argv[]) {
             else if (my_strncmp(cmd_ptr, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf
                 char* filename = cmd_ptr + 2; // Пропускаем "./"
-                
+
+                // issuse.txt №47: '&' раньше распознавался ТОЛЬКО в
+                // builtin'е exec — здесь arg (всё, что после первого
+                // пробела в командной строке) вообще не читался, поэтому
+                // "./file &" всегда исполнялся синхронно, а сам "&" молча
+                // терялся. Тот же разбор, что уже есть в exec (без
+                // поддержки пайпа — конвейер справа от "./" не имеет
+                // смысла тут, ./file и так не участвует в is_piping).
+                bool run_in_background = false;
+                if (arg) {
+                    int alen = my_strlen(arg);
+                    if (alen > 0 && arg[alen - 1] == '&') {
+                        run_in_background = true;
+                        arg[alen - 1] = '\0';
+                        alen--;
+                        while (alen > 0 && arg[alen - 1] == ' ') { arg[alen - 1] = '\0'; alen--; }
+                    }
+                }
+
                 // --- НОВЫЙ БЛОК ПАРСИНГА ПУТЕЙ ---
                 // Если в имени файла есть слеш (например, mnt/test.elf),
                 // нам нужно извлечь только само имя (test.elf)
@@ -2211,17 +2407,19 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 
-                char safe_name[64] = {0};
-                my_strncpy(safe_name, pure_filename, 63);
-                
+                // issuse.txt №30 — согласовано с MR-транспортом SYS_EXEC
+                // (см. main.cpp/shell.cpp комментарии у issuse.txt №30).
+                char safe_name[192] = {0};
+                my_strncpy(safe_name, pure_filename, 191);
+
                 // Упаковываем строку прямо в регистры процессора!
                 seL4_SetMR(0, 100); // 100 = SYS_EXEC
                 uint64_t* name_ptr = (uint64_t*)safe_name;
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < 24; i++) {
                     seL4_SetMR(i + 1, name_ptr[i]);
                 }
                 
-                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 9);
+                seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 25);
                 seL4_Call(root_ep, msg);
 
                 int pid = (int)seL4_GetMR(0);
@@ -2233,10 +2431,14 @@ int main(int argc, char *argv[]) {
                     if (temp == 0) buf[j++] = '0';
                     while(temp > 0) { buf[j++] = (temp % 10) + '0'; temp /= 10; }
                     while(j > 0) { char c[2] = {buf[--j], 0}; sys_puts(console_ep, c); }
-                    sys_puts(console_ep, "\nParent sleeping, handing over TTY...\n");
 
-                    sys_wait(root_ep, pid);
-                    sys_puts(console_ep, "\nChild exited. Parent taking back TTY.\n");
+                    if (run_in_background) {
+                        sys_puts(console_ep, "\n[Running in background] TTY retained by parent.\n");
+                    } else {
+                        sys_puts(console_ep, "\nParent sleeping, handing over TTY...\n");
+                        sys_wait(root_ep, pid);
+                        sys_puts(console_ep, "\nChild exited. Parent taking back TTY.\n");
+                    }
                 } else if (pid == -1) {
                     sys_puts(console_ep, "[SHELL] Error: File not found on disk.\n");
                 } else if (pid == -2) {
@@ -2254,20 +2456,51 @@ int main(int argc, char *argv[]) {
                 // процесса прямо на пайп (см. spawn_process/stdout_pipe_id в
                 // main.cpp) — sys_write(1,...) внутри /sbin-утилиты (см.
                 // h/sys_client.h) уже общий по FD, менять её код не нужно.
+                // issuse.txt №47: '&' раньше распознавался ТОЛЬКО в
+                // builtin'е exec — здесь буквальный "&" уходил как
+                // мусорный аргумент внутрь exec_payload, а команда всё
+                // равно исполнялась синхронно (sys_wait ниже, безусловно).
+                // При активном пайпе фон не поддерживаем — синхронизация
+                // "закрыть writer-конец пайпа после завершения левой
+                // части" рассчитана на то, что левая часть уже завершена
+                // к этому моменту.
+                bool run_in_background = false;
+                if (arg && !is_piping) {
+                    int alen = my_strlen(arg);
+                    if (alen > 0 && arg[alen - 1] == '&') {
+                        run_in_background = true;
+                        arg[alen - 1] = '\0';
+                        alen--;
+                        while (alen > 0 && arg[alen - 1] == ' ') { arg[alen - 1] = '\0'; alen--; }
+                    }
+                }
+
                 char sbin_path[64] = {0};
                 int plen = my_strlcpy(sbin_path, "/sbin/", sizeof(sbin_path));
                 plen += my_strlcpy(sbin_path + plen, cmd_ptr, sizeof(sbin_path) - plen);
                 my_strlcpy(sbin_path + plen, ".elf", sizeof(sbin_path) - plen);
 
-                char exec_payload[64] = {0};
+                // issuse.txt №30 (расследование, найдено на живом железе):
+                // было exec_payload[64] — "/sbin/<cmd>.elf " (обычно
+                // 15-20 байт) уже съедал треть бюджета, реальный лимит на
+                // САМ аргумент был ~40-48 символов. `touch /root/<51 a>`
+                // создавал файл КОРОЧЕ на 10 символов — молча, без единой
+                // ошибки. Расширено до 192 байт (=24 регистра MR1-24 ниже,
+                // см. согласованное расширение в main.cpp SYS_EXEC/
+                // spawn_process() STARTUP PAYLOAD — реальный итоговый
+                // предел там, 127 символов на сам аргумент).
+                char exec_payload[192] = {0};
                 int elen = my_strlcpy(exec_payload, sbin_path, sizeof(exec_payload));
-                if (arg && elen + 1 < (int)sizeof(exec_payload)) {
+                if (arg && arg[0] != '\0' && elen + 1 < (int)sizeof(exec_payload)) {
                     exec_payload[elen] = ' ';
                     my_strlcpy(exec_payload + elen + 1, arg, sizeof(exec_payload) - elen - 1);
                 }
 
-                // Передаём текущий cwd через MR9-16 (см. EXEC_CWD_MSG_SLOT
-                // в common.h) — /sbin-утилиты резолвят относительные
+                // Передаём текущий cwd через MR25-32 (сдвинуто с MR9-16
+                // после расширения exec_payload выше, см. EXEC_CWD_MSG_SLOT
+                // в common.h — та константа про ДРУГОЙ, персистентный
+                // буфер ребёнка, эта нумерация локальна для этого одного
+                // сырого вызова) — /sbin-утилиты резолвят относительные
                 // пути сами (см. h/sys_client.h/build_absolute_path), как
                 // раньше делал сам шелл для ls/cat/touch/rm/mv. НЕ через
                 // общую VFS SHM — найдено на живом железе, что
@@ -2279,19 +2512,23 @@ int main(int argc, char *argv[]) {
 
                 seL4_SetMR(0, 100); // SYS_EXEC
                 uint64_t* name_ptr = (uint64_t*)exec_payload;
-                for (int i = 0; i < 8; i++) seL4_SetMR(i + 1, name_ptr[i]);
+                for (int i = 0; i < 24; i++) seL4_SetMR(i + 1, name_ptr[i]);
                 uint64_t* cwd_ptr = (uint64_t*)cwd_payload;
-                for (int i = 0; i < 8; i++) seL4_SetMR(i + 9, cwd_ptr[i]);
-                int exec_msg_len = 17;
+                for (int i = 0; i < 8; i++) seL4_SetMR(i + 25, cwd_ptr[i]);
+                int exec_msg_len = 33;
                 if (is_piping) {
-                    seL4_SetMR(17, (seL4_Word)pipe_id);
-                    exec_msg_len = 18;
+                    seL4_SetMR(33, (seL4_Word)pipe_id);
+                    exec_msg_len = 34;
                 }
                 seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, exec_msg_len));
 
                 int pid = (int)seL4_GetMR(0);
                 if (pid > 0) {
-                    sys_wait(root_ep, pid);
+                    if (run_in_background) {
+                        sys_puts(console_ep, "[Running in background] TTY retained by parent.\n");
+                    } else {
+                        sys_wait(root_ep, pid);
+                    }
                 } else {
                     sys_puts(console_ep, "Unknown command. Type 'help'.\n");
                 }
@@ -2301,11 +2538,32 @@ int main(int argc, char *argv[]) {
                 if (is_piping) sys_pipe_wr_close(pipe_fd);
             }
 
+            // issuse.txt №46: раньше write-конец пайпа закрывали только
+            // echo/help и /sbin-диспетчер (см. их собственные
+            // sys_pipe_wr_close выше) — для всех остальных builtin'ов
+            // (pwd/date/history/ping/wifi status/cd/exec/./file/shm/...)
+            // читающий grep никогда не получал EOF, и shell вис в
+            // sys_wait на правую часть навсегда. Все ветки диспетчера
+            // выше исполняются СИНХРОННО до этой точки (ни одна не
+            // возвращает управление раньше своего завершения), поэтому
+            // безусловное закрытие здесь корректно закрывает трубу ровно
+            // после того, как левая часть реально закончила работу.
+            // SYS_PIPE_WR_CLOSE идемпотентен (main.cpp, case 24) — это НЕ
+            // ломает echo/help/exec-диспетчер, которые уже закрыли её
+            // сами чуть выше.
+            if (is_piping) sys_pipe_wr_close(pipe_fd);
+
             // --- ПРАВАЯ ЧАСТЬ КОНВЕЙЕРА ---
             if (is_piping) {
                 char *arg2 = cmd2;
                 while (*arg2 && *arg2 != ' ') arg2++;
-                if (*arg2 == ' ') { *arg2 = '\0'; arg2++; } else { arg2 = nullptr; }
+                if (*arg2 == ' ') { *arg2 = '\0'; arg2++; while (*arg2 == ' ') arg2++; } else { arg2 = nullptr; }
+                // issuse.txt №58: паттерн из одних пробелов ("grep " с
+                // хвостовым пробелом и без ничего после) раньше давал
+                // непустой указатель на "" — пустой needle в my_strstr()
+                // совпадает с любой строкой. Это то же самое "нет паттерна",
+                // что и вызов вообще без аргумента.
+                if (arg2 && *arg2 == '\0') arg2 = nullptr;
 
                 if (my_strcmp(cmd2, "grep") == 0) {
                     if (arg2) {

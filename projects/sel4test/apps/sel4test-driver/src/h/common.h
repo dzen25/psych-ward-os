@@ -72,13 +72,23 @@ enum BootIPCSlot {
     // Retype в spawn_process() и передаёт здесь, та же схема, что
     // BOOT_BLK_DMA_PADDR).
     BOOT_USB_EP                       = 119,
-    BOOT_USB_DCBAA_PADDR              = 120,
-    BOOT_USB_CMDRING_PADDR            = 121,
-    BOOT_USB_ERST_PADDR               = 122,
-    BOOT_USB_EVTRING_PADDR            = 123,
-    BOOT_USB_DEVCTX_PADDR             = 124,
-    BOOT_USB_INPUTCTX_PADDR           = 125,
-    BOOT_USB_SCRATCHPAD_ARR_PADDR     = 126,
+    // issuse.txt №59: 120..126 сюда специально НЕ ставим. seL4_IPCBuffer —
+    // это `tag; msg[120]; userData; caps_or_badges[3]; receiveCNode;
+    // receiveIndex; receiveDepth;` (см. kernel/libsel4/include/sel4/
+    // shared_types.h) — 128 слов ровно. msg[N] физически лежит по смещению
+    // (N+1) слов от начала структуры, поэтому msg[120..126] — это не
+    // "продолжение сообщения", а буквально userData/caps_or_badges[0..2]/
+    // receiveCNode/receiveIndex/receiveDepth САМОГО ядра. Раньше 7
+    // констант ниже (DCBAA..SCRATCHPAD_ARR) стояли на 120..126 и писали
+    // прямо в эти поля — молча "работало" только потому, что usb_driver.cpp
+    // никогда не читает caps_or_badges[]/не зовёт seL4_SetCapReceivePath.
+    // msg[127] и дальше — уже настоящая свободная память СРАЗУ ПОСЛЕ конца
+    // структуры (структура ровно 1024 байта = 2×512, ipc-буфер сидит на
+    // 1024-выровненном адресе внутри 4КиБ-страницы — см. main.cpp,
+    // child_ipc_ptr = ipc_temp_vaddr+2048), поэтому 127..167 ниже — НЕ
+    // трогаем, они безопасны и так. Сами 7 констант переехали ниже, после
+    // BOOT_USB_HEARTBEAT_NTFN_CAP (168..174) — свободная зона с тем же
+    // запасом.
     BOOT_USB_SCRATCHPAD_COUNT         = 127, // не капа — просто seL4_Word N (см. USB_MAX_SCRATCHPAD_PAGES)
     BOOT_USB_SCRATCHPAD_BUF0_PADDR    = 128, // первый из N (<= USB_MAX_SCRATCHPAD_PAGES) подряд идущих слотов 128..(128+N-1)
     // Фаза 14 (закрытие, Mass Storage) — Milestone 1: настоящий EP0 Transfer
@@ -109,6 +119,33 @@ enum BootIPCSlot {
     // timer_driver (is_driver==2), тот же принцип, что
     // BOOT_BLK_HEARTBEAT_NTFN_CAP.
     BOOT_USB_HEARTBEAT_NTFN_CAP        = 167,
+    // issuse.txt №59 — см. комментарий у BOOT_USB_EP выше: эти 7 констант
+    // раньше стояли на 120..126 и алиасили userData/caps_or_badges[]/
+    // receive* самого seL4_IPCBuffer. Перенесены сюда, в свободную зону
+    // сразу после конца используемого диапазона (168..174 — тот же
+    // страничный запас, что уже безопасно использует 127..167).
+    BOOT_USB_DCBAA_PADDR              = 168,
+    BOOT_USB_CMDRING_PADDR            = 169,
+    BOOT_USB_ERST_PADDR               = 170,
+    BOOT_USB_EVTRING_PADDR            = 171,
+    BOOT_USB_DEVCTX_PADDR             = 172,
+    BOOT_USB_INPUTCTX_PADDR           = 173,
+    BOOT_USB_SCRATCHPAD_ARR_PADDR     = 174,
+    // Фаза 3b плана "Сигналы драйверам" — badged-копия root'ового
+    // mmc_shared_irq_ntfn (см. DRIVER_LIVENESS_*_BADGE выше), которой сам
+    // драйвер сигналит root'у "я жив" — ОБЫЧНОЕ копирование capability (не
+    // TCB-bind, читает СВОЙ local-слот и зовёт seL4_Signal() сам, тот же
+    // принцип, что и остальные *_NTFN_CAP выше, только направление сигнала
+    // обратное — драйвер -> root). Продолжение той же свободной зоны 168-174.
+    BOOT_BLK_LIVENESS_NTFN_CAP        = 175,
+    BOOT_NET_LIVENESS_NTFN_CAP        = 176,
+    BOOT_WIFI_LIVENESS_NTFN_CAP       = 177,
+    BOOT_USB_LIVENESS_NTFN_CAP        = 178,
+    // Фаза 3b — badged-копия blk_liveness_tick_ntfn (badge
+    // BLK_LIVENESS_TICK_BADGE, см. выше) — читает ТОЛЬКО timer_driver
+    // (is_driver==2), тот же принцип, что BOOT_BLK_HEARTBEAT_NTFN_CAP, но на
+    // отдельном, не разделяемом ни с чем объекте (см. константу выше).
+    BOOT_BLK_LIVENESS_TICK_NTFN_CAP   = 179,
 };
 
 // Фаза 9.A (см. ROADMAP.md): индекс msg[]-слова (НЕ капа, НЕ CNode-слот —
@@ -212,6 +249,45 @@ constexpr seL4_Word UART_KBD_IRQ_BADGE = 0x8001;
 // происходит, следующий клиент с PID==1, позвавший sys_sleep, попадал бы в
 // ту же ловушку. См. UART_KBD_IRQ_BADGE выше.
 constexpr seL4_Word TIMER_IRQ_BADGE = 0x8002;
+
+// Фаза 3b плана "Сигналы драйверам" (heartbeat-watchdog) — blk_driver
+// единственный из мониторимых драйверов БЕЗ уже существующего периодического
+// тика в своём главном диспетчер-цикле (net/usb/wifi уже потребляют
+// HEARTBEAT-биты на СВОИХ TCB-bound нотификациях). Раньше у blk_driver ТОЖЕ
+// был heartbeat-driven seL4_Wait (см. BLK_HEARTBEAT_BADGE выше), но его
+// убрали — 20мс-гранулярность добавляла задержку поверх реальных multi-block
+// EMMC-передач (см. emmc_wait_irpt_bit() в blk_driver.cpp). BLK_HEARTBEAT_BADGE
+// и объект, на котором он живёт (blk_irq_ntfn/g_emmc_irq_ntfn), НАМЕРЕННО не
+// переиспользуются здесь — тот же объект ещё и разделяет общую линию
+// EMMC2/Wi-Fi SDIO (см. IRQ_MMC_SHARED_BADGE), а blk_driver сейчас держит на
+// него только СЫРУЮ (небейджированную) капу без TCB-bind; связывать с ним
+// новый тик рисковало бы смешать в один pending-бейдж настоящий IRQ (badge=0
+// при сигнале от root) и тик (после OR'а неотличимо от "просто тик") — тот
+// же класс проблемы, что уже документирован у IRQ_MMC_SHARED_BADGE. Вместо
+// этого — полностью ОТДЕЛЬНЫЙ, выделенный notification-объект
+// (blk_liveness_tick_ntfn, см. main.cpp), TCB-bind на blk_driver (пустовавший
+// irq_ntfn-параметр его spawn_process()), сигналится ТОЛЬКО timer_driver'ом
+// на общем heartbeat-тике — единственный источник, единственный бейдж,
+// никакого разделения с чем-либо ещё.
+constexpr seL4_Word BLK_LIVENESS_TICK_BADGE = 0x8003;
+
+// Фаза 3b — "обратное" направление: badged-копии СОБСТВЕННОГО
+// mmc_shared_irq_ntfn root'а (см. main.cpp), которыми КАЖДЫЙ из 4
+// мониторимых драйверов (blk/net/wifi/usb) сам сигналит root'у "я жив" на
+// каждом обработанном heartbeat-тике — root обновляет last_seen и по
+// таймауту (WATCHDOG_TIMEOUT_MS) вызывает generic_recover_process(). ≥0x10000
+// — заведомо выше диапазонов PID (1-255), пайпов (1000-1015) И битового
+// паттерна IRQ_MMC_SHARED_BADGE=2000=0x7D0 (биты 4,6,7,8,9,10, максимум
+// 0x7FF) — непересекающиеся одиночные биты, безопасны для битового OR друг с
+// другом и с IRQ_MMC_SHARED_BADGE на одном объекте (см. main.cpp, тот же
+// приём проверки "sender_badge >= порог && (sender_badge & бит)", что уже
+// применён в Фазе 3a). uart_driver/timer_driver сюда намеренно не входят
+// (см. план — uart без heartbeat-тика, timer не может обнаружить собственное
+// зависание через тик, который сам же производит).
+constexpr seL4_Word DRIVER_LIVENESS_BLK_BADGE  = 0x10000;
+constexpr seL4_Word DRIVER_LIVENESS_NET_BADGE  = 0x20000;
+constexpr seL4_Word DRIVER_LIVENESS_WIFI_BADGE = 0x40000;
+constexpr seL4_Word DRIVER_LIVENESS_USB_BADGE  = 0x80000;
 
 // Слот CSpace процесса, в который ядро минтит capability активного пайпа
 // (см. SYS_PIPE/SYS_PIPE_CLOSE в main.cpp и запрос пайпа в shell.cpp).
@@ -387,6 +463,20 @@ constexpr seL4_Word SYS_GET_FS_SPACE = 146;
 // usb_driver.cpp), собирает текстовую таблицу в rootserver_shm_base.
 // Ответ: MR0=0, текст в SHM.
 constexpr seL4_Word SYS_DF_STATS = 147;
+
+// Концепция сигналов драйверам (см. план — "Сигналы драйверам") —
+// лёгкая альтернатива kill+full-respawn для случая "драйвер жив,
+// просто нужно переинициализировать железо". MR1-4 = имя драйвера
+// (32 байта, та же упаковка, что SYS_RECOVER), MR5 = тип сигнала
+// (0=STOP, 1=START, 2=RESTART). Ответ MR0: 0=ok, -1=не найден,
+// -2=admin-check не прошёл, -3=не поддержано для этого драйвера сейчас.
+// Root форвардит РОВНО ТОТ ЖЕ номер и MR1=тип сигнала на командный
+// endpoint целевого драйвера (см. main.cpp) — драйвер сам решает, что
+// значит каждый сигнал для его железа.
+constexpr seL4_Word SYS_DRIVER_SIGNAL = 148;
+constexpr int DRIVER_SIGNAL_STOP = 0;
+constexpr int DRIVER_SIGNAL_START = 1;
+constexpr int DRIVER_SIGNAL_RESTART = 2;
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

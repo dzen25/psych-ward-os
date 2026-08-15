@@ -15,6 +15,11 @@ int main(int argc, char *argv[]) {
         sys_exit(env.root_ep);
         return 1;
     }
+    if (!is_all_digits(pid_str) || !is_all_digits(core_str)) { // issuse.txt №54
+        sys_puts(0, "taskset: pid и номер ядра должны быть числами\n");
+        sys_exit(env.root_ep);
+        return 1;
+    }
 
     seL4_SetMR(0, SYS_SET_AFFINITY);
     seL4_SetMR(1, simple_atoi(pid_str));

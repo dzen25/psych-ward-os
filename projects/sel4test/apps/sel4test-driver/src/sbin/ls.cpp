@@ -35,8 +35,21 @@ int main(int argc, char *argv[]) {
 
     // Milestone 9 (Фаза 14, закрытие) — маршрутизация /mnt/<имя тома>.
     seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep);
-    vfs_syscall(110, target_ep); // SYS_LS — пишет листинг прямо в shm
-    sys_puts(0, shm);
+    // issuse.txt №52: раньше статус SYS_LS не проверялся вообще — на
+    // ошибке (каталог не найден и т.п.) печаталось то, что осталось в shm
+    // от предыдущего вызова, вместо явной ошибки (в отличие от cat.cpp,
+    // который эту проверку уже делает).
+    if (vfs_syscall(110, target_ep) != 0) { // SYS_LS — на успехе пишет листинг прямо в shm
+        if (!(is_mnt_root && have_usb_entries)) {
+            sys_puts(0, "ls: cannot access: No such file or directory\n");
+            sys_exit(env.root_ep);
+            return 1;
+        }
+        // "/mnt" сам не существует как реальный каталог на диске, но у нас
+        // всё равно есть что показать — список смонтированных USB-томов.
+    } else {
+        sys_puts(0, shm);
+    }
     if (have_usb_entries) {
         for (int i = 0; i < USB_MAX_DEVICES; i++) {
             if (!vols.mounted[i]) continue;

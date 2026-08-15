@@ -119,14 +119,42 @@ static int simple_atoi(const char *str) {
     return res;
 }
 
+// issuse.txt №54: simple_atoi() останавливается на первом не-цифровом
+// символе и возвращает 0 для строк вроде "abc"/"5x"/"-1" без единой
+// ошибки — kill/taskset передавали этот 0 (или обрезанное число) дальше
+// как реальный PID/номер ядра. Вызывающий должен проверить это ПЕРЕД
+// simple_atoi(), если разница между "ввели 0" и "ввели мусор" важна.
+static bool is_all_digits(const char *str) {
+    if (!str || *str == '\0') return false;
+    for (const char *p = str; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
+// issuse.txt №50: поддержка одного уровня двойных кавычек — токен вида
+// "foo bar" читается как ОДИН аргумент "foo bar" (пробел внутри не
+// разделяет, сами кавычки в результат не входят), вместо того чтобы
+// молча развалиться на два токена `"foo` и `bar"`. Без экранирования
+// (нет \" внутри кавычек) — минимально достаточно для путей/имён файлов
+// с пробелами, которые и были реальной жалобой.
 static char *next_token(char **cursor) {
     if (!cursor || !*cursor) return nullptr;
     char *tok = *cursor;
     while (*tok == ' ') tok++;
     if (*tok == '\0') { *cursor = tok; return nullptr; }
 
-    char *end = tok;
-    while (*end && *end != ' ') end++;
+    char *end;
+    if (*tok == '"') {
+        tok++; // токен начинается ПОСЛЕ открывающей кавычки
+        end = tok;
+        while (*end && *end != '"') end++;
+        if (*end == '"') { *end = '\0'; end++; } // закрывающую тоже съедаем
+        // (не закрыта — берём до конца строки как есть, без ошибки)
+    } else {
+        end = tok;
+        while (*end && *end != ' ') end++;
+    }
     if (*end == ' ') {
         *end = '\0';
         end++;
@@ -146,23 +174,68 @@ static char *next_token(char **cursor) {
 
 static char g_cwd[CWD_SIZE] = "/root";
 
+// issuse.txt №57: см. 1:1-копию normalize_absolute_path() в shell.cpp —
+// резолвит "." и ".." в ЛЮБОМ месте уже собранного абсолютного пути
+// (раньше это умела только ручная спецветка "cd .." в shell.cpp, а
+// touch/rm/mkdir/cat/mv/ls через этот build_absolute_path — нет).
+static void normalize_absolute_path(char* target, int max_len) {
+    constexpr int SCRATCH = 512;
+    if ((int)my_strlen(target) >= SCRATCH) return;
+
+    char src[SCRATCH];
+    my_strlcpy(src, target, SCRATCH);
+
+    constexpr int MAX_COMPONENTS = 64;
+    int starts[MAX_COMPONENTS];
+    int lens[MAX_COMPONENTS];
+    int n = 0;
+
+    int i = 1; // после ведущего '/'
+    while (src[i] != '\0') {
+        while (src[i] == '/') i++;
+        if (src[i] == '\0') break;
+        int start = i;
+        while (src[i] != '\0' && src[i] != '/') i++;
+        int len = i - start;
+        if (len == 1 && src[start] == '.') {
+            // "." — сам текущий каталог, пропускаем компонент
+        } else if (len == 2 && src[start] == '.' && src[start + 1] == '.') {
+            if (n > 0) n--; // ".." — подняться на уровень выше
+        } else if (n < MAX_COMPONENTS) {
+            starts[n] = start; lens[n] = len; n++;
+        }
+    }
+
+    char out[SCRATCH];
+    int w = 0;
+    out[w++] = '/';
+    for (int c = 0; c < n; c++) {
+        if (c > 0) out[w++] = '/';
+        for (int k = 0; k < lens[c] && w < SCRATCH - 1; k++) out[w++] = src[starts[c] + k];
+    }
+    out[w] = '\0';
+
+    my_strlcpy(target, out, max_len);
+}
+
 // 1:1 с build_absolute_path() в shell.cpp, только читает g_cwd вместо
 // current_working_dir.
 static void build_absolute_path(char* target, const char* arg, int max_len) {
     if (max_len <= 0) return;
     if (arg[0] == '/') {
         my_strlcpy(target, arg, max_len);
-        return;
+    } else {
+        int len = my_strlcpy(target, g_cwd, max_len);
+        if (len > 0 && target[len - 1] != '/' && len + 1 < max_len) {
+            target[len] = '/';
+            target[len + 1] = '\0';
+            len++;
+        }
+        if (len < max_len - 1) {
+            my_strlcpy(target + len, arg, max_len - len);
+        }
     }
-    int len = my_strlcpy(target, g_cwd, max_len);
-    if (len > 0 && target[len - 1] != '/' && len + 1 < max_len) {
-        target[len] = '/';
-        target[len + 1] = '\0';
-        len++;
-    }
-    if (len < max_len - 1) {
-        my_strlcpy(target + len, arg, max_len - len);
-    }
+    normalize_absolute_path(target, max_len);
 }
 
 // Milestone A3 (Фаза 15, см. ROADMAP.md/план) — при нескольких
@@ -220,6 +293,11 @@ struct SysClientEnv {
     seL4_CPtr root_ep;
     seL4_CPtr blk_ep;
     seL4_CPtr usb_storage_ep; // Milestone 9 — 0, если не выдан (см. main.cpp shm/cap-выдачу для is_driver!=0/253)
+    // issuse.txt №5 (тестовый хук `sleep`, см. sbin/sleep.cpp) — уже
+    // безусловно минтится каждому спавненному процессу (main.cpp, ветка
+    // "Shell or other user app") и проставляется в BOOT_TIMER_EP, просто
+    // раньше ничем в общем клиентском окружении не читался.
+    seL4_CPtr timer_ep;
     char *shm;      // nullptr, если SHM не выдан (не доверенный exec)
     char arg_buffer[512];
     char *arg;      // nullptr, если аргументов не передали
@@ -232,6 +310,7 @@ static void sys_client_init(SysClientEnv &env) {
     env.root_ep = ipc->msg[BOOT_ROOT_EP];
     env.blk_ep  = ipc->msg[BOOT_BLK_EP];
     env.usb_storage_ep = ipc->msg[BOOT_USB_STORAGE_EP]; // Milestone 9
+    env.timer_ep = ipc->msg[BOOT_TIMER_EP];
     g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP];
 
     my_strlcpy(env.arg_buffer, (char*)&ipc->msg[0], (int)sizeof(env.arg_buffer));

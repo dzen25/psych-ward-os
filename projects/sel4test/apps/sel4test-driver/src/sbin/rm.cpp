@@ -12,16 +12,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    while (*p != '\0') {
-        while (*p == ' ') p++;
-        if (*p == '\0') break;
-
-        char* start_of_arg = p;
-        while (*p != ' ' && *p != '\0') p++;
-
-        char temp_char = *p;
-        *p = '\0';
-
+    // issuse.txt №50: next_token() (h/sys_client.h) вместо ручного разбора
+    // по пробелам — понимает "имя в кавычках" как один аргумент.
+    char* start_of_arg;
+    while ((start_of_arg = next_token(&p)) != nullptr) {
         char *shm = env.shm;
         build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
         seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep); // Milestone 9
@@ -30,7 +24,6 @@ int main(int argc, char *argv[]) {
             sys_puts(0, start_of_arg);
             sys_puts(0, "': No such file or directory\n");
         }
-        *p = temp_char;
     }
     sys_exit(env.root_ep);
     return 0;

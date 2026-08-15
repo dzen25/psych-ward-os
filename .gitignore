@@ -10,7 +10,6 @@ fat32.img
 .venv/
 env/
 venv/
-issuse.txt
 # Фаза 12 — собранный хостовый бинарник sign_elf (не сорец, пересобирается
 # из sign_elf.c на месте).
 tools/sign_elf/sign_elf

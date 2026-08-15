@@ -946,8 +946,19 @@ static bool erom_get_regaddr(uint32_t *eromaddr, uint32_t *regbase, uint32_t *wr
         return false;
     }
 
+    // issuse.txt №23: ни внутренний, ни внешний do-while здесь не имели
+    // собственного лимита итераций — рассчитывали ТОЛЬКО на то, что рано
+    // или поздно встретится DMP_DESC_EOT/COMPONENT. При сбое SDIO-шины
+    // посреди backplane bring-up (этот файл сам не раз документирует
+    // такие сбои на этом железе) backplane_read32() может стабильно
+    // возвращать один и тот же "непереходный" дескриптор — тогда обе
+    // петли крутятся бесконечно, вешая wifi start/restart вместо честной
+    // ошибки. wifi_erom_scan() снаружи бережёт СВОЙ цикл лимитом в 4000
+    // итераций, но не спасает от зависания ВНУТРИ этого вызова.
+    int guard = 0;
     do {
         do {
+            if (++guard > 8000) { *eromaddr -= 4; return false; }
             val = erom_get_desc(eromaddr, &desc);
             if (desc == DMP_DESC_EOT) { *eromaddr -= 4; return false; }
         } while (desc != DMP_DESC_ADDRESS && desc != DMP_DESC_COMPONENT);
@@ -2809,7 +2820,15 @@ static void wifi_print_escan_bss(seL4_CPtr console_ep, const uint8_t *buf, uint3
 // печатали каждое сырое событие как отдельную строку. Простая таблица
 // "уже видели этот BSSID в ЭТОМ скане" — не самый свежий/сильный сигнал,
 // просто первое попадание, этого достаточно для списка сетей.
-constexpr uint32_t WIFI_SCAN_SEEN_BSS_CAP = 64;
+// issuse.txt №21: было 64 — таблица дедупликации молча ПЕРЕСТАВАЛА
+// дедуплицировать после 64-й уникальной точки доступа (не растёт дальше,
+// но wifi_scan_bss_already_seen() продолжает возвращать false для всего
+// сверх лимита), в плотной среде (многоквартирный дом/офис) сети после
+// 64-й спамились повторно на каждый beacon. 256 — с большим запасом
+// (1536 байт статической памяти), не идеальный fix для патологических
+// случаев с сотнями точек, но покрывает подавляющее большинство реальных
+// сценариев.
+constexpr uint32_t WIFI_SCAN_SEEN_BSS_CAP = 256;
 alignas(4) static uint8_t g_scan_seen_bssid[WIFI_SCAN_SEEN_BSS_CAP][6];
 static uint32_t g_scan_seen_bss_count = 0;
 
@@ -2877,6 +2896,21 @@ static void wifi_scan_drain_stale_frames(seL4_CPtr console_ep) {
 // timeout_us остаётся как аварийный потолок (на случай, если финальное
 // событие вообще не придёт), но обычный выход — по факту увиденного
 // завершения, гарантированно вычерпывая очередь до конца.
+// issuse.txt №20: попытка отсюда дренировать data-канал ВНУТРИ
+// wifi_wait_for_join_result()/wifi_wait_and_dump_any_events() (см. git
+// history) была ОТКАЧЕНА — hw-тест показал, что она ломает `wifi connect`
+// (стабильный таймаут join). Причина: sdpcm_try_read_one_data_frame()
+// делает sdio_f2_read() и безусловно забирает СЛЕДУЮЩИЙ кадр из общей
+// F2-очереди (данные/события/control там перемешаны, канал различается
+// только ПОСЛЕ чтения по тегу в самом кадре) — если это оказывается
+// EVENT-кадр (например SET_SSID/PSK_SUP, которых как раз ждёт
+// wifi_wait_for_join_result()), функция просто отбрасывает его как "не
+// наш канал", кадр уже съеден с шины и потерян навсегда для того, кто
+// его реально ждал. Тот же риск есть и в scan-цикле (ESCAN_RESULT на том
+// же канале) — там просто не проявилось в конкретном тесте. Правильный
+// фикс потребовал бы полноценного диспетчера кадров (не молча
+// отбрасывать чужой канал, а буферизировать/передавать) — за рамками
+// этого прохода, оставлено как есть в issuse.txt.
 static uint32_t wifi_wait_and_dump_any_events(seL4_CPtr console_ep, uint32_t timeout_us) {
     uint64_t freq = wifi_read_cntfrq();
     uint64_t start = wifi_read_cntvct();
@@ -3562,6 +3596,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr net_wifi_rx_ntfn = ipc->msg[BOOT_WIFI_NET_RX_SIGNAL_CAP]; // Фаза 4.5.5: капа сигнала net_driver'у "кадр в RX-mailbox"
     g_wifi_vfs_mutex_ep  = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
     seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
+    seL4_CPtr liveness_ntfn = ipc->msg[BOOT_WIFI_LIVENESS_NTFN_CAP]; // Фаза 3b плана "Сигналы драйверам", см. main.cpp
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -3649,6 +3684,12 @@ int main(int argc, char *argv[]) {
         if (badge & (WIFI_EVENT_HEARTBEAT | WIFI_EVENT_TX_READY)) {
             if (badge & WIFI_EVENT_HEARTBEAT) {
                 g_wifi_heartbeat_ticks++;
+                // Фаза 3b плана "Сигналы драйверам" — "я жив". WATCHDOG_
+                // TIMEOUT_MS[5]=45с в main.cpp намеренно с большим запасом
+                // сверх легального connect/scan (15-30с) — этот тик всё
+                // равно не придёт, пока главный цикл занят внутри одного
+                // из них, но следующий после возврата в Recv наверстает.
+                if (liveness_ntfn != 0) seL4_Signal(liveness_ntfn);
                 // Печать тика убрана (была нужна только для проверки Фазы 4.5.1,
                 // что нотификация реально приходит с ~100мс кадансом) — счётчик
                 // остаётся живым и теперь виден через "wifi status" (см.
@@ -3712,8 +3753,18 @@ int main(int argc, char *argv[]) {
             } else {
                 uint32_t ssid_len = *(uint32_t*)(g_wifi_shm + WIFI_SHM_SSID_LEN_OFFSET);
                 uint32_t pass_len = *(uint32_t*)(g_wifi_shm + WIFI_SHM_PASS_LEN_OFFSET);
-                if (ssid_len > 32) ssid_len = 32;
-                if (pass_len > 63) pass_len = 63;
+                // issuse.txt №22: раньше обрезка была молчаливой — обрезанный
+                // пароль проваливал handshake с ошибкой, неотличимой от
+                // "просто неверный пароль", без единого намёка на реальную
+                // причину.
+                if (ssid_len > 32) {
+                    sys_puts(console_ep, "[WIFI] warning: SSID longer than 32 bytes, truncated.\n");
+                    ssid_len = 32;
+                }
+                if (pass_len > 63) {
+                    sys_puts(console_ep, "[WIFI] warning: password longer than 63 bytes, truncated.\n");
+                    pass_len = 63;
+                }
                 const char *ssid = g_wifi_shm + WIFI_SHM_SSID_OFFSET;
                 const char *pass = g_wifi_shm + WIFI_SHM_PASS_OFFSET;
                 result = (uint32_t)wifi_connect(console_ep, ssid, ssid_len, pass, pass_len, &reason);

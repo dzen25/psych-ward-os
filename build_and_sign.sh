@@ -87,18 +87,18 @@ cp "$B/wifi_driver" "$LOAD_CHAIN/service/wifi.elf"
 cp "$B/test_app" "$LOAD_CHAIN/bin/test_app.elf"
 cp "$B/test_app" "$LOAD_CHAIN/root/test_app.elf"
 
-# /etc/init.conf — обычный текст, не сборочный артефакт. Редактировать
-# ТОЛЬКО load_chain/etc/init.conf.src (без подписи) — ниже он подписывается
-# заново при каждом запуске.
-if [ -f "$LOAD_CHAIN/etc/init.conf.src" ]; then
-    cp "$LOAD_CHAIN/etc/init.conf.src" "$LOAD_CHAIN/etc/init.conf"
-fi
+# /etc/init.conf, /etc/auto_restart.conf — по просьбе пользователя
+# (2026-08-16) больше НЕ сборочные артефакты и НЕ подписываются (см.
+# load_text_config_from_disk() в main.cpp) — простой текст, редактируется
+# ПРЯМО на устройстве (touch/echo>файл, в будущем — полноценный редактор).
+# Копий .src больше нет — load_chain/etc/{init.conf,auto_restart.conf}
+# сами по себе каноничны, этот скрипт их не трогает вообще.
 
 # --- 5. Подпись — просто список ПАПОК, без знания конкретных имён файлов.
 # Подписывает КАЖДЫЙ .elf, что найдёт внутри, на месте. Новый .elf в любой
 # из перечисленных папок подхватится сам — редактировать этот список нужно,
 # только если появится СОВСЕМ НОВАЯ папка (не новый файл в существующей). ---
-echo "[5/6] Подписываю все .elf в load_chain/{sbin,service,bin,root} + init.conf ..."
+echo "[5/6] Подписываю все .elf в load_chain/{sbin,service,bin,root} (/etc — простой текст, не подписывается) ..."
 
 SIGN_DIRS=("$LOAD_CHAIN/sbin" "$LOAD_CHAIN/service" "$LOAD_CHAIN/bin" "$LOAD_CHAIN/root")
 for dir in "${SIGN_DIRS[@]}"; do
@@ -108,11 +108,6 @@ for dir in "${SIGN_DIRS[@]}"; do
         "$SIGN_ELF" sign "$SIGN_KEY" "$f" "$tmp" && mv "$tmp" "$f" && chmod 755 "$f"
     done
 done
-
-if [ -f "$LOAD_CHAIN/etc/init.conf" ]; then
-    tmp="$(mktemp)"
-    "$SIGN_ELF" sign "$SIGN_KEY" "$LOAD_CHAIN/etc/init.conf" "$tmp" && mv "$tmp" "$LOAD_CHAIN/etc/init.conf"
-fi
 
 # --- 6. FIT-подпись загрузочного образа (Фаза 13, RSA — отдельный механизм
 # от Ed25519 выше, проверяется САМИМ U-Boot, не rootserver'ом). Ключ здесь
