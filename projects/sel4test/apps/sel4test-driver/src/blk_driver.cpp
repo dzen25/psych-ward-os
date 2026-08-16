@@ -2,6 +2,7 @@
 #include "h/common.h"
 #include "h/exfat.h"
 #include "h/platform.h"
+#include "h/gpio.h"
 #include <stdint.h>
 
 // ARM generic timer (CNTVCT_EL0/CNTFRQ_EL0) — те же самые EL0-регистры, что
@@ -706,6 +707,12 @@ int main(int argc, char *argv[]) {
     }
     if (LOG_BLK) sys_puts(console_ep, "[BLK] EMMC2 initialized.\n");
 
+    // Начало GPIO-драйвера (см. h/gpio.h) — зелёный ACT LED, независимая от
+    // EMMC периферия, PLAT_GPIO_VADDR уже замаплен root'ом при спавне (см.
+    // spawn_process()/main.cpp, gpio_frame_param). Физический адрес не нужен —
+    // достаточно скомпилированного vaddr.
+    gpio_init((void*)PLAT_GPIO_VADDR);
+
     // 2.5/3. Монтируем файловую систему (см. blk_mount_exfat() выше —
     // теперь отдельная функция, чтобы SYS_DRIVER_SIGNAL(RESTART) могла
     // позвать её повторно).
@@ -758,6 +765,18 @@ int main(int argc, char *argv[]) {
         seL4_Word sender_badge = 0;
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &sender_badge);
 
+        // Начало GPIO-драйвера (см. h/gpio.h) — гасим ACT LED здесь,
+        // БЕЗУСЛОВНО, СРАЗУ после seL4_Recv(), ДО любых веток/`continue`
+        // ниже (включая heartbeat-тик — иначе на holостом ходу, когда
+        // единственные пробуждения это тики, этот код никогда бы не
+        // исполнялся, и LED, once зажжённый первой же командой, оставался
+        // бы гореть навсегда — именно так и было в первой версии, hw-
+        // подтверждено 2026-08-16: "горит постоянно"). LED снова включится
+        // ниже, непосредственно перед разбором настоящей VFS-команды.
+        // Задержка выключения ограничена периодом heartbeat-тика (20мс,
+        // см. main() выше) — незаметна глазу.
+        gpio_act_led_off();
+
         // Фаза 3b плана "Сигналы драйверам" — ЧИСТО notification-пробуждение
         // (badge, MR0 не несёт настоящего сообщения — см. тот же паттерн у
         // net_driver.cpp/badge&NET_EVENT_*), проверяется ДО чтения cmd,
@@ -802,6 +821,9 @@ int main(int argc, char *argv[]) {
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             continue;
         }
+
+        // Настоящая VFS-команда — мигаем ACT LED (см. gpio_act_led_off() выше).
+        gpio_act_led_on();
 
         if (cmd == 110) { // SYS_LS
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64

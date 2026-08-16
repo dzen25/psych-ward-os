@@ -76,6 +76,15 @@ for built in "$B"/sb_*; do
     name="$(basename "$built")"; name="${name#sb_}"
     cp "$built" "$LOAD_CHAIN/sbin/${name}.elf"
 done
+# issuse.txt №62 (расследование) — тестовые хуки (holdshm/proxytest/
+# recovertest/stresstest, PSYCH_TEST_TOOLS в CMakeLists.txt) собираются с
+# префиксом sbtest_ (не sb_!) специально, чтобы не путаться с обычными
+# /sbin-командами — раскладываем в отдельную load_chain/sbin/tests/.
+mkdir -p "$LOAD_CHAIN/sbin/tests"
+for built in "$B"/sbtest_*; do
+    name="$(basename "$built")"; name="${name#sbtest_}"
+    cp "$built" "$LOAD_CHAIN/sbin/tests/${name}.elf"
+done
 for built in "$B"/svc_*; do
     name="$(basename "$built")"; name="${name#svc_}"
     cp "$built" "$LOAD_CHAIN/service/${name}.elf"
@@ -98,9 +107,9 @@ cp "$B/test_app" "$LOAD_CHAIN/root/test_app.elf"
 # Подписывает КАЖДЫЙ .elf, что найдёт внутри, на месте. Новый .elf в любой
 # из перечисленных папок подхватится сам — редактировать этот список нужно,
 # только если появится СОВСЕМ НОВАЯ папка (не новый файл в существующей). ---
-echo "[5/6] Подписываю все .elf в load_chain/{sbin,service,bin,root} (/etc — простой текст, не подписывается) ..."
+echo "[5/6] Подписываю все .elf в load_chain/{sbin,sbin/tests,service,bin,root} (/etc — простой текст, не подписывается) ..."
 
-SIGN_DIRS=("$LOAD_CHAIN/sbin" "$LOAD_CHAIN/service" "$LOAD_CHAIN/bin" "$LOAD_CHAIN/root")
+SIGN_DIRS=("$LOAD_CHAIN/sbin" "$LOAD_CHAIN/sbin/tests" "$LOAD_CHAIN/service" "$LOAD_CHAIN/bin" "$LOAD_CHAIN/root")
 for dir in "${SIGN_DIRS[@]}"; do
     for f in "$dir"/*.elf; do
         [ -e "$f" ] || continue

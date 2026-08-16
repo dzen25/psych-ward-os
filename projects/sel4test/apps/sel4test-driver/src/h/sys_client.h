@@ -75,8 +75,18 @@ static void sys_write(int fd, const char* str) {
         for (int i = 0; i < chunk; i++) {
             ipc->msg[i + 1] = str[offset + i];
         }
-        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
-        offset += chunk;
+        seL4_MessageInfo_t reply = seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        // issuse.txt №7 — при записи в пайп root теперь возвращает реальное
+        // число принятых байт в MR0 (см. main.cpp, case 8) вместо молчаливого
+        // "всё ок", если буфер пайпа полон. Консоль (uart_driver) отвечает
+        // пустым сообщением (length 0) — там accepted остаётся chunk, как и
+        // раньше, поведение для обычного вывода не меняется.
+        int accepted = chunk;
+        if (seL4_MessageInfo_get_length(reply) >= 1) {
+            accepted = (int)seL4_GetMR(0);
+            if (accepted < chunk) break; // пайп полон — читателя, способного его освободить, ждать нет смысла
+        }
+        offset += accepted;
     }
 }
 
@@ -84,6 +94,32 @@ static void sys_write(int fd, const char* str) {
 // игнорируется) — чтобы логику команд можно было переносить как есть.
 static inline void sys_puts(seL4_CPtr /*unused_ep*/, const char *str) {
     sys_write(1, str);
+}
+
+// issuse.txt №63(b) — вариант sys_write() с явной длиной вместо strlen():
+// нужен для сырых чанков файла (SYS_READ_FILE=119), которые НЕ гарантированно
+// '\0'-терминированы в нужном месте (могут содержать нулевые байты как
+// законный байт содержимого посередине чанка — strlen() в этом случае
+// молча обрежет вывод раньше времени).
+static void sys_write_n(int fd, const char *buf, int len) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr target_ep = ipc->caps_or_badges[fd];
+
+    int offset = 0;
+    while (offset < len) {
+        int chunk = len - offset;
+        if (chunk > 100) chunk = 100;
+
+        ipc->msg[0] = 8; // SYS_PUTS
+        for (int i = 0; i < chunk; i++) ipc->msg[i + 1] = buf[offset + i];
+        seL4_MessageInfo_t reply = seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        int accepted = chunk;
+        if (seL4_MessageInfo_get_length(reply) >= 1) {
+            accepted = (int)seL4_GetMR(0);
+            if (accepted < chunk) break; // см. sys_write() — пайп полон, дальше ждать некого
+        }
+        offset += accepted;
+    }
 }
 
 static int my_strcmp(const char *s1, const char *s2) {

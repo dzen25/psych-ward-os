@@ -172,12 +172,16 @@ foreach(tool ${PSYCH_SBIN_TOOLS})
     target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
 endforeach()
 
-set(PSYCH_TEST_TOOLS holdshm proxytest recovertest)
+# issuse.txt №62 (расследование) — префикс sbtest_ (не sb_!) специально
+# ОТЛИЧАЕТСЯ от PSYCH_SBIN_TOOLS выше: build_and_sign.sh различает их по
+# этому префиксу и раскладывает тестовые хуки в load_chain/sbin/tests/,
+# а не в load_chain/sbin/ — чтобы не путались с обычными командами.
+set(PSYCH_TEST_TOOLS holdshm proxytest recovertest stresstest ctrlbytetest timedread)
 foreach(tool ${PSYCH_TEST_TOOLS})
-    add_executable(sb_${tool} src/tests/${tool}.cpp)
-    target_include_directories(sb_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
-    target_link_options(sb_${tool} PRIVATE "-static")
-    target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
+    add_executable(sbtest_${tool} src/tests/${tool}.cpp)
+    target_include_directories(sbtest_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
+    target_link_options(sbtest_${tool} PRIVATE "-static")
+    target_link_libraries(sbtest_${tool} sel4 sel4runtime muslc)
 endforeach()
 
 # Фаза 9.B (см. ROADMAP.md): фоновые сервисы для автозапуска из

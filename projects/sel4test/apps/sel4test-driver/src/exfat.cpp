@@ -572,6 +572,23 @@ bool exfat_format_dir_listing(EXFAT_Instance* fs, uint32_t dir_cluster, char* ou
 // ============================================================================
 // === ЧТЕНИЕ ДАННЫХ ФАЙЛА ===
 // ============================================================================
+// issuse.txt №66/№63(a) — кэш последней позиции обхода FAT-цепочки (см.
+// read_extent() ниже). Живой тест: chunked-чтение (SYS_READ_FILE, offset
+// растёт монотонно на каждый вызов — так читают cat.cpp и timedread.elf)
+// 120МиБ фрагментированного файла ПОВИСЛО на 10+ минут без единого чанка.
+// Причина: для файла БЕЗ NoFatChain-бита (реальная цепочка, не один
+// сплошной run) read_extent() КАЖДЫЙ раз шёл по цепочке кластеров с самого
+// начала (first_cluster), чтобы найти нужный cluster_index — O(индекс) на
+// вызов, а раз offset растёт линейно с каждым чанком — O(N^2) на весь файл
+// целиком. Единственный клиент этой функции — здесь, в этом же файле, и
+// вызывается всегда последовательно (chunked-протокол только вперёд) —
+// кэш валиден, только если это ТОТ ЖЕ файл (совпадает first_cluster) И
+// запрошенный cluster_index >= кэшированного (иначе — честно с начала, как
+// раньше, ничего не ломаем для произвольного/обратного доступа).
+static uint32_t g_extent_cache_first_cluster = 0; // 0 = кэш пуст/невалиден (first_cluster всегда >= 2)
+static uint32_t g_extent_cache_cluster_index = 0;
+static uint32_t g_extent_cache_cluster = 0;
+
 static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_fat_chain, uint32_t offset, char* out_buffer, uint32_t max_len) {
     uint32_t bytes_per_cluster = EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
     if (bytes_per_cluster == 0 || first_cluster < 2) return 0;
@@ -581,12 +598,34 @@ static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_
     uint32_t offset_in_cluster = offset % bytes_per_cluster;
 
     uint32_t cluster;
+    uint32_t running_cluster_index = cluster_index; // индекс ТЕКУЩЕГО cluster — для кэша на выходе
     if (no_fat_chain) {
         cluster = first_cluster + cluster_index;
     } else {
-        if (fat_chain_has_cycle(fs, first_cluster)) return 0;
-        cluster = first_cluster;
-        for (uint32_t i = 0; i < cluster_index; i++) {
+        // issuse.txt №68 (продолжение) — сам кэш позиции (start_index) не
+        // помог по-настоящему: fat_chain_has_cycle() двумя строками выше
+        // ходит по ВСЕЙ цепочке целиком (алгоритм Флойда, O(длина цепочки))
+        // БЕЗУСЛОВНО на каждый вызов, независимо от того, что мы уже кэшируем
+        // позицию — оказалась доминирующей стоимостью (константные ~3с на
+        // чанк на живом железе, 154МиБ файл, не зависит от offset — именно
+        // так и выглядит "не растущая, но постоянная" стоимость O(N) на
+        // каждый вызов). Раз цепочка для ЭТОГО first_cluster уже была
+        // проверена раньше (кэш непуст и совпадает) — цикла в ней физически
+        // не могло появиться с прошлого раза без изменения ФС (а любое
+        // изменение ФС уже инвалидирует кэш в bitmap_free_run()) —
+        // повторная проверка того же самого не нужна.
+        bool already_verified = (g_extent_cache_first_cluster == first_cluster);
+        if (!already_verified && fat_chain_has_cycle(fs, first_cluster)) return 0;
+
+        uint32_t start_index = 0;
+        if (already_verified && g_extent_cache_cluster_index <= cluster_index) {
+            cluster = g_extent_cache_cluster;
+            start_index = g_extent_cache_cluster_index;
+        } else {
+            cluster = first_cluster;
+            start_index = 0;
+        }
+        for (uint32_t i = start_index; i < cluster_index; i++) {
             uint32_t next = fat_get_entry(fs, cluster);
             if (!exfat_cluster_has_next(next)) return 0;
             cluster = next;
@@ -612,6 +651,7 @@ static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_
         offset_in_cluster += take;
         if (offset_in_cluster >= bytes_per_cluster) {
             offset_in_cluster = 0;
+            running_cluster_index++;
             if (no_fat_chain) {
                 cluster = cluster + 1; // предел общей длины проверяет вызывающий (remaining/chunk)
             } else {
@@ -619,6 +659,12 @@ static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_
                 cluster = exfat_cluster_has_next(next) ? next : 0;
             }
         }
+    }
+
+    if (!no_fat_chain && cluster >= 2) {
+        g_extent_cache_first_cluster = first_cluster;
+        g_extent_cache_cluster_index = running_cluster_index;
+        g_extent_cache_cluster = cluster;
     }
 
     my_memcpy(out_buffer, staging, copied);
@@ -856,6 +902,13 @@ static bool bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t
     for (uint32_t i = 0; i < num_clusters; i++) {
         if (!bitmap_set_bit(fs, first_cluster + i, false)) ok = false;
     }
+    // issuse.txt №66 — освобождённые кластеры могут быть переиспользованы
+    // ДРУГИМ файлом (bitmap_alloc_run), потенциально с тем же самым
+    // first_cluster, что и у только что удалённого — кэш read_extent()
+    // хранит позицию по одному лишь first_cluster, так что должен стать
+    // невалидным здесь, иначе отдаст позицию из чужой, уже не существующей
+    // цепочки.
+    g_extent_cache_first_cluster = 0;
     return ok;
 }
 

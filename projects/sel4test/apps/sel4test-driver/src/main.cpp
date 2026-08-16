@@ -367,6 +367,22 @@ static uint64_t object_size_bytes(seL4_Word type, seL4_Word size_bits) {
 // вокруг конкретного вызова spawn_process() для команд), их retype идут
 // через тот же ram_retype(), просто с g_current_arena==0 — поведение не
 // меняется ни на бит.
+//
+// issuse.txt №62 (ЗАКРЫТО 2026-08-16) — подтверждённая причина: именно
+// переиспользование этой арены (весь address space команды — CNode/
+// VSpace/TCB/страницы ELF — из одного и того же физического 1МиБ между
+// командами) давала спорадическую порчу TLS-образа при старте. hw-тест
+// (см. sbin/tests/stresstest.cpp): 350 спавнов /sbin-команд подряд (50+300
+// итераций, 2 отдельных прогона) с ареной выключенной — 0 крашей/зависаний,
+// раньше проблема ловилась уже в пределах 5-10 команд. CMD_ARENA_ENABLED
+// оставлен константой (не удаляем инфраструктуру арены целиком) на случай
+// более аккуратного варианта позже — арена только под data/ELF-фреймы, а
+// служебные kernel-объекты (CNode/VSpace/TCB/page tables) всегда из общего
+// монотонного пула, который и не переиспользуется, и потому не подвержен
+// этому классу порчи. Пока — просто выключено; `free`/Used снова растёт
+// монотонно (цена статус-кво до Фазы с ареной, см. issuse.txt №3), это
+// сознательный компромисс в пользу стабильности.
+constexpr bool CMD_ARENA_ENABLED = false;
 static seL4_CPtr g_current_arena = 0; // 0 = обычный путь через g_ram_pool, как раньше
 static uint64_t g_current_arena_bytes = 0; // сколько байт ТЕКУЩАЯ арена уже отдала — для точного отката g_ram_bytes_used при освобождении
 
@@ -690,6 +706,10 @@ struct ProcessControlBlock {
     // здесь респавненный драйвер молча терял бы автомониторинг навсегда —
     // тот же класс потери, что уже был у mbox/blk_dma выше (issuse.txt №8/№65).
     seL4_CPtr liveness_ntfn_badged;
+    // Начало GPIO-драйвера (см. h/gpio.h) — фрейм регистров GPIO-контроллера,
+    // только is_driver==3 (blk_driver). Тот же класс потери через респавн,
+    // что у mbox_regs_frame/blk_dma_frame выше, если не сохранить здесь.
+    seL4_CPtr gpio_frame;
     // issuse.txt №6 — vaddr, выданный ПЕРВЫМ SYS_SHM_GET этого процесса.
     // Повторный вызов (например shell-команда `shm`, вызываемая уже ПОСЛЕ
     // автоматического SHM_GET при старте в sys_client_init()) отдаёт его же
@@ -743,13 +763,13 @@ struct pipe_t {
     bool active;
     char buffer[4096];
     int count; // Сколько байт сейчас в буфере
-    
+
     // Блокировка! Если читатель пришел, а пайп пуст, мы сохраняем его Reply Cap,
     // чтобы ответить (разбудить) его позже, когда писатель положит данные.
-    seL4_CPtr reader_reply_cap; 
+    seL4_CPtr reader_reply_cap;
     int writer_pid;
     int owner_pid; // PID процесса, который создал пайп
-    
+
     bool eof; // Флаг конца файла (писатель умер или закрыл трубу)
 };
 
@@ -1172,6 +1192,34 @@ static seL4_CPtr pcie_rc_frame = 0;
 static seL4_CPtr pcie_err_frame = 0;
 static seL4_CPtr usb_cmd_recv_ep = 0;
 
+// issuse.txt №9 — базовая раздача ресурсов процесса в spawn_process()
+// (retype CNode/VSpace/PUD/PD/PT, ELF-страницы, стек, IPC-фрейм, TCB) не
+// проверяла ошибки ram_retype()/seL4_ARM_Page_Map(), непоследовательно с
+// HW-фреймами драйверов чуть ниже в этой же функции (те через check_err()).
+// НЕ переиспользуем сам check_err() — там halt-forever (while(1)), что
+// оправдано ТОЛЬКО для одноразового boot-time кода (без MMIO-фрейма
+// драйвер вообще не может жить). spawn_process() же вызывается на КАЖДЫЙ
+// runtime `exec` — halt-forever здесь превратил бы истощение RAM/CSlot-
+// пула (например, от одной неудачной фоновой команды) в смерть всей
+// системы вместо честного отказа этого одного spawn'а. Вместо этого —
+// откат уже захваченных капов через тот же cap_tracker-цикл, что
+// использует generic_recover_process() при респавне, и return -1
+// вызывающему (тот уже умеет обрабатывать -1 — см. другие ранние return -1
+// в этой же функции).
+static int abort_spawn(ProcessControlBlock &pcb, PsychAllocator &alloc, seL4_CPtr root_cnode, const char *stage) {
+    uart_puts("[SPAWN] FATAL: '"); uart_puts(pcb.name); uart_puts("' - ");
+    uart_puts(stage); uart_puts(" failed (RAM/CSlots exhausted?) - aborting this spawn.\n");
+    for (int i = 0; i < pcb.cap_tracker.count; i++) {
+        seL4_CPtr cap_to_free = pcb.cap_tracker.caps[i];
+        seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+        seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
+        alloc.free(cap_to_free);
+    }
+    pcb.cap_tracker.count = 0;
+    pcb.active = false;
+    return -1;
+}
+
 static int spawn_process(const char* name, char* elf_data, unsigned long elf_size, seL4_CPtr ep, seL4_CPtr med_ep,
                          PsychAllocator &alloc, seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
                          seL4_CPtr shm_frame_root, int is_driver, seL4_CPtr console_ep, seL4_CPtr timer_ep,
@@ -1314,7 +1362,14 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // timer_driver (is_driver==2), чтобы периодически
                          // сигналить её рядом с net/wifi/blk/usb-heartbeat
                          // (см. BOOT_BLK_LIVENESS_TICK_NTFN_CAP/common.h).
-                         seL4_CPtr blk_liveness_tick_param = 0) {
+                         seL4_CPtr blk_liveness_tick_param = 0,
+                         // Начало GPIO-драйвера (см. h/gpio.h) — фрейм
+                         // регистров GPIO-контроллера (RPI4_GPIO_PADDR,
+                         // platform.h), читает ТОЛЬКО blk_driver
+                         // (is_driver==3) — мигание ACT LED при обращении
+                         // к SD. Обычное копирование capability, не TCB-bind,
+                         // тот же приём, что mbox_regs_frame выше.
+                         seL4_CPtr gpio_frame_param = 0) {
 
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -1347,7 +1402,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     // 1. Создаем локальный CSpace (8 бит = 256 слотов)
     seL4_CPtr child_cnode = alloc_and_track_cap(alloc, pcb);
-    ram_retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1);
+    if (ram_retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype CNode");
 
     seL4_CPtr badged_ep = alloc_and_track_cap(alloc, pcb);
     seL4_CNode_Mint(root_cnode, badged_ep, seL4_WordBits, 
@@ -1456,6 +1512,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.blk_dma_paddr = blk_dma_paddr_param;
     pcb.blk_dma_frame2 = blk_dma_frame2_param;
     pcb.blk_dma_paddr2 = blk_dma_paddr2_param;
+    // Начало GPIO-драйвера (см. h/gpio.h) — тот же приём, для respawn.
+    pcb.gpio_frame = gpio_frame_param;
     // Фаза 3b — см. поле в struct ProcessControlBlock выше.
     pcb.liveness_ntfn_badged = liveness_ntfn_param;
     // Фаза 3b — сбрасываем last_seen на "ещё не проверялся" (0) при каждом
@@ -1489,17 +1547,27 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr child_pt  = alloc_and_track_cap(alloc, pcb);
     seL4_CPtr child_pt2 = alloc_and_track_cap(alloc, pcb); // Вторая таблица для потоков
 
-    ram_retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1);
-    ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1);
-    ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1);
-    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1);
-    ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1); // Выделяем объект
+    if (ram_retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype VSpace");
+    if (ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype PUD");
+    if (ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype PD");
+    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype PT");
+    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1) != seL4_NoError) // Вторая таблица для потоков
+        return abort_spawn(pcb, alloc, root_cnode, "retype PT2");
 
-    seL4_ARM_ASIDPool_Assign(seL4_CapInitThreadASIDPool, child_vspace);
-    seL4_ARM_PageUpperDirectory_Map(child_pud, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes);
-    seL4_ARM_PageDirectory_Map(child_pd, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes);
-    seL4_ARM_PageTable_Map(child_pt, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes);     // Покрывает 0x400000 - 0x5FFFFF
-    seL4_ARM_PageTable_Map(child_pt2, child_vspace, 0x600000, seL4_ARM_Default_VMAttributes);    // Покрывает 0x600000 - 0x7FFFFF (Тут живут наши потоки)
+    if (seL4_ARM_ASIDPool_Assign(seL4_CapInitThreadASIDPool, child_vspace) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "ASIDPool_Assign");
+    if (seL4_ARM_PageUpperDirectory_Map(child_pud, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "map PUD");
+    if (seL4_ARM_PageDirectory_Map(child_pd, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "map PD");
+    if (seL4_ARM_PageTable_Map(child_pt, child_vspace, 0x400000, seL4_ARM_Default_VMAttributes) != seL4_NoError) // Покрывает 0x400000 - 0x5FFFFF
+        return abort_spawn(pcb, alloc, root_cnode, "map PT");
+    if (seL4_ARM_PageTable_Map(child_pt2, child_vspace, 0x600000, seL4_ARM_Default_VMAttributes) != seL4_NoError) // Покрывает 0x600000 - 0x7FFFFF (Тут живут наши потоки)
+        return abort_spawn(pcb, alloc, root_cnode, "map PT2");
 
     pcbs[pid].vmap_bump_pointer = 0x60000000; // Курсор для динамического маппинга
 
@@ -1527,12 +1595,14 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             
             for (uint64_t page = page_start; page < page_end; page += 4096) {
                 seL4_CPtr frame = alloc_and_track_cap(alloc, pcb);
-                ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1);
-                
+                if (ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, frame, 1) != seL4_NoError)
+                    return abort_spawn(pcb, alloc, root_cnode, "retype ELF page");
+
                 // Используем скользящее окно!
-                seL4_ARM_Page_Map(frame, root_vspace, elf_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+                if (seL4_ARM_Page_Map(frame, root_vspace, elf_temp_vaddr, seL4_AllRights, seL4_ARM_Default_VMAttributes) != seL4_NoError)
+                    return abort_spawn(pcb, alloc, root_cnode, "map ELF page to root");
                 memset((void*)elf_temp_vaddr, 0, 4096);
-                
+
                 uint64_t copy_start = (page > vaddr) ? page : vaddr;
                 uint64_t copy_end = (page + 4096 < vaddr + filesz) ? page + 4096 : vaddr + filesz;
                 if (copy_start < copy_end) {
@@ -1541,7 +1611,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 seL4_ARM_Page_Clean_Data(frame, 0, 4096);
                 seL4_ARM_Page_Unmap(frame);
 
-                seL4_ARM_Page_Map(frame, child_vspace, page, seL4_AllRights, seL4_ARM_Default_VMAttributes);
+                if (seL4_ARM_Page_Map(frame, child_vspace, page, seL4_AllRights, seL4_ARM_Default_VMAttributes) != seL4_NoError)
+                    return abort_spawn(pcb, alloc, root_cnode, "map ELF page to child");
             }
         }
     }
@@ -1568,10 +1639,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr stack_frames[STACK_PAGES];
     for (int i = 0; i < STACK_PAGES; i++) {
         stack_frames[i] = alloc_and_track_cap(alloc, pcb);
-        ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frames[i], 1);
+        if (ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, stack_frames[i], 1) != seL4_NoError)
+            return abort_spawn(pcb, alloc, root_cnode, "retype stack page");
     }
     seL4_CPtr ipc_frame = alloc_and_track_cap(alloc, pcb);
-    ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1);
+    if (ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, ipc_frame, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype IPC frame");
 
     uintptr_t ipc_temp_vaddr = global_ipc_temp_vaddr;
     global_ipc_temp_vaddr += 0x1000;
@@ -1635,6 +1708,16 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
         seL4_Word pipe_badge = PIPE_BASE_BADGE + stdout_pipe_id;
         seL4_CNode_Mint(child_cnode, local_stdout_pipe_ep, 8, root_cnode, ep, seL4_WordBits, seL4_AllRights, pipe_badge);
         child_ipc_ptr->caps_or_badges[1] = local_stdout_pipe_ep;
+        // issuse.txt №7 (найдено при расследовании зависания) — writer_pid
+        // раньше оставался PID'ом шелла (кто вызвал SYS_PIPE), никогда не
+        // переставлялся на реального EXEC'нутого писателя. Из-за этого
+        // авто-EOF в SYS_EXIT/SYS_THREAD_EXIT (сравнение writer_pid ==
+        // sender_pid) был мёртвым кодом для ЛЮБОГО /sbin-писателя вроде
+        // ls — работало только благодаря отдельному, безусловному
+        // sys_pipe_wr_close() в shell.cpp. Если писатель падает/убит
+        // (не штатный exit) вместо этого явного close — читатель раньше
+        // завис бы навсегда без EOF.
+        g_pipes[stdout_pipe_id].writer_pid = pid;
     } else {
         child_ipc_ptr->caps_or_badges[1] = local_console_ep; // FD 1 = STDOUT
     }
@@ -1714,6 +1797,17 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                                       root_cnode, blk_dma_frame2_param, seL4_WordBits, seL4_AllRights), "Copy Blk DMA Frame2 Cap");
             check_err(seL4_ARM_Page_Map(blk_dma_child2, child_vspace, PLAT_BLK_DMA_VADDR + 0x1000,
                                         seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Blk DMA Buf2 to Driver");
+        }
+        // Начало GPIO-драйвера (см. h/gpio.h) — регистры GPIO-контроллера
+        // (RPI4_GPIO_PADDR, одна страница), тот же приём, что DMA-страницы
+        // выше — Page_Map поверх уже созданной для is_driver==3 иерархии
+        // drv_pud/drv_pd/drv_pt, отдельная PUD/PD/PT не нужна.
+        if (is_driver == 3 && gpio_frame_param != 0) {
+            seL4_CPtr gpio_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, gpio_child, seL4_WordBits,
+                                      root_cnode, gpio_frame_param, seL4_WordBits, seL4_AllRights), "Copy GPIO Frame Cap");
+            check_err(seL4_ARM_Page_Map(gpio_child, child_vspace, PLAT_GPIO_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map GPIO to Driver");
         }
 
         // Фаза 14 (USB, xHCI) — приватные DMA-страницы usb_driver'а, все в
@@ -1920,7 +2014,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr tcb = alloc_and_track_cap(alloc, pcb);
     pcb.tcb = tcb;
     pcb.vspace = child_vspace;
-    ram_retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1);
+    if (ram_retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1) != seL4_NoError)
+        return abort_spawn(pcb, alloc, root_cnode, "retype TCB");
 
     // Фаза 6.1 (продолжение, см. ROADMAP.md): собственная TCB-капа — только
     // uart/blk/net/wifi (is_driver 1/3/4/5), см. BOOT_SELF_TCB_CAP выше.
@@ -2140,7 +2235,11 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
                                     // выше (тот же класс потери, что issuse.txt
                                     // №8/№65, если бы не сохранялись).
                                     meta.liveness_ntfn_badged,
-                                    meta.blk_liveness_tick_badged);
+                                    meta.blk_liveness_tick_badged,
+                                    // Начало GPIO-драйвера (см. h/gpio.h) — тот
+                                    // же класс потери через респавн, что у
+                                    // blk_dma_frame выше, если бы не сохранялся.
+                                    meta.gpio_frame);
 
         if (new_pid > 0) {
             // path не приходит через spawn_process (и так огромный список
@@ -2596,6 +2695,15 @@ int main(int argc, char *argv[]) {
     // ниже — см. комментарий там же и проверку "target_paddr BEHIND watermark"
     // в alloc_device_frame()).
     seL4_CPtr mbox_regs_frame = alloc_device_frame(info, alloc, PLAT_MBOX_PADDR, root_cnode);
+    // Начало GPIO-драйвера (зелёный ACT LED, GPIO42 — см. h/gpio.h) — DT
+    // bcm2711-rpi-4-b.dts: led-act, gpios = <&gpio 42 GPIO_ACTIVE_HIGH>,
+    // напрямую через ARM-side GPIO-контроллер (не firmware-gpio/expgpio,
+    // как PWR LED). RPI4_GPIO_PADDR (0xfe200000) физически МЕЖДУ MBOX
+    // (0xfe00b000) и mini-UART AUX (0xfe215000) в ТОМ ЖЕ untyped-регионе —
+    // ДОЛЖЕН аллоцироваться строго здесь, между ними (см. проверку
+    // "target_paddr BEHIND watermark" в alloc_device_frame() выше — тот же
+    // класс бага, что уже один раз сломал wifi_sdio_frame/emmc_frame).
+    seL4_CPtr gpio_frame = alloc_device_frame(info, alloc, RPI4_GPIO_PADDR, root_cnode);
     seL4_CPtr uart_frame = alloc_device_frame(info, alloc, PLAT_UART_PADDR, root_cnode);
     seL4_CPtr emmc_frame = 0;
     seL4_CPtr avs_frame = 0;
@@ -3192,7 +3300,9 @@ int main(int argc, char *argv[]) {
                       nullptr, 0, 0, 0, 0, 0, 0, 0, 0, blk_dma_frame, blk_dma_paddr,
                       0, 0, 0, 0, mmc_shared_irq_handler, blk_dma_frame2, blk_dma_paddr2,
                       0, nullptr, -1, 0, nullptr, 0, 0, 0, 0, // vfs_mutex_ntfn_param .. usb_heartbeat_ntfn_param (не для blk_driver)
-                      blk_liveness_badged) < 0) { // Фаза 3b: капа-"я жив"
+                      blk_liveness_badged, // Фаза 3b: капа-"я жив" (param 48: liveness_ntfn_param)
+                      0, // blk_liveness_tick_param (param 49) — НЕ для самого blk_driver, читает только timer_driver
+                      gpio_frame) < 0) { // Начало GPIO-драйвера (см. h/gpio.h) — ACT LED при обращении к SD (param 50: gpio_frame_param)
         uart_puts("PANIC: Block Driver failed to load!\n"); while(1);
     }
     }
@@ -3368,7 +3478,7 @@ int main(int argc, char *argv[]) {
                 sender_pid = actual_pid;
             } else {
                 // Неопознанный бейдж, который не является пайпом. Игнорируем.
-                continue; 
+                continue;
             }
         }
         // Если это вызов к пайпу (is_pipe_call == true), sender_pid остается 0.
@@ -3537,11 +3647,11 @@ int main(int argc, char *argv[]) {
                     pipe_t* p = &g_pipes[pipe_id];
                     
                     int chunk = seL4_MessageInfo_get_length(recv_info) - 1;
-                    // Пишем данные в кольцевой буфер пайпа
-                    for (int i = 0; i < chunk; i++) {
-                        if (p->count < 4096) {
-                            p->buffer[p->count++] = (char)seL4_GetMR(i + 1);
-                        }
+                    // Пишем данные в буфер пайпа — сколько влезает.
+                    int written = 0;
+                    while (written < chunk && p->count < 4096) {
+                        p->buffer[p->count++] = (char)seL4_GetMR(written + 1);
+                        written++;
                     }
 
                     // Если кто-то спал и ждал данных (grep) - БУДИМ ЕГО!
@@ -3555,7 +3665,26 @@ int main(int argc, char *argv[]) {
                         alloc.free(p->reader_reply_cap);
                         p->reader_reply_cap = 0;
                     }
-                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+
+                    // issuse.txt №7 — буфер (4096) кончился раньше, чем влез
+                    // весь чанк. ПЕРВАЯ попытка фикса (2026-08-16) блокировала
+                    // писателя через SaveCaller до освобождения места —
+                    // ОТКАЧЕНА после hw-теста: shell.cpp запускает правую
+                    // часть конвейера ТОЛЬКО ПОСЛЕ полного выхода левой
+                    // (sys_wait перед spawn_thread(grep)), так что писатель
+                    // мог застрять в ожидании читателя, которого структурно
+                    // ещё не существует — гарантированный дедлок при любом
+                    // выводе больше 4096 байт. Вместо блокировки — честный
+                    // короткий write: пишем сколько влезло, ВСЕГДА отвечаем
+                    // немедленно, но возвращаем реальное число принятых байт
+                    // вместо молчаливого "успех" (см. sys_write() в
+                    // h/sys_client.h — теперь останавливается на коротком
+                    // write вместо тихой потери хвоста).
+                    if (written < chunk) {
+                        uart_puts("[PIPE] WARNING: buffer full, write truncated\n");
+                    }
+                    seL4_SetMR(0, written);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 } else {
                     // Заглушка, если кто-то случайно прислал консольный вывод в ядро
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
@@ -3636,13 +3765,12 @@ int main(int argc, char *argv[]) {
                 // Проверяем, жив ли еще процесс, которого мы хотим ждать
                 if (target_pid > 0 && target_pid < 256 && pcbs[target_pid].active) {
                     pcbs[sender_pid].waiting_for = target_pid;
-                    
+
                     // Сохраняем "канал возврата" к заснувшему процессу
                     seL4_CPtr wait_reply = alloc.alloc_slot();
                     seL4_CNode_SaveCaller(root_cnode, wait_reply, seL4_WordBits);
                     pcbs[sender_pid].reply_cap = wait_reply;
-                    
-                    continue; 
+                    continue;
                 } else {
                     seL4_SetMR(0, 0); // Процесс уже умер, сразу возвращаем успех
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
@@ -3669,6 +3797,9 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_CLONE: {
+                // issuse.txt (найдено 2026-08-16) — сейчас ничем в кодовой
+                // базе не вызывается, см. комментарий у case 105
+                // (SYS_THREAD_EXIT) ниже.
                 // ИСПРАВЛЕНО: Аргументы потока (func, arg0, arg1, arg2) передаются через регистры, а не SHM
                 seL4_Word entry_point = seL4_GetMR(1);
                 seL4_Word arg0 = seL4_GetMR(2);
@@ -3792,6 +3923,14 @@ int main(int argc, char *argv[]) {
             }
 
             case 105: { // SYS_THREAD_EXIT
+                // issuse.txt (найдено 2026-08-16) — этот case (и SYS_CLONE
+                // выше) сейчас НИЧЕМ в кодовой базе не вызывается: grep был
+                // единственным пользователем, seL4_Call() из клонированного
+                // потока к root через cptr 100+pid никогда не доходил до
+                // root на живом железе (100% детерминированно), grep
+                // переведён на прямой вызов функции (см. run_grep_filter()
+                // в shell.cpp). Код здесь оставлен как есть — не root-caused,
+                // трогать без диагностики рискованно.
                 int thread_pid = sender_badge & 0xFFFF;
                 int parent_pid = (sender_badge >> 16) & 0xFFFF;
 
@@ -3841,7 +3980,7 @@ int main(int argc, char *argv[]) {
                         alloc.free(cap_to_free);
                     }
                     pcb.cap_tracker.count = 0;
-                    
+
                     pcb.active = false;
                 }
                 // Не отвечаем на этот вызов, т.к. поток уничтожается
@@ -3945,7 +4084,7 @@ int main(int argc, char *argv[]) {
                         // обычным путём через общий пул, как раньше (деградация,
                         // не отказ).
                         seL4_CPtr cmd_arena_for_this_spawn = 0;
-                        if (exec_is_driver == 253 || exec_is_driver == 254) {
+                        if (CMD_ARENA_ENABLED && (exec_is_driver == 253 || exec_is_driver == 254)) {
                             cmd_arena_for_this_spawn = acquire_cmd_arena(alloc, root_cnode);
                             if (cmd_arena_for_this_spawn != 0) {
                                 g_current_arena = cmd_arena_for_this_spawn;

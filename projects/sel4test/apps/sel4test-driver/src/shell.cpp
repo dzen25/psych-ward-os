@@ -10,16 +10,13 @@
 // Системные часы (SYS_GET_TIME) всегда хранятся в UTC — здесь только отображение.
 static const int TZ_OFFSET_HOURS = 3;
 
-// Выделяем по 16 КБ для каждого потока и СТРОГО выравниваем по 16 байт (требование ARM64)
-static char grep_thread_stack[16384] __attribute__((aligned(16)));
-
 static char* shm_base = nullptr;
 static seL4_CPtr vfs_mutex_ep = 0;
 
 // Милстоун 4.4 (см. wifi_driver.cpp) — "знакомые сети" (PATH_WIFI_PQW,
 // строки "имясети|пароль"). Буферы для чтения/перезаписи файла целиком
 // (у blk_driver нет append, см. net_driver.cpp/platform.h) — статические
-// (не в стеке main()), по тому же принципу, что grep_thread_stack/cmd_history
+// (не в стеке main()), по тому же принципу, что cmd_history
 // выше: единственный поток шелла обрабатывает одну команду за раз, повторный
 // вход невозможен, а 2x4000 байт на стеке main() было бы неоправданным риском.
 static char g_pqw_old[4000];
@@ -151,8 +148,16 @@ void sys_write(int fd, const char* str) {
         for (int i = 0; i < chunk; i++) {
             ipc->msg[i + 1] = str[offset + i];
         }
-        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
-        offset += chunk;
+        seL4_MessageInfo_t reply = seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        // issuse.txt №7 — та же логика честного короткого write, что и в
+        // h/sys_client.h::sys_write() (см. её комментарий) — на случай
+        // builtin-команды слева от конвейера.
+        int accepted = chunk;
+        if (seL4_MessageInfo_get_length(reply) >= 1) {
+            accepted = (int)seL4_GetMR(0);
+            if (accepted < chunk) break;
+        }
+        offset += accepted;
     }
 }
 
@@ -444,34 +449,19 @@ static void net_call_ping(seL4_CPtr net_ep, seL4_Word ip, seL4_Word count, seL4_
 
 #define sys_puts_direct sys_puts
 
-static void sys_thread_exit() {
-    // 1. Получаем безопасный указатель на буфер текущего потока
-    seL4_IPCBuffer *ipc = get_local_ipc(); 
-    
-    // 2. Везде используем локальный 'ipc' вместо глобального макроса
-    seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
-    ipc->msg[0] = 105; // ID нашего нового сисколла
-    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    while(1) seL4_Yield(); // Сюда выполнение никогда не дойдет, ядро уничтожит поток
-}
-
-static int spawn_thread(seL4_Word func_ptr, seL4_Word stack_top, seL4_Word arg0, seL4_Word arg1, seL4_Word arg2, int pipe_id, seL4_CPtr stdin_cap, seL4_CPtr stdout_cap, seL4_CPtr stderr_cap) {
-    seL4_CPtr my_root_syscall_ep = get_local_ipc()->msg[BOOT_ROOT_EP];
-
-    get_local_ipc()->msg[0] = 101; // SYS_CLONE
-    get_local_ipc()->msg[1] = func_ptr;
-    get_local_ipc()->msg[2] = arg0;
-    get_local_ipc()->msg[3] = arg1;
-    get_local_ipc()->msg[4] = arg2;
-    get_local_ipc()->msg[5] = stdin_cap;
-    get_local_ipc()->msg[6] = stdout_cap;
-    get_local_ipc()->msg[7] = stderr_cap;
-    get_local_ipc()->msg[8] = pipe_id;
-    get_local_ipc()->msg[9] = stack_top;
-    seL4_MessageInfo_t info = seL4_MessageInfo_new(0, 0, 0, 10);
-    seL4_Call(my_root_syscall_ep, info);
-    return seL4_GetMR(0);
-}
+// issuse.txt (найдено 2026-08-16 при расследовании зависания `cmd | grep`) —
+// SYS_CLONE/SYS_THREAD_EXIT (sys_thread_exit()/spawn_thread(), ранее здесь)
+// удалены: grep был ЕДИНСТВЕННЫМ пользователем этого пути в кодовой базе, и
+// на живом железе seL4_Call() из клонированного потока к root через cptr
+// 100+pid (тот же слот, что и TCB fault_ep) НИКОГДА не доходит до root —
+// 100% детерминированно, независимо от объёма данных/heartbeat/watchdog
+// (6 hw-прогонов, все варианты дали идентичный результат). Сама механика
+// SYS_CLONE(101)/SYS_THREAD_EXIT(105) в main.cpp пока НЕ удалена (не
+// root-caused, трогать рискованно) — просто ничем в кодовой базе больше не
+// вызывается. См. run_grep_filter() ниже — grep теперь работает как обычная
+// функция в потоке шелла, что и корректно: к моменту её вызова конвейер уже
+// не конкурентный (shell полностью ждёт левую часть до того, как вызывает
+// правую), отдельный поток был не нужен архитектурно, а не только из-за бага.
 
 static char sys_read(seL4_CPtr _ignored) {
     return sys_read_fd(0);
@@ -1044,23 +1034,17 @@ static void sys_pipe_close(int fd) {
     get_local_ipc()->caps_or_badges[fd] = 0; // Invalidate local FD
 }
 
-void grep_thread_func(const char* pattern) {
-    // CRITICAL: Initialize libsel4's IPC buffer for this thread.
-    seL4_Word tls_addr;
-    asm volatile("mrs %0, tpidr_el0" : "=r" (tls_addr));
-    seL4_SetIPCBuffer((seL4_IPCBuffer*)(tls_addr - 1024));
-
-    if (!pattern) {
-        sys_write(2, "grep: missing pattern\n"); // Write to stderr
-        sys_thread_exit();
-        return;
-    }
-
+// issuse.txt — раньше это был grep_thread_func(), спавнился отдельным
+// SYS_CLONE-потоком (см. комментарий выше про удалённые sys_thread_exit()/
+// spawn_thread()). Теперь обычная функция, вызываемая напрямую из потока
+// шелла: input_fd — уже открытый дескриптор (пайп), из которого читаем;
+// вывод, как и раньше, идёт в fd 1 (stdout шелла).
+static void run_grep_filter(int input_fd, const char* pattern) {
     char line_buf[256];
     int line_pos = 0;
 
     while (1) {
-        char c = sys_read_fd(0); // Read from pipe (stdin)
+        char c = sys_read_fd(input_fd);
 
         if (c == '\n' || c == '\0') {
             if (line_pos > 0) {
@@ -1078,9 +1062,6 @@ void grep_thread_func(const char* pattern) {
             line_buf[line_pos++] = c;
         }
     }
-    
-    // Корректно завершаем поток
-    sys_thread_exit();
 }
 
 // --- Точка входа ---
@@ -1317,10 +1298,8 @@ int main(int argc, char *argv[]) {
 
             // --- НОВЫЙ ПАРСЕР КОНВЕЙЕРОВ ---
             int left_pid = -1;
-            int right_pid = -1;
 
             int pipe_fd = -1;
-            seL4_CPtr pipe_cap = 0;
             int pipe_id = -1; // issuse.txt: нужен для SYS_EXEC, если левая часть — /sbin-команда
 
             char *pipe_sym = cmd_ptr;
@@ -1375,9 +1354,6 @@ int main(int argc, char *argv[]) {
                     // В seL4 Capability Pointer (CPtr) — это и есть номер слота (индекс).
                     // Раз ядро положило cap в слот pipe_fd, значит CPtr равен pipe_fd!
                     ipc->caps_or_badges[pipe_fd] = pipe_fd;
-
-                    // Теперь мы можем безопасно читать его для передачи потомкам
-                    pipe_cap = ipc->caps_or_badges[pipe_fd];
                 }
             } else {
                 is_piping = false;
@@ -2567,9 +2543,14 @@ int main(int argc, char *argv[]) {
 
                 if (my_strcmp(cmd2, "grep") == 0) {
                     if (arg2) {
-                        right_pid = spawn_thread((seL4_Word)grep_thread_func, (seL4_Word)grep_thread_stack + sizeof(grep_thread_stack) - 16, 
-                                                    (seL4_Word)arg2, 0, 0, -1,
-                                                    pipe_cap, ipc->caps_or_badges[1], ipc->caps_or_badges[2]);
+                        // К этому моменту левая часть конвейера уже
+                        // полностью завершилась (см. sys_wait внутри
+                        // /sbin-диспетчера выше) и writer-конец пайпа уже
+                        // закрыт — весь вывод и EOF уже лежат в пайпе.
+                        // Отдельный поток тут не нужен архитектурно (не
+                        // только из-за бага SYS_CLONE, см. комментарий у
+                        // run_grep_filter()) — просто зовём как функцию.
+                        run_grep_filter(pipe_fd, arg2);
                     } else {
                         sys_puts(console_ep, "grep: usage: grep <pattern>\n");
                     }
@@ -2579,9 +2560,7 @@ int main(int argc, char *argv[]) {
 
                 // ИСПРАВЛЕНО: Ждем завершения дочерних процессов с помощью sys_wait
                 // Это надежнее, чем глобальный флаг.
-                // Порядок не важен, т.к. sys_wait немедленно вернется, если процесс уже завершился.
                 if (left_pid != -1) sys_wait(root_ep, left_pid);
-                if (right_pid != -1) sys_wait(root_ep, right_pid);
 
                 sys_pipe_close(pipe_fd);
             }

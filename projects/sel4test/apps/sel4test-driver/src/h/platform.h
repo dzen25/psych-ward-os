@@ -235,6 +235,11 @@ constexpr uintptr_t PLAT_AVS_VADDR          = 0x200019000ULL;
 constexpr uintptr_t PLAT_WIFI_SDIO_VADDR    = 0x20001a000ULL;
 constexpr uintptr_t PLAT_MBOX_VADDR         = 0x20001b000ULL;    // регистры mailbox (см. PLAT_MBOX_PADDR)
 constexpr uintptr_t PLAT_MBOX_BUF_VADDR     = 0x20001c000ULL;    // приватный некэшируемый буфер под property-tag запрос (см. main.cpp)
+// Начало GPIO-драйвера (см. RPI4_GPIO_PADDR/RPI4_GPIO_SIZE выше, h/gpio.h) —
+// пока только blk_driver (is_driver==3), для мигания зелёным ACT LED
+// (GPIO42) при обращении к SD-карте. Тот же 2MB-регион, что и остальные
+// vaddr выше — свободный слот сразу после PLAT_MBOX_BUF_VADDR.
+constexpr uintptr_t PLAT_GPIO_VADDR         = 0x20001d000ULL;
 
 // USB (Фаза 14) — отдельное, СОБСТВЕННОЕ 2MB-окно usb_driver'а (не тот же
 // регион, что UART/EMMC/GENET/... выше). Изначально рассчитывалось на 1MB
