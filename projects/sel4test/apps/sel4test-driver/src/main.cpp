@@ -374,15 +374,27 @@ static uint64_t object_size_bytes(seL4_Word type, seL4_Word size_bits) {
 // командами) давала спорадическую порчу TLS-образа при старте. hw-тест
 // (см. sbin/tests/stresstest.cpp): 350 спавнов /sbin-команд подряд (50+300
 // итераций, 2 отдельных прогона) с ареной выключенной — 0 крашей/зависаний,
-// раньше проблема ловилась уже в пределах 5-10 команд. CMD_ARENA_ENABLED
-// оставлен константой (не удаляем инфраструктуру арены целиком) на случай
-// более аккуратного варианта позже — арена только под data/ELF-фреймы, а
-// служебные kernel-объекты (CNode/VSpace/TCB/page tables) всегда из общего
-// монотонного пула, который и не переиспользуется, и потому не подвержен
-// этому классу порчи. Пока — просто выключено; `free`/Used снова растёт
-// монотонно (цена статус-кво до Фазы с ареной, см. issuse.txt №3), это
-// сознательный компромисс в пользу стабильности.
-constexpr bool CMD_ARENA_ENABLED = false;
+// раньше проблема ловилась уже в пределах 5-10 команд. Арену тогда выключили
+// целиком, обратная сторона — issuse.txt №65: `free`/Used снова растёт
+// монотонно на КАЖДУЮ команду.
+//
+// issuse.txt №65 (2026-08-24) — реализован путь, намеченный в самой
+// находке: арена переиспользуется ТОЛЬКО под data/ELF/stack/IPC-фреймы
+// команды (seL4_ARM_SmallPageObject-ретайпы в spawn_process() — сама
+// TLS-страница, содержимое ELF, стек), а служебные kernel-объекты (CNode,
+// VSpace/PUD/PD/PT ×2, TCB — см. force_pool=true у соответствующих
+// ram_retype() внутри spawn_process()) всегда из общего монотонного
+// g_ram_pool, как и раньше. Логика: seL4_Untyped_Retype ВСЕГДА зануляет
+// память нового объекта (kernel-инвариант, иначе была бы утечка данных
+// между capability-доменами) — простое переиспользование физических байт
+// само по себе не может оставить "мусор" от предыдущей команды. Значит
+// порча №62 была не из зануляемого содержимого, а из побочного эффекта
+// самого факта переиспользования РОВНО ТЕХ ЖЕ физических страниц под
+// CNode/VSpace/TCB следующей команды (детальный механизм не диагностирован
+// — решение сознательно обходит его, а не объясняет). Гипотеза проверяется
+// стресс-тестом (см. stresstest.elf) с ареной снова включённой именно в
+// этом урезанном виде.
+constexpr bool CMD_ARENA_ENABLED = true;
 static seL4_CPtr g_current_arena = 0; // 0 = обычный путь через g_ram_pool, как раньше
 static uint64_t g_current_arena_bytes = 0; // сколько байт ТЕКУЩАЯ арена уже отдала — для точного отката g_ram_bytes_used при освобождении
 
@@ -404,10 +416,17 @@ static int g_cmd_arena_created_count = 0; // сколько арен вообщ�
 // (seL4_NotEnoughMemory), переходим на следующий блок пула и повторяем
 // retype ТОЙ ЖЕ команды — вызывающий код ничего не замечает, кроме того
 // что теперь может получить успех там, где раньше был бы отказ.
+// issuse.txt №65 — force_pool=true заставляет retype идти из общего
+// g_ram_pool, ДАЖЕ если сейчас активна командная арена (g_current_arena) —
+// используется в spawn_process() для служебных kernel-объектов (CNode/
+// VSpace-уровни/TCB), см. комментарий у CMD_ARENA_ENABLED выше. По
+// умолчанию false — все существующие сайты вызова (ELF/стек/IPC-страницы и
+// весь остальной код файла, не связанный с командной ареной) не меняют
+// поведение ни на бит.
 static inline seL4_Error ram_retype(seL4_CPtr /*untyped, игнорируется*/, seL4_Word type, seL4_Word size_bits,
                                      seL4_CPtr root, seL4_Word node_index, seL4_Word node_depth,
-                                     seL4_Word slot, seL4_Word num_objects) {
-    if (g_current_arena != 0) {
+                                     seL4_Word slot, seL4_Word num_objects, bool force_pool = false) {
+    if (g_current_arena != 0 && !force_pool) {
         seL4_Error err = seL4_Untyped_Retype(g_current_arena, type, size_bits, root, node_index, node_depth, slot, num_objects);
         if (err == seL4_NoError) {
             uint64_t bytes = object_size_bytes(type, size_bits) * num_objects;
@@ -657,6 +676,22 @@ struct ProcessControlBlock {
     seL4_CPtr thread_ipc_frame;
     seL4_CPtr thread_stack_frame1;
     seL4_CPtr thread_stack_frame2;
+    // issuse.txt №64 (root-caused и исправлено 2026-08-23) — PID родителя
+    // для потока, созданного через SYS_CLONE (см. case SYS_CLONE ниже).
+    // Раньше кодировался ПРЯМО В БЕЙДЖЕ ((parent_pid<<16)|new_pid) — это и
+    // была настоящая причина зависания: биты 16-19 составного бейджа
+    // случайно (для БОЛЬШИНСТВА PID) совпадали с диапазоном
+    // DRIVER_LIVENESS_*_BADGE (0x10000-0x80000, common.h), который
+    // диспетчер root'а (см. "sender_badge >= DRIVER_LIVENESS_BLK_BADGE")
+    // безусловно перехватывает как heartbeat-тик и делает `continue` — ДО
+    // switch(cmd), seL4_Reply() никогда не вызывается. Само IPC ядром
+    // доставлялось корректно (проверено JTAG: cap_type=endpoint,
+    // BlockedOnReply, не BlockedOnSend) — root просто ошибочно
+    // игнорировал сообщение. Обычное поле PCB вместо кодирования в
+    // бейдж — тот же класс данных, что is_driver/name/etc, никакого
+    // риска коллизии с ЛЮБЫМ будущим диапазоном бейджей. 0 — не поток
+    // (обычный процесс) или родитель неизвестен.
+    int parent_pid = 0;
 
     // --- ГЕНЕРИЧЕСКИЕ МЕТАДАННЫЕ ДЛЯ АВТОПЕРЕЗАПУСКА ---
     int is_driver;
@@ -1402,7 +1437,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     // 1. Создаем локальный CSpace (8 бит = 256 слотов)
     seL4_CPtr child_cnode = alloc_and_track_cap(alloc, pcb);
-    if (ram_retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_CapTableObject, 8, root_cnode, 0, 0, child_cnode, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype CNode");
 
     seL4_CPtr badged_ep = alloc_and_track_cap(alloc, pcb);
@@ -1547,15 +1582,15 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr child_pt  = alloc_and_track_cap(alloc, pcb);
     seL4_CPtr child_pt2 = alloc_and_track_cap(alloc, pcb); // Вторая таблица для потоков
 
-    if (ram_retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_ARM_PageGlobalDirectoryObject, 0, root_cnode, 0, 0, child_vspace, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype VSpace");
-    if (ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_ARM_PageUpperDirectoryObject, 0, root_cnode, 0, 0, child_pud, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype PUD");
-    if (ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_ARM_PageDirectoryObject, 0, root_cnode, 0, 0, child_pd, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype PD");
-    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype PT");
-    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1) != seL4_NoError) // Вторая таблица для потоков
+    if (ram_retype(normal_untyped, seL4_ARM_PageTableObject, 0, root_cnode, 0, 0, child_pt2, 1, true) != seL4_NoError) // Вторая таблица для потоков
         return abort_spawn(pcb, alloc, root_cnode, "retype PT2");
 
     if (seL4_ARM_ASIDPool_Assign(seL4_CapInitThreadASIDPool, child_vspace) != seL4_NoError)
@@ -2014,7 +2049,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_CPtr tcb = alloc_and_track_cap(alloc, pcb);
     pcb.tcb = tcb;
     pcb.vspace = child_vspace;
-    if (ram_retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1) != seL4_NoError)
+    if (ram_retype(normal_untyped, seL4_TCBObject, 0, root_cnode, 0, 0, tcb, 1, true) != seL4_NoError)
         return abort_spawn(pcb, alloc, root_cnode, "retype TCB");
 
     // Фаза 6.1 (продолжение, см. ROADMAP.md): собственная TCB-капа — только
@@ -3797,9 +3832,26 @@ int main(int argc, char *argv[]) {
             }
 
             case SYS_CLONE: {
-                // issuse.txt (найдено 2026-08-16) — сейчас ничем в кодовой
-                // базе не вызывается, см. комментарий у case 105
-                // (SYS_THREAD_EXIT) ниже.
+                // issuse.txt №64 — root-caused и исправлено 2026-08-23 (было
+                // "не root-caused, обойдено" с 2026-08-16). Настоящая причина:
+                // бейдж потока кодировал parent_pid В СТАРШИХ БИТАХ
+                // ((parent_pid<<16)|new_pid) — для БОЛЬШИНСТВА parent_pid это
+                // задевало биты 16-19, ровно диапазон DRIVER_LIVENESS_*_BADGE
+                // (0x10000-0x80000, common.h, Фаза 15 — появился ПОЗЖЕ этого
+                // кода). Диспетчер root'а безусловно перехватывает ЛЮБОЙ
+                // sender_badge >= DRIVER_LIVENESS_BLK_BADGE как heartbeat-тик
+                // и делает `continue` до switch(cmd) — seL4_Reply() для
+                // настоящего сообщения потока никогда не вызывался, поток
+                // навсегда зависал в seL4_Call (подтверждено JTAG:
+                // seL4_DebugCapIdentify показывал корректный endpoint-cap,
+                // seL4_DebugDumpScheduler — BlockedOnReply, не BlockedOnSend,
+                // т.е. IPC ядром доставлялось верно, root его просто
+                // игнорировал). Фикс — бейдж потока теперь ПРОСТО new_pid
+                // (1:1 с обычным badged_ep процессов выше, безопасный
+                // диапазон 1-255), parent_pid хранится отдельным полем PCB
+                // (см. struct ProcessControlBlock) вместо кодирования в
+                // бейдж — тот же принцип, что и весь остальной PCB, без
+                // риска коллизии с любым будущим диапазоном бейджей.
                 // ИСПРАВЛЕНО: Аргументы потока (func, arg0, arg1, arg2) передаются через регистры, а не SHM
                 seL4_Word entry_point = seL4_GetMR(1);
                 seL4_Word arg0 = seL4_GetMR(2);
@@ -3832,12 +3884,18 @@ int main(int argc, char *argv[]) {
                 pcb.active = true;
                 pcb.vspace = pcbs[sender_pid].vspace; // Потоки разделяют VSpace и CSpace родителя
                 pcb.cspace = pcbs[sender_pid].cspace;
+                pcb.parent_pid = (int)sender_pid; // issuse.txt №64 — вместо кодирования в бейдж
 
                 seL4_CPtr new_tcb = alloc_and_track_cap(alloc, pcb);
                 ram_retype(normal_untyped, seL4_TCBObject, seL4_TCBBits, root_cnode, 0, 0, new_tcb, 1);
 
-                // --- ГЕНЕРАЦИЯ УНИКАЛЬНОГО БЕЙДЖА ПОТОКА ---
-                seL4_Word thread_badge = (sender_pid << 16) | new_pid;
+                // --- БЕЙДЖ ПОТОКА (issuse.txt №64) — просто new_pid, 1:1 с
+                // обычным badged_ep процессов (см. выше в этой функции),
+                // безопасный диапазон 1-255, никогда не пересечётся ни с
+                // pipe-бейджами (1000+), ни с IRQ_MMC (2000), ни с
+                // DRIVER_LIVENESS_*_BADGE (0x10000+). parent_pid — в pcb
+                // (см. выше), не в бейдже.
+                seL4_Word thread_badge = (seL4_Word)new_pid;
                 seL4_CPtr thread_badged_ep = alloc_and_track_cap(alloc, pcb);
                 seL4_CNode_Mint(root_cnode, thread_badged_ep, seL4_WordBits,
                                 root_cnode, ep, seL4_WordBits, seL4_AllRights, thread_badge);
@@ -3915,6 +3973,14 @@ int main(int argc, char *argv[]) {
                     g_pipes[pipe_id].writer_pid = new_pid;
                 }
 
+                // issuse.txt №64 (расследование, временно) — именуем поток для
+                // seL4_DebugDumpScheduler() (clonetest.elf), иначе в дампе он
+                // неотличим от остальных "child of: 'rootserver'" по одному
+                // только IP. Чисто диагностическое, безопасно оставить —
+                // seL4_DebugNameThread не влияет на поведение, только на имя
+                // в отладочном выводе (CONFIG_DEBUG_BUILD).
+                seL4_DebugNameThread(new_tcb, "CLONE_THREAD");
+
                 seL4_TCB_Resume(new_tcb);
 
                 seL4_SetMR(0, new_pid);
@@ -3923,16 +3989,15 @@ int main(int argc, char *argv[]) {
             }
 
             case 105: { // SYS_THREAD_EXIT
-                // issuse.txt (найдено 2026-08-16) — этот case (и SYS_CLONE
-                // выше) сейчас НИЧЕМ в кодовой базе не вызывается: grep был
-                // единственным пользователем, seL4_Call() из клонированного
-                // потока к root через cptr 100+pid никогда не доходил до
-                // root на живом железе (100% детерминированно), grep
-                // переведён на прямой вызов функции (см. run_grep_filter()
-                // в shell.cpp). Код здесь оставлен как есть — не root-caused,
-                // трогать без диагностики рискованно.
-                int thread_pid = sender_badge & 0xFFFF;
-                int parent_pid = (sender_badge >> 16) & 0xFFFF;
+                // issuse.txt №64 — root-caused и исправлено 2026-08-23 (см.
+                // подробный разбор у case SYS_CLONE выше). Бейдж потока
+                // теперь просто new_pid — sender_pid (общая переменная
+                // диспетчера, извлечённая ДО switch(cmd)) уже корректно
+                // равен thread_pid, доп. извлечение из бейджа не нужно.
+                // parent_pid — из pcb (записан в case SYS_CLONE), не из
+                // бейджа.
+                int thread_pid = (int)sender_pid;
+                int parent_pid = pcbs[thread_pid].parent_pid;
 
                 if (thread_pid <= 0 || thread_pid >= 256 || !pcbs[thread_pid].active) {
                     break; // Invalid thread PID, ignore.

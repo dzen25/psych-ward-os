@@ -1,6 +1,0 @@
-arm_64bit=1
-arm_freq=1800
-kernel=u-boot.bin
-enable_jtag_gpio=1
-gpio=22-27=np
-enable_uart=1

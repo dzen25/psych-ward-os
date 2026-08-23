@@ -45,17 +45,18 @@ static void putdec(int val) {
     while (j > 0) { char c[2] = {buf[--j], 0}; sys_puts(0, c); }
 }
 
-// Фиксированные (не per-итерация) scratch-пути — touch/mkdir на уже
-// существующем только предупреждают, rm/cat на отсутствующем — честная
-// ошибка, ни один шаблон не падает от повторного прогона.
+// По просьбе пользователя (2026-08-23) ls/ps/free/touch/cat/mkdir/rm слиты
+// в shell.cpp как builtin-функции (см. run_*() там) — больше не отдельные
+// ELF, спавнить их по пути через SYS_EXEC (как раньше) уже нельзя. Ротация
+// команд, которая изначально и нашла баг №62, потеряла разнообразие —
+// сейчас гоняет единственный оставшийся безопасный к повтору отдельный
+// бинарник, /bin/test_app.elf (минимальный, только печатает и выходит, см.
+// src/test.cpp). Цель теста (стресс самого spawn_process()/SYS_EXEC/
+// SYS_WAIT — CNode/VSpace/TCB-аллокация по кругу) по-прежнему полностью
+// покрывается; VFS-специфичные пути (exFAT-запись/чтение/mkdir через
+// разные процессы подряд) этим прогоном больше не проверяются.
 static const char *ROTATION[] = {
-    "/sbin/ls.elf",
-    "/sbin/ps.elf",
-    "/sbin/free.elf",
-    "/sbin/touch.elf /root/stress_scratch.txt",
-    "/sbin/cat.elf /root/stress_scratch.txt",
-    "/sbin/mkdir.elf /root/stress_scratch_dir",
-    "/sbin/rm.elf /root/stress_scratch.txt",
+    "/bin/test_app.elf",
 };
 constexpr int ROTATION_LEN = sizeof(ROTATION) / sizeof(ROTATION[0]);
 

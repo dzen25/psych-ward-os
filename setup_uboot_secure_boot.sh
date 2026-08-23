@@ -25,6 +25,9 @@ RPI_PATCH="$ROOT/tools/boot_fit/rpi_merge_signature.patch"
 PCIE_PATCH="$ROOT/tools/boot_fit/pcie_no_os_prepare.patch"
 XHCI_PATCH="$ROOT/tools/boot_fit/xhci_pci_no_os_prepare.patch"
 LOAD_CHAIN="$ROOT/load_chain"
+# load_chain/BOOT — партиция FAT32 (см. INSTRUCTIONS.md/rt/flash.sh
+# BOOT_ITEMS). Этот скрипт пишет только u-boot.bin сюда.
+LOAD_CHAIN_BOOT="$LOAD_CHAIN/BOOT"
 CROSS="aarch64-linux-gnu-"
 
 echo "=== Psych Ward OS: U-Boot + FIT/RSA secure boot (Фаза 13) ==="
@@ -103,7 +106,7 @@ echo "[3/6] Настраиваю конфиг (rpi_4_defconfig + FIT_SIGNATURE/R
     # (0xC0000000, см. предыдущие диагностические попытки в истории этого
     # файла/ROADMAP.md) — PCI-BUS-SIDE адрес, DT `ranges` PCIe-узла
     # транслирует его в CPU-адрес 0x600000000 (недоступен seL4). Сам DTB
-    # на SD-карте (load_chain/bcm2711-rpi-4-b.dtb, НЕ этот U-Boot и не его
+    # на SD-карте (load_chain/BOOT/bcm2711-rpi-4-b.dtb, НЕ этот U-Boot и не его
     # BOOTCOMMAND) отредактирован fdtput'ом — outbound-окно перенацелено
     # на 0xfd600000. U-Boot(host)/эта конфигурация тут больше ни при чём —
     # никаких дополнительных патчей/диагностики в BOOTCOMMAND не требуется.
@@ -190,7 +193,7 @@ echo "[4/6] Собираю (проход 2/2, с ключом) ..."
 # лежит в СОБСТВЕННОМ (OF_SEPARATE) u-boot.dtb — то, что merge в DTB
 # прошивки на реальной плате сработает именно так, как задумано,
 # подтверждается только на живом железе (см. ROADMAP.md). ---
-echo "[5/6] Проверяю и копирую в load_chain/u-boot.bin ..."
+echo "[5/6] Проверяю и копирую в load_chain/BOOT/u-boot.bin ..."
 (
     cd "$UBOOT_DIR"
     # Через переменную, не пайпом: fdtdump выводит весь dtb (там огромные
@@ -219,7 +222,8 @@ echo "[5/6] Проверяю и копирую в load_chain/u-boot.bin ..."
     fi
 )
 rm -f "$keygen_test_itb"
-cp "$UBOOT_DIR/u-boot.bin" "$LOAD_CHAIN/u-boot.bin"
+mkdir -p "$LOAD_CHAIN_BOOT"
+cp "$UBOOT_DIR/u-boot.bin" "$LOAD_CHAIN_BOOT/u-boot.bin"
 
 # --- 6. Патч bcm2711-rpi-4-b.dtb (Фаза 14, USB/xHCI, см. ROADMAP.md) ---
 # ВРЕМЕННО ОТКЛЮЧЕНО (см. ROADMAP.md, "Тринадцатая попытка"): этот шаг
@@ -237,7 +241,7 @@ cp "$UBOOT_DIR/u-boot.bin" "$LOAD_CHAIN/u-boot.bin"
 # раскомментировать вслепую.
 : <<'DISABLED_PCIE_DTB_PATCH'
 echo "[6/6] Проверяю/патчу PCIe outbound-окно в bcm2711-rpi-4-b.dtb ..."
-DTB_FILE="$LOAD_CHAIN/bcm2711-rpi-4-b.dtb"
+DTB_FILE="$LOAD_CHAIN_BOOT/bcm2711-rpi-4-b.dtb"
 DTB_PCIE_NODE="/scb/pcie@7d500000"
 DTB_RANGES_OLD="2000000 0 c0000000 6 0 0 40000000"
 DTB_RANGES_NEW="2000000 0 c0000000 0 fd600000 0 800000"
@@ -261,5 +265,5 @@ fi
 DISABLED_PCIE_DTB_PATCH
 
 echo
-echo "=== Готово: $LOAD_CHAIN/u-boot.bin собран, ключ встроен и проверен локально. ==="
+echo "=== Готово: $LOAD_CHAIN_BOOT/u-boot.bin собран, ключ встроен и проверен локально. ==="
 echo "=== Дальше: ./build_and_sign.sh (соберёт и подпишет сам образ ядра в boot.itb), потом rt/flash.sh -br. ==="

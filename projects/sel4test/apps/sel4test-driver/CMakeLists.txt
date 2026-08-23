@@ -82,7 +82,7 @@ set(ARCHIVE_S "${CMAKE_CURRENT_BINARY_DIR}/archive.S")
 # в отличие от uart/timer/blk/net, которые остаются встроенными в образ.
 # CMake-цель wifi_driver ниже (строка ~53) никуда не делась — просто больше
 # не участвует в CPIO-архиве, а собирается как обычный отдельный бинарник
-# (см. деплой в load_chain/service/wifi.elf).
+# (см. деплой в load_chain/RPI/service/wifi.elf).
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pack_vfs.sh"
 "#!/bin/bash
 cd ${CMAKE_CURRENT_BINARY_DIR}
@@ -157,26 +157,17 @@ target_include_directories(test_app PRIVATE "${CMAKE_BINARY_DIR}/libsel4/autocon
 target_link_options(test_app PRIVATE "-static")
 target_link_libraries(test_app sel4 sel4runtime muslc)
 
-# Фаза A (см. ROADMAP.md): команды, вынесенные из shell.cpp в отдельные
-# /sbin/*.elf (см. src/sbin/, src/h/sys_client.h) — тот же паттерн сборки,
-# что у test_app выше. Имена целей CMake — с префиксом sb_, т.к. голые "rm"/
-# "mkdir" конфликтуют с уже существующими служебными целями внутри сборки
-# musllibc (обнаружено по факту: CMake ругался на цикл зависимостей через
-# muslc_gen). Имя файла результата сборки от имени цели НЕ зависит — при
-# копировании в load_chain переименовываем в <tool>.elf сами.
-set(PSYCH_SBIN_TOOLS ps kill taskset top balance ls cat touch rm mv mkdir usb df free)
-foreach(tool ${PSYCH_SBIN_TOOLS})
-    add_executable(sb_${tool} src/sbin/${tool}.cpp)
-    target_include_directories(sb_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
-    target_link_options(sb_${tool} PRIVATE "-static")
-    target_link_libraries(sb_${tool} sel4 sel4runtime muslc)
-endforeach()
+# По просьбе пользователя (2026-08-23): команды, которые раньше жили здесь
+# как отдельные /sbin/*.elf (Фаза A), слиты обратно в shell.cpp как обычные
+# функции (run_ls()/run_cat()/... — см. shell.cpp) — слишком маленькие
+# (~15-100 строк каждая), чтобы оправдывать накладные расходы полного
+# SYS_EXEC-спавна процесса при каждом вызове, особенно из скриптов/
+# init.conf. src/sbin/ больше не участвует в сборке.
 
-# issuse.txt №62 (расследование) — префикс sbtest_ (не sb_!) специально
-# ОТЛИЧАЕТСЯ от PSYCH_SBIN_TOOLS выше: build_and_sign.sh различает их по
-# этому префиксу и раскладывает тестовые хуки в load_chain/sbin/tests/,
-# а не в load_chain/sbin/ — чтобы не путались с обычными командами.
-set(PSYCH_TEST_TOOLS holdshm proxytest recovertest stresstest ctrlbytetest timedread)
+# issuse.txt №62 (расследование) — префикс sbtest_ (не sb_!) — тестовые хуки
+# (см. src/tests/) специально НЕ трогали при слиянии выше, остаются
+# отдельными ELF; build_and_sign.sh раскладывает их в load_chain/RPI/sbin/tests/.
+set(PSYCH_TEST_TOOLS holdshm proxytest recovertest stresstest ctrlbytetest timedread clonetest)
 foreach(tool ${PSYCH_TEST_TOOLS})
     add_executable(sbtest_${tool} src/tests/${tool}.cpp)
     target_include_directories(sbtest_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")

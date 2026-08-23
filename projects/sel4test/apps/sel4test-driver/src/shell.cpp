@@ -161,6 +161,30 @@ void sys_write(int fd, const char* str) {
     }
 }
 
+// 1:1 с sys_write() выше, только явная длина вместо strlen() — нужна для
+// печати чанков, которые могут содержать встроенный NUL (см. run_cat()
+// ниже, слито из бывшего sbin/cat.cpp — issuse.txt №63(c)).
+static void sys_write_n(int fd, const char *buf, int len) {
+    seL4_IPCBuffer *ipc = get_local_ipc();
+    seL4_CPtr target_ep = ipc->caps_or_badges[fd];
+
+    int offset = 0;
+    while (offset < len) {
+        int chunk = len - offset;
+        if (chunk > 100) chunk = 100;
+
+        ipc->msg[0] = 8; // SYS_PUTS
+        for (int i = 0; i < chunk; i++) ipc->msg[i + 1] = buf[offset + i];
+        seL4_MessageInfo_t reply = seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, chunk + 1));
+        int accepted = chunk;
+        if (seL4_MessageInfo_get_length(reply) >= 1) {
+            accepted = (int)seL4_GetMR(0);
+            if (accepted < chunk) break; // см. sys_write() выше — пайп полон
+        }
+        offset += accepted;
+    }
+}
+
 void sys_write_eof(int fd) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     seL4_CPtr target_ep = ipc->caps_or_badges[fd];
@@ -248,6 +272,18 @@ static int simple_atoi(const char *str) {
     int res = 0;
     while (*str >= '0' && *str <= '9') { res = res * 10 + (*str - '0'); str++; }
     return res;
+}
+
+// issuse.txt №54 — 1:1 с is_all_digits() из h/sys_client.h (см. kill/taskset,
+// теперь слитые в этот файл, см. run_kill()/run_taskset() ниже). simple_atoi()
+// молча возвращает 0 для мусора вроде "abc" — вызывающий обязан проверить
+// ДО simple_atoi(), если разница между "ввели 0" и "ввели мусор" важна.
+static bool is_all_digits(const char *str) {
+    if (!str || *str == '\0') return false;
+    for (const char *p = str; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
 }
 
 static bool is_piping = false;
@@ -902,6 +938,36 @@ static seL4_CPtr route_vfs_path(char *path, seL4_CPtr blk_ep, seL4_CPtr usb_stor
     return blk_ep;
 }
 
+// 1:1 с h/sys_client.h — раньше нужна была только ls.cpp (слито в
+// run_ls() ниже, бывший sbin/ls.cpp) для листинга "/mnt": точки монтирования
+// USB физически не существуют как записи каталога на SD-карте, поэтому
+// обычный листинг их не увидит — отдельно запрашиваем у usb_driver'а список
+// смонтированных томов (USB_CMD_LIST_VOLUMES возвращает битовую маску +
+// имя каждого, 4 регистра/слот, тот же приём упаковки строки в регистры,
+// что и cwd/имя exec'а при спавне).
+struct UsbVolumeList {
+    bool mounted[USB_MAX_DEVICES];
+    char name[USB_MAX_DEVICES][32];
+};
+
+static bool fetch_usb_volume_list(seL4_CPtr usb_storage_ep, UsbVolumeList &out) {
+    for (int i = 0; i < USB_MAX_DEVICES; i++) { out.mounted[i] = false; out.name[i][0] = '\0'; }
+    if (usb_storage_ep == 0) return false;
+    seL4_SetMR(0, 3); // USB_CMD_LIST_VOLUMES
+    seL4_MessageInfo_t reply = seL4_Call(usb_storage_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    if (seL4_MessageInfo_get_length(reply) < (seL4_Word)(1 + 4 * USB_MAX_DEVICES)) return false;
+    seL4_Word mask = seL4_GetMR(0);
+    bool any = false;
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        out.mounted[i] = (mask & (1u << i)) != 0;
+        seL4_Word *words = (seL4_Word*)out.name[i];
+        for (int w = 0; w < 4; w++) words[w] = seL4_GetMR(1 + i * 4 + w);
+        out.name[i][31] = '\0';
+        if (out.mounted[i]) any = true;
+    }
+    return any;
+}
+
 // --- "Знакомые сети" Wi-Fi (Милстоун 4.4, см. wifi_driver.cpp) ---
 // Формат PATH_WIFI_PQW: одна сеть на строку, "имясети|пароль". Всё через
 // тот же синхронный blk_ep-протокол (SYS_TOUCH=112/SYS_READ_TEXT_FILE=114/
@@ -1061,6 +1127,378 @@ static void run_grep_filter(int input_fd, const char* pattern) {
         } else if (line_pos < sizeof(line_buf) - 1) {
             line_buf[line_pos++] = c;
         }
+    }
+}
+
+// По просьбе пользователя (2026-08-23): все /sbin-команды (кроме
+// /sbin/tests/*, см. src/tests/) слиты обратно в shell.cpp как обычные
+// функции — тот же приём, что уже применён к grep (run_grep_filter()
+// выше). Раньше каждая была отдельным ELF, спавнящимся через SYS_EXEC —
+// накладные расходы полного спавна процесса (CNode/VSpace/TCB/чтение и
+// парсинг ELF с диска) заметно тормозили при вызове из скриптов/init.conf,
+// а сами команды слишком маленькие (~15-100 строк каждая), чтобы это
+// оправдывать. 1:1 портировано из src/sbin/*.cpp (удалены) — env.blk_ep/
+// env.usb_storage_ep/env.root_ep теперь параметры, env.shm — глобальный
+// shm_base, sys_client_init()/sys_exit() не нужны (шелл уже инициализирован
+// и не завершается после одной команды).
+
+static void run_ls(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep, seL4_CPtr root_ep) {
+    char *shm = shm_base;
+    if (arg) build_absolute_path(shm, arg, SHM_TOTAL_SIZE);
+    else build_absolute_path(shm, "", SHM_TOTAL_SIZE);
+
+    // build_absolute_path("") на непустом cwd оставляет хвостовой "/" —
+    // снимаем его, иначе сравнение с "/mnt" ниже никогда не совпадёт для
+    // "ls" без аргумента.
+    {
+        int shm_len = my_strlen(shm);
+        if (shm_len > 1 && shm[shm_len - 1] == '/') shm[shm_len - 1] = '\0';
+    }
+
+    bool is_mnt_root = (my_strcmp(shm, "/mnt") == 0);
+    UsbVolumeList vols;
+    bool have_usb_entries = false;
+    if (is_mnt_root && usb_storage_ep != 0) {
+        have_usb_entries = fetch_usb_volume_list(usb_storage_ep, vols);
+    }
+
+    seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+    if (vfs_syscall(110, target_ep) != 0) { // SYS_LS — на успехе пишет листинг прямо в shm
+        if (!(is_mnt_root && have_usb_entries)) {
+            sys_puts(0, "ls: cannot access: No such file or directory\n");
+            return;
+        }
+    } else {
+        sys_puts(0, shm);
+    }
+    if (have_usb_entries) {
+        for (int i = 0; i < USB_MAX_DEVICES; i++) {
+            if (!vols.mounted[i]) continue;
+            sys_puts(0, " [DIR] ");
+            sys_puts(0, vols.name[i]);
+            sys_puts(0, "\n");
+        }
+    }
+}
+
+static bool is_safe_terminal_byte(unsigned char c) {
+    if (c >= 0x20 && c <= 0x7E) return true; // печатаемый ASCII
+    return c == '\n' || c == '\t' || c == '\r';
+}
+
+static void run_cat(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg) { sys_puts(0, "Usage: cat <file>\n"); return; }
+
+    char *shm = shm_base;
+    build_absolute_path(shm, arg, SHM_TOTAL_SIZE);
+    seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+
+    char path[256];
+    my_strlcpy(path, shm, sizeof(path)); // shm перезапишется содержимым файла на первом же чанке
+
+    vfs_lock(); // держим на весь цикл — иначе чужой ls/touch между чанками испортит SHM
+    uint32_t offset = 0;
+    bool file_found = false;
+    bool stopped_unsafe = false;
+
+    while (1) {
+        my_strlcpy(shm, path, SHM_TOTAL_SIZE); // драйвер перезаписывает shm содержимым — путь восстанавливаем перед каждым запросом
+        seL4_SetMR(0, 119); // SYS_READ_FILE
+        seL4_SetMR(1, offset);
+        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        int status = (int)seL4_GetMR(0);
+        if (status != 0) break;
+
+        int bytes_read = (int)seL4_GetMR(1);
+        file_found = true;
+        if (bytes_read == 0) break; // EOF
+
+        int safe_len = 0;
+        while (safe_len < bytes_read && is_safe_terminal_byte((unsigned char)shm[safe_len])) safe_len++;
+
+        if (safe_len > 0) sys_write_n(1, shm, safe_len);
+
+        if (safe_len < bytes_read) {
+            stopped_unsafe = true;
+            break;
+        }
+        offset += (uint32_t)bytes_read;
+    }
+    vfs_unlock();
+
+    if (!file_found) {
+        sys_puts(0, "File not found or is a directory.\n");
+    } else {
+        sys_puts(0, "\n");
+        if (stopped_unsafe) {
+            sys_puts(0, "cat: файл содержит небезопасные для терминала байты (нулевые/control/ANSI) — вывод оборван на первом из них.\n");
+        }
+    }
+}
+
+static void run_touch(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg || *arg == '\0') { sys_puts(0, "touch: missing file operand\n"); return; }
+
+    char *p = arg;
+    char *start_of_arg;
+    while ((start_of_arg = next_token(&p)) != nullptr) {
+        char *shm = shm_base;
+        build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
+        seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+        int status = vfs_syscall(112, target_ep);
+        if (status == 1) {
+            sys_puts(0, "touch: '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "' уже существует — ничего не делаю\n");
+        } else if (status != 0) {
+            sys_puts(0, "touch: failed to create '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "'\n");
+        }
+    }
+}
+
+static void run_mkdir(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg) { sys_puts(0, "mkdir: missing operand\n"); return; }
+
+    char *p = arg;
+    char *start_of_arg;
+    while ((start_of_arg = next_token(&p)) != nullptr) {
+        char *shm = shm_base;
+        build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
+        seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+        vfs_lock();
+        seL4_SetMR(0, 117); // SYS_MKDIR
+        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+        int ret = seL4_GetMR(0);
+        vfs_unlock();
+
+        if (ret == 1) {
+            sys_puts(0, "mkdir: '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "' уже существует — ничего не делаю\n");
+        } else if (ret != 0) {
+            sys_puts(0, "mkdir: cannot create directory '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "'\n");
+        }
+    }
+}
+
+static void run_rm(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg || *arg == '\0') { sys_puts(0, "rm: missing operand\n"); return; }
+
+    char *p = arg;
+    char *start_of_arg;
+    while ((start_of_arg = next_token(&p)) != nullptr) {
+        char *shm = shm_base;
+        build_absolute_path(shm, start_of_arg, SHM_TOTAL_SIZE);
+        seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+        if (vfs_syscall(120, target_ep) != 0) {
+            sys_puts(0, "rm: cannot remove '");
+            sys_puts(0, start_of_arg);
+            sys_puts(0, "': No such file or directory\n");
+        }
+    }
+}
+
+static void run_mv(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg) { sys_puts(0, "mv: missing file operand\n"); return; }
+    char *p = arg;
+
+    char *old_tok = next_token(&p);
+    if (!old_tok) { sys_puts(0, "mv: missing file operand\n"); return; }
+    char old_name[128];
+    my_strlcpy(old_name, old_tok, sizeof(old_name));
+
+    char *new_tok = next_token(&p);
+    if (!new_tok) {
+        sys_puts(0, "mv: missing destination file operand after '");
+        sys_puts(0, old_name);
+        sys_puts(0, "'\n");
+        return;
+    }
+    char new_name[128];
+    my_strlcpy(new_name, new_tok, sizeof(new_name));
+
+    if (next_token(&p) != nullptr) {
+        sys_puts(0, "mv: too many arguments\n");
+        return;
+    }
+
+    char *shm = shm_base;
+    build_absolute_path(shm, old_name, 128);
+    build_absolute_path(shm + 128, new_name, SHM_TOTAL_SIZE - 128);
+
+    // route_vfs_path() переписывает буфер НА МЕСТЕ, поэтому сначала
+    // проверяем оба префикса на ОТДЕЛЬНЫХ копиях, только потом
+    // маршрутизируем старый путь по-настоящему (SYS_RENAME принимает оба
+    // имени одним вызовом — оба обязаны попасть на ОДИН бэкенд, иначе
+    // честная cross-device ошибка вместо переименования "в никуда").
+    char old_probe[128], new_probe[128];
+    my_strlcpy(old_probe, shm, sizeof(old_probe));
+    my_strlcpy(new_probe, shm + 128, sizeof(new_probe));
+    seL4_CPtr old_ep = route_vfs_path(old_probe, blk_ep, usb_storage_ep);
+    seL4_CPtr new_ep = route_vfs_path(new_probe, blk_ep, usb_storage_ep);
+    bool cross_device = (old_ep != new_ep);
+    if (!cross_device && old_ep == usb_storage_ep) {
+        int oe = 1; while (old_probe[oe] != '\0' && old_probe[oe] != '/') oe++;
+        int ne = 1; while (new_probe[ne] != '\0' && new_probe[ne] != '/') ne++;
+        cross_device = (oe != ne);
+        if (!cross_device) {
+            for (int k = 1; k < oe; k++) if (old_probe[k] != new_probe[k]) { cross_device = true; break; }
+        }
+    }
+    if (cross_device) {
+        sys_puts(0, "mv: '");
+        sys_puts(0, old_name);
+        sys_puts(0, "' -> '");
+        sys_puts(0, new_name);
+        sys_puts(0, "': Invalid cross-device link\n");
+        return;
+    }
+    seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+    route_vfs_path(shm + 128, blk_ep, usb_storage_ep);
+
+    vfs_lock();
+    seL4_SetMR(0, 116); // SYS_RENAME
+    seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    int ret_val = seL4_GetMR(0);
+    vfs_unlock();
+
+    if (ret_val != 0) {
+        sys_puts(0, "mv: cannot stat '");
+        sys_puts(0, old_name);
+        sys_puts(0, "': No such file or directory\n");
+    }
+}
+
+static void run_ps(seL4_CPtr root_ep) {
+    vfs_lock();
+    seL4_SetMR(0, 104); // SYS_PS
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    sys_puts(0, shm_base);
+    vfs_unlock();
+}
+
+static void run_kill(char *arg, seL4_CPtr root_ep) {
+    if (!arg) { sys_puts(0, "Usage: kill <pid>\n"); return; }
+    if (!is_all_digits(arg)) { // issuse.txt №54
+        sys_puts(0, "kill: pid must be a non-negative number\n");
+        return;
+    }
+
+    seL4_SetMR(0, 102); // SYS_KILL
+    seL4_SetMR(1, simple_atoi(arg));
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    seL4_Word status = seL4_GetMR(0);
+    if ((int)status == -2) {
+        sys_puts(0, "Доступ запрещён: kill может выполнять только shell/доверенные /sbin-сервисы.\n");
+    } else if ((int)status == -1) {
+        sys_puts(0, "Нельзя убить rootserver.\n");
+    } else {
+        sys_puts(0, "Signal sent.\n");
+    }
+}
+
+static void run_top(char *arg, seL4_CPtr root_ep) {
+    bool longFormat = arg && my_strcmp(arg, "-l") == 0;
+    vfs_lock();
+    seL4_SetMR(0, SYS_TOP_STATS);
+    seL4_SetMR(1, longFormat ? 1 : 0);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    sys_puts(0, shm_base);
+    vfs_unlock();
+}
+
+static void run_df(char *arg, seL4_CPtr root_ep) {
+    bool humanReadable = arg && my_strcmp(arg, "-h") == 0;
+    vfs_lock();
+    seL4_SetMR(0, SYS_DF_STATS);
+    seL4_SetMR(1, humanReadable ? 1 : 0);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    sys_puts(0, shm_base);
+    vfs_unlock();
+}
+
+static void run_free(seL4_CPtr root_ep) {
+    vfs_lock();
+    seL4_SetMR(0, SYS_FREE_STATS);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    sys_puts(0, shm_base);
+    vfs_unlock();
+}
+
+static void run_balance(seL4_CPtr root_ep) {
+    vfs_lock();
+    seL4_SetMR(0, SYS_BALANCE);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    sys_puts(0, shm_base);
+    vfs_unlock();
+}
+
+static void run_taskset(char *arg, seL4_CPtr root_ep) {
+    char *cursor = arg;
+    char *pid_str = arg ? next_token(&cursor) : nullptr;
+    char *core_str = arg ? next_token(&cursor) : nullptr;
+    if (!pid_str || !core_str) {
+        sys_puts(0, "Usage: taskset <pid> <ядро 0-3>\n");
+        return;
+    }
+    if (!is_all_digits(pid_str) || !is_all_digits(core_str)) { // issuse.txt №54
+        sys_puts(0, "taskset: pid и номер ядра должны быть числами\n");
+        return;
+    }
+
+    seL4_SetMR(0, SYS_SET_AFFINITY);
+    seL4_SetMR(1, simple_atoi(pid_str));
+    seL4_SetMR(2, simple_atoi(core_str));
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 3));
+    seL4_Word status = seL4_GetMR(0);
+    switch (status) {
+        case 0: sys_puts(0, "OK.\n"); break;
+        case 1: sys_puts(0, "Процесс не найден.\n"); break;
+        case 2: sys_puts(0, "root зафиксирован на ядре 0, перенос невозможен.\n"); break;
+        case 3: sys_puts(0, "timer_driver нельзя переносить: держит физический таймер (PPI) через капу, привязанную к ядру 0 — перенос вызовет тихое зависание при следующем перевзведении.\n"); break;
+        case 4: sys_puts(0, "Некорректный номер ядра (0-3).\n"); break;
+        case 5: sys_puts(0, "Доступ запрещён: taskset может выполнять только shell/доверенные /sbin-сервисы.\n"); break;
+        default: sys_puts(0, "Неизвестная ошибка.\n"); break;
+    }
+}
+
+static void usb_put_hex16(uint16_t val) {
+    char buf[5];
+    for (int i = 0; i < 4; i++) buf[i] = "0123456789abcdef"[(val >> ((3 - i) * 4)) & 0xF];
+    buf[4] = '\0';
+    sys_puts(0, buf);
+}
+
+static void usb_put_dec(uint32_t val) {
+    char buf[12]; int i = 11; buf[i--] = '\0';
+    if (val == 0) buf[i--] = '0';
+    while (val > 0) { buf[i--] = '0' + (val % 10); val /= 10; }
+    sys_puts(0, &buf[i + 1]);
+}
+
+static void run_usb(seL4_CPtr root_ep) {
+    seL4_SetMR(0, 144); // SYS_USB_LIST
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word found = seL4_GetMR(0);
+    seL4_Word vendor = seL4_GetMR(1);
+    seL4_Word product = seL4_GetMR(2);
+    seL4_Word dclass = seL4_GetMR(3);
+    seL4_Word dsub = seL4_GetMR(4);
+    seL4_Word dproto = seL4_GetMR(5);
+
+    if (!found) {
+        sys_puts(0, "USB: устройств не найдено (или usb_driver выключен — см. RPI4_ENABLE_USB).\n");
+    } else {
+        sys_puts(0, "USB устройство: ");
+        usb_put_hex16((uint16_t)vendor); sys_puts(0, ":"); usb_put_hex16((uint16_t)product);
+        sys_puts(0, "  class="); usb_put_dec(dclass);
+        sys_puts(0, " subclass="); usb_put_dec(dsub);
+        sys_puts(0, " protocol="); usb_put_dec(dproto);
+        sys_puts(0, "\n");
     }
 }
 
@@ -2348,6 +2786,25 @@ int main(int argc, char *argv[]) {
                 vfs_syscall(121, blk_ep); // Оправляем команду умереть
             }
             // ==========================================
+
+            // По просьбе пользователя (2026-08-23): бывшие /sbin-команды,
+            // теперь встроенные функции (см. run_*() выше) — не требуют
+            // SYS_EXEC/спавна отдельного процесса. /sbin/tests/* НЕ сюда —
+            // те остаются отдельными ELF, вызываются полным путём.
+            else if (my_strcmp(cmd_ptr, "ls") == 0) { run_ls(arg, blk_ep, usb_storage_ep, root_ep); }
+            else if (my_strcmp(cmd_ptr, "cat") == 0) { run_cat(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "touch") == 0) { run_touch(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "mkdir") == 0) { run_mkdir(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "rm") == 0) { run_rm(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "mv") == 0) { run_mv(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "ps") == 0) { run_ps(root_ep); }
+            else if (my_strcmp(cmd_ptr, "kill") == 0) { run_kill(arg, root_ep); }
+            else if (my_strcmp(cmd_ptr, "top") == 0) { run_top(arg, root_ep); }
+            else if (my_strcmp(cmd_ptr, "df") == 0) { run_df(arg, root_ep); }
+            else if (my_strcmp(cmd_ptr, "free") == 0) { run_free(root_ep); }
+            else if (my_strcmp(cmd_ptr, "balance") == 0) { run_balance(root_ep); }
+            else if (my_strcmp(cmd_ptr, "taskset") == 0) { run_taskset(arg, root_ep); }
+            else if (my_strcmp(cmd_ptr, "usb") == 0) { run_usb(root_ep); }
 
             else if (my_strncmp(cmd_ptr, "./", 2) == 0) {
                 // Пользователь ввел команду типа ./test.elf

@@ -19,25 +19,32 @@ REMOTE_HOST="nikita@compni"
 REMOTE_PORT="22"
 REMOTE_DIR="/home/nikita/psych-ward-os/load_chain"
 
+# load_chain/ на сборочном сервере теперь разложен на два подкаталога,
+# зеркалящие сами партиции (BOOT/RPI) — см. INSTRUCTIONS.md. Пути ниже
+# относительно REMOTE_DIR, с префиксом подкаталога; rsync копирует каждый
+# элемент ПО ИМЕНИ БЕЗ префикса на смонтированный том (место назначения —
+# каталог, rsync берёт basename), поэтому сама партиция остаётся плоской,
+# как и раньше — префикс влияет только на то, откуда брать файл на сервере.
+
 # Что копируется на партицию BOOT (список путей относительно REMOTE_DIR)
 BOOT_ITEMS=(
-    "bcm2711-rpi-4-b.dtb"
-    "boot.itb"
-    "config.txt"
-    "fixup4.dat"
-    "start4.elf"
-    "u-boot.bin"
-    "overlays"
+    "BOOT/bcm2711-rpi-4-b.dtb"
+    "BOOT/boot.itb"
+    "BOOT/config.txt"
+    "BOOT/fixup4.dat"
+    "BOOT/start4.elf"
+    "BOOT/u-boot.bin"
+    "BOOT/overlays"
 )
 
 # Что копируется на партицию RPI (список путей относительно REMOTE_DIR)
 RPI_ITEMS=(
-    "bin"
-    "sbin"
-    "etc"
-    "conf"
-    "service"
-    "root"
+    "RPI/bin"
+    "RPI/sbin"
+    "RPI/etc"
+    "RPI/conf"
+    "RPI/service"
+    "RPI/root"
 )
 
 # 1 = удалить всё видимое содержимое партиции перед копированием
@@ -221,7 +228,10 @@ process_partition() {
     echo "    Копируем элементы через rsync..."
     local item
     for item in "${items[@]}"; do
-        if is_excluded "${item}"; then
+        # is_excluded сравнивает по basename (-ncpd/-ncpf принимают имена
+        # без префикса подкаталога, например /root, а не /RPI/root) — item
+        # теперь содержит префикс BOOT/RPI (см. BOOT_ITEMS/RPI_ITEMS выше).
+        if is_excluded "$(basename "${item}")"; then
             echo "    - ${item} — в списке исключений, пропускаем"
             continue
         fi

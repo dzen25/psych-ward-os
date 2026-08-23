@@ -10,6 +10,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT/build-rpi4"
 LOAD_CHAIN="$ROOT/load_chain"
+# load_chain/ теперь два подкаталога, зеркалящие партиции SD-карты (см.
+# INSTRUCTIONS.md, §"Подготовка SD-карты" + rt/flash.sh BOOT_ITEMS/RPI_ITEMS):
+# BOOT (FAT32, загрузочные файлы) и RPI (exFAT, рабочие каталоги ОС). Этот
+# скрипт пишет только в RPI (sbin/service/bin/root) — BOOT наполняется
+# setup_uboot_secure_boot.sh (u-boot.bin) + вручную (start4.elf/fixup4.dat/
+# config.txt/dtb/overlays, разово) — кроме boot.itb на шаге [6/6] ниже.
+LOAD_CHAIN_BOOT="$LOAD_CHAIN/BOOT"
+LOAD_CHAIN_RPI="$LOAD_CHAIN/RPI"
 SIGN_ELF="$ROOT/tools/sign_elf/sign_elf"
 SIGN_KEY="$ROOT/.signing-key"
 B="$BUILD_DIR/apps/sel4test-driver"
@@ -60,7 +68,14 @@ fi
 
 # --- 4. Раскладка сырых (ещё не подписанных) артефактов под их итоговые
 # имена в load_chain/ ---
-echo "[4/6] Раскладываю сырые артефакты в load_chain/ ..."
+echo "[4/6] Раскладываю сырые артефакты в load_chain/RPI/ ..."
+
+# load_chain/ может отсутствовать вовсе (свежий клон/чистое дерево) — весь
+# каталог самовосстанавливается при каждом запуске, руками ничего создавать
+# не нужно. BOOT сюда НЕ входит (кроме boot.itb на шаге [6/6]) — start4.elf/
+# fixup4.dat/config.txt/dtb/overlays/u-boot.bin туда попадают отдельно (см.
+# INSTRUCTIONS.md), этот скрипт их не трогает и не создаёт.
+mkdir -p "$LOAD_CHAIN_RPI/sbin/tests" "$LOAD_CHAIN_RPI/service" "$LOAD_CHAIN_RPI/bin" "$LOAD_CHAIN_RPI/root" "$LOAD_CHAIN_BOOT"
 
 # Сырой образ ядра НЕ копируется в load_chain/ — на SD-карту он больше не
 # попадает (с Фазы 13 U-Boot грузит только подписанный boot.itb, см. шаг
@@ -74,42 +89,41 @@ echo "[4/6] Раскладываю сырые артефакты в load_chain/ 
 shopt -s nullglob
 for built in "$B"/sb_*; do
     name="$(basename "$built")"; name="${name#sb_}"
-    cp "$built" "$LOAD_CHAIN/sbin/${name}.elf"
+    cp "$built" "$LOAD_CHAIN_RPI/sbin/${name}.elf"
 done
 # issuse.txt №62 (расследование) — тестовые хуки (holdshm/proxytest/
 # recovertest/stresstest, PSYCH_TEST_TOOLS в CMakeLists.txt) собираются с
 # префиксом sbtest_ (не sb_!) специально, чтобы не путаться с обычными
-# /sbin-командами — раскладываем в отдельную load_chain/sbin/tests/.
-mkdir -p "$LOAD_CHAIN/sbin/tests"
+# /sbin-командами — раскладываем в отдельную load_chain/RPI/sbin/tests/.
 for built in "$B"/sbtest_*; do
     name="$(basename "$built")"; name="${name#sbtest_}"
-    cp "$built" "$LOAD_CHAIN/sbin/tests/${name}.elf"
+    cp "$built" "$LOAD_CHAIN_RPI/sbin/tests/${name}.elf"
 done
 for built in "$B"/svc_*; do
     name="$(basename "$built")"; name="${name#svc_}"
-    cp "$built" "$LOAD_CHAIN/service/${name}.elf"
+    cp "$built" "$LOAD_CHAIN_RPI/service/${name}.elf"
 done
 shopt -u nullglob
 
 # wifi_driver и test_app — свои имена цели, не sb_*/svc_*, поэтому явно.
-cp "$B/wifi_driver" "$LOAD_CHAIN/service/wifi.elf"
-cp "$B/test_app" "$LOAD_CHAIN/bin/test_app.elf"
-cp "$B/test_app" "$LOAD_CHAIN/root/test_app.elf"
+cp "$B/wifi_driver" "$LOAD_CHAIN_RPI/service/wifi.elf"
+cp "$B/test_app" "$LOAD_CHAIN_RPI/bin/test_app.elf"
+cp "$B/test_app" "$LOAD_CHAIN_RPI/root/test_app.elf"
 
 # /etc/init.conf, /etc/auto_restart.conf — по просьбе пользователя
 # (2026-08-16) больше НЕ сборочные артефакты и НЕ подписываются (см.
 # load_text_config_from_disk() в main.cpp) — простой текст, редактируется
 # ПРЯМО на устройстве (touch/echo>файл, в будущем — полноценный редактор).
-# Копий .src больше нет — load_chain/etc/{init.conf,auto_restart.conf}
+# Копий .src больше нет — load_chain/RPI/etc/{init.conf,auto_restart.conf}
 # сами по себе каноничны, этот скрипт их не трогает вообще.
 
 # --- 5. Подпись — просто список ПАПОК, без знания конкретных имён файлов.
 # Подписывает КАЖДЫЙ .elf, что найдёт внутри, на месте. Новый .elf в любой
 # из перечисленных папок подхватится сам — редактировать этот список нужно,
 # только если появится СОВСЕМ НОВАЯ папка (не новый файл в существующей). ---
-echo "[5/6] Подписываю все .elf в load_chain/{sbin,sbin/tests,service,bin,root} (/etc — простой текст, не подписывается) ..."
+echo "[5/6] Подписываю все .elf в load_chain/RPI/{sbin,sbin/tests,service,bin,root} (/etc — простой текст, не подписывается) ..."
 
-SIGN_DIRS=("$LOAD_CHAIN/sbin" "$LOAD_CHAIN/sbin/tests" "$LOAD_CHAIN/service" "$LOAD_CHAIN/bin" "$LOAD_CHAIN/root")
+SIGN_DIRS=("$LOAD_CHAIN_RPI/sbin" "$LOAD_CHAIN_RPI/sbin/tests" "$LOAD_CHAIN_RPI/service" "$LOAD_CHAIN_RPI/bin" "$LOAD_CHAIN_RPI/root")
 for dir in "${SIGN_DIRS[@]}"; do
     for f in "$dir"/*.elf; do
         [ -e "$f" ] || continue
@@ -120,11 +134,11 @@ done
 
 # --- 6. FIT-подпись загрузочного образа (Фаза 13, RSA — отдельный механизм
 # от Ed25519 выше, проверяется САМИМ U-Boot, не rootserver'ом). Ключ здесь
-# только ПОДПИСЫВАЕТ — публичная половина уже зашита в load_chain/u-boot.bin
+# только ПОДПИСЫВАЕТ — публичная половина уже зашита в load_chain/BOOT/u-boot.bin
 # при его отдельной (не автоматизированной этим скриптом) пересборке, см.
 # INSTRUCTIONS.md. Если поменяли .fit-signing-key — u-boot.bin нужно
 # пересобрать и передать заново, иначе новый boot.itb не пройдёт проверку. ---
-echo "[6/6] Подписываю загрузочный образ (FIT/RSA) -> load_chain/boot.itb ..."
+echo "[6/6] Подписываю загрузочный образ (FIT/RSA) -> load_chain/BOOT/boot.itb ..."
 
 if [ -z "$MKIMAGE" ]; then
     echo "!!! mkimage не найден (пакет u-boot-tools) — пропускаю FIT-подпись."
@@ -141,7 +155,7 @@ else
     sed "s|@@IMAGE_PATH@@|$BUILD_DIR/images/sel4test-driver-image-arm-bcm2711|" \
         "$BOOT_ITS_TEMPLATE" > "$its_tmp"
     "$MKIMAGE" -f "$its_tmp" -k "$FIT_KEY_DIR" -r "$itb_tmp"
-    mv "$itb_tmp" "$LOAD_CHAIN/boot.itb"
+    mv "$itb_tmp" "$LOAD_CHAIN_BOOT/boot.itb"
     rm -f "$its_tmp"
 fi
 

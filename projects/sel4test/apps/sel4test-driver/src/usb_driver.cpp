@@ -19,6 +19,22 @@
 // зависимость которых — читать этот же глобал, не порядок объявления.
 static seL4_CPtr g_console_ep = 0;
 
+// issuse.txt №66 (тот же фикс, что blk_driver.cpp/g_blk_liveness_ntfn) — капа,
+// которой САМ usb_driver сигналит root'у "я жив" (badge
+// DRIVER_LIVENESS_USB_BADGE). Раньше heartbeat уходил ТОЛЬКО пока driver
+// простаивал на seL4_Recv() — длинная легитимная VFS-операция над USB-
+// накопителем (chunked-чтение большого файла и т.п.) держала бы его занятым
+// дольше WATCHDOG_TIMEOUT_MS[6]=5000мс без единого тика, watchdog принял бы
+// "занят" за "завис" и убил бы живой процесс, навсегда повесив клиента,
+// синхронно ждавшего ответа (root не умеет перехватить чужой reply у
+// обычного seL4_Call). Та же фиксированная сигнатура block_read_fn/
+// block_write_fn (см. g_console_ep выше) не оставляет места для параметра
+// контекста — глобал по тому же паттерну. Сигналится дополнительно после
+// КАЖДОГО реального сектор-I/O в hardware_usb_rw_generic_read/write() ниже,
+// не только по тику — лишние сигналы безвредны, root просто обновляет
+// last_seen_ms (main.cpp, DRIVER_LIVENESS_*_BADGE-блок).
+static seL4_CPtr g_usb_liveness_ntfn = 0;
+
 // --- Обвязка (тот же паттерн, что blk_driver.cpp/net_driver.cpp) ---
 
 static void my_memcpy(void *dest, const void *src, int n) {
@@ -2307,6 +2323,9 @@ static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t coun
     // предыдущего вызова; раньше это молча копировалось наружу.
     if (actual != count * 512u) return false;
     my_memcpy(buffer, (const void*)bounce_vaddr(idx), (int)(count * 512u));
+    // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
+    // g_usb_liveness_ntfn выше.
+    if (g_usb_liveness_ntfn != 0) seL4_Signal(g_usb_liveness_ntfn);
     return true;
 }
 
@@ -2337,7 +2356,11 @@ static bool hardware_usb_rw_generic_write(int idx, uint32_t sector, uint32_t cou
     // issuse.txt №11: симметрично чтению — если устройство приняло меньше
     // байт, чем запрошено, это не полноценная успешная запись, даже если
     // CSW status формально 0.
-    return csw_status == 0 && actual == count * 512u;
+    bool ok = csw_status == 0 && actual == count * 512u;
+    // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
+    // g_usb_liveness_ntfn выше.
+    if (ok && g_usb_liveness_ntfn != 0) seL4_Signal(g_usb_liveness_ntfn);
+    return ok;
 }
 
 // exfat.h фиксирует сигнатуру block_read_fn/block_write_fn без параметра
@@ -3004,6 +3027,7 @@ int main(int argc, char *argv[]) {
     g_console_ep = console_ep; // Milestone 7 — hardware_usb_read/write берут его отсюда (сигнатура block_read_fn фиксирована)
     seL4_CPtr usb_cmd_ep = ipc->msg[BOOT_USB_EP];
     seL4_CPtr liveness_ntfn = ipc->msg[BOOT_USB_LIVENESS_NTFN_CAP]; // Фаза 3b плана "Сигналы драйверам", см. main.cpp
+    g_usb_liveness_ntfn = liveness_ntfn; // issuse.txt №66 — hardware_usb_rw_generic_read/write() берут его отсюда, см. комментарий у объявления
     g_cntfrq = read_cntfrq();
 
     g_dcbaa_paddr          = ipc->msg[BOOT_USB_DCBAA_PADDR];

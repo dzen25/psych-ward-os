@@ -1,149 +1,160 @@
 #!/bin/bash
-# ВРЕМЕННЫЙ скрипт для JTAG-репродукции SError из usb_driver (Фаза 14,
-# см. ROADMAP.md "Пятнадцатая попытка"). Порядок действий: ЗАПУСТИТЬ
-# ЭТОТ СКРИПТ ПЕРВЫМ, и только потом подать питание на RPi4 (прошитую
-# build с PLAT_XHCI_PADDR=0xfd600000 + 90с паузой в usb_driver.cpp/main()).
+# МОДЕРНИЗИРОВАНО 2026-08-23 для issuse.txt №64 (SYS_CLONE/SYS_THREAD_EXIT
+# никогда не доставляет вызов до root). Старая версия этого скрипта (см.
+# git-историю/situation.txt) была написана под мост RP2040/DirtyJTAG
+# (remote_bitbang, побитовый, медленный) и хрупкие hex-адреса точек
+# останова — оба обстоятельства изменились:
+#   - JTAG теперь идёт через FT232H (MPSSE, аппаратный, быстрый) с
+#     отдельного хоста carto (см. uart_wifi_JTAG/debug_of_FT232H/) —
+#     никакого моста/bitbang-Python не нужно, OpenOCD говорит с чипом
+#     напрямую. Все JTAG-операции — ТОЛЬКО там, через ssh.
+#   - Цель теперь НЕ мимолётный крах (SError -> WFI/idle, где чтение
+#     регистров ломалось) — clonetest.elf (src/tests/clonetest.cpp)
+#     нарочно виснет в while(1)/seL4_Yield() НАВСЕГДА, если баг
+#     воспроизвёлся, и родитель, и (если дошёл) дочерний поток. Гонки со
+#     временем нет вообще — можно подключаться когда угодно после того,
+#     как лог (out.log) подтвердит зависание. Поэтому вместо
+#     Tcl-breakpoint-ДО-краха здесь просто halt + инспекция по имени
+#     символа (add-symbol-file), без хардкода hex-адресов.
 #
-# ИСТОРИЯ ПОДХОДОВ (не повторять):
-# 1) 4 параллельные GDB-сессии - ЛОМАЛИ OpenOCD конкурентным доступом к
-#    общему DAP через один физический мост. usb_driver работает только
-#    на cpu0 (main.cpp:1421-1424) - 4 сессии были не нужны вообще.
-# 2) Одна GDB-сессия, connect + continue - RAW connect в СЛУЧАЙНЫЙ
-#    момент (до постановки breakpoint'ов) один раз поймал ядро посреди
-#    входа в вектор IRQ, другой раз - посреди захвата ОБЩЕГО SMP-лока
-#    ядра (clh_lock_acquire, риск подвесить всю систему). Сам GDB
-#    "continue" через этот мост минимум один раз "потерял" момент
-#    остановки (keep_alive-предупреждение, дальше "target is running").
-# 3) Ожидание через Tcl-опрос (poll+targets) - ПРОВЕРЕНО: пассивный
-#    "targets" без явного действия НЕ обновляет закешированное
-#    состояние (poll off), просидели бы в цикле впустую.
-# 4) Подключение GDB ПОСЛЕ того, как ядро уже дошло до финального
-#    idle-цикла (halt() -> idle_thread(), после SError) - воспроизводимо
-#    ломает чтение регистров ("warning: Selected architecture aarch64
-#    is not compatible with reported target architecture arm",
-#    "Truncated register 8", "No registers"). Природа не выяснена
-#    (не DAIF-маскирование - тот же набор масок стоит и во время
-#    успешного захвата IRQ-вектора, где регистры читаются чисто) -
-#    похоже на что-то специфичное именно для WFI/idle-состояния ЭТОГО
-#    моста/OpenOCD, а не архитектурное ограничение.
+# ПРЕДПОЛАГАЕТСЯ (проверить перед использованием):
+#   - Плата уже прошита свежим build_and_sign.sh (включает clonetest.elf
+#     в load_chain/RPI/sbin/tests/) и загружена.
+#   - На плате УЖЕ выполнено `exec /sbin/tests/clonetest.elf` вручную
+#     (физическая клавиатура/консоль пользователя — этот скрипт НЕ умеет
+#     сам вводить команды в шелл, JTAG и обычная UART-консоль это разные
+#     каналы) и лог подтвердил зависание (call_returned не стал 1 за 20с).
+#   - Провода FT232H<->RPi4 разведены на carto (см. debug_of_FT232H).
 #
-# ТЕКУЩИЙ ПОДХОД: breakpoint на ВХОДЕ в обработчик исключения (НЕ на
-# финальном halt()/idle - именно та точка, что стабильно давала чистое
-# чтение регистров при случайной поимке IRQ-вектора) ставится через Tcl
-# ДО того, как код может дойти до крашащего чтения. Аппаратный
-# breakpoint держит ядро там СКОЛЬКО УГОДНО ДОЛГО - ядро физически не
-# может пройти дальше без явного resume от отладчика, так что точное
-# время подключения GDB после этого уже не имеет значения - можно
-# просто подождать с запасом и подключиться один раз, без гонки.
+# Использование: ./jtag_run.sh [cpu]
+#   cpu — 0-3, какое ядро инспектировать (по умолчанию перебирает все 4 и
+#         сам находит "интересные" — see [2/4] ниже). Обычно шелл/потоки
+#         без явного SYS_SET_AFFINITY остаются на дефолтном ядре, но
+#         точно не гадаем, проверяем все.
 set -u
 cd /home/nikita/psych-ward-os || exit 1
-TMP=tmp
-JTAG_FILES=uart-wifi_JTAG/files
+TMP=tmp/jtag
+CARTO=nikita@carto
+LOCAL_ELF_DIR=build-rpi4/apps/sel4test-driver
+REMOTE_CFG_DIR='~/jtag'
 
-echo "=== [1/6] убиваю старые мост/OpenOCD, если остались ==="
-pkill -f dirtyjtag_bitbang_bridge.py 2>/dev/null
-pkill -f "openocd -f dirtyjtag" 2>/dev/null
+mkdir -p "$TMP"
+
+echo "=== [1/4] SSH до carto + запуск OpenOCD там (FT232H, MPSSE) ==="
+if ! ssh -o ConnectTimeout=5 "$CARTO" 'echo ok' > /dev/null 2>&1; then
+    echo "!!! Нет SSH до carto (ключ не разблокирован в этом сеансе?). Прерываю."
+    exit 1
+fi
+
+pkill -f "ssh.*-L 3333.*carto" 2>/dev/null
+ssh "$CARTO" 'pkill -x openocd' 2>/dev/null
 sleep 1
 
-echo "=== [2/6] поднимаю мост (DirtyJTAG <-> remote_bitbang) ==="
-( cd "$JTAG_FILES" && python3 dirtyjtag_bitbang_bridge.py --port 44444 ) > "$TMP/bridge.log" 2>&1 &
+# Туннель ВСЕХ портов (3333-3336 gdb по ядру, 4444 telnet/Tcl, 6666 tcl) —
+# держим в фоне на всё время сессии.
+ssh -N -L 3333:localhost:3333 -L 3334:localhost:3334 -L 3335:localhost:3335 \
+    -L 3336:localhost:3336 -L 4444:localhost:4444 -L 6666:localhost:6666 \
+    "$CARTO" > "$TMP/tunnel.log" 2>&1 &
+TUNNEL_PID=$!
 sleep 2
+if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    echo "!!! Туннель не поднялся, см. $TMP/tunnel.log. Прерываю."
+    exit 1
+fi
+echo "    туннель поднят (pid $TUNNEL_PID, локально удерживаем для очистки в конце)."
 
-echo "=== [3/6] жду появления платы (можно подавать питание СЕЙЧАС) ==="
-echo "    OpenOCD будет пытаться найти JTAG-цепочку до ~10 минут, проверяя каждые пару секунд."
-READY=0
-ATTEMPT=0
-while [ "$ATTEMPT" -lt 200 ]; do
-  ATTEMPT=$((ATTEMPT + 1))
-  ( cd "$JTAG_FILES" && openocd -f dirtyjtag_remote_bitbang.cfg -f /usr/share/openocd/scripts/board/rpi4b.cfg -c "init" -c "poll off" ) > "$TMP/openocd.log" 2>&1 &
-  OPENOCD_PID=$!
-  # Ждём именно порт 4444 (telnet/Tcl) - он поднимается ПОСЛЕДНИМ, после
-  # всех 4 GDB-портов и Tcl-порта 6666 - к этому моменту гарантированно
-  # готово вообще всё.
-  for i in $(seq 1 60); do
-    if grep -q "Listening on port 4444 for telnet connections" "$TMP/openocd.log" 2>/dev/null; then
-      READY=1
-      break
-    fi
-    if ! kill -0 "$OPENOCD_PID" 2>/dev/null; then
-      break
-    fi
+# OpenOCD НА carto, через -tt (форсированный pty) — иначе локальный kill
+# не гарантированно убивает удалённый процесс (проверено эмпирически на
+# этой же машине при настройке debug_of_FT232H, см. гайд).
+ssh -tt "$CARTO" "cd $REMOTE_CFG_DIR && openocd -f ft232h-jtag.cfg -f board/rpi4b.cfg" \
+    > "$TMP/openocd.log" 2>&1 &
+OCD_SSH_PID=$!
+sleep 3
+if ! grep -q "Listening on port 3333 for gdb connections" "$TMP/openocd.log"; then
+    echo "!!! OpenOCD не поднялся (нет tap found?), см. $TMP/openocd.log."
+    echo "    Частая причина — цель не запитана/не прошла boot. Прерываю."
+    kill "$OCD_SSH_PID" "$TUNNEL_PID" 2>/dev/null
+    exit 1
+fi
+echo "    OpenOCD на carto готов, tap найден (см. $TMP/openocd.log)."
+
+echo "=== [2/4] ищу, какое(ие) ядро(а) реально что-то держат ==="
+# targets без предварительного poll/halt всё равно покажет закешированное
+# состояние достаточно свежим (в отличие от старого DirtyJTAG-моста с
+# ЯВНО отключённым poll — здесь MPSSE достаточно быстрый, poll по
+# умолчанию включён).
+{
+    echo "targets"
     sleep 1
-  done
-  if [ "$READY" = "1" ]; then
-    echo "    OpenOCD готов (попытка $ATTEMPT) - плата обнаружена."
-    break
-  fi
-  kill "$OPENOCD_PID" 2>/dev/null
-  wait "$OPENOCD_PID" 2>/dev/null
-  if [ $((ATTEMPT % 10)) -eq 0 ]; then
-    echo "    ...всё ещё жду плату (попытка $ATTEMPT, ~$((ATTEMPT * 3))с прошло)"
-  fi
-  sleep 2
+} | timeout 5 nc localhost 4444 > "$TMP/tcl_targets.log" 2>&1
+cat "$TMP/tcl_targets.log"
+echo "    (полный вывод также в $TMP/tcl_targets.log — halted-ядра смотреть руками,"
+echo "     не гадаем автоматически, какое из них 'интересное')"
+
+REQUESTED_CPU="${1:-}"
+
+echo "=== [3/4] halt + чтение состояния запрошенного/каждого ядра ==="
+# ВАЖНО: shell и КАЖДЫЙ /sbin/tests-бинарник (включая clonetest) — все
+# EXEC (не PIE), линкуются на ОДИН И ТОТ ЖЕ фиксированный базовый адрес
+# 0x400000 (проверено: readelf -h/-l обоих ELF, entry 0x4001d0 у обоих) —
+# на живой системе это не конфликтует (разные VSpace у разных процессов),
+# но грузить ОБА ELF в ОДНУ gdb-сессию одновременно даёт неоднозначные/
+# перекрывающиеся символы по одному и тому же числовому адресу. Поэтому —
+# ДВА отдельных прохода на ядро (сначала clonetest, потом shell), не один
+# с обоими add-symbol-file сразу.
+for cpu in 0 1 2 3; do
+    if [ -n "$REQUESTED_CPU" ] && [ "$cpu" != "$REQUESTED_CPU" ]; then
+        continue
+    fi
+    port=$((3333 + cpu))
+    echo "--- cpu$cpu (порт $port), символы clonetest ---"
+    timeout 30 gdb-multiarch -q \
+        -ex "set pagination off" \
+        -ex "set confirm off" \
+        -ex "set remotetimeout 20" \
+        -ex "target extended-remote localhost:$port" \
+        -ex "add-symbol-file $LOCAL_ELF_DIR/sbtest_clonetest" \
+        -ex 'printf "\n===== cpu'"$cpu"' (символы: clonetest) PC/символ =====\n"' \
+        -ex "info symbol \$pc" \
+        -ex "p/x \$pc" \
+        -ex "p/x \$sp" \
+        -ex 'printf "\n----- bt -----\n"' \
+        -ex "bt" \
+        -ex 'printf "\n----- флаги clonetest (валидны, только если pc реально внутри этого ELF) -----\n"' \
+        -ex "p g_thread_reached_entry" \
+        -ex "p g_thread_call_returned" \
+        -ex "p/x g_thread_result" \
+        -ex 'printf "\n----- disas вокруг pc -----\n"' \
+        -ex "x/8i \$pc-16" \
+        -ex "quit" \
+        > "$TMP/gdb_cpu${cpu}_clonetest.log" 2>&1
+    grep -A3 "PC/символ\|флаги clonetest" "$TMP/gdb_cpu${cpu}_clonetest.log"
+
+    echo "--- cpu$cpu (порт $port), символы shell (на случай если pc не в clonetest) ---"
+    timeout 30 gdb-multiarch -q \
+        -ex "set pagination off" \
+        -ex "set confirm off" \
+        -ex "set remotetimeout 20" \
+        -ex "target extended-remote localhost:$port" \
+        -ex "add-symbol-file $LOCAL_ELF_DIR/shell" \
+        -ex 'printf "\n===== cpu'"$cpu"' (символы: shell) PC/символ =====\n"' \
+        -ex "info symbol \$pc" \
+        -ex 'printf "\n----- bt -----\n"' \
+        -ex "bt" \
+        -ex "quit" \
+        > "$TMP/gdb_cpu${cpu}_shell.log" 2>&1
+    grep -A3 "PC/символ" "$TMP/gdb_cpu${cpu}_shell.log"
+    echo "    полные логи: $TMP/gdb_cpu${cpu}_clonetest.log, $TMP/gdb_cpu${cpu}_shell.log"
 done
-if [ "$READY" != "1" ]; then
-  echo "!!! Плата так и не появилась за отведённое время. См. $TMP/openocd.log. Прерываю."
-  exit 1
-fi
 
-echo "=== [4/6] ставлю breakpoint'ы на ВХОД в обработчик исключения через Tcl ==="
-# invalid_vector_entry/cur_el_serr/lower_el_serr - НЕ halt() - именно
-# эти адреса стабильно давали чистое чтение регистров при случайной
-# поимке IRQ-вектора раньше (см. коммент выше). Как только КАКОЙ-ТО из
-# них сработает - ядро остановится ТАМ ЖЕ и будет ждать нас сколько
-# угодно, дальше в halt()/idle оно уже не пройдёт.
-{
-  echo "targets bcm2711.cpu0"
-  echo "bp 0xffffff8000010784 4 hw"
-  echo "bp 0xffffff80000107e8 4 hw"
-  echo "bp 0xffffff8000010940 4 hw"
-  sleep 1
-} | timeout 8 nc localhost 4444 > "$TMP/tcl_bp.log" 2>&1
-BP_COUNT=$(grep -c "breakpoint set" "$TMP/tcl_bp.log" 2>/dev/null || echo 0)
-echo "    breakpoint'ов взведено: $BP_COUNT/3 (см. $TMP/tcl_bp.log)"
-if [ "$BP_COUNT" != "3" ]; then
-  echo "!!! Не все breakpoint'ы встали - см. $TMP/tcl_bp.log. Продолжаю всё равно."
-fi
-
-echo "=== [5/6] жду с запасом, пока usb_driver дойдёт до краша (breakpoint держит ядро сколько угодно) ==="
-echo "    (90с пауза в коде + запас на сам bring-up - жду 110с; спешить некуда, ядро всё равно не уйдёт дальше)"
-sleep 110
-
-echo "=== [6/6] ОДНА короткая GDB-сессия ТОЛЬКО для чтения состояния (без continue-ожидания) ==="
-timeout 90 gdb-multiarch -q \
-    build-rpi4/kernel/kernel.elf \
-    -ex "set pagination off" \
-    -ex "set confirm off" \
-    -ex "set remotetimeout 60" \
-    -ex "target extended-remote localhost:3333" \
-    -ex "add-symbol-file build-rpi4/apps/sel4test-driver/usb_driver" \
-    -ex "printf \"\\n===== СОСТОЯНИЕ НА HALT =====\\n\"" \
-    -ex "info symbol \$pc" \
-    -ex "p/x \$pc" \
-    -ex "info registers" \
-    -ex "printf \"\\n----- system regs -----\\n\"" \
-    -ex "info all-registers" \
-    -ex "p/x \$ESR_EL1" \
-    -ex "p/x \$esr_el1" \
-    -ex "p/x \$FAR_EL1" \
-    -ex "p/x \$far_el1" \
-    -ex "p/x \$ELR_EL1" \
-    -ex "p/x \$elr_el1" \
-    -ex "printf \"\\n----- bt / disas -----\\n\"" \
-    -ex "bt" \
-    -ex "x/8i \$pc-16" \
-    -ex "continue" \
-    -ex "quit" \
-    > "$TMP/gdb_cpu0.log" 2>&1
-
-echo "=== финальная подстраховка - резюмирую cpu0, если он остался halted ==="
-{
-  echo "targets"
-  sleep 1
-  echo "targets bcm2711.cpu0"
-  echo "resume"
-  echo "targets"
-  sleep 1
-} | timeout 10 nc localhost 4444 > "$TMP/final_state.log" 2>&1
-
-echo "=== ГОТОВО. Главный лог: $TMP/gdb_cpu0.log (плюс $TMP/tcl_bp.log, $TMP/openocd.log, $TMP/bridge.log, $TMP/final_state.log) ==="
+echo "=== [4/4] ГЛАВНОЕ ПРАВИЛО (см. debug_of_RP2040/JTAG-GDB-cheatsheet.md) ==="
+echo "    Halted-ядро НЕ резюмится само по себе — если инспекция выше делала"
+echo "    halt (а не только read-only через уже-established gdb-сессию с"
+echo "    'continue' в конце), ОБЯЗАТЕЛЬНО resume перед тем как отключаться,"
+echo "    иначе шелл/плата замрёт навсегда независимо от результата теста."
+echo "    Резюмировать всё сразу:"
+echo '    ssh '"$CARTO"' '"'"'(for c in 0 1 2 3; do echo "targets bcm2711.cpu$c"; echo resume; done; echo targets) | nc localhost 4444'"'"''
+echo
+echo "    Туннель (pid $TUNNEL_PID) и OpenOCD на carto оставлены работать —"
+echo "    сначала резюмировать нужные ядра выше, потом (если больше не нужно):"
+echo "    kill $TUNNEL_PID ; ssh $CARTO pkill -x openocd"

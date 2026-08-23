@@ -64,6 +64,26 @@ pip install -r requirements.txt
 ---
 
 <details>
+<summary><b>🚀 Пайплайны — коротко, весь путь целиком</b></summary>
+
+Три шага, по порядку. Ниже — только команды; зачем каждая нужна и какие узлы за ней стоят — в соответствующих разделах дальше по файлу.
+
+```bash
+./setup_uboot_secure_boot.sh   # 1. ОДИН РАЗ (заново — только при смене .fit-signing-key/ или конфига U-Boot)
+./build_and_sign.sh            # 2. КАЖДЫЙ билд — ninja + подпись + раскладка в load_chain/
+./flash.sh -br                 # 3. На отдельной машине с картой (projects/sel4test/apps/sel4test-driver/src/rt/) — прошивка обеих партиций
+```
+
+- Оба скрипта в корне репозитория (`setup_uboot_secure_boot.sh`/`build_and_sign.sh`) **самовосстанавливающие** — если `load_chain/` отсутствует целиком (свежий клон) или урезана, оба сами создадут нужные подпапки (`mkdir -p`) при следующем запуске, руками ничего готовить не надо.
+- `load_chain/` — **в `.gitignore`, не коммитится** (собирается заново из `build-rpi4/` каждым запуском `build_and_sign.sh`). Внутри — два подкаталога, 1:1 с партициями SD-карты (см. «💾 Подготовка SD-карты» ниже):
+  - `load_chain/BOOT/` — FAT32-партиция (`start4.elf`, `fixup4.dat`, `config.txt`, `bcm2711-rpi-4-b.dtb`, `overlays/`, `u-boot.bin`, `boot.itb`). `u-boot.bin` кладёт `setup_uboot_secure_boot.sh`, `boot.itb` — `build_and_sign.sh` (шаг `[6/6]`, при каждой сборке); остальное (`start4.elf`/`fixup4.dat`/`config.txt`/`bcm2711-rpi-4-b.dtb`/`overlays/`) — статичные файлы прошивки RPi4, ни один скрипт их не генерирует, кладутся туда вручную один раз (взять из офиц. `raspberrypi/firmware/boot`, см. «💾 Подготовка SD-карты»).
+  - `load_chain/RPI/` — exFAT-партиция (`bin/`, `sbin/` (+ `sbin/tests/`), `etc/`, `conf/`, `service/`, `root/`) — целиком собирается `build_and_sign.sh` при каждом запуске.
+- `rt/flash.sh` (на отдельной машине, где физически смонтирована SD-карта — обычно macOS, `projects/sel4test/apps/sel4test-driver/src/rt/`) синхронизирует эти же два подкаталога на партиции `BOOT`/`RPI` по rsync через SSH (`BOOT_ITEMS`/`RPI_ITEMS` внутри скрипта уже знают про подкаталоги) — этот файл не запускается и не собирается на сборочной машине, только читается по SSH.
+</details>
+
+---
+
+<details>
 <summary><b>🔨 Тестовая прошивка (sel4test hello-world, Фаза 1.3)</b></summary>
 
 Полностью отдельный, самодостаточный цикл (свой repo sync, свой venv, своя сборка U-Boot без Фазы 13, своя разметка карты) — специально вынесен из этого файла, чтобы не путаться с основной прошивкой ниже. Всё — от зависимостей до проверки на живом железе — в [load_chain_test/INSTRUCTIONS.md](../load_chain_test/INSTRUCTIONS.md).
@@ -71,6 +91,10 @@ pip install -r requirements.txt
 Необязательный, но рекомендуемый шаг: если этот образ (от seL4 Foundation, без единой строчки кода `psych-ward-os`) не грузится на вашем железе/карте/проводах — проблема гарантированно в тулчейне, а не в шагах ниже. Дальше можно сразу перейти к следующему разделу.
 
 </details>
+
+---
+
+Дальнейшие пункты это описание каждого процесса из `Пайплайны — коротко, весь путь целиком`. Дальше идти не обязательно если текущий процесс вас устраивает.
 
 ---
 
@@ -145,11 +169,11 @@ make CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"   # финальный u-boot
 tools/fit_check_sign -f /tmp/test.itb -k u-boot.dtb -c conf-1
 ```
 
-Готовый `u-boot.bin` скопировать в `load_chain/u-boot.bin` (как любой другой файл этой папки — прошивает пользователь через `rt/flash.sh`).
+Готовый `u-boot.bin` скопировать в `load_chain/BOOT/u-boot.bin` (как любой другой файл этой папки — прошивает пользователь через `rt/flash.sh`).
 
 ### Рутинная пересборка/подпись образа ядра
 
-`./build_and_sign.sh` (см. ниже) делает это сам, шаг `[6/6]` — рендерит `tools/boot_fit/boot.its.template` под сырой образ прямо из `build-rpi4/apps/sel4test-driver/images/` (в `load_chain/` сырой образ больше не копируется — на SD-карту он не попадает, U-Boot с Фазы 13 грузит только `boot.itb`) и подписывает в `load_chain/boot.itb`. `u-boot.bin` при этом НЕ пересобирается — этот шаг нужен отдельно, только при смене `.fit-signing-key/` или конфига U-Boot.
+`./build_and_sign.sh` (см. ниже) делает это сам, шаг `[6/6]` — рендерит `tools/boot_fit/boot.its.template` под сырой образ прямо из `build-rpi4/apps/sel4test-driver/images/` (в `load_chain/` сырой образ больше не копируется — на SD-карту он не попадает, U-Boot с Фазы 13 грузит только `boot.itb`) и подписывает в `load_chain/BOOT/boot.itb`. `u-boot.bin` при этом НЕ пересобирается — этот шаг нужен отдельно, только при смене `.fit-signing-key/` или конфига U-Boot.
 
 **Модель угроз, честно**: защищён образ ядра + boot-команда. `start4.elf`/`fixup4.dat`/`config.txt`/FAT32-копия `bcm2711-rpi-4-b.dtb`/сам `u-boot.bin` до своего запуска — вне схемы, грузятся GPU-прошивкой RPi4 раньше, чем U-Boot вообще существует. Настоящая защита этого требует OTP secure boot самой платы (прожиг физических fuse — необратимо) — сознательно не делается.
 
@@ -177,7 +201,7 @@ ninja
 <details>
 <summary><b>🔏 Подпись бинарников (Ed25519, Фаза 12)</b></summary>
 
-С Фазы 12 (см. [ROADMAP.md](ROADMAP.md)) `load_elf_from_disk()` в `main.cpp` отказывается использовать любой файл с диска без действительной Ed25519-подписи — это касается ВСЕХ файлов из `load_chain/sbin/`, `load_chain/service/` и `load_chain/etc/init.conf` (не только `.elf`).
+С Фазы 12 (см. [ROADMAP.md](ROADMAP.md)) `load_elf_from_disk()` в `main.cpp` отказывается использовать любой файл с диска без действительной Ed25519-подписи — это касается ВСЕХ файлов из `load_chain/RPI/sbin/`, `load_chain/RPI/service/` и `load_chain/RPI/etc/init.conf` (не только `.elf`).
 
 ### Быстрый способ (рекомендуется)
 
@@ -225,7 +249,7 @@ ninja
 - Партиция 1 (`BOOT`, FAT32) — `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`, `config.txt`, `u-boot.bin`, `boot.itb` (подписанный образ ядра, Фаза 13 — `boot.scr` больше не используется), `overlays/`.
 - Партиция 2 (`RPI`, exFAT) — `bin/`, `sbin/`, `etc/`, `conf/`, `service/`, `root/`.
 
-Обе готовые структуры лежат в [`load_chain/`](../load_chain) этого репозитория.
+Обе готовые структуры лежат в `load_chain/` этого репозитория, каждая в своём подкаталоге 1:1 с именем партиции — `load_chain/BOOT/` и `load_chain/RPI/` (сам `load_chain/` в `.gitignore`, не в git, собирается локально — см. «🚀 Пайплайны» в начале файла).
 
 ### Разметка (macOS)
 

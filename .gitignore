@@ -1,5 +1,6 @@
 build/
 build-rpi4/
+/load_chain/
 .vscode/
 *.log
 fat32.img

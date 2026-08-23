@@ -32,6 +32,21 @@ static bool g_blk_stopped = false;
 // root'у "я жив" (badge DRIVER_LIVENESS_BLK_BADGE), на каждом полученном
 // BLK_LIVENESS_TICK_BADGE (см. main() ниже). 0, если root её не выдал
 // (не должно случаться, но main() уже гейтит на 0 своей стороной).
+//
+// issuse.txt №66 — этого одного источника (тик снаружи, только пока драйвер
+// простаивает на seL4_Recv()) НЕДОСТАТОЧНО: длинная легитимная VFS-операция
+// (chunked-чтение большого файла, рост фрагментированной директории при
+// mkdir/write) держит driver вне seL4_Recv() дольше 3с — тик просто некому
+// принять, watchdog видит "не отвечает" и убивает ЖИВОЙ, просто занятый
+// процесс, что навсегда вешает клиента, синхронно ждавшего ответа (root не
+// умеет перехватить чужой reply у обычного seL4_Call, см. issuse.txt). Фикс
+// (см. hardware_emmc_read()/hardware_emmc_write() ниже) — сигналить эту же
+// капу ДОПОЛНИТЕЛЬНО после КАЖДОГО реального сектор-I/O, не только по тику:
+// самый нижний общий слой, через который проходит любая VFS-операция (чтение/
+// запись/рост директории/бит carte), так что "занят, но жив" покрывает вообще
+// любую будущую медленную операцию, а не только конкретный repro с большим
+// файлом. Лишние сигналы безвредны — root просто обновляет last_seen_ms на
+// текущее время (main.cpp, DRIVER_LIVENESS_BLK_BADGE-блок), не считает их.
 static seL4_CPtr g_blk_liveness_ntfn = 0;
 
 // Глобальные переменные EMMC2 (см. h/platform.h — регистровая карта SDHCI)
@@ -512,6 +527,9 @@ bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
     if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
 
     my_memcpy(buffer, (const void*)blk_dma_buf(), count * 512);
+    // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
+    // g_blk_liveness_ntfn выше.
+    if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
     return true;
 }
 
@@ -541,6 +559,9 @@ bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
     if (!emmc_send_cmd(cmd_flags, cmd_index, g_partition_start_sector + sector)) return false;
 
     if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+    // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
+    // g_blk_liveness_ntfn выше.
+    if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
     return true;
 }
 
