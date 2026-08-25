@@ -305,6 +305,22 @@ constexpr seL4_Word PIPE_FD_SLOT = 20;
 // что main.cpp уже использует для СЕБЯ через seL4_CapInitThreadCNode).
 constexpr seL4_Word SELF_CNODE_SLOT = 11;
 
+// issuse.txt №69 — тот же приём, что UART_PENDING_REPLY_SLOT в
+// uart_driver.cpp, но для СИНХРОННЫХ VFS-команд blk_driver.cpp/
+// usb_driver.cpp: SaveCaller ПЕРЕД обработкой КАЖДОЙ VFS-команды (не только
+// когда реально нечего ответить сразу, как у SYS_READ) кладёт reply-капу
+// текущего клиента в этот фиксированный слот СВОЕГО CNode на всё время
+// обработки. Если driver умирает/зависает посреди обработки, root (см.
+// generic_recover_process() в main.cpp) успевает вытащить эту капу из
+// CNode жертвы ДО его уничтожения и ответить клиенту сам, с ошибкой —
+// вместо того чтобы клиент завис навсегда (обычный seL4_Call не даёт
+// root'у такой возможности). 27 — следующий свободный слот после старших
+// local_*-констант spawn_process() (см. main.cpp, up to local_blk_
+// liveness_tick=26) — сознательно НЕ 12 (как у UART_PENDING_REPLY_SLOT),
+// хотя коллизии не было бы (CNode каждого процесса свой, приватный) —
+// просто чтобы не наводить на мысль о связи с uart-конкретной логикой.
+constexpr seL4_Word VFS_PENDING_REPLY_SLOT = 27;
+
 // Сисколл rootserver'у: "моя синхронная инициализация завершена, я готов
 // обслуживать запросы". Каждый драйвер шлет его один раз перед входом в
 // свой главный while(1); rootserver ждет этот сигнал между spawn_process()
@@ -477,6 +493,44 @@ constexpr seL4_Word SYS_DRIVER_SIGNAL = 148;
 constexpr int DRIVER_SIGNAL_STOP = 0;
 constexpr int DRIVER_SIGNAL_START = 1;
 constexpr int DRIVER_SIGNAL_RESTART = 2;
+
+// issuse.txt №69 (регрессионный тест, см. sbin/tests/killwindow.cpp) —
+// сентинел-offset для SYS_READ_FILE (119), которого НИКОГДА не бывает в
+// реальном chunked-протоколе (шелл/cat/timedread всегда идут от 0 вверх
+// кратно 4096, а реальные файлы столько не весят) — blk_driver.cpp/
+// usb_driver.cpp узнают его и делают искусственную паузу ПОСЛЕ
+// SaveCaller(VFS_PENDING_REPLY_SLOT), ДО реальной работы, вместо честного
+// чтения — даёт гарантированное окно в несколько секунд, чтобы вручную (или
+// скриптом) поймать `kill <pid>` driver'а РОВНО посреди обработки
+// VFS-команды. Без этого сентинела момент "именно посреди обработки" (а не
+// "пока driver простаивал на seL4_Recv") — не воспроизводимая на глаз гонка
+// (окно — миллисекунды на реальный 4КБ chunk).
+constexpr uint32_t KILL_WINDOW_TEST_OFFSET = 0xFFFFFFF0;
+constexpr int KILL_WINDOW_TEST_DELAY_MS = 5000;
+
+// issuse.txt №70 — vfs_lock()/vfs_unlock() (shell.cpp/h/sys_client.h) сами
+// сообщают root'у, кто СЕЙЧАС держит глобальный vfs_mutex_ep (MR1: 1=взял,
+// 0=отдал) — обычный fire-and-forget seL4_Send, БЕЗ reply (root просто
+// обновляет g_vfs_lock_holder_pid и не отвечает, тот же приём, что уже есть
+// у heartbeat-тиков/badge-нотификаций). Если владелец умирает/убивается
+// (см. generic_recover_process() в main.cpp) ДО того, как успел сам
+// вызвать vfs_unlock() (обычный seL4_Signal тут бессилен — убитый
+// процесс никогда до него не дойдёт), root форсирует seL4_Signal сам —
+// иначе мьютекс, будучи голым notification-семафором без владельца/
+// таймаута/robust-семантики, остаётся захваченным НАВСЕГДА, вешая
+// абсолютно ЛЮБУЮ будущую VFS-команду от ЛЮБОГО процесса в системе.
+constexpr seL4_Word SYS_VFS_LOCK_NOTIFY = 149;
+
+// issuse.txt №75 (доп.) — жёсткий reboot через тот же PM_WDOG/PM_RSTC,
+// что уже "кормит" timer_driver (см. platform.h/PLAT_PM_*,
+// timer_driver.cpp/pm_watchdog_kick_ticks()). Shell -> root (admin-check,
+// как SYS_BALANCE/SYS_KILL) -> forward на timer_ep — единственный
+// процесс, у которого вообще замаплены эти регистры. Взводит watchdog
+// на минимальный таймаут (10 тиков, ~150мкс — тот же приём, что
+// bcm2835_wdt_expire_now() в /home/nikita/u-boot/drivers/watchdog/
+// bcm2835_wdt.c) вместо обычных 12с — чип перезагружает всю плату
+// аппаратно, почти мгновенно.
+constexpr seL4_Word SYS_REBOOT = 150;
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

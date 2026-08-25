@@ -43,15 +43,32 @@ static void sys_exit(seL4_CPtr root_ep) {
 // /sbin-утилиты, см. ROADMAP Фаза A). Ноль для обычного exec — vfs_lock/
 // unlock() в этом случае просто no-op (см. main.cpp shm_pages_mask_for_role).
 static seL4_CPtr g_vfs_mutex_ep = 0;
+// issuse.txt №70 — root_ep нужен, чтобы vfs_lock()/vfs_unlock() сами могли
+// сообщить root'у о владении (SYS_VFS_LOCK_NOTIFY, см. common.h), не
+// принимая root_ep отдельным параметром в каждый вызов. Ставится в
+// sys_client_init() вместе с g_vfs_mutex_ep.
+static seL4_CPtr g_vfs_root_ep = 0;
 
 static inline void vfs_lock() {
     if (!g_vfs_mutex_ep) return;
     seL4_Word badge;
     seL4_Wait(g_vfs_mutex_ep, &badge);
+    // issuse.txt №70 — fire-and-forget, БЕЗ ожидания ответа (root не шлёт
+    // reply на этот cmd, см. main.cpp): "я теперь держу vfs_mutex_ep".
+    seL4_SetMR(0, SYS_VFS_LOCK_NOTIFY);
+    seL4_SetMR(1, 1);
+    seL4_Send(g_vfs_root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
 static inline void vfs_unlock() {
     if (!g_vfs_mutex_ep) return;
+    // issuse.txt №70 — "отдаю", ДО реального Signal (симметрично vfs_lock:
+    // если процесс убьют РОВНО между этими двумя строками, root либо ещё
+    // считает его владельцем и форсирует Signal сам — лишний Signal
+    // безвреден, notification идемпотентна, — либо мы успеваем сами).
+    seL4_SetMR(0, SYS_VFS_LOCK_NOTIFY);
+    seL4_SetMR(1, 0);
+    seL4_Send(g_vfs_root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
     seL4_Signal(g_vfs_mutex_ep);
 }
 
@@ -348,6 +365,7 @@ static void sys_client_init(SysClientEnv &env) {
     env.usb_storage_ep = ipc->msg[BOOT_USB_STORAGE_EP]; // Milestone 9
     env.timer_ep = ipc->msg[BOOT_TIMER_EP];
     g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP];
+    g_vfs_root_ep = env.root_ep; // issuse.txt №70 — см. vfs_lock()/vfs_unlock() выше
 
     my_strlcpy(env.arg_buffer, (char*)&ipc->msg[0], (int)sizeof(env.arg_buffer));
     env.arg = env.arg_buffer[0] ? env.arg_buffer : nullptr;

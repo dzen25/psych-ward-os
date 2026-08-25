@@ -350,6 +350,22 @@ struct UsbDeviceSlot {
     uint8_t parent_port_number = 0;
     bool parent_multi_tt = false;
     uint8_t parent_tt_think_time = 0;
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: parent_port_number один
+    // сам по себе достаточен ТОЛЬКО для устройства на 1 уровне вложенности
+    // (хаб напрямую на корневом порту). Для 2+ уровней (флешка -> хаб
+    // пользователя -> встроенный root-hub VL805 -> корневой порт) нужен
+    // ПОЛНЫЙ Route String (по нибблу на каждый ярус, см. xHCI 8.9/USB3
+    // spec) и НАСТОЯЩИЙ корневой порт (не порт непосредственного
+    // родителя, если сам родитель — тоже не на корневом порту). hub_tier
+    // — номер яруса (0 для корневого устройства, 1 для хаба/устройства
+    // сразу на корневом хабе, 2 для следующего уровня и т.д.) — считается
+    // при перечислении (enumerate_device_behind_hub), наследуется от
+    // родителя. route_string_full/root_port_full — уже готовые, полные
+    // значения для Slot Context (dword0/dword1), не пересчитываются
+    // заново в каждой команде из одного parent_port_number, как раньше.
+    uint8_t hub_tier = 0;
+    uint32_t route_string_full = 0;
+    int root_port_full = 0;
 };
 static UsbDeviceSlot g_usb_devices[USB_MAX_DEVICES];
 
@@ -448,6 +464,24 @@ static inline volatile uint32_t* devctx_vaddr_for(uint8_t slot_id) { return (vol
 constexpr int CMDRING_TRB_COUNT = 4096 / 16; // 256
 constexpr int EVTRING_TRB_COUNT = 4096 / 16; // 256
 constexpr int TRB_RING_COUNT    = 4096 / 16; // 256 — общий размер для любого производящего (не Event) кольца, см. TrbRing ниже
+// issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: живой тест поймал полный
+// зависон системы БЕЗ единого дальнейшего сообщения в логе и БЕЗ
+// срабатывания watchdog'а usb_driver'а — печать останавливалась ровно
+// после чтения битмапа interrupt-эндпоинта хаба, ДО следующего печатного
+// вызова (hub_get_port_status()). Единственный цикл между ними без
+// собственного дедлайна — внутренний `while (dequeue_event_trb(ev))`
+// внутри wait_transfer_completion()/wait_command_completion()/
+// try_check_transfer_complete() (и одноразового дренажа в
+// poll_hub_interrupts()) — если event ring когда-либо попадёт в
+// состояние, где dequeue_event_trb() бесконечно возвращает true (не
+// понят точный триггер, но это ЕДИНСТВЕННОЕ место без верхней границы
+// на число итераций), внешний дедлайн по read_cntvct() никогда не
+// перепроверяется — настоящий зависон, не просто долгое ожидание.
+// Защитный потолок ниже НЕ объясняет первопричину, но переводит отказ
+// из "весь стенд намертво, watchdog не помогает" в чистый, ограниченный
+// по времени возврат false с диагностикой — и даёт данные для следующего
+// живого теста (какая функция и с каким dev.slot_id/hp упёрлась).
+constexpr int EVT_RING_DRAIN_SANITY_CAP = 20000;
 
 static int g_evt_dequeue_idx = 0;
 static uint32_t g_evt_ccs = 1;
@@ -589,6 +623,10 @@ static bool wait_command_completion(seL4_CPtr console_ep, uint64_t cmd_trb_paddr
             last_other_parameter = ev.parameter;
             last_other_status = ev.status;
             last_other_control = ev.control;
+            if (other_events >= EVT_RING_DRAIN_SANITY_CAP) {
+                sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring превысил защитный потолок (см. EVT_RING_DRAIN_SANITY_CAP) — обрываю.\n");
+                break;
+            }
         }
         seL4_Yield();
     }
@@ -653,6 +691,10 @@ static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr
             last_other_parameter = ev.parameter;
             last_other_status = ev.status;
             last_other_control = ev.control;
+            if (other_events >= EVT_RING_DRAIN_SANITY_CAP) {
+                sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring превысил защитный потолок (см. EVT_RING_DRAIN_SANITY_CAP) — обрываю.\n");
+                break;
+            }
         }
         seL4_Yield();
     }
@@ -682,6 +724,7 @@ static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr
 static bool try_check_transfer_complete(uint64_t trb_dev_addr, uint8_t &completion_code, uint32_t &residual_len) {
     bool found = false;
     Trb ev;
+    int drained = 0;
     while (dequeue_event_trb(ev)) {
         update_erdp();
         uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
@@ -696,8 +739,135 @@ static bool try_check_transfer_complete(uint64_t trb_dev_addr, uint8_t &completi
         // от КОРНЕВЫХ портов это не мешает — их основной путь всё
         // равно polling (poll_ports_for_hotplug), не событийный (см.
         // Milestone 11, живая находка про ненадёжность событий).
+        if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
+            sys_puts(g_console_ep, "[USB]   ОШИБКА: дренаж event ring (try_check_transfer_complete) превысил защитный потолок — обрываю.\n");
+            break;
+        }
     }
     return found;
+}
+
+// issuse.txt №15 — асинхронный, тик-возобновляемый вариант control-
+// transfer'а (ep0_control_in()/ep0_control_no_data() ЦЕЛИКОМ остаются
+// нетронутыми, синхронными — этот код НИЧЕГО в них не меняет, чистое
+// добавление рядом). Setup+Data+Status TRB енкьюжатся СРАЗУ (та же схема,
+// что уже в ep0_control_in — контроллер сам проигрывает их по очереди,
+// одного doorbell'а достаточно), поэтому "асинхронность" — это просто
+// замена двух блокирующих wait_transfer_completion() на два тик-опроса
+// try_check_transfer_complete() (уже существующий неблокирующий примитив,
+// см. выше) с собственным дедлайном на каждой стадии. Мотивация — см.
+// HubConnAsync ниже: настоящая причина issuse.txt №15 в том, что
+// blocking control-transfer'ы происходят ВНУТРИ функции, которую
+// poll_hub_interrupts() зовёт синхронно каждый heartbeat-тик, так что
+// сделать "внутренний" wait неблокирующим бессмысленно, если вызывающая
+// функция всё равно не возвращается в диспетчер между тиками — отсюда и
+// необходимость поднять асинхронность на уровень ВСЕЙ последовательности
+// (см. HubConnAsync), а не только одного control-transfer'а.
+struct AsyncCtrl {
+    enum St : uint8_t { IDLE, WAITING, DONE, FAILED } state = IDLE;
+    uint64_t data_trb_addr = 0;   // 0, если у запроса нет Data Stage
+    uint64_t status_trb_addr = 0;
+    uint64_t deadline = 0;        // cntvct-тики
+    uint32_t wlength = 0;
+    uint32_t actual_length = 0;   // валидно только при state==DONE
+    bool data_done = false;       // true сразу при старте, если Data Stage нет вообще
+    uint8_t data_cc = 0;
+    uint32_t data_residual = 0;
+};
+
+// issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: Data и Status TRB енкьюжатся
+// ВМЕСТЕ (см. *_start() ниже) и контроллер обычно завершает их почти
+// одновременно — первая версия ждала ИХ ПООЧЕРЁДНО (WAIT_DATA, потом
+// WAIT_STATUS), через try_check_transfer_complete(), который дренирует
+// ВЕСЬ event ring за один вызов и ищет только ОДИН целевой адрес. Если
+// оба события уже лежали в кольце к моменту первого опроса — событие
+// Status Stage тихо ВЫБРАСЫВАЛОСЬ (не совпало с искомым Data-адресом),
+// и второй, отдельный опрос на WAIT_STATUS никогда его не находил —
+// висело до дедлайна на КАЖДОМ control-transfer'е с Data Stage (GET_
+// PORT_STATUS). Фикс — один общий WAITING-статус, каждый тик дренирует
+// кольцо ОДИН раз и проверяет ОБА адреса сразу (см. цикл ниже) — то же
+// самое кольцо, тот же courtsor, но ни одно событие больше не теряется,
+// в каком бы порядке/пачками они ни пришли.
+static void async_ctrl_in_start(AsyncCtrl &x, TrbRing &ep0_ring, uint8_t slot_id, uint8_t bmRequestType,
+                                 uint8_t bRequest, uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+                                 uint64_t buffer_paddr) {
+    uint64_t setup = (uint64_t)bmRequestType | ((uint64_t)bRequest << 8) | ((uint64_t)wValue << 16)
+                    | ((uint64_t)wIndex << 32) | ((uint64_t)wLength << 48);
+    ring_enqueue_trb(ep0_ring, setup, 8u,
+                      trb_type(TRB_TYPE_SETUP_STAGE) | (1u << 6) /*IDT*/ | (3u << 16) /*TRT=IN Data Stage*/);
+    x.data_trb_addr = ring_enqueue_trb(ep0_ring, to_dev_addr(buffer_paddr), (uint32_t)wLength,
+                      trb_type(TRB_TYPE_DATA_STAGE) | (1u << 16) /*DIR=IN*/ | (1u << 2) /*ISP*/ | TRB_IOC);
+    x.status_trb_addr = ring_enqueue_trb(ep0_ring, 0, 0,
+                      trb_type(TRB_TYPE_STATUS_STAGE) | TRB_IOC);
+    ring_endpoint_doorbell(slot_id, 1);
+    x.wlength = wLength;
+    x.data_done = false;
+    x.deadline = read_cntvct() + 500ull * g_cntfrq / 1000;
+    x.state = AsyncCtrl::WAITING;
+}
+
+static void async_ctrl_no_data_start(AsyncCtrl &x, TrbRing &ep0_ring, uint8_t slot_id, uint8_t bmRequestType,
+                                      uint8_t bRequest, uint16_t wValue, uint16_t wIndex) {
+    uint64_t setup = (uint64_t)bmRequestType | ((uint64_t)bRequest << 8) | ((uint64_t)wValue << 16)
+                    | ((uint64_t)wIndex << 32);
+    ring_enqueue_trb(ep0_ring, setup, 8u,
+                      trb_type(TRB_TYPE_SETUP_STAGE) | (1u << 6) /*IDT*/ | (0u << 16) /*TRT=No Data Stage*/);
+    x.data_trb_addr = 0;
+    x.status_trb_addr = ring_enqueue_trb(ep0_ring, 0, 0,
+                      trb_type(TRB_TYPE_STATUS_STAGE) | (1u << 16) /*DIR=IN — обязателен без Data Stage*/ | TRB_IOC);
+    ring_endpoint_doorbell(slot_id, 1);
+    x.data_done = true; // нет Data Stage — нечего ждать
+    x.deadline = read_cntvct() + 500ull * g_cntfrq / 1000;
+    x.state = AsyncCtrl::WAITING;
+}
+
+// Один шаг вперёд. Возвращает true, когда state стал терминальным
+// (DONE или FAILED) — вызывающий смотрит x.state, чтобы различить их.
+// НЕ блокируется НИКОГДА — при "ещё не готово" просто возвращает false.
+// Один проход по event ring'у за тик, проверяет ОБА адреса разом (см.
+// комментарий у struct AsyncCtrl выше) — не теряет событие, даже если
+// Data и Status Stage завершились в один и тот же дрейн.
+static bool async_ctrl_tick(AsyncCtrl &x) {
+    if (x.state != AsyncCtrl::WAITING) return true; // IDLE/DONE/FAILED — уже терминально
+
+    bool status_done = false;
+    uint8_t status_cc = 0; uint32_t status_residual = 0;
+    Trb ev;
+    int drained = 0;
+    while (dequeue_event_trb(ev)) {
+        update_erdp();
+        uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        if (type != TRB_TYPE_TRANSFER_EVENT) continue;
+        if (!x.data_done && x.data_trb_addr != 0 && ev.parameter == x.data_trb_addr) {
+            x.data_done = true;
+            x.data_cc = (uint8_t)(ev.status >> 24);
+            x.data_residual = ev.status & 0xFFFFFFu;
+        } else if (ev.parameter == x.status_trb_addr) {
+            status_done = true;
+            status_cc = (uint8_t)(ev.status >> 24);
+            status_residual = ev.status & 0xFFFFFFu;
+        }
+        if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
+            sys_puts(g_console_ep, "[USB]   ОШИБКА: дренаж event ring (async_ctrl_tick) превысил защитный потолок — обрываю.\n");
+            break;
+        }
+    }
+
+    if (!x.data_done) {
+        if (read_cntvct() >= x.deadline) { x.state = AsyncCtrl::FAILED; return true; }
+        return false; // Data Stage ещё не завершился — Status физически не мог завершиться раньше
+    }
+    if (x.data_trb_addr != 0 && x.data_cc != 1 && x.data_cc != 13) { // код см. ep0_control_in()
+        x.state = AsyncCtrl::FAILED; return true;
+    }
+    if (x.data_trb_addr != 0) x.actual_length = x.wlength - x.data_residual;
+
+    if (!status_done) {
+        if (read_cntvct() >= x.deadline) { x.state = AsyncCtrl::FAILED; return true; }
+        return false;
+    }
+    x.state = (status_cc == 1) ? AsyncCtrl::DONE : AsyncCtrl::FAILED;
+    return true;
 }
 
 // === Шаги bring-up (см. ROADMAP.md "Порядок bring-up") ===
@@ -1097,7 +1267,11 @@ static bool step7_address_device(seL4_CPtr console_ep, int idx, uint8_t slot_id,
     // [23:16] — для устройства ЗА хабом это КОРНЕВОЙ порт ХАБА, не его
     // downstream-порт, вызывающий обязан передать именно его в `port`).
     UsbDeviceSlot &self = g_usb_devices[idx];
-    uint32_t route_string = self.behind_hub ? ((uint32_t)self.parent_port_number & 0xFu) : 0;
+    // issuse.txt №15 — route_string_full уже полный (по нибблу на КАЖДЫЙ
+    // ярус вложенности, см. UsbDeviceSlot/enumerate_device_behind_hub) —
+    // раньше здесь пересчитывался ЗАНОВО из одного parent_port_number,
+    // что верно только для 1 яруса.
+    uint32_t route_string = self.behind_hub ? self.route_string_full : 0;
     write_ctx_dword(inputctx(), 1, 0, route_string | (1u << 27) | ((port_speed & 0xF) << 20) | (self.behind_hub && self.parent_multi_tt ? (1u << 25) : 0));
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
     // Milestone B3 (Фаза 15) — dword2: Parent Hub Slot ID [7:0], Parent
@@ -1484,7 +1658,9 @@ static void step_hub_enumerate(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
 // той же командой — Transfer Ring переиспользует bulkin_ring/
 // bulkin_trring_paddr (у хаба нет bulk-эндпоинтов, страница иначе
 // простаивала бы); фактический опрос данных с него — Milestone B4.
-static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
+constexpr uint8_t USB_HUB_REQ_SET_HUB_DEPTH = 0x0C; // USB3 spec 10.14.2.6 — ТОЛЬКО для SS-хабов, recipient=Device (0x20), не Other
+
+static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_id, int root_port, uint32_t port_speed) {
     UsbDeviceSlot &dev = g_usb_devices[idx];
 
     // issuse.txt №18: hub_int_ep_addr==0 (дескриптор хаба не дал interrupt
@@ -1499,8 +1675,19 @@ static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_
         return false;
     }
 
-    uint32_t portsc = *reg32(g_op_base, XHCI_OP_PORTSC_BASE + (uintptr_t)(dev.port - 1) * 0x10);
-    uint32_t port_speed = (portsc >> 10) & 0xF;
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (первый раз, когда хаб-за-
+    // хабом реально дошёл до этого шага): раньше port_speed бралась ЖИВЫМ
+    // чтением PORTSC(dev.port-1) — корректно ТОЛЬКО для хаба на корневом
+    // порту. Для хаба ЗА хабом dev.port умышленно 0 (см. behind_hub в
+    // UsbDeviceSlot) — (dev.port-1) уходил в wraparound и читал МУСОР из
+    // MMIO по случайному смещению вместо PORTSC. Теперь port_speed —
+    // параметр, тот же device_speed, что уже корректно определила
+    // предшествующая асинхронная (или синхронная, root-port) стадия
+    // сброса/скорости и передала через step7_address_device() — та же
+    // логика, что уже применяется в step10_configure_endpoints() для
+    // Mass Storage за хабом (см. её же route_string ниже — тот же
+    // источник живой находки Milestone B3).
+    uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
 
     bool have_int_ep = (dev.hub_int_ep_addr != 0);
     uint8_t int_epnum = dev.hub_int_ep_addr & 0x0Fu;
@@ -1510,8 +1697,9 @@ static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_
 
     for (int i = 0; i < 3; i++) for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), i, d, 0);
     write_ctx_dword(inputctx(), 0, 1, (1u << 0) | (have_int_ep ? (1u << int_dci) : 0)); // A0 (Slot) [+ A(int_dci)]
-    write_ctx_dword(inputctx(), 1, 0, (ctx_entries << 27) | ((port_speed & 0xF) << 20) | (1u << 26) /*Hub*/);
-    write_ctx_dword(inputctx(), 1, 1, ((uint32_t)dev.port << 16) | ((uint32_t)dev.hub_num_ports << 24));
+    write_ctx_dword(inputctx(), 1, 0, route_string | (ctx_entries << 27) | ((port_speed & 0xF) << 20) | (1u << 26) /*Hub*/
+                     | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
+    write_ctx_dword(inputctx(), 1, 1, ((uint32_t)root_port << 16) | ((uint32_t)dev.hub_num_ports << 24));
 
     if (have_int_ep) {
         init_trb_ring(dev.bulkin_ring, bulkinring_vaddr(idx), dev.bulkin_trring_paddr);
@@ -1543,6 +1731,22 @@ static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_
     // хаба (не Input Context, который мы только что ОТПРАВИЛИ) и
     // печатаем то, что контроллер РЕАЛЬНО туда записал.
     if (LOG_USB) dump_slot_context(console_ep, "[USB]   DIAG живой Device Context хаба ПОСЛЕ Configure Endpoint:", devctx_vaddr_for(slot_id), 0);
+    // issuse.txt №15 — НАЙДЕНО ЧТЕНИЕМ СПЕКИ (USB 3.x spec 10.14.2.6):
+    // SS-хаб ОБЯЗАН получить SET_HUB_DEPTH (bRequest=12, recipient=Device,
+    // не Other — не путать с SET/CLEAR_FEATURE на порт) ДО того, как его
+    // downstream-порты можно адресовать — без этого хаб не знает свою
+    // позицию в топологии и не может корректно маршрутизировать/линковать
+    // трафик к устройствам за собой, что на практике даёт Transaction
+    // Error на Address Device ребёнка (см. issuse.txt, Milestone B5).
+    // Раньше этот запрос не отправлялся вообще, ни для одного SS-хаба.
+    // Значение — hub_tier ЭТОГО хаба (0, если хаб сам на корневом порту —
+    // ровно то же число, что USB3 spec называет Hub Depth: "0 хабов
+    // ВЫШЕ меня", см. hub_tier в UsbDeviceSlot).
+    if (dev.found.device_protocol == 3) {
+        if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x20, USB_HUB_REQ_SET_HUB_DEPTH, dev.hub_tier, 0)) {
+            sys_puts(console_ep, "[USB]   ПРЕДУПРЕЖДЕНИЕ (хаб): SET_HUB_DEPTH не удался — устройства за этим SS-хабом могут не адресоваться.\n");
+        }
+    }
     return true;
 }
 
@@ -1579,10 +1783,19 @@ constexpr uint16_t USB_PORT_FEAT_POWER             = 8;  // см. USB 2.0 spec T
 constexpr uint16_t USB_PORT_FEAT_RESET             = 4;
 constexpr uint16_t USB_PORT_FEAT_C_PORT_CONNECTION = 16;
 constexpr uint16_t USB_PORT_FEAT_C_PORT_RESET      = 20;
+// issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: у SS-порта wPortChange несёт
+// ещё и C_PORT_LINK_STATE (бит6, USB 3.x spec Table 10-12/10-7) —
+// меняется, например, при отключении SS-устройства (линк уходит из U0).
+// Раньше код чистил только C_PORT_CONNECTION — если реальное событие
+// несло ТОЛЬКО этот бит (что и происходит после отключения), хаб
+// продолжал репортить его на КАЖДОМ interrupt-опросе бесконечно (см.
+// живой лог — один и тот же bitmap/DIAG на каждом тике без остановки).
+constexpr uint16_t USB_PORT_FEAT_C_PORT_LINK_STATE = 25;
 constexpr uint16_t USB_PORT_STAT_CONNECTION = 0x0001; // wPortStatus, бит0
 constexpr uint16_t USB_PORT_STAT_LOW_SPEED  = 0x0200;  // wPortStatus, бит9
 constexpr uint16_t USB_PORT_STAT_HIGH_SPEED = 0x0400;  // wPortStatus, бит10 (ни один из двух = Full-Speed)
 constexpr uint16_t USB_PORT_STAT_C_RESET    = 0x0010;  // wPortChange, бит4
+constexpr uint16_t USB_PORT_STAT_C_LINK_STATE = 0x0040; // wPortChange, бит6 (SS)
 
 // GET_PORT_STATUS возвращает 4 байта: wPortStatus (0-1), wPortChange
 // (2-3) — тот же ctrlbuf(idx), что и у GET_DESCRIPTOR (переиспользуем,
@@ -1765,6 +1978,289 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
     }
 }
 
+// issuse.txt №15 — асинхронный, тик-возобновляемый аналог
+// hub_handle_port_connect() ВЫШЕ (та функция оставлена нетронутой,
+// используется только статическим сканом step_hub_scan_downstream_ports()
+// при ПЕРВОМ подключении хаба — одноразовое событие при bring-up, не тот
+// повторяющийся источник задержки, о котором issuse.txt №15). Этот путь
+// используется ТОЛЬКО из poll_hub_interrupts() (динамический опрос
+// interrupt-эндпоинта хаба, каждый heartbeat-тик) — именно там
+// нестабильный/медленный нижестоящий порт даёт повторные ретраи,
+// синхронно державшие ВЕСЬ usb_driver (и VFS-команды ко ВСЕМ другим
+// смонтированным томам) колом на секунды.
+//
+// Фаза 1 этого фикса: сама последовательность сброса порта + определения
+// скорости (то, что issuse.txt №15 явно называет — hub_get_port_status/
+// hub_handle_port_connect) — асинхронная, тик-возобновляемая. Финальное
+// перечисление устройства (enumerate_device_behind_hub() — Enable Slot/
+// Address Device/дескрипторы/SCSI/монтирование exFAT, общий "стержень" с
+// root-port путём, см. continue_enumeration_after_address()) НАМЕРЕННО
+// остаётся ОДНИМ синхронным вызовом здесь — это одноразовый блокирующий
+// вызов НА УСПЕШНОЕ подключение (не повторяющиеся ретраи нестабильного
+// порта — та часть, что реально копится в секунды), и полная асинхронная
+// переделка ~15 функций общего движка (используемого И root-port путём)
+// — отдельная, более крупная следующая фаза, не в этом заходе.
+//
+// Однопоточность: как и оригинал (см. g_hub_wait_* выше), это ОДИН
+// активный процесс подключения за раз — hub_conn_async_start() молча
+// игнорирует новый вызов, если уже что-то в процессе; бит изменения
+// порта на хабе НЕ чистится, пока мы не дойдём до него, поэтому хаб
+// продолжит репортить его на каждом interrupt-опросе — событие не
+// теряется, просто откладывается до освобождения (см. poll_hub_interrupts()).
+enum class HubConnSt : uint8_t {
+    IDLE,
+    SS_PRECHECK, SS_RESET_SET, SS_RESET_POLL, SS_CLEAR_C_RESET, SS_CLEAR_C_CONN,
+    NONSS_RESET_SET, NONSS_RESET_POLL, NONSS_CLEAR_C_RESET, NONSS_CLEAR_C_CONN,
+    START_ENUM,
+};
+static HubConnSt g_hub_conn_state = HubConnSt::IDLE;
+static AsyncCtrl  g_hub_conn_actrl;
+static int        g_hub_conn_idx = 0;
+static uint8_t    g_hub_conn_port = 0;
+static bool       g_hub_conn_is_ss = false;
+static bool       g_hub_conn_reset_needed = true; // (SS) false, если Port Link State уже 0 до всякого сброса
+static bool       g_hub_conn_reset_ok = false;
+static uint16_t   g_hub_conn_status = 0;          // последний прочитанный wPortStatus (для финального speed-check)
+static uint16_t   g_hub_conn_pls = 0;              // (SS) Port Link State, биты[8:5]
+static uint64_t   g_hub_conn_poll_deadline = 0;    // общий бюджет цикла RESET_POLL — как у исходного wait_ms(500,...)
+
+static void hub_conn_async_start(seL4_CPtr console_ep, int idx, uint8_t hp) {
+    if (g_hub_conn_state != HubConnSt::IDLE) return; // уже что-то в процессе, см. комментарий выше
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    g_hub_conn_idx = idx;
+    g_hub_conn_port = hp;
+    g_hub_conn_is_ss = (dev.found.device_protocol == 3);
+    g_hub_conn_reset_needed = true;
+    sys_puthex32(console_ep, "[USB]   Хаб-порт с устройством: ", hp);
+    volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+    buf[0] = buf[1] = buf[2] = buf[3] = 0;
+    if (g_hub_conn_is_ss) {
+        async_ctrl_in_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0xA3, USB_HUB_REQ_GET_STATUS, 0, hp, 4, dev.ctrl_buf_paddr);
+        g_hub_conn_state = HubConnSt::SS_PRECHECK;
+    } else {
+        async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_SET_FEATURE, USB_PORT_FEAT_RESET, hp);
+        g_hub_conn_state = HubConnSt::NONSS_RESET_SET;
+    }
+}
+
+// Вызывается КАЖДЫЙ heartbeat-тик из main() — НЕ блокируется никогда,
+// продвигает текущий шаг ровно на один tick вперёд (или ничего не делает,
+// если IDLE — большинство тиков).
+static void hub_conn_async_tick(seL4_CPtr console_ep) {
+    if (g_hub_conn_state == HubConnSt::IDLE) return;
+    int idx = g_hub_conn_idx;
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    uint8_t hp = g_hub_conn_port;
+
+    switch (g_hub_conn_state) {
+
+    case HubConnSt::SS_PRECHECK: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        if (g_hub_conn_actrl.state != AsyncCtrl::DONE || g_hub_conn_actrl.actual_length < 4) {
+            sys_puts(console_ep, "[USB]     ОШИБКА: GET_PORT_STATUS не удался.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+        g_hub_conn_status = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+        g_hub_conn_pls = (g_hub_conn_status >> 5) & 0xFu;
+        sys_puthex32(console_ep, "[USB]     Port Link State ДО сброса = ", g_hub_conn_pls);
+        if (g_hub_conn_pls != 0) {
+            async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_SET_FEATURE, USB_PORT_FEAT_RESET, hp);
+            g_hub_conn_state = HubConnSt::SS_RESET_SET;
+        } else {
+            g_hub_conn_reset_needed = false;
+            async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_CONNECTION, hp);
+            g_hub_conn_state = HubConnSt::SS_CLEAR_C_CONN;
+        }
+        return;
+    }
+
+    case HubConnSt::SS_RESET_SET: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        if (g_hub_conn_actrl.state != AsyncCtrl::DONE) {
+            sys_puts(console_ep, "[USB]     ОШИБКА: SET_PORT_FEATURE(RESET) не удался.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        g_hub_conn_poll_deadline = read_cntvct() + 500ull * g_cntfrq / 1000;
+        volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+        buf[0] = buf[1] = buf[2] = buf[3] = 0;
+        async_ctrl_in_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0xA3, USB_HUB_REQ_GET_STATUS, 0, hp, 4, dev.ctrl_buf_paddr);
+        g_hub_conn_state = HubConnSt::SS_RESET_POLL;
+        return;
+    }
+    case HubConnSt::SS_RESET_POLL: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) {
+            if (read_cntvct() >= g_hub_conn_poll_deadline) {
+                g_hub_conn_reset_ok = false;
+                async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_RESET, hp);
+                g_hub_conn_state = HubConnSt::SS_CLEAR_C_RESET;
+            }
+            return;
+        }
+        volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+        bool ok = (g_hub_conn_actrl.state == AsyncCtrl::DONE && g_hub_conn_actrl.actual_length >= 4);
+        uint16_t change = 0;
+        if (ok) {
+            g_hub_conn_status = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            change = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+        }
+        if ((ok && (change & USB_PORT_STAT_C_RESET)) || read_cntvct() >= g_hub_conn_poll_deadline) {
+            g_hub_conn_reset_ok = ok && (change & USB_PORT_STAT_C_RESET) != 0;
+            async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_RESET, hp);
+            g_hub_conn_state = HubConnSt::SS_CLEAR_C_RESET;
+            return;
+        }
+        // Ни C_PORT_RESET, ни дедлайн — повторяем опрос (см. cond_hub_port_c_reset()).
+        buf[0] = buf[1] = buf[2] = buf[3] = 0;
+        async_ctrl_in_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0xA3, USB_HUB_REQ_GET_STATUS, 0, hp, 4, dev.ctrl_buf_paddr);
+        return;
+    }
+    case HubConnSt::SS_CLEAR_C_RESET: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return; // код завершения самого CLEAR не критичен, оригинал его тоже не проверял
+        async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_CONNECTION, hp);
+        g_hub_conn_state = HubConnSt::SS_CLEAR_C_CONN;
+        return;
+    }
+    case HubConnSt::SS_CLEAR_C_CONN: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        if (g_hub_conn_reset_needed && !g_hub_conn_reset_ok) {
+            sys_puts(console_ep, "[USB]     ОШИБКА: порт не сообщил о завершении сброса за 500мс.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        if (g_hub_conn_reset_needed) g_hub_conn_pls = (g_hub_conn_status >> 5) & 0xFu;
+        sys_puthex32(console_ep, "[USB]     Port Link State ПОСЛЕ сброса = ", g_hub_conn_pls);
+        if (g_hub_conn_pls != 0) {
+            sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: SuperSpeed-порт не поднялся до U0 — устройство честно пропущено.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        sys_puts(console_ep, "[USB]     Скорость: SuperSpeed\n");
+        g_hub_conn_state = HubConnSt::START_ENUM;
+        return;
+    }
+
+    case HubConnSt::NONSS_RESET_SET: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        if (g_hub_conn_actrl.state != AsyncCtrl::DONE) {
+            sys_puts(console_ep, "[USB]     ОШИБКА: SET_PORT_FEATURE(RESET) не удался.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        g_hub_conn_poll_deadline = read_cntvct() + 500ull * g_cntfrq / 1000;
+        volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+        buf[0] = buf[1] = buf[2] = buf[3] = 0;
+        async_ctrl_in_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0xA3, USB_HUB_REQ_GET_STATUS, 0, hp, 4, dev.ctrl_buf_paddr);
+        g_hub_conn_state = HubConnSt::NONSS_RESET_POLL;
+        return;
+    }
+    case HubConnSt::NONSS_RESET_POLL: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) {
+            if (read_cntvct() >= g_hub_conn_poll_deadline) {
+                g_hub_conn_reset_ok = false;
+                async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_RESET, hp);
+                g_hub_conn_state = HubConnSt::NONSS_CLEAR_C_RESET;
+            }
+            return;
+        }
+        volatile uint8_t *buf = ctrlbuf_vaddr(idx);
+        bool ok = (g_hub_conn_actrl.state == AsyncCtrl::DONE && g_hub_conn_actrl.actual_length >= 4);
+        uint16_t change = 0;
+        if (ok) {
+            g_hub_conn_status = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            change = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+        }
+        if ((ok && (change & USB_PORT_STAT_C_RESET)) || read_cntvct() >= g_hub_conn_poll_deadline) {
+            g_hub_conn_reset_ok = ok && (change & USB_PORT_STAT_C_RESET) != 0;
+            async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_RESET, hp);
+            g_hub_conn_state = HubConnSt::NONSS_CLEAR_C_RESET;
+            return;
+        }
+        buf[0] = buf[1] = buf[2] = buf[3] = 0;
+        async_ctrl_in_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0xA3, USB_HUB_REQ_GET_STATUS, 0, hp, 4, dev.ctrl_buf_paddr);
+        return;
+    }
+    case HubConnSt::NONSS_CLEAR_C_RESET: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        async_ctrl_no_data_start(g_hub_conn_actrl, dev.ep0_ring, dev.slot_id, 0x23, USB_HUB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_C_PORT_CONNECTION, hp);
+        g_hub_conn_state = HubConnSt::NONSS_CLEAR_C_CONN;
+        return;
+    }
+    case HubConnSt::NONSS_CLEAR_C_CONN: {
+        if (!async_ctrl_tick(g_hub_conn_actrl)) return;
+        if (!g_hub_conn_reset_ok) {
+            sys_puts(console_ep, "[USB]     ОШИБКА: порт не сообщил о завершении сброса за 500мс.\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        bool low_speed = (g_hub_conn_status & USB_PORT_STAT_LOW_SPEED) != 0;
+        bool high_speed = (g_hub_conn_status & USB_PORT_STAT_HIGH_SPEED) != 0;
+        sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
+                                        : (high_speed ? "[USB]     Скорость: High-Speed\n" : "[USB]     Скорость: Full-Speed\n"));
+        if (!high_speed) {
+            sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: не High-Speed — Transaction Translator не реализован в этой фазе, монтирование этого устройства невозможно (честное ограничение, см. план).\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        g_hub_conn_state = HubConnSt::START_ENUM;
+        return;
+    }
+
+    case HubConnSt::START_ENUM: {
+        // Фаза 1 (см. комментарий у enum выше) — отсюда и глубже всё ещё
+        // ОДИН синхронный блокирующий вызов, как в оригинальном
+        // hub_handle_port_connect() (см. её же копию этого хвоста).
+        uint32_t device_speed = g_hub_conn_is_ss ? 4u : 3u;
+        int child_idx = find_free_device_slot();
+        if (child_idx < 0) {
+            sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: нет свободных слотов под устройство за хабом (USB_MAX_DEVICES исчерпан).\n");
+            g_hub_conn_state = HubConnSt::IDLE; return;
+        }
+        g_usb_devices[child_idx].found = UsbFoundDevice{};
+        g_usb_devices[child_idx].bulk_eps = UsbBulkEndpoints{};
+        g_usb_devices[child_idx].in_use = true;
+        g_usb_devices[child_idx].port = 0;
+        uint8_t child_slot_id = 0;
+        enumerate_device_behind_hub(console_ep, idx, hp, child_idx, child_slot_id, device_speed);
+        // issuse.txt №15 — диагностика (временная, до выяснения находки
+        // "флешка за хабом определилась как хаб за хабом"): что реально
+        // прочитал Device Descriptor для child_idx, и на каком slot_id —
+        // плюс VID/PID/slot_id САМОГО РОДИТЕЛЬСКОГО хаба (idx) рядом, для
+        // прямого сравнения на предмет "child читает данные parent'а".
+        sys_puthex32(console_ep, "[USB]     DIAG parent_idx=", (uint32_t)idx);
+        sys_puthex32(console_ep, "[USB]     DIAG parent_slot_id=", (uint32_t)dev.slot_id);
+        sys_puthex32(console_ep, "[USB]     DIAG parent_vendor=", dev.found.vendor_id);
+        sys_puthex32(console_ep, "[USB]     DIAG parent_product=", dev.found.product_id);
+        sys_puthex32(console_ep, "[USB]     DIAG child_idx=", (uint32_t)child_idx);
+        sys_puthex32(console_ep, "[USB]     DIAG child_slot_id=", (uint32_t)child_slot_id);
+        sys_puthex32(console_ep, "[USB]     DIAG vendor=", g_usb_devices[child_idx].found.vendor_id);
+        sys_puthex32(console_ep, "[USB]     DIAG product=", g_usb_devices[child_idx].found.product_id);
+        sys_puthex32(console_ep, "[USB]     DIAG device_class=", g_usb_devices[child_idx].found.device_class);
+        sys_puthex32(console_ep, "[USB]     DIAG device_subclass=", g_usb_devices[child_idx].found.device_subclass);
+        sys_puthex32(console_ep, "[USB]     DIAG device_protocol=", g_usb_devices[child_idx].found.device_protocol);
+        sys_puthex32(console_ep, "[USB]     DIAG found.found=", (uint32_t)g_usb_devices[child_idx].found.found);
+        bool child_is_hub = (g_usb_devices[child_idx].found.device_class == USB_CLASS_HUB);
+        bool child_ok = g_usb_devices[child_idx].found.found && (child_is_hub || g_usb_devices[child_idx].bulk_eps.found);
+        if (!child_ok) {
+            if (child_slot_id != 0) step_disable_slot(console_ep, child_slot_id);
+            g_usb_devices[child_idx].found.found = false;
+            g_usb_devices[child_idx].bulk_eps.found = false;
+            g_usb_devices[child_idx].behind_hub = false;
+            g_usb_devices[child_idx].in_use = false;
+        } else if (child_is_hub) {
+            sys_puthex32(console_ep, "[USB]     Хаб за хабом подключён и опрошен, портов = ", g_usb_devices[child_idx].hub_num_ports);
+        } else if (!g_usb_devices[child_idx].storage_mounted) {
+            sys_puts(console_ep, "[USB]     Устройство за хабом перечислено, но exFAT не смонтировался (не exFAT / повреждён / не тот раздел).\n");
+        } else {
+            sys_puts(console_ep, "[USB]     Флешка за хабом автоматически смонтирована: /mnt/");
+            sys_puts(console_ep, g_usb_devices[child_idx].volume_name);
+            sys_puts(console_ep, "\n");
+        }
+        g_hub_conn_state = HubConnSt::IDLE;
+        return;
+    }
+
+    default:
+        g_hub_conn_state = HubConnSt::IDLE;
+        return;
+    }
+}
+
 // Milestone B2/B3 (Фаза 15) — статический скан downstream-портов хаба
 // (один раз, при перечислении САМОГО хаба): GET_PORT_STATUS на КАЖДОМ
 // порту (1..hub_num_ports — хаб-порты нумеруются с 1, не с 0), если
@@ -1800,7 +2296,21 @@ static void step_hub_scan_downstream_ports(seL4_CPtr console_ep, int idx, uint8_
             sys_puthex32(console_ep, "[USB]   ОШИБКА (хаб): GET_PORT_STATUS порта ", hp);
             continue;
         }
-        if (!(status & USB_PORT_STAT_CONNECTION)) continue; // ничего не подключено
+        if (!(status & USB_PORT_STAT_CONNECTION)) {
+            // issuse.txt №15 — НАЙДЕНО ЧТЕНИЕМ КОДА: SET_FEATURE(POWER) на
+            // всех портах разом — известный триггер паразитного
+            // C_PORT_CONNECTION даже без физического устройства (settle
+            // переходного процесса на D+/D-, см. USB 2.0 spec 11.11).
+            // Раньше для "ничего не подключено" change-биты НЕ чистились —
+            // паразитный C_PORT_CONNECTION оставался висеть и хаб report'ил
+            // бы его ПОЗЖЕ через interrupt-эндпоинт, как будто это новое
+            // событие (см. poll_hub_interrupts() — не различает "новое
+            // событие" от "старый непрочищенный change-бит").
+            if (change & USB_PORT_STAT_CONNECTION) {
+                hub_clear_port_feature(console_ep, idx, slot_id, hp, USB_PORT_FEAT_C_PORT_CONNECTION);
+            }
+            continue; // ничего не подключено
+        }
         hub_handle_port_connect(console_ep, idx, hp);
     }
 }
@@ -1847,11 +2357,58 @@ static void hub_handle_port_disconnect(seL4_CPtr console_ep, int hub_idx, uint8_
 // (одна новая слушающая TRB) — без этого второе изменение порта
 // никогда не заметили бы.
 static void poll_hub_interrupts(seL4_CPtr console_ep) {
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: тот же класс бага, что уже
+    // чинили в AsyncCtrl (Data+Status stage теряли друг друга). Раньше
+    // try_check_transfer_complete() звался ОТДЕЛЬНО на каждый хаб в
+    // цикле — а эта функция дренирует ВЕСЬ event ring за один вызов и
+    // матчит только ОДИН целевой адрес, молча выбрасывая всё остальное.
+    // Если события ДВУХ хабов (например, встроенного root-hub'а VL805 и
+    // хаба пользователя, висящего у него на порту) оказывались в кольце
+    // ОДНОВРЕМЕННО — первый по индексу хаб дренировал кольцо и МОЛЧА
+    // терял событие второго, пока искал только своё. На живом тесте это
+    // проявилось как "нулевая реакция" на устройство, воткнутое в хаб
+    // пользователя, сразу после того, как встроенный VL805-хаб получил
+    // СВОЁ собственное событие (апстрим-линк хаба пользователя мигнул в
+    // момент вставки) — событие хаба пользователя терялось безвозвратно.
+    // Фикс — ОДИН проход по кольцу за тик, матчим СРАЗУ все армированные
+    // hub_int_pending_trb, обрабатываем результаты уже ПОСЛЕ дренажа.
+    uint8_t hub_cc[USB_MAX_DEVICES];
+    uint32_t hub_residual[USB_MAX_DEVICES];
+    bool hub_completed[USB_MAX_DEVICES];
+    bool any_target = false;
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        hub_completed[i] = false;
+        UsbDeviceSlot &d = g_usb_devices[i];
+        if (d.in_use && d.found.device_class == USB_CLASS_HUB && d.hub_int_dci != 0 && d.hub_int_pending_trb != 0) any_target = true;
+    }
+    if (any_target) {
+        Trb ev;
+        int drained = 0;
+        while (dequeue_event_trb(ev)) {
+            update_erdp();
+            uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+            if (type != TRB_TYPE_TRANSFER_EVENT) continue;
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                UsbDeviceSlot &d = g_usb_devices[i];
+                if (!d.in_use || d.found.device_class != USB_CLASS_HUB || d.hub_int_dci == 0) continue;
+                if (ev.parameter == d.hub_int_pending_trb) {
+                    hub_cc[i] = (uint8_t)(ev.status >> 24);
+                    hub_residual[i] = ev.status & 0xFFFFFFu;
+                    hub_completed[i] = true;
+                    break;
+                }
+            }
+            if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
+                sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring (poll_hub_interrupts) превысил защитный потолок — обрываю.\n");
+                break;
+            }
+        }
+    }
     for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
         UsbDeviceSlot &dev = g_usb_devices[idx];
         if (!dev.in_use || dev.found.device_class != USB_CLASS_HUB || dev.hub_int_dci == 0) continue;
-        uint8_t cc = 0; uint32_t residual = 0;
-        if (!try_check_transfer_complete(dev.hub_int_pending_trb, cc, residual)) continue;
+        if (!hub_completed[idx]) continue;
+        uint8_t cc = hub_cc[idx]; uint32_t residual = hub_residual[idx];
         if (cc != 1 && cc != 13) { // 13 = Short Packet, не ошибка (см. bulk_transfer)
             sys_puthex32(console_ep, "[USB]   ПРЕДУПРЕЖДЕНИЕ: interrupt-передача хаба завершилась с кодом ", cc);
             hub_enqueue_interrupt_listen(idx); // перевооружаем в любом случае — иначе эндпоинт замолчит навсегда
@@ -1859,21 +2416,68 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
         }
         volatile uint8_t *bitmap = bounce_vaddr(idx);
         uint32_t mps = dev.hub_int_ep_mps ? dev.hub_int_ep_mps : 1;
+        // issuse.txt №15 — НАЙДЕНО ЧТЕНИЕМ КОДА (ждёт hw-подтверждения):
+        // cc==13 (Short Packet) означает "пришло МЕНЬШЕ, чем mps байт", а не
+        // "пришло 0 байт" — но раньше это тоже принималось как "пришло 0
+        // байт". Настоящий actual = mps - residual; если он 0, xHC не
+        // записал в bounce-буфер ВООБЩЕ НИЧЕГО — читать его как битмап
+        // означает читать неинициализированную/старую DMA-страницу.
+        // ПОДОЗРЕНИЕ: именно так объясняется "флешка за хабом определилась
+        // как хаб за хабом" при пустом хабе — первое вооружение interrupt-
+        // эндпоинта после Configure Endpoint у некоторых хабов завершается
+        // 0-байтным Short Packet'ом ещё до реального события на порту.
+        uint32_t actual_bytes = (residual <= mps) ? (mps - residual) : 0;
+        sys_puthex32(console_ep, "[USB]   DIAG hub interrupt: mps=", mps);
+        sys_puthex32(console_ep, "[USB]   DIAG hub interrupt: residual=", residual);
+        sys_puthex32(console_ep, "[USB]   DIAG hub interrupt: actual_bytes=", actual_bytes);
+        sys_puthex32(console_ep, "[USB]   DIAG hub interrupt: bitmap[0]=", bitmap[0]);
+        if (actual_bytes == 0) {
+            sys_puts(console_ep, "[USB]   DIAG hub interrupt: 0 реальных байт — битмап НЕ доверяем, пропускаем.\n");
+            hub_enqueue_interrupt_listen(idx);
+            continue;
+        }
         for (uint8_t hp = 1; hp <= dev.hub_num_ports; hp++) {
             uint32_t byte_idx = (uint32_t)hp / 8, bit_idx = (uint32_t)hp % 8;
             if (byte_idx >= mps) break; // защита от битой/усечённой карты
+            if (byte_idx >= actual_bytes) break; // за пределами реально пришедших байт
             if (!((bitmap[byte_idx] >> bit_idx) & 1u)) continue; // этот порт не менялся
             uint16_t status = 0, change = 0;
             if (!hub_get_port_status(console_ep, idx, dev.slot_id, hp, status, change)) {
                 sys_puthex32(console_ep, "[USB]   ОШИБКА (хаб): GET_PORT_STATUS порта ", hp);
                 continue;
             }
+            sys_puthex32(console_ep, "[USB]   DIAG живой wPortStatus порта = ", status);
+            sys_puthex32(console_ep, "[USB]   DIAG живой wPortChange порта = ", change);
             hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_CONNECTION);
-            if (status & USB_PORT_STAT_CONNECTION) {
-                sys_puthex32(console_ep, "[USB] Хаб: обнаружено подключение (опрос interrupt-эндпоинта), порт = ", hp);
-                hub_handle_port_connect(console_ep, idx, hp);
-            } else {
-                hub_handle_port_disconnect(console_ep, idx, hp);
+            // issuse.txt №15 — см. комментарий у USB_PORT_FEAT_C_PORT_LINK_STATE:
+            // без этого хаб бесконечно репортит один и тот же C_PORT_LINK_STATE
+            // (например, после отключения SS-устройства) на каждом опросе.
+            if (change & USB_PORT_STAT_C_LINK_STATE) {
+                hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_LINK_STATE);
+            }
+            // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: раньше решение
+            // "подключение или отключение" принималось ТОЛЬКО по текущему
+            // status.CONNECTION — но событие могло быть чисто Link-State
+            // (мигнул линк уже смонтированного устройства, change.CONNECTION
+            // не установлен, status.CONNECTION всё ещё 1, потому что кабель
+            // никуда не делся). Раньше это ошибочно трактовалось как "новое
+            // устройство" — пере-перечисление уже смонтированного слота,
+            // тратящее ещё один g_usb_devices[]-слот впустую и в итоге
+            // приводящее к "нет свободных слотов". Реагируем ТОЛЬКО если
+            // change.CONNECTION реально установлен — сам факт смены статуса
+            // подключения, а не любое шевеление на порту.
+            if (change & USB_PORT_STAT_CONNECTION) {
+                if (status & USB_PORT_STAT_CONNECTION) {
+                    sys_puthex32(console_ep, "[USB] Хаб: обнаружено подключение (опрос interrupt-эндпоинта), порт = ", hp);
+                    // issuse.txt №15 — асинхронный, тик-возобновляемый путь
+                    // (см. hub_conn_async_start()/hub_conn_async_tick() выше)
+                    // вместо синхронного hub_handle_port_connect(), который
+                    // держал бы весь usb_driver колом на секунды при
+                    // нестабильном/медленном нижестоящем порту.
+                    hub_conn_async_start(console_ep, idx, hp);
+                } else {
+                    hub_handle_port_disconnect(console_ep, idx, hp);
+                }
             }
         }
         hub_enqueue_interrupt_listen(idx); // перевооружаем — ждём следующее изменение
@@ -1916,7 +2520,7 @@ static bool step10_configure_endpoints(seL4_CPtr console_ep, int idx, uint8_t sl
     // Route String — см. подробный комментарий в step7_address_device()
     // (Milestone B3, живая находка) — та же логика, обязана совпадать с
     // тем, что было записано на Address Device, иначе Parameter Error.
-    uint32_t route_string = dev.behind_hub ? ((uint32_t)dev.parent_port_number & 0xFu) : 0;
+    uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
     write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
     // dword2 (Parent Hub Slot ID/Port/TT Think Time) — НАЙДЕНО НА ЖИВОМ
@@ -2372,11 +2976,19 @@ static bool hardware_usb_read_0(uint32_t s, uint32_t c, void* b) { return hardwa
 static bool hardware_usb_read_1(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(1, s, c, b); }
 static bool hardware_usb_read_2(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(2, s, c, b); }
 static bool hardware_usb_read_3(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(3, s, c, b); }
+static bool hardware_usb_read_4(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(4, s, c, b); }
+static bool hardware_usb_read_5(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(5, s, c, b); }
+static bool hardware_usb_read_6(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(6, s, c, b); }
+static bool hardware_usb_read_7(uint32_t s, uint32_t c, void* b) { return hardware_usb_rw_generic_read(7, s, c, b); }
 static bool hardware_usb_write_0(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(0, s, c, b); }
 static bool hardware_usb_write_1(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(1, s, c, b); }
 static bool hardware_usb_write_2(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(2, s, c, b); }
 static bool hardware_usb_write_3(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(3, s, c, b); }
-static_assert(USB_MAX_DEVICES == 4, "добавьте ещё пару hardware_usb_read_N/write_N и строку в step15_mount_filesystem, если увеличили USB_MAX_DEVICES");
+static bool hardware_usb_write_4(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(4, s, c, b); }
+static bool hardware_usb_write_5(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(5, s, c, b); }
+static bool hardware_usb_write_6(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(6, s, c, b); }
+static bool hardware_usb_write_7(uint32_t s, uint32_t c, const void* b) { return hardware_usb_rw_generic_write(7, s, c, b); }
+static_assert(USB_MAX_DEVICES == 8, "добавьте ещё пару hardware_usb_read_N/write_N и строку в step15_mount_filesystem, если увеличили USB_MAX_DEVICES");
 
 // GPT (GUID Partition Table) — найдено на живом железе: NVMe SSD через
 // переходник, ранее стоявший системным диском в другом компьютере,
@@ -2495,7 +3107,11 @@ static void step15_mount_filesystem(seL4_CPtr console_ep, int idx, uint8_t slot_
         case 0:  mounted = exfat_init(&dev.fs, hardware_usb_read_0, hardware_usb_write_0); break;
         case 1:  mounted = exfat_init(&dev.fs, hardware_usb_read_1, hardware_usb_write_1); break;
         case 2:  mounted = exfat_init(&dev.fs, hardware_usb_read_2, hardware_usb_write_2); break;
-        default: mounted = exfat_init(&dev.fs, hardware_usb_read_3, hardware_usb_write_3); break;
+        case 3:  mounted = exfat_init(&dev.fs, hardware_usb_read_3, hardware_usb_write_3); break;
+        case 4:  mounted = exfat_init(&dev.fs, hardware_usb_read_4, hardware_usb_write_4); break;
+        case 5:  mounted = exfat_init(&dev.fs, hardware_usb_read_5, hardware_usb_write_5); break;
+        case 6:  mounted = exfat_init(&dev.fs, hardware_usb_read_6, hardware_usb_write_6); break;
+        default: mounted = exfat_init(&dev.fs, hardware_usb_read_7, hardware_usb_write_7); break;
     }
     if (mounted) {
         dev.storage_mounted = true;
@@ -2646,7 +3262,7 @@ static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, ui
         // ОБЯЗАТЕЛЕН до попытки адресовать любого ребёнка этого хаба —
         // если он не удался, честно НЕ сканируем downstream-порты (нет
         // смысла находить детей, которых всё равно не сможем адресовать).
-        if (!step_hub_configure_slot(console_ep, idx, slot_id)) return;
+        if (!step_hub_configure_slot(console_ep, idx, slot_id, port, port_speed)) return;
         // Milestone B4 — сразу "вооружаем" Interrupt-эндпоинт статуса
         // портов (одна слушающая TRB) — дальше poll_hub_interrupts()
         // подхватит её на heartbeat-тиках, обеспечивая динамический
@@ -2729,19 +3345,33 @@ static void enumerate_device_behind_hub(seL4_CPtr console_ep, int hub_idx, uint8
     self.parent_port_number = hub_port;
     self.parent_multi_tt = (hub.found.device_protocol == 2); // см. USB 2.0 spec, Hub Class Device Descriptor bDeviceProtocol — для SS-хаба (protocol==3) остаётся false, MTT/TT не для SS
     self.parent_tt_think_time = hub.hub_tt_think_time;
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (первый раз, когда реально
+    // дошли до 2 яруса вложенности — устройство за хабом пользователя,
+    // который сам висит на встроенном root-hub'е VL805): hub.port у
+    // РОДИТЕЛЯ равен 0, если родитель САМ не на корневом порту (см.
+    // behind_hub) — наследуем настоящий корневой порт и полный Route
+    // String от родителя, а не берём его "port"/parent_port_number
+    // напрямую (это годится ТОЛЬКО для 1 яруса, ровно то, что было
+    // проверено раньше). hub.hub_tier/route_string_full/root_port_full
+    // для хаба НА корневом порту остаются 0 по умолчанию — формулы ниже
+    // корректно сводятся к прежнему поведению для 1 яруса.
+    self.hub_tier = (uint8_t)(hub.hub_tier + 1);
+    self.route_string_full = hub.route_string_full | ((uint32_t)(hub_port & 0xFu) << (4 * (self.hub_tier - 1)));
+    self.root_port_full = hub.behind_hub ? hub.root_port_full : hub.port;
 
     uint8_t slot_id = 0;
     if (!step6_enable_slot(console_ep, slot_id)) return;
     out_slot_id = slot_id;
     self.slot_id = slot_id; // см. тот же комментарий в enumerate_and_mount_device() — на будущее (вложенные хабы), сейчас не критично
-    // Root Hub Port Number = корневой порт ХАБА (вся цепочка "висит" на
-    // нём с точки зрения xHCI), НЕ downstream-порт хаба — тот идёт
-    // отдельным полем (Parent Port Number, dword2, см. step7).
+    // Root Hub Port Number = НАСТОЯЩИЙ корневой порт xHC, на котором
+    // висит вся цепочка (см. root_port_full выше), НЕ порт непосредственного
+    // родителя — downstream-порт хаба идёт отдельным полем (Parent Port
+    // Number, dword2, см. step7).
     // device_speed — Milestone B5 (доп.): 3 (High-Speed, за HS-хабом)
     // или 4 (SuperSpeed, за SS-хабом) — вызывающий (hub_handle_port_connect())
     // уже определил реальную скорость и отфильтровал остальные случаи.
-    if (!step7_address_device(console_ep, idx, slot_id, hub.port, device_speed)) return;
-    continue_enumeration_after_address(console_ep, idx, slot_id, hub.port, device_speed);
+    if (!step7_address_device(console_ep, idx, slot_id, self.root_port_full, device_speed)) return;
+    continue_enumeration_after_address(console_ep, idx, slot_id, self.root_port_full, device_speed);
 }
 
 // Milestone 2 (находка на живом железе, см. ROADMAP.md) — на этой плате
@@ -2783,6 +3413,26 @@ static bool try_enumerate_port(seL4_CPtr console_ep, int port, int &out_idx) {
     // до enumerate_and_mount_device(), не после.
     g_usb_devices[idx].in_use = true;
     g_usb_devices[idx].port = port;
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (плавающий зависон Address
+    // Device после многих циклов подключения/отключения в разные порты):
+    // этот слот мог РАНЬШЕ принадлежать устройству ЗА хабом (behind_hub=
+    // true, ненулевые hub_tier/route_string_full/root_port_full) —
+    // find_free_device_slot() не различает роль ПРЕДЫДУЩЕГО обитателя.
+    // Если тот же idx теперь достаётся устройству НА КОРНЕВОМ порту,
+    // step7_address_device() читает self.behind_hub/route_string_full
+    // как есть — сброс только found/bulk_eps их не трогал, в Address
+    // Device уходил чужой, стухший Route String/MTT от предыдущего
+    // обитателя. Сбрасываем явно, а не полагаемся на enumerate_device_
+    // behind_hub() (для КОРНЕВОГО устройства она вообще не вызывается).
+    g_usb_devices[idx].behind_hub = false;
+    g_usb_devices[idx].parent_hub_idx = -1;
+    g_usb_devices[idx].parent_hub_slot_id = 0;
+    g_usb_devices[idx].parent_port_number = 0;
+    g_usb_devices[idx].parent_multi_tt = false;
+    g_usb_devices[idx].parent_tt_think_time = 0;
+    g_usb_devices[idx].hub_tier = 0;
+    g_usb_devices[idx].route_string_full = 0;
+    g_usb_devices[idx].root_port_full = 0;
     uint8_t slot_id = 0;
     enumerate_and_mount_device(console_ep, idx, port, slot_id);
     // Milestone 3/B1 — "то самое" устройство теперь означает: ЛИБО хаб
@@ -3016,6 +3666,18 @@ static void poll_ports_for_hotplug(seL4_CPtr console_ep) {
     g_port_ccs_mask_initialized = true;
 }
 
+// issuse.txt №69 — тот же приём и то же обоснование, что blk_vfs_reply() в
+// blk_driver.cpp: заменяет seL4_Reply() для настоящих VFS-команд (110-120,
+// после резолва устройства/write-гейта), чей reply-капа уже отложена в
+// VFS_PENDING_REPLY_SLOT (см. seL4_CNode_SaveCaller перед `if (cmd == 110)`
+// ниже) — так root может забрать эту капу из нашего CNode и ответить
+// клиенту сам, если usb_driver умрёт/зависнет посреди обработки (см.
+// generic_recover_process() в main.cpp).
+static inline void usb_vfs_reply(seL4_MessageInfo_t info) {
+    seL4_Send(VFS_PENDING_REPLY_SLOT, info);
+    seL4_CNode_Delete(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT, 8);
+}
+
 // --- Главный цикл ---
 
 int main(int argc, char *argv[]) {
@@ -3147,6 +3809,14 @@ int main(int argc, char *argv[]) {
             // Фаза 3b плана "Сигналы драйверам" — "я жив", БЕЗУСЛОВНО (даже
             // если g_usb_stopped — см. тот же принцип в blk_driver.cpp).
             if (liveness_ntfn != 0) seL4_Signal(liveness_ntfn);
+            // issuse.txt №15 — асинхронная последовательность подключения
+            // за хабом (см. hub_conn_async_tick() выше) продвигается на
+            // КАЖДОМ heartbeat-тике (~20мс), а не только раз в
+            // USB_HOTPLUG_POLL_EVERY_N_TICKS (~200мс, см. ниже) — иначе
+            // сама "асинхронность" искусственно тормозила бы уже начатое
+            // подключение лишней гранулярностью поверх и так небыстрого
+            // xHCI-обмена.
+            hub_conn_async_tick(console_ep);
             if (++heartbeat_tick_count >= USB_HOTPLUG_POLL_EVERY_N_TICKS) {
                 heartbeat_tick_count = 0;
                 poll_ports_for_hotplug(console_ep);
@@ -3159,6 +3829,22 @@ int main(int argc, char *argv[]) {
         }
 
         if (badge & USB_EVENT_XHCI_IRQ) {
+            // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: реальное xHCI-
+            // прерывание от завершения control-transfer'а асинхронной
+            // hub-connect-последовательности (см. hub_conn_async_tick()
+            // выше) чаще всего приходит НА СВОЁМ бейдже, БЕЗ heartbeat-
+            // бита (аппаратура отвечает за микросекунды-миллисекунды,
+            // редко совпадая с 20мс-тиком) — а общий дренаж событий чуть
+            // ниже слепо вычитывает и отбрасывает ЛЮБОЕ событие, кроме
+            // Port Status Change (см. его же комментарий: "Transfer Event
+            // уже обрабатываются синхронно... сюда попасть не должны" —
+            // верно для СТАРОГО синхронного кода, но НЕ для нового
+            // асинхронного, у которого именно такие события в очереди —
+            // штатный случай). Без этого вызова здесь стейт-машина
+            // практически никогда не видела свой Transfer Event сама
+            // (общий дренаж успевал украсть его первым) и таймаутила по
+            // 500мс на КАЖДОМ шаге — hw-подтверждённая находка.
+            hub_conn_async_tick(console_ep);
             // Штатный событийный путь (после bring-up) — снять EINT,
             // дочитать Event Ring, отдать назад ERDP, Ack'нуть IRQ (см.
             // GENET-паттерн в net_driver.cpp — собственная линия, Ack сам).
@@ -3175,11 +3861,18 @@ int main(int argc, char *argv[]) {
             // всё же попадут (устройство прислало событие ПОСЛЕ того, как
             // синхронный ожидающий уже сдался по таймауту) — просто
             // молча дренируем, как и раньше.
-            while (dequeue_event_trb(ev)) {
-                uint32_t ev_type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
-                if (ev_type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
-                    uint8_t changed_port = (uint8_t)(ev.parameter >> 24);
-                    handle_port_status_change(console_ep, changed_port);
+            {
+                int drained = 0;
+                while (dequeue_event_trb(ev)) {
+                    uint32_t ev_type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+                    if (ev_type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
+                        uint8_t changed_port = (uint8_t)(ev.parameter >> 24);
+                        handle_port_status_change(console_ep, changed_port);
+                    }
+                    if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
+                        sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring (XHCI_IRQ) превысил защитный потолок — обрываю.\n");
+                        break;
+                    }
                 }
             }
             update_erdp();
@@ -3380,6 +4073,13 @@ int main(int argc, char *argv[]) {
         // одной веткой ниже, см. финальный else).
         EXFAT_Instance &fs = g_usb_devices[dispatch_idx >= 0 ? dispatch_idx : 0].fs;
 
+        // issuse.txt №69 — reply-капа текущего клиента откладывается в
+        // фиксированный слот СВОЕГО CNode на всё время обработки этой
+        // команды (см. usb_vfs_reply()/VFS_PENDING_REPLY_SLOT выше) — та же
+        // защита, что у blk_driver.cpp. Каждая ветка ниже отвечает через
+        // usb_vfs_reply(), а не напрямую seL4_Reply().
+        seL4_CNode_SaveCaller(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT, 8);
+
         if (cmd == 110) { // SYS_LS
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
@@ -3394,7 +4094,7 @@ int main(int argc, char *argv[]) {
                 if (parent_clus == 0xFFFFFFFF) {
                     my_strcpy(g_shm_vaddr, "ls: path not found\n");
                     seL4_SetMR(0, 0);
-                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                     continue;
                 }
                 if (basename[0] == '\0') {
@@ -3407,7 +4107,7 @@ int main(int argc, char *argv[]) {
                     if (dir_cluster != 0xFFFFFFFF && !is_dir) {
                         my_strcpy(g_shm_vaddr, "ls: not a directory\n");
                         seL4_SetMR(0, 0);
-                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                         continue;
                     }
                 }
@@ -3416,14 +4116,14 @@ int main(int argc, char *argv[]) {
             if (dir_cluster == 0xFFFFFFFF) {
                 my_strcpy(g_shm_vaddr, "ls: directory not found\n");
                 seL4_SetMR(0, 0);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 continue;
             }
             if (dir_cluster == 0) dir_cluster = fs.root_cluster;
 
             exfat_format_dir_listing(&fs, dir_cluster, g_shm_vaddr, 0x1000 - 8);
             seL4_SetMR(0, 0);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 119) { // SYS_READ_FILE
             uint32_t offset = seL4_GetMR(1);
@@ -3441,7 +4141,7 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(0, (seL4_Word)-1);
                 seL4_SetMR(1, 0);
             }
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
         }
         else if (cmd == 112) { // SYS_TOUCH
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
@@ -3449,7 +4149,7 @@ int main(int argc, char *argv[]) {
             bool existed = false;
             if (exfat_create_file(&fs, path, &existed)) seL4_SetMR(0, existed ? 1 : 0);
             else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 113) { // SYS_WRITE_FILE (echo > file) — RPI4_USB_ALLOW_WRITE=false, см. hardware_usb_write()
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
@@ -3463,7 +4163,7 @@ int main(int argc, char *argv[]) {
 
             if (exfat_write_file(&fs, path, safe_text_buf, len)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
@@ -3473,10 +4173,10 @@ int main(int argc, char *argv[]) {
             if (exfat_read_text_file(&fs, path, g_shm_vaddr, &copied)) {
                 seL4_SetMR(0, 0);
                 seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+                usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
             } else {
                 seL4_SetMR(0, (seL4_Word)-1);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
             }
         }
         else if (cmd == 120) { // SYS_RM
@@ -3484,7 +4184,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_delete_file(&fs, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 116) { // SYS_RENAME (mv)
             char old_p[256], new_p[256]; // issuse.txt №35/№42: было 32, обрезало длинные имена
@@ -3492,7 +4192,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p));
             if (exfat_rename_file(&fs, old_p, new_p)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 117) { // SYS_MKDIR
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
@@ -3500,17 +4200,17 @@ int main(int argc, char *argv[]) {
             bool existed = false;
             if (exfat_mkdir(&fs, path, &existed)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, existed ? 1 : (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 118) { // SYS_CD
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_cd(&fs, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else {
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0)); // неизвестная команда — не подвешиваем вызывающего
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 0)); // неизвестная команда — не подвешиваем вызывающего
         }
     }
 

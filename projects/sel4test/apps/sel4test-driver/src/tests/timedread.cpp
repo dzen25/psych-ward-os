@@ -33,10 +33,28 @@ int main(int argc, char *argv[]) {
     SysClientEnv env;
     sys_client_init(env);
 
-    if (!env.arg) { sys_puts(0, "Usage: timedread <file>\n"); sys_exit(env.root_ep); return 1; }
+    if (!env.arg) { sys_puts(0, "Usage: timedread <file> [интервал прогресса в чанках, по умолч. 32]\n"); sys_exit(env.root_ep); return 1; }
+
+    // issuse.txt №69 (найдено при ручном тесте живого убийства blk_driver
+    // посреди чтения) — фиксированные 32 чанка (~128КБ, ~0.2с при обычной
+    // скорости SD) печатают СТОЛЬКО, что заливают консоль и физически не
+    // оставляют окна, чтобы вручную набрать `kill <pid>` в тот же терминал
+    // (см. issuse.txt №30 — потерь ввода уже нет, но само эхо/строки
+    // конкурентно мешаются с вводом до нечитаемости). Необязательный
+    // второй токен — свой интервал печати; по умолчанию поведение не
+    // меняется (32, та же гранулярность, что нужна была для диагностики
+    // №66 — где именно зависает при чтении).
+    char *cursor = env.arg;
+    char *filename = next_token(&cursor);
+    char *interval_str = next_token(&cursor);
+    int progress_interval = 32;
+    if (interval_str && *interval_str) {
+        int v = simple_atoi(interval_str);
+        if (v > 0) progress_interval = v;
+    }
 
     char *shm = env.shm;
-    build_absolute_path(shm, env.arg, SHM_TOTAL_SIZE);
+    build_absolute_path(shm, filename, SHM_TOTAL_SIZE);
     seL4_CPtr target_ep = route_vfs_path(shm, env.blk_ep, env.usb_storage_ep);
 
     char path[256];
@@ -72,7 +90,7 @@ int main(int argc, char *argv[]) {
         // от "встало намертво"). Первый чанк — всегда, дальше — каждые 32
         // (128КБ) с текущим временем на каждой строке, чтобы сразу была
         // видна скорость (или её отсутствие).
-        if (chunk_num == 1 || (chunk_num % 32) == 0) {
+        if (chunk_num == 1 || (chunk_num % progress_interval) == 0) {
             seL4_Word now = get_time_ms(env.timer_ep);
             sys_puts(0, "timedread: чанк "); putdec(chunk_num);
             sys_puts(0, " offset="); putdec((int)offset);

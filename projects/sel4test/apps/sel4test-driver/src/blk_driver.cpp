@@ -666,6 +666,21 @@ static bool blk_mount_exfat(seL4_CPtr console_ep) {
     }
 }
 
+// issuse.txt №69 — заменяет seL4_Reply() для ВСЕХ настоящих VFS-команд
+// (см. вызов seL4_CNode_SaveCaller(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT,
+// 8) в главном цикле, прямо перед разбором cmd). Reply-капа текущего
+// клиента к этому моменту уже лежит в VFS_PENDING_REPLY_SLOT (см.
+// common.h) — обычный seL4_Reply() использовал бы её неявно и тоже сработал
+// бы, но тогда root не смог бы её оттуда достать, если blk_driver умрёт
+// ПОСЛЕ SaveCaller, но ДО этого вызова (см. generic_recover_process()).
+// seL4_Send на явный слот + Delete — функционально то же самое, что
+// seL4_Reply, только с явным слотом, который остаётся адресуемым снаружи
+// (из root'а) всё это время.
+static inline void blk_vfs_reply(seL4_MessageInfo_t info) {
+    seL4_Send(VFS_PENDING_REPLY_SLOT, info);
+    seL4_CNode_Delete(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT, 8);
+}
+
 // ==========================================
 // ГЛАВНАЯ ФУНКЦИЯ БЛОЧНОГО ДРАЙВЕРА
 // ==========================================
@@ -846,6 +861,16 @@ int main(int argc, char *argv[]) {
         // Настоящая VFS-команда — мигаем ACT LED (см. gpio_act_led_off() выше).
         gpio_act_led_on();
 
+        // issuse.txt №69 — reply-капа ТЕКУЩЕГО клиента откладывается в
+        // фиксированный слот СВОЕГО CNode на всё время обработки этой
+        // команды (см. blk_vfs_reply()/VFS_PENDING_REPLY_SLOT выше) — если
+        // blk_driver умрёт/зависнет посреди обработки, root сможет вытащить
+        // эту капу из нашего CNode и ответить клиенту сам (см.
+        // generic_recover_process() в main.cpp). Каждая ветка ниже отвечает
+        // через blk_vfs_reply(), а не напрямую seL4_Reply() — иначе капа
+        // осталась бы висеть в слоте, никогда не удаляемая.
+        seL4_CNode_SaveCaller(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT, 8);
+
         if (cmd == 110) { // SYS_LS
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
@@ -860,7 +885,7 @@ int main(int argc, char *argv[]) {
                 if (parent_clus == 0xFFFFFFFF) {
                     my_strcpy(g_shm_vaddr, "ls: path not found\n");
                     seL4_SetMR(0, 0);
-                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                     continue;
                 }
                 if (basename[0] == '\0') {
@@ -873,7 +898,7 @@ int main(int argc, char *argv[]) {
                     if (dir_cluster != 0xFFFFFFFF && !is_dir) {
                         my_strcpy(g_shm_vaddr, "ls: not a directory\n");
                         seL4_SetMR(0, 0);
-                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                         continue;
                     }
                 }
@@ -882,7 +907,7 @@ int main(int argc, char *argv[]) {
             if (dir_cluster == 0xFFFFFFFF) {
                 my_strcpy(g_shm_vaddr, "ls: directory not found\n");
                 seL4_SetMR(0, 0);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 continue;
             }
             if (dir_cluster == 0) dir_cluster = g_file_system.root_cluster;
@@ -892,11 +917,24 @@ int main(int argc, char *argv[]) {
             // перечисляются полностью. Лимит — размер первой страницы SHM.
             exfat_format_dir_listing(&g_file_system, dir_cluster, g_shm_vaddr, 0x1000 - 8);
             seL4_SetMR(0, 0);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         else if (cmd == 119) { // SYS_READ_FILE
             uint32_t offset = seL4_GetMR(1);
             uint32_t bytes_read = 0;
+
+            // issuse.txt №69 (регрессионный тест) — см. KILL_WINDOW_TEST_OFFSET
+            // в common.h: искусственная пауза ВМЕСТО настоящего чтения, чтобы
+            // дать гарантированное окно на ручной `kill <pid>` РОВНО посреди
+            // обработки (SaveCaller уже отработал выше, до этой ветки).
+            if (offset == KILL_WINDOW_TEST_OFFSET) {
+                uint64_t deadline = read_cntvct() + (uint64_t)KILL_WINDOW_TEST_DELAY_MS * g_cntfrq / 1000;
+                while (read_cntvct() < deadline) {}
+                seL4_SetMR(0, 0);
+                seL4_SetMR(1, 0);
+                blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
+                continue;
+            }
 
             // ОЧЕНЬ ВАЖНО: Сейчас в SHM (g_shm_vaddr) лежит строковое имя файла,
             // которое передал Rootserver. Мы обязаны скопировать его себе на стек,
@@ -913,7 +951,7 @@ int main(int argc, char *argv[]) {
                 seL4_SetMR(0, -1); // Ошибка: Файл не найден
                 seL4_SetMR(1, 0);
             }
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
         }
 
         else if (cmd == 112) { // SYS_TOUCH
@@ -922,7 +960,7 @@ int main(int argc, char *argv[]) {
             bool existed = false;
             if (exfat_create_file(&g_file_system, path, &existed)) seL4_SetMR(0, existed ? 1 : 0); // 1 = уже существовал, ничего не создали
             else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
         else if (cmd == 113) { // SYS_WRITE_FILE (echo > file)
@@ -944,7 +982,7 @@ int main(int argc, char *argv[]) {
             
             if (exfat_write_file(&g_file_system, path, safe_text_buf, len)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
@@ -956,10 +994,10 @@ int main(int argc, char *argv[]) {
             if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr, &copied)) {
                 seL4_SetMR(0, 0);
                 seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+                blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
             } else {
                 seL4_SetMR(0, -1);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
             }
         }
 
@@ -968,7 +1006,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_delete_file(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
         else if (cmd == 116) { // SYS_RENAME (mv)
@@ -977,7 +1015,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(new_p, g_shm_vaddr + 128, sizeof(new_p)); // Ожидаем новое имя по смещению 128
             if (exfat_rename_file(&g_file_system, old_p, new_p)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
         else if (cmd == 117) { // SYS_MKDIR
@@ -986,7 +1024,7 @@ int main(int argc, char *argv[]) {
             bool existed = false;
             if (exfat_mkdir(&g_file_system, path, &existed)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, existed ? 1 : -1); // 1 = уже существовал
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
         
         else if (cmd == 118) { // SYS_CD
@@ -994,7 +1032,7 @@ int main(int argc, char *argv[]) {
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
             if (exfat_cd(&g_file_system, path)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
 
@@ -1003,13 +1041,13 @@ int main(int argc, char *argv[]) {
             exfat_free_space(&g_file_system, &total, &free_bytes);
             seL4_SetMR(0, (seL4_Word)total);
             seL4_SetMR(1, (seL4_Word)free_bytes);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
         }
 
         else if (cmd == SYS_BENCHMARK_RESET_LOCAL) { // Фаза 6.1 (продолжение, см. ROADMAP.md)
             seL4_BenchmarkResetLog();
             seL4_SetMR(0, 0);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
         else if (cmd == SYS_BENCHMARK_FINALIZE_LOCAL) { // пара к RESET выше, см. h/common.h
@@ -1019,11 +1057,11 @@ int main(int argc, char *argv[]) {
             seL4_Word total_local = seL4_GetMR(9); // BENCHMARK_TOTAL_UTILISATION
             seL4_SetMR(0, idle_local);
             seL4_SetMR(1, total_local);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
         }
 
         else {
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 0));
         }
     }
 

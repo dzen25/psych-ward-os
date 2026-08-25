@@ -280,16 +280,26 @@ static int df_format_row(char *buf, const char *name, uint64_t total_bytes,
     char tmp[24];
     int n;
 
+    // issuse.txt (найдено 2026-08-24) — без -h цифры печатались голыми
+    // МиБ без единицы измерения (напр. "29586") — неотличимо на глаз от
+    // байт/КБ, выглядело как явно неверный, слишком маленький размер.
+    // Суффикс "M" убирает двусмысленность, не трогая -h путь (тот уже сам
+    // выбирает K/M/G/T через append_human_size). Ширины колонок раздвинуты
+    // (4→6/4→6/5→7), чтобы вместить суффикс без потери выравнивания на
+    // реалистичных объёмах (карта до сотен ГиБ = до 6 цифр + буква).
     n = human ? append_human_size(tmp, total_bytes) : append_udec(tmp, total_bytes / (1024 * 1024));
-    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 4);
+    if (!human) tmp[n++] = 'M';
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 6);
 
     buf[offset++] = ' '; buf[offset++] = ' ';
     n = human ? append_human_size(tmp, used_bytes) : append_udec(tmp, used_bytes / (1024 * 1024));
-    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 4);
+    if (!human) tmp[n++] = 'M';
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 6);
 
     buf[offset++] = ' ';
     n = human ? append_human_size(tmp, free_bytes) : append_udec(tmp, free_bytes / (1024 * 1024));
-    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 5);
+    if (!human) tmp[n++] = 'M';
+    tmp[n] = '\0'; offset += append_str_width(buf + offset, tmp, 7);
 
     buf[offset++] = ' ';
     offset += append_udec_width(buf + offset, (uint64_t)use_pct, 3);
@@ -745,6 +755,10 @@ struct ProcessControlBlock {
     // только is_driver==3 (blk_driver). Тот же класс потери через респавн,
     // что у mbox_regs_frame/blk_dma_frame выше, если не сохранить здесь.
     seL4_CPtr gpio_frame;
+    // issuse.txt №73/№75 — аппаратный watchdog (PM_WDOG/PM_RSTC), только
+    // is_driver==2 (timer_driver). Тот же класс потери через респавн, что
+    // у остальных HW-профилей выше.
+    seL4_CPtr pm_wdog_frame;
     // issuse.txt №6 — vaddr, выданный ПЕРВЫМ SYS_SHM_GET этого процесса.
     // Повторный вызов (например shell-команда `shm`, вызываемая уже ПОСЛЕ
     // автоматического SHM_GET при старте в sys_client_init()) отдаёт его же
@@ -906,6 +920,19 @@ static bool g_usb_driver_ready = false;
 static seL4_Word g_driver_last_seen_ms[7] = {0, 0, 0, 0, 0, 0, 0};
 static bool g_auto_restart_enabled[7] = {false, false, false, false, false, false, false};
 static constexpr seL4_Word WATCHDOG_TIMEOUT_MS[7] = {0, 0, 0, 3000, 5000, 45000, 5000};
+
+// issuse.txt №70 — PID текущего держателя глобального vfs_mutex_ep (0 =
+// никто), обновляется ТОЛЬКО через case SYS_VFS_LOCK_NOTIFY ниже (клиенты
+// сами сообщают о взятии/отдаче, см. vfs_lock()/vfs_unlock() в shell.cpp/
+// h/sys_client.h) — единственный держатель одновременно, т.к. сам мьютекс
+// бинарный. g_vfs_mutex_ntfn_cap — копия локальной vfs_mutex_ntfn из
+// main() (см. её создание ниже), нужна здесь, чтобы generic_recover_process()
+// могла форсировать seL4_Signal, если убитый/упавший процесс оказался
+// текущим держателем (root создал объект и всегда сохраняет на него
+// сигнал-капу, см. "main.cpp сигналит vfs_mutex_ntfn один раз сразу после
+// создания" в shell.cpp).
+static seL4_Word g_vfs_lock_holder_pid = 0;
+static seL4_CPtr g_vfs_mutex_ntfn_cap = 0;
 
 // Фаза 12 (см. ROADMAP.md) — формат подписи: 4-байтовый magic + 64-байтовая
 // Ed25519-подпись, приклеенные в конец файла (см. tools/sign_elf/). Работает
@@ -1404,7 +1431,15 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // (is_driver==3) — мигание ACT LED при обращении
                          // к SD. Обычное копирование capability, не TCB-bind,
                          // тот же приём, что mbox_regs_frame выше.
-                         seL4_CPtr gpio_frame_param = 0) {
+                         seL4_CPtr gpio_frame_param = 0,
+                         // issuse.txt №73/№75 — фрейм регистров PM_WDOG/
+                         // PM_RSTC (platform.h/PLAT_PM_PADDR), читает
+                         // ТОЛЬКО timer_driver (is_driver==2) — "кормит"
+                         // его на каждом своём heartbeat-тике, последний
+                         // рубеж на случай, если сам CPU застрянет
+                         // настолько жёстко (PCIe-транзакция без ответа),
+                         // что даже JTAG-halt не проходит.
+                         seL4_CPtr pm_wdog_frame_param = 0) {
 
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -1475,12 +1510,15 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
-    if (is_driver == 1 || is_driver == 2 || is_driver == 4) {
-        // UART/Timer/Net driver: капа на СОБСТВЕННЫЙ CNode (см. SELF_CNODE_SLOT
-        // в common.h) — нужна для seL4_CNode_SaveCaller() внутри самого
-        // процесса, чтобы откладывать reply вместо немедленного ответа
-        // (UART: SYS_READ, Timer: SYS_SLEEP_MS, Фаза 4.5; Net: NET_CMD_PING,
-        // фикс низкочастотных мейлбоксов — см. situation.txt, net_driver.cpp).
+    if (is_driver == 1 || is_driver == 2 || is_driver == 3 || is_driver == 4 || is_driver == 6) {
+        // UART/Timer/Block/Net/USB driver: капа на СОБСТВЕННЫЙ CNode (см.
+        // SELF_CNODE_SLOT в common.h) — нужна для seL4_CNode_SaveCaller()
+        // внутри самого процесса, чтобы откладывать reply вместо немедленного
+        // ответа (UART: SYS_READ, Timer: SYS_SLEEP_MS, Фаза 4.5; Net:
+        // NET_CMD_PING, фикс низкочастотных мейлбоксов — см. situation.txt,
+        // net_driver.cpp; Block/USB: issuse.txt №69 — SaveCaller на КАЖДУЮ
+        // VFS-команду, чтобы root мог вытащить reply-капу зависшего клиента,
+        // если сам driver умрёт посреди обработки, см. VFS_PENDING_REPLY_SLOT).
         // child_cnode здесь — это capability НА ТОТ ЖЕ CNode-объект в
         // адресном пространстве root_cnode; копия внутрь себя же — обычный
         // seL4-приём для self-reference.
@@ -1549,6 +1587,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     pcb.blk_dma_paddr2 = blk_dma_paddr2_param;
     // Начало GPIO-драйвера (см. h/gpio.h) — тот же приём, для respawn.
     pcb.gpio_frame = gpio_frame_param;
+    // issuse.txt №73/№75 — тот же приём, для respawn.
+    pcb.pm_wdog_frame = pm_wdog_frame_param;
     // Фаза 3b — см. поле в struct ProcessControlBlock выше.
     pcb.liveness_ntfn_badged = liveness_ntfn_param;
     // Фаза 3b — сбрасываем last_seen на "ещё не проверялся" (0) при каждом
@@ -1844,6 +1884,16 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             check_err(seL4_ARM_Page_Map(gpio_child, child_vspace, PLAT_GPIO_VADDR,
                                         seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map GPIO to Driver");
         }
+        // issuse.txt №73/№75 — аппаратный watchdog (PM_WDOG/PM_RSTC),
+        // тот же приём, что mbox_regs_frame выше — тот же 2MB-регион,
+        // отдельная PUD/PD/PT не нужна. Только timer_driver.
+        if (is_driver == 2 && pm_wdog_frame_param != 0) {
+            seL4_CPtr pm_wdog_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, pm_wdog_child, seL4_WordBits,
+                                      root_cnode, pm_wdog_frame_param, seL4_WordBits, seL4_AllRights), "Copy PM Wdog Frame Cap");
+            check_err(seL4_ARM_Page_Map(pm_wdog_child, child_vspace, PLAT_PM_VADDR,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map PM Wdog to Driver");
+        }
 
         // Фаза 14 (USB, xHCI) — приватные DMA-страницы usb_driver'а, все в
         // ТОМ ЖЕ 2MB-окне, что PLAT_XHCI_VADDR выше (drv_pud/pd/pt для
@@ -2098,10 +2148,31 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // переживает respawn ("wifi restart") без дополнительного состояния.
     // Вызывается ДО seL4_TCB_Resume — поток ещё не runnable, просто
     // выставляет поле affinity, без IPI/remote-stall машинерии ядра.
-    if (is_driver == 5) {
-        seL4_TCB_SetAffinity(tcb, 1);
+    //
+    // issuse.txt №15 — ПОПЫТКА ОТКАЧЕНА после hw-теста: пробовали также
+    // перенести usb_driver на своё ядро (2), тем же приёмом, что и
+    // wifi_driver (1) — гипотеза была "делит ядро 0 с равным приоритетом,
+    // вытесняет соседей". После переноса watchdog/аварийное восстановление
+    // (generic_recover_process() — seL4_TCB_Suspend/работа с CNode
+    // целевого TCB, см. main.cpp) перестало срабатывать вообще (раньше
+    // хотя бы убивало blk_driver, после переноса — полное зависание
+    // системы, включая ROOT, без единого сообщения). Подозрение — cross-
+    // core seL4_TCB_Suspend() на АКТИВНО выполняющийся (не только что
+    // заспавненный, как у SetAffinity-до-Resume выше, для которого
+    // IPI/remote-stall не нужен) поток ДРУГОГО ядра требует remote-stall
+    // машинерии, которая либо не задействована, либо ведёт себя иначе в
+    // этой сборке — не подтверждено, но совпадение по времени слишком
+    // точное, чтобы держать риск. usb_driver остаётся на ядре 0, как и
+    // был всегда, hw-подтверждённо безопасно для watchdog-восстановления.
+    // Реальный фикс исходной находки (blk_driver терял тик во время
+    // долгих USB-операций) — явный seL4_Yield() в горячих циклах
+    // exfat.cpp (fat_chain_has_cycle() и соседи), НЕ перенос ядра.
+    bool pin_to_own_core = (is_driver == 5);
+    int own_core = 1;
+    if (pin_to_own_core) {
+        seL4_TCB_SetAffinity(tcb, own_core);
     }
-    pcb.core = (is_driver == 5) ? 1 : 0; // Фаза 6.1: отображение текущего ядра для taskset/top
+    pcb.core = pin_to_own_core ? own_core : 0; // Фаза 6.1: отображение текущего ядра для taskset/top
 
     // Привязываем прерывание только тем драйверам, у кого реально есть IRQ
     // (раньше это было "is_driver == 1 || is_driver == 2", но таймер (2)
@@ -2129,6 +2200,23 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     uart_puts("\n[WATCHDOG] Emergency recovery initiated for PID: "); uart_putdec(pid);
     uart_puts(" ("); uart_puts(meta.name); uart_puts(")\n");
 
+    // issuse.txt №70 — если жертва оказалась ТЕКУЩИМ держателем глобального
+    // vfs_mutex_ep (см. g_vfs_lock_holder_pid/SYS_VFS_LOCK_NOTIFY выше),
+    // форсируем seL4_Signal сам ЕЁ ИМЕНИ — обычный vfs_unlock() жертва уже
+    // никогда не вызовет (убита/упала ДО него), а голый notification-
+    // семафор без владельца/robust-семантики иначе остаётся захваченным
+    // НАВСЕГДА, вешая абсолютно любую будущую VFS-команду (даже `ps`) от
+    // ЛЮБОГО процесса в системе — hw-подтверждённый баг, не гипотеза
+    // (см. issuse.txt: `kill` фонового `timedread.elf` посреди чтения
+    // навсегда повесил `ps` без единого пути восстановления кроме ребута).
+    if (g_vfs_lock_holder_pid == (seL4_Word)pid) {
+        if (g_vfs_mutex_ntfn_cap != 0) {
+            seL4_Signal(g_vfs_mutex_ntfn_cap);
+            uart_puts("[WATCHDOG] Освободил зависший глобальный vfs_mutex_ep (issuse.txt №70).\n");
+        }
+        g_vfs_lock_holder_pid = 0;
+    }
+
     // issuse.txt: если у жертвы был отложенный (deferred-reply) запрос в
     // timer_driver (SYS_SLEEP_MS) или uart_driver (SYS_READ), просим их
     // отбросить свой слот ДО того, как реально уберём жертву — иначе когда
@@ -2146,6 +2234,43 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         seL4_SetMR(0, SYS_CANCEL_PENDING_FOR_PID);
         seL4_SetMR(1, (seL4_Word)pid);
         seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    }
+
+    // issuse.txt №69 — blk_driver/usb_driver теперь SaveCaller'ят reply-капу
+    // ТЕКУЩЕГО VFS-клиента в VFS_PENDING_REPLY_SLOT своего CNode на всё время
+    // обработки команды (см. common.h/VFS_PENDING_REPLY_SLOT). Если жертва —
+    // именно blk/usb driver, вытаскиваем эту капу из meta.cspace ПРЯМО
+    // СЕЙЧАС, пока CNode жертвы ещё жив (ниже, в цикле по cap_tracker, он
+    // будет revoke+delete'нут вместе со всем остальным) — и отвечаем
+    // клиенту сами, с ошибкой, вместо того чтобы он завис навсегда (обычный
+    // seL4_Call не даёт root'у другого способа вмешаться, см. issuse.txt).
+    // seL4_CNode_Move, НЕ Copy — hw-подтверждено 2026-08-24: reply-капы в
+    // seL4 принципиально не копируются (deriveCap() для cap_reply_cap
+    // ВСЕГДА возвращает null-cap, kernel/src/object/objecttype.c) — Copy
+    // ловил "Mutated cap would be invalid" (seL4_IllegalOperation) на
+    // каждый вызов, спасение ни разу не срабатывало, а зависший клиент
+    // навсегда держал глобальный vfs_mutex_ep, вешая заодно КАЖДУЮ
+    // следующую VFS-команду (даже ps/ls от других процессов). Move не
+    // проходит через deriveCap() (kernel/src/object/cnode.c,
+    // case CNodeMove — прямой cteMove) — тот же приём, что уже использует
+    // сам seL4_CNode_SaveCaller() внутри ядра для translateCaller. Честно
+    // проваливается (seL4_FailedLookup), если слот пуст — это НОРМАЛЬНЫЙ,
+    // самый частый случай ("жертва была на seL4_Recv, не в процессе
+    // VFS-команды"), не ошибка, просто нечего спасать.
+    if (meta.is_driver == 3 || meta.is_driver == 6) {
+        seL4_CPtr rescue_slot = alloc.alloc_slot();
+        if (rescue_slot != 0) {
+            seL4_Error rescue_err = seL4_CNode_Move(root_cnode, rescue_slot, seL4_WordBits,
+                                                     meta.cspace, VFS_PENDING_REPLY_SLOT, 8);
+            if (rescue_err == seL4_NoError) {
+                uart_puts("[WATCHDOG] Найден зависший VFS-клиент — будим с ошибкой вместо вечного зависания.\n");
+                seL4_SetMR(0, (seL4_Word)-1); // общий "ошибка" статус, тот же, что и у обычных VFS-неудач
+                seL4_SetMR(1, 0);
+                seL4_Send(rescue_slot, seL4_MessageInfo_new(0, 0, 0, 2)); // 2 слова — покрывает и 1-словные, и 2-словные VFS-ответы
+                seL4_CNode_Delete(root_cnode, rescue_slot, seL4_WordBits);
+            }
+            alloc.free(rescue_slot);
+        }
     }
 
     for (int i = 1; i < 256; i++) {
@@ -2206,7 +2331,22 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
         }
     }
 
-    if (respawn && (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0)) {
+    // issuse.txt №71 — is_driver==253/254 покрывает ДВА разных класса:
+    // настоящие персистентные сервисы (init.conf, напр. balancer — ХОТЯТ
+    // авто-восстановление после краха) И ручные одноразовые тестовые
+    // инструменты (/sbin/tests/*, exec'нутые вручную — НЕ предназначены
+    // жить долго/переживать kill, respawn для них бессмысленный шум:
+    // "не найден на диске" — не настоящая ошибка, просто driver ещё
+    // доигрывал ответ на ИХ ЖЕ прерванный запрос, см. issuse.txt). meta.path
+    // для них всегда начинается с "/sbin/tests/" (см. shell.cpp: exec
+    // хранит туда буквально то, что набрал пользователь) — единственный
+    // надёжный признак, is_driver сам по себе не различает эти два случая.
+    bool is_manual_test_tool = (strncmp(meta.path, "/sbin/tests/", 12) == 0);
+
+    if (respawn && is_manual_test_tool) {
+        uart_puts("[WATCHDOG] "); uart_puts(meta.name);
+        uart_puts(" — ручной тестовый инструмент (/sbin/tests/), респавн не требуется.\n");
+    } else if (respawn && (meta.is_driver > 0 || strcmp(meta.name, "shell") == 0)) {
         uart_puts("[WATCHDOG] Respawning critical system component...\n");
 
         // issuse.txt (было: watchdog не мог респавнить не-драйверные
@@ -2274,7 +2414,10 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
                                     // Начало GPIO-драйвера (см. h/gpio.h) — тот
                                     // же класс потери через респавн, что у
                                     // blk_dma_frame выше, если бы не сохранялся.
-                                    meta.gpio_frame);
+                                    meta.gpio_frame,
+                                    // issuse.txt №73/№75 — аппаратный watchdog,
+                                    // тот же класс потери через респавн.
+                                    meta.pm_wdog_frame);
 
         if (new_pid > 0) {
             // path не приходит через spawn_process (и так огромный список
@@ -2730,6 +2873,12 @@ int main(int argc, char *argv[]) {
     // ниже — см. комментарий там же и проверку "target_paddr BEHIND watermark"
     // в alloc_device_frame()).
     seL4_CPtr mbox_regs_frame = alloc_device_frame(info, alloc, PLAT_MBOX_PADDR, root_cnode);
+    // issuse.txt №73/№75 — аппаратный watchdog (PM_WDOG/PM_RSTC, см.
+    // platform.h/PLAT_PM_PADDR). PLAT_PM_PADDR (0xfe100000) физически
+    // МЕЖДУ MBOX (0xfe00b000) и RPI4_GPIO_PADDR (0xfe200000) в ТОМ ЖЕ
+    // untyped-регионе — аллоцируется строго здесь, между ними (тот же
+    // класс требования, что и у gpio_frame ниже).
+    seL4_CPtr pm_wdog_frame = alloc_device_frame(info, alloc, PLAT_PM_PADDR, root_cnode);
     // Начало GPIO-драйвера (зелёный ACT LED, GPIO42 — см. h/gpio.h) — DT
     // bcm2711-rpi-4-b.dts: led-act, gpios = <&gpio 42 GPIO_ACTIVE_HIGH>,
     // напрямую через ARM-side GPIO-контроллер (не firmware-gpio/expgpio,
@@ -3209,6 +3358,7 @@ int main(int argc, char *argv[]) {
         vfs_mutex_ntfn = alloc.alloc_slot();
         check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, vfs_mutex_ntfn, 1), "Retype vfs_mutex_ntfn");
         seL4_Signal(vfs_mutex_ntfn);
+        g_vfs_mutex_ntfn_cap = vfs_mutex_ntfn; // issuse.txt №70 — см. generic_recover_process()
     }
 
     // Физический таймер (PPI 30, non-secure) — Фаза 4.5, событийный sys_sleep
@@ -3251,7 +3401,11 @@ int main(int argc, char *argv[]) {
                       0, // liveness_ntfn_param (Фаза 3b, timer_driver сам не мониторится)
                       // Фаза 3b: тик для blk_driver — timer_driver сигналит
                       // её на том же общем heartbeat-тике (см. timer_driver.cpp).
-                      blk_liveness_tick_badged) < 0) {
+                      blk_liveness_tick_badged,
+                      0, // gpio_frame_param (timer_driver не GPIO)
+                      // issuse.txt №73/№75 — аппаратный watchdog, кормит
+                      // его на каждом heartbeat-тике (см. timer_driver.cpp).
+                      pm_wdog_frame) < 0) {
         uart_puts("PANIC: Timer Driver failed to load!\n"); while(1);
     }
     }
@@ -4284,7 +4438,28 @@ int main(int argc, char *argv[]) {
                     status = 2;
                 } else if (target_pid >= 256 || !pcbs[target_pid].active) {
                     status = 1;
-                } else if (pcbs[target_pid].is_driver == 2) {
+                } else if (pcbs[target_pid].is_driver != 0) {
+                    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (JTAG,
+                    // 2026-08-25): раньше здесь исключался только
+                    // timer_driver (PPI-опасность). Любой ДРУГОЙ драйвер,
+                    // перенесённый на не-0 ядро (этой командой или
+                    // SYS_BALANCE ниже) и позже требующий восстановления
+                    // (watchdog ИЛИ ручной `recover`, см. generic_recover_
+                    // process() -> seL4_TCB_Suspend()) — если он к этому
+                    // моменту РЕАЛЬНО активно исполняется на своём (не
+                    // корневом) ядре, seL4 требует IPI remote-stall
+                    // (remoteTCBStall() -> ipi_wait(), см. kernel/src/smp/
+                    // ipi.c) — синхронный barrier БЕЗ таймаута. Живой
+                    // тест: root (ядро 0) застрял в ipi_wait() навсегда
+                    // (полное зависание системы, не только драйвера) —
+                    // usb_driver был перенесён на ядро 3 (этой самой
+                    // командой/SYS_BALANCE) и в момент аварийного
+                    // восстановления реально работал там. Единственный
+                    // безопасный вариант — не давать драйверам вообще
+                    // покидать ядро 0 (кроме wifi_driver, у которого
+                    // ЕСТЬ выделенное ядро 1 с самого спавна, см.
+                    // spawn_process() — трогать его отсюда тоже нельзя,
+                    // ровно та же опасность).
                     status = 3;
                 } else if (target_core > 3) {
                     status = 4;
@@ -4420,6 +4595,18 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            // issuse.txt №70 — клиент сам сообщает о взятии/отдаче
+            // vfs_mutex_ep (см. vfs_lock()/vfs_unlock() в shell.cpp/
+            // h/sys_client.h). Обычный fire-and-forget seL4_Send со стороны
+            // клиента — БЕЗ seL4_Reply() здесь: отвечать некому, отправитель
+            // уже продолжил работу, не дожидаясь ответа (тот же приём, что
+            // heartbeat-тики/badge-нотификации в этом же цикле).
+            case SYS_VFS_LOCK_NOTIFY: {
+                if (arg1) g_vfs_lock_holder_pid = sender_pid;
+                else if (g_vfs_lock_holder_pid == sender_pid) g_vfs_lock_holder_pid = 0;
+                continue;
+            }
+
             // Фаза 6.1 (продолжение, см. ROADMAP.md): `balance` — по команде
             // шелла, но цель переноса выбирает алгоритм. Политика: находим
             // САМОЕ занятое ядро (среди тех, где есть реальные данные и
@@ -4529,7 +4716,13 @@ int main(int argc, char *argv[]) {
                     if (!pcbs[i].active) continue;
                     if (pcbs[i].core != source) continue;
                     if (i == heavy) continue;
-                    if (pcbs[i].is_driver == 2) continue; // timer_driver — никогда не переносим (PPI-опасность)
+                    // issuse.txt №15 — см. подробный комментарий у того же
+                    // условия в SYS_SET_AFFINITY выше: ЛЮБОЙ драйвер, не
+                    // только timer_driver, опасно переносить с ядра 0 —
+                    // watchdog/ручной recover() может застать его активно
+                    // работающим на новом ядре и намертво зависнуть в
+                    // remoteTCBStall()/ipi_wait() при попытке Suspend.
+                    if (pcbs[i].is_driver != 0) continue;
 
                     int dest = -1;
                     for (int c = 0; c < 4; c++) {
@@ -4561,6 +4754,28 @@ int main(int argc, char *argv[]) {
                 }
 
                 flush_rootserver_shm();
+                seL4_SetMR(0, 0);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // issuse.txt №75 (доп.) — жёсткий reboot через PM_WDOG/PM_RSTC
+            // (см. common.h/SYS_REBOOT, timer_driver.cpp/
+            // pm_watchdog_expire_now()) — тот же admin-гейт, что
+            // SYS_BALANCE/SYS_SET_AFFINITY выше. timer_driver — единственный
+            // процесс с замапленными регистрами, просто форвардим и сразу
+            // отвечаем вызывающему (реального ответа от timer_driver можно
+            // не ждать — плата перезагрузится раньше, чем это имело бы
+            // значение).
+            case SYS_REBOOT: {
+                if (!is_admin_caller(sender_pid)) {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                uart_puts("[ROOT] SYS_REBOOT: запрошена аппаратная перезагрузка (PM_WDOG).\n");
+                seL4_SetMR(0, SYS_REBOOT);
+                seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                 break;
@@ -5170,11 +5385,13 @@ int main(int argc, char *argv[]) {
                 // считать не нужно (кириллица была не только некрасивой,
                 // но и источником самого бага с шириной колонок).
                 offset += append_str_left_width(shm + offset, "Filesystem", 29);
-                offset += append_str_width(shm + offset, "Size", 4);
+                // 6/6/7 — согласовано с шириной колонок в df_format_row()
+                // (расширено там же ради суффикса "M" у не-human вывода).
+                offset += append_str_width(shm + offset, "Size", 6);
                 strcpy(shm + offset, "  "); offset += 2;
-                offset += append_str_width(shm + offset, "Used", 4);
+                offset += append_str_width(shm + offset, "Used", 6);
                 strcpy(shm + offset, " "); offset += 1;
-                offset += append_str_width(shm + offset, "Avail", 5);
+                offset += append_str_width(shm + offset, "Avail", 7);
                 strcpy(shm + offset, " "); offset += 1;
                 offset += append_str_width(shm + offset, "Use%", 4);
                 strcpy(shm + offset, " "); offset += 1;

@@ -12,6 +12,7 @@ static const int TZ_OFFSET_HOURS = 3;
 
 static char* shm_base = nullptr;
 static seL4_CPtr vfs_mutex_ep = 0;
+static seL4_CPtr g_vfs_root_ep = 0; // issuse.txt №70 — см. vfs_lock()/vfs_unlock() ниже, ставится в main()
 
 // Милстоун 4.4 (см. wifi_driver.cpp) — "знакомые сети" (PATH_WIFI_PQW,
 // строки "имясети|пароль"). Буферы для чтения/перезаписи файла целиком
@@ -43,10 +44,23 @@ void vfs_lock() {
     if (!vfs_mutex_ep) return; // Guard against early calls
     seL4_Word badge;
     seL4_Wait(vfs_mutex_ep, &badge);
+    // issuse.txt №70 — fire-and-forget (root не отвечает на этот cmd, см.
+    // main.cpp/SYS_VFS_LOCK_NOTIFY): "я теперь держу vfs_mutex_ep", чтобы
+    // root мог форсировать освобождение, если нас убьют до vfs_unlock().
+    seL4_SetMR(0, SYS_VFS_LOCK_NOTIFY);
+    seL4_SetMR(1, 1);
+    seL4_Send(g_vfs_root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
 void vfs_unlock() {
     if (!vfs_mutex_ep) return;
+    // issuse.txt №70 — "отдаю", ДО реального Signal (см. симметричный
+    // комментарий в h/sys_client.h — тот же приём, отдельная копия для
+    // шелла: лишний форсированный Signal от root'а в узком окне гонки
+    // безвреден, notification идемпотентна).
+    seL4_SetMR(0, SYS_VFS_LOCK_NOTIFY);
+    seL4_SetMR(1, 0);
+    seL4_Send(g_vfs_root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
     seL4_Signal(vfs_mutex_ep);
 }
 
@@ -1437,6 +1451,19 @@ static void run_balance(seL4_CPtr root_ep) {
     vfs_unlock();
 }
 
+// issuse.txt №75 (доп.) — жёсткий reboot через PM_WDOG/PM_RSTC (см.
+// common.h/SYS_REBOOT, main.cpp/timer_driver.cpp). При успехе плата
+// перезагружается почти мгновенно (~150мкс) — печатать что-либо ПОСЛЕ
+// seL4_Call бессмысленно в успешном случае, только для отказа по правам.
+static void run_reboot(seL4_CPtr root_ep) {
+    seL4_SetMR(0, SYS_REBOOT);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word status = seL4_GetMR(0);
+    if (status != 0) {
+        sys_puts(0, "reboot: доступ запрещён (нужны права администратора).\n");
+    }
+}
+
 static void run_taskset(char *arg, seL4_CPtr root_ep) {
     char *cursor = arg;
     char *pid_str = arg ? next_token(&cursor) : nullptr;
@@ -1518,6 +1545,7 @@ int main(int argc, char *argv[]) {
     seL4_CPtr usb_storage_ep = ipc->msg[BOOT_USB_STORAGE_EP]; // Milestone 9 (Фаза 14, закрытие) — маршрутизация /mnt/usb0
     seL4_CPtr wifi_ep    = ipc->msg[BOOT_WIFI_EP]; // Фаза 4, Милстоун 4.1 (см. wifi_driver.cpp)
     vfs_mutex_ep         = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP]; // Фаза 6 (SMP, см. common.h)
+    g_vfs_root_ep        = root_ep; // issuse.txt №70 — см. vfs_lock()/vfs_unlock() выше
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -2803,6 +2831,7 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "df") == 0) { run_df(arg, root_ep); }
             else if (my_strcmp(cmd_ptr, "free") == 0) { run_free(root_ep); }
             else if (my_strcmp(cmd_ptr, "balance") == 0) { run_balance(root_ep); }
+            else if (my_strcmp(cmd_ptr, "reboot") == 0) { run_reboot(root_ep); }
             else if (my_strcmp(cmd_ptr, "taskset") == 0) { run_taskset(arg, root_ep); }
             else if (my_strcmp(cmd_ptr, "usb") == 0) { run_usb(root_ep); }
 

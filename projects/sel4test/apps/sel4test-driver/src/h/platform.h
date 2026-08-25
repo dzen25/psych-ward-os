@@ -16,7 +16,7 @@ constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false;     // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
 constexpr bool LOG_NET     = false;     // net_driver.cpp — самый свежий/менее обкатанный компонент
 constexpr bool LOG_WIFI    = false;     // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
-constexpr bool LOG_USB     = false;     // usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
+constexpr bool LOG_USB     = true;      // issuse.txt №15 — временно включено для разбора находки "флешка за хабом определилась как хаб за хабом (VID/PID родителя?)"; usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
 constexpr bool LOG_ROOT    = false;     // main.cpp: "Fetching ELF from disk / ELF loaded successfully! Spawning..." на каждый спавн /sbin-команды (SYS_EXEC/init.conf) — рутинный шум при обычной работе шелла
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
@@ -240,6 +240,35 @@ constexpr uintptr_t PLAT_MBOX_BUF_VADDR     = 0x20001c000ULL;    // приват
 // (GPIO42) при обращении к SD-карте. Тот же 2MB-регион, что и остальные
 // vaddr выше — свободный слот сразу после PLAT_MBOX_BUF_VADDR.
 constexpr uintptr_t PLAT_GPIO_VADDR         = 0x20001d000ULL;
+// issuse.txt №73/№75 — аппаратный watchdog PM_WDOG/PM_RSTC (последний
+// рубеж: живёт в кремнии, не зависит от того, жив ли вообще ЛЮБОЙ CPU-
+// поток — см. подробный разбор в issuse.txt/памяти сессии, JTAG живьём
+// поймал cpu0, зависший НАСТОЛЬКО жёстко на PCIe-транзакции, что даже
+// отладочный halt-запрос не проходил). Регистры сверены с рабочим
+// драйвером того же чипа — /home/nikita/u-boot/drivers/watchdog/
+// bcm2835_wdt.c (тот же BCM2835/2711 PM-блок, HW не менялся). Только
+// timer_driver (is_driver==2) — единственный процесс, который ни от кого
+// не ждёт и не зависит, "кормит" его на каждом своём heartbeat-тике.
+// Тот же 2MB-регион, что и остальные vaddr выше — свободный слот сразу
+// после PLAT_GPIO_VADDR.
+constexpr uintptr_t PLAT_PM_PADDR           = 0xfe100000ULL;     // страница, кратная 0x1000 — МЕЖДУ MBOX (0xfe00b000) и GPIO (0xfe200000) в физическом порядке, аллоцировать СТРОГО между ними (см. alloc_device_frame()/watermark)
+constexpr uintptr_t PLAT_PM_VADDR           = 0x20001e000ULL;
+constexpr uintptr_t PM_RSTC_OFFSET          = 0x1c;
+constexpr uintptr_t PM_WDOG_OFFSET          = 0x24;
+constexpr uint32_t  PM_PASSWORD             = 0x5a000000u;
+constexpr uint32_t  PM_WDOG_MAX_TICKS       = 0x000fffffu; // ~16с, аппаратный потолок одного взвода — см. bcm2835_wdt.c
+constexpr uint32_t  PM_RSTC_WRCFG_CLR       = 0xffffffcfu;
+constexpr uint32_t  PM_RSTC_WRCFG_FULL_RESET = 0x00000020u;
+// Тики идут с частотой 2^16 Гц (65536 Hz) — см. MS_TO_WDOG_TICKS в
+// bcm2835_wdt.c ((ms << 16) / 1000). PM_WDOG_TIMEOUT_MS ниже — таймаут
+// ОДНОГО взвода; timer_driver перевзводит намного чаще (на каждом
+// heartbeat-тике, ~20мс), так что реальная задержка до аппаратного
+// ресета после того, как кормление прекратилось, — примерно этот
+// таймаут, не дольше. НЕ привязан к длительности легитимно долгих
+// операций (wifi scan/connect) — timer_driver кормит НЕЗАВИСИМО от
+// того, чем заняты остальные драйверы, ждать окончания их работы не
+// нужно вообще.
+constexpr uint32_t  PM_WDOG_TIMEOUT_MS      = 12000u;
 
 // USB (Фаза 14) — отдельное, СОБСТВЕННОЕ 2MB-окно usb_driver'а (не тот же
 // регион, что UART/EMMC/GENET/... выше). Изначально рассчитывалось на 1MB
@@ -271,7 +300,16 @@ constexpr uintptr_t PLAT_PCIE_ERR_VADDR = 0x201002000ULL;         // PCIE_OUTB_E
 // + позже устройства за хабом), USB_MAX_SLOTS_ENABLED — xHCI Slot ID
 // budget (MaxSlotsEn), с запасом сверх USB_MAX_DEVICES под сами хабы (у
 // хаба тоже есть свой Slot ID, не только у устройств за ним).
-constexpr int USB_MAX_DEVICES        = 4;
+// issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: реальная топология (хаб с
+// SS+HS-парностью) сама по себе съедает 3 слота ПОСТОЯННО (встроенный
+// VL805 root-hub, SS-ипостась внешнего хаба, её HS-двойник за VL805,
+// см. issuse.txt/память) ещё до единого реального накопителя — с бюджетом
+// 4 на реальные устройства оставался ровно 1, "нет свободных слотов"
+// всплывало на второй же вставке. Подняли до USB_MAX_SLOTS_ENABLED (8) —
+// контроллер и так уже это поддерживает, комментарий ниже с самого начала
+// предполагал запас сверх USB_MAX_DEVICES под сами хабы, просто массив
+// не был соразмерен.
+constexpr int USB_MAX_DEVICES        = 8;
 constexpr int USB_MAX_SLOTS_ENABLED  = 8;
 
 constexpr uintptr_t PLAT_XHCI_DCBAA_VADDR       = 0x201100000ULL; // Device Context Base Address Array
@@ -304,27 +342,33 @@ constexpr int         USB_MAX_SCRATCHPAD_PAGES       = 32; // бюджет эт�
 // ep0ring_vaddr()/ctrlbuf_vaddr()/... в usb_driver.cpp) вместо одной
 // общей страницы — несколько накопителей одновременно, у каждого свой
 // набор колец/буферов.
+// issuse.txt №15 — базы ниже раньше стояли вплотную с шагом РОВНО 4
+// страницы (под старый USB_MAX_DEVICES=4) — idx=4..7 (после поднятия
+// бюджета до 8, см. USB_MAX_DEVICES выше) наехал бы на страницы
+// СЛЕДУЮЩЕГО ресурса. Раздвинуто на шаг 8 страниц (>= USB_MAX_DEVICES) —
+// с большим запасом до конца 2MB-окна (0x2011FFFFF), см. итоговый
+// комментарий ниже.
 constexpr uintptr_t PLAT_XHCI_EP0_TRRING_VADDR      = 0x201130000ULL; // + idx*0x1000, idx < USB_MAX_DEVICES
 
 // Milestone 2 — буфер данных control-transfer'ов на EP0 (GET_DESCRIPTOR
 // Device/Configuration и т.д.) — одна страница с избытком на устройство.
-constexpr uintptr_t PLAT_XHCI_CTRL_BUF_VADDR        = 0x201134000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_CTRL_BUF_VADDR        = 0x201138000ULL; // + idx*0x1000
 
 // Milestone 4 — Transfer Ring'и bulk OUT/IN эндпоинтов Mass Storage
 // интерфейса (найдены в Milestone 3), активируются командой Configure
 // Endpoint. Тот же приём, что EP0 Transfer Ring — отдельная честная
 // страница на каждое кольцо КАЖДОГО устройства.
-constexpr uintptr_t PLAT_XHCI_BULKOUT_TRRING_VADDR  = 0x201138000ULL; // + idx*0x1000
-constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x20113C000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_BULKOUT_TRRING_VADDR  = 0x201140000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x201148000ULL; // + idx*0x1000
 
 // Milestone 5 — Bulk-Only Transport: CBW(31 байт, offset 0)/CSW(13 байт,
 // offset 64, выровнено) в ОДНОЙ странице на устройство; отдельная
 // страница-"bounce" под данные SCSI-команд (INQUIRY/READ CAPACITY/
 // READ(10)/WRITE(10)) — тот же приём, что ctrlbuf() у EP0.
-constexpr uintptr_t PLAT_XHCI_CBW_CSW_VADDR         = 0x201140000ULL; // + idx*0x1000
-constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201144000ULL; // + idx*0x1000
-// Последняя занятая страница: 0x201144000 + (USB_MAX_DEVICES-1)*0x1000 —
-// с запасом до конца 2MB-окна (0x2011FFFFF).
+constexpr uintptr_t PLAT_XHCI_CBW_CSW_VADDR         = 0x201150000ULL; // + idx*0x1000
+constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201158000ULL; // + idx*0x1000
+// Последняя занятая страница: 0x201158000 + (USB_MAX_DEVICES-1)*0x1000 =
+// 0x20115F000 — с большим запасом до конца 2MB-окна (0x2011FFFFF).
 
 // --- Оффсеты/биты регистров VideoCore mailbox, считаются от MAILBOX_BASE
 // (см. PLAT_MBOX_PADDR — сама страница начинается на 0x880 раньше). ---

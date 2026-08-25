@@ -173,6 +173,47 @@ static bool g_timer_stopped = false;
 static inline uint32_t mbox_reg_read(uintptr_t off) { return *(volatile uint32_t*)(PLAT_MBOX_VADDR + off); }
 static inline void mbox_reg_write(uintptr_t off, uint32_t val) { *(volatile uint32_t*)(PLAT_MBOX_VADDR + off) = val; }
 
+// issuse.txt №73/№75 — аппаратный watchdog PM_WDOG/PM_RSTC (последний
+// рубеж, живёт в кремнии — см. подробный разбор в issuse.txt/памяти
+// сессии: JTAG живьём поймал cpu0, зависший на PCIe-транзакции
+// НАСТОЛЬКО жёстко, что даже отладочный halt-запрос не проходил;
+// программный heartbeat-watchdog (WATCHDOG_TIMEOUT_MS в main.cpp) в
+// такой ситуации бесполезен — сам root, зависящий от того же cpu0, тоже
+// не может ничего восстановить). Регистры/пароль/тики сверены с рабочим
+// драйвером того же чипа — /home/nikita/u-boot/drivers/watchdog/
+// bcm2835_wdt.c. Взводится ЗАНОВО на каждом heartbeat-тике (см. main
+// loop ниже) — независимо от того, чем заняты остальные драйверы
+// (timer_driver ни от кого не ждёт), поэтому легитимно долгие операции
+// (wifi scan/connect) никак не мешают: таймаут одного взвода (12с,
+// platform.h/PM_WDOG_TIMEOUT_MS) отсчитывается заново от ПОСЛЕДНЕГО
+// кормления, а не от начала какой-либо операции. Если cpu0 застрянет
+// НАСТОЛЬКО, что даже timer_driver перестанет исполняться, — кормление
+// прекратится, и через ~12с чип аппаратно перезагрузит всю плату сам,
+// без участия ЛЮБОГО софта.
+static inline uint32_t pm_reg_read(uintptr_t off) { return *(volatile uint32_t*)(PLAT_PM_VADDR + off); }
+static inline void pm_reg_write(uintptr_t off, uint32_t val) { *(volatile uint32_t*)(PLAT_PM_VADDR + off) = val; }
+
+static void pm_watchdog_kick_ticks(uint32_t ticks) {
+    if (ticks > PM_WDOG_MAX_TICKS) ticks = PM_WDOG_MAX_TICKS;
+    pm_reg_write(PM_WDOG_OFFSET, PM_PASSWORD | ticks);
+    uint32_t cur = pm_reg_read(PM_RSTC_OFFSET);
+    pm_reg_write(PM_RSTC_OFFSET, PM_PASSWORD | (cur & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET);
+}
+
+static void pm_watchdog_kick(uint32_t timeout_ms) {
+    uint64_t ticks64 = ((uint64_t)timeout_ms << 16) / 1000;
+    uint32_t ticks = (ticks64 > PM_WDOG_MAX_TICKS) ? PM_WDOG_MAX_TICKS : (uint32_t)ticks64;
+    pm_watchdog_kick_ticks(ticks);
+}
+
+// issuse.txt №75 (доп.) — жёсткий reboot по требованию (см. SYS_REBOOT/
+// common.h): 10 тиков (~150мкс, тот же приём, что bcm2835_wdt_expire_now()
+// в bcm2835_wdt.c) вместо обычных 12с — плата перезагружается почти
+// мгновенно вместо ожидания полного таймаута.
+static void pm_watchdog_expire_now() {
+    pm_watchdog_kick_ticks(10);
+}
+
 // Один запрос-ответ по property-channel, честный wall-clock таймаут (тот же
 // приём, что и EMMC/Wi-Fi busy-wait в blk_driver.cpp/wifi_driver.cpp — см.
 // ROADMAP.md 4.5 про честные таймауты вместо счётчика итераций; здесь
@@ -517,6 +558,14 @@ int main(int argc, char *argv[]) {
             // для контраста, где общая линия потребовала SYS_MMC_IRQ_ACK).
             write_cntp_ctl(0);
             seL4_IRQHandler_Ack(irq_ep);
+            // issuse.txt №73/№75 — аппаратный watchdog, взводим на КАЖДОМ
+            // физическом IRQ таймера (не только на heartbeat_enabled-
+            // тике ниже, и НЕЗАВИСИМО от g_timer_stopped — этот
+            // watchdog ловит "cpu0 вообще перестал исполнять код
+            // timer_driver'а", а не "сигналы драйверам временно
+            // остановлены по команде"). См. подробный разбор у
+            // pm_watchdog_kick() выше.
+            pm_watchdog_kick(PM_WDOG_TIMEOUT_MS);
             if (LOG_TIMER) sys_puts(console_ep, "[TIMER] IRQ физического таймера пришёл\n");
 
             // Один компаратор, МНОГО независимых дедлайнов (см. rearm_timer()
@@ -576,6 +625,18 @@ int main(int argc, char *argv[]) {
             }
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+
+        // issuse.txt №75 (доп.) — жёсткий reboot (см. SYS_REBOOT/common.h).
+        // Admin-check уже сделан в root'е ДО пересылки сюда (тот же
+        // паттерн, что SYS_BALANCE/SYS_KILL) — здесь безусловно. Отвечаем
+        // ПЕРЕД самим взводом — after this the board resets in ~150мкс,
+        // не оставляем вызывающего висеть на seL4_Call.
+        if (sys == SYS_REBOOT) {
+            seL4_SetMR(0, 0);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            pm_watchdog_expire_now();
             continue;
         }
 

@@ -1,3 +1,4 @@
+#include <sel4/sel4.h>
 #include "h/exfat.h"
 
 // Этап A (см. ROADMAP.md/issuse.txt, план ухода от FAT32/8.3): монтирование +
@@ -112,7 +113,37 @@ static bool fat_set_entry(EXFAT_Instance* fs, uint32_t cluster, uint32_t value) 
 static bool fat_chain_has_cycle(EXFAT_Instance* fs, uint32_t start_cluster) {
     if (start_cluster < 2) return false;
     uint32_t slow = start_cluster, fast = start_cluster;
-    while (true) {
+    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (полное зависание системы,
+    // без срабатывания watchdog'а, детерминированно на 5-й подряд
+    // перемонтировании флешки за хабом): алгоритм Флойда математически
+    // гарантированно завершается для ЛЮБОЙ конечной цепочки (либо цикл
+    // найден, либо кто-то из курсоров упирается в конец), НО не даёт
+    // НИКАКОЙ практической верхней границы по РЕАЛЬНОМУ времени/числу
+    // аппаратных чтений — каждое успешное чтение сигналит usb-watchdog'у
+    // "жив" (см. g_usb_liveness_ntfn в hardware_usb_rw_generic_read()),
+    // поэтому по-настоящему длинный или испорченный проход не ловится
+    // watchdog'ом вообще, просто крутится. Соседний цикл ниже (обход
+    // корня после этой проверки) уже защищён guard++ < 65536 — здесь
+    // такого потолка не было ни разу, хотя комментарий на месте вызова
+    // прямо предполагал двойную защиту. Добавлен тот же приём.
+    //
+    // Второй, более точный фактор той же живой находки (второе мнение,
+    // независимо проверено против исходников seL4 — handleYield/schedule):
+    // на non-MCS seL4 seL4_Yield() честно ставит вызывающего в конец
+    // очереди готовности своего приоритета — НО примитивы ожидания завершения
+    // передачи (wait_transfer_completion() и т.п., см. usb_driver.cpp)
+    // зовут seL4_Yield() ТОЛЬКО если совпадение не нашлось с первой
+    // попытки — быстрый (обычный!) путь при живом устройстве возвращается
+    // сразу, ни разу не отдав квант. Длинная цепочка из МНОГИХ подряд
+    // быстрых чтений (типичный случай, не редкий) может не отдавать CPU
+    // вообще ни разу за весь проход — другой процесс той же приоритетности
+    // на том же ядре (blk_driver, ждущий свой 20мс liveness-тик) реально
+    // может не получить квант секундами, это НЕ придумка, а прямое
+    // следствие round-robin без принудительного yield в хот-пути. Explicit
+    // yield здесь — тот же дешёвый приём, что уже применяется в
+    // wait_transfer_completion() на медленном пути, просто безусловно.
+    int guard = 0;
+    while (guard++ < 65536) {
         uint32_t f1 = fat_get_entry(fs, fast);
         if (!exfat_cluster_has_next(f1)) return false;
         uint32_t f2 = fat_get_entry(fs, f1);
@@ -120,7 +151,9 @@ static bool fat_chain_has_cycle(EXFAT_Instance* fs, uint32_t start_cluster) {
         slow = fat_get_entry(fs, slow);
         fast = f2;
         if (slow == fast) return true;
+        seL4_Yield();
     }
+    return true; // потолок исчерпан — не доверяем цепочке, ведём себя как при обнаруженном цикле
 }
 
 // ============================================================================
@@ -833,6 +866,7 @@ bool exfat_init(EXFAT_Instance* fs, block_read_fn read_func, block_write_fn writ
             break;
         }
         if (!dir_cursor_advance(&cur)) break;
+        seL4_Yield(); // issuse.txt №15 — см. комментарий у fat_chain_has_cycle() выше
     }
 
     // Фаза 8 (`df`) — единственный ПОЛНЫЙ проход по битмапу за всю жизнь
@@ -1014,6 +1048,7 @@ static uint32_t count_free_clusters(EXFAT_Instance* fs) {
                 goto done;
             }
             sectors_loaded = chunk;
+            seL4_Yield(); // issuse.txt №15 — см. комментарий у fat_chain_has_cycle() выше, тот же приём
         }
         uint8_t byte_val = (uint8_t)sector_buf[byte_index - sector_base_byte];
         for (int b = 0; b < 8; b++) {
