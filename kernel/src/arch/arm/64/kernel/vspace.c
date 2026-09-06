@@ -1875,6 +1875,35 @@ void kernelDataAbort(word_t pc)
            getFAR(), getDFSR());
     halt();
 }
+
+/* Psych Ward OS, issuse.txt №74/в (2026-08-27) — до этой правки
+ * cur_el_serr/lower_el_serr (traps.S) на асинхронный SError падали
+ * молча в invalid_vector_entry -> halt() без единой печати (в отличие
+ * от kernelDataAbort/kernelPrefetchAbort выше, у которых ЕСТЬ ESR/FAR)
+ * — единственный видимый след был debug_printKernelEntryReason()
+ * ("Kernel entry via Unknown (0)"), который на этой сборке БЕСПОЛЕЗЕН:
+ * CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES отключен, ksKernelEntry.path
+ * никогда не обновляется и печатает один и тот же "Unknown (0)"
+ * НЕЗАВИСИМО от реальной причины входа в ядро. Живая JTAG-диагностика
+ * зависания usb_driver/usbreset (issuse.txt №74/в, situation.txt)
+ * установила по CPSR.DAIF (все 4 класса исключений замаскированы,
+ * ровно как это делает halt()) и по молчанию лога, что происходит
+ * ИМЕННО это — асинхронный SError, а не физическое зависание шины и не
+ * баг диспетчера. Печатаем ESR (тот же регистр, что даёт EC/IDS/синдром
+ * — см. исторический разбор в platform.h у PLAT_MBOX_PADDR/
+ * RPI4_XHCI_PADDR, "Шестнадцатая попытка", ESR_EL1=0xbf000002 —
+ * НАЙДЕНО ТОГДА только благодаря GDB под JTAG вживую, теперь будет
+ * видно прямо в серийном логе при первом же следующем срабатывании).
+ */
+void kernelSError(word_t pc) VISIBLE;
+
+void kernelSError(word_t pc)
+{
+    printf("\n\nKERNEL SERROR!\n");
+    printf("PC at SError entry: 0x%"SEL4_PRIx_word"\n", pc);
+    printf("ESR (syndrome): 0x%"SEL4_PRIx_word"\n", getESR());
+    halt();
+}
 #endif /* CONFIG_DEBUG_BUILD */
 
 #ifdef CONFIG_PRINTING

@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/driver_state.h"
 #include "h/exfat.h"
 #include "h/platform.h"
 #include "h/gpio.h"
@@ -99,9 +100,23 @@ constexpr bool RPI4_EMMC_ALLOW_WRITE = true;
 constexpr const char* USER_ROOT_DIR = "/root";
 
 // --- Вспомогательные функции ---
+static ExfatStream g_blk_stream = {}; // потоковая запись, см. h/exfat.h
+
 static void my_memcpy(void *dest, const void *src, int n) {
+    // По 8 байт там, где ОБА адреса выровнены — см. подробный разбор в
+    // usb_driver.cpp: SHM и DMA-буферы отображены НЕкэшируемо, каждый
+    // доступ это отдельная транзакция на шине, и побайтовый цикл был
+    // настоящим потолком скорости. Невыровненный 8-байтовый доступ к
+    // Device-памяти даёт Alignment Fault, поэтому хвост — побайтово.
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
+    if (n >= 8 && (((uintptr_t)d | (uintptr_t)s) & 7) == 0) {
+        uint64_t *d8 = (uint64_t *)d; const uint64_t *s8 = (const uint64_t *)s;
+        int words = n / 8;
+        for (int i = 0; i < words; i++) d8[i] = s8[i];
+        int done = words * 8;
+        d += done; s += done; n -= done;
+    }
     while (n--) *d++ = *s++;
 }
 static int my_strlen(const char* s) { int len = 0; while (s[len]) len++; return len; }
@@ -693,6 +708,13 @@ int main(int argc, char *argv[]) {
 
     // 2. Теперь безопасно получаем root_ep
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — общая страница состояния PARKED/BUSY, см.
+    // h/driver_state.h. Инициализируем как можно раньше: до первого
+    // seL4_Recv драйвер занят своим bring-up'ом, и root обязан это
+    // видеть, иначе может счесть безопасным суспендить его посреди
+    // инициализации железа.
+    driver_state_init(PLAT_DRIVER_STATE_VADDR, 3, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr my_ep   = ipc->msg[7]; // BOOT_BLK_EP
     seL4_CPtr timer_ep = ipc->msg[BOOT_TIMER_EP]; // Фикс зависания (см. situation.txt): нужен для SYS_TIMER_HEARTBEAT_SUBSCRIBE ниже
@@ -799,7 +821,9 @@ int main(int argc, char *argv[]) {
     // 4. Главный цикл диспетчеризации (Control Plane)
     while (1) {
         seL4_Word sender_badge = 0;
+        driver_state_parked(); // см. h/driver_state.h — с этой точки root вправе нас суспендить/переносить
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &sender_badge);
+        driver_state_busy();   // ДО любых ветвлений/continue ниже
 
         // Начало GPIO-драйвера (см. h/gpio.h) — гасим ACT LED здесь,
         // БЕЗУСЛОВНО, СРАЗУ после seL4_Recv(), ДО любых веток/`continue`
@@ -942,7 +966,7 @@ int main(int argc, char *argv[]) {
             char filename[256]; // issuse.txt №42
             my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
 
-            bool success = exfat_read_file(&g_file_system, filename, g_shm_vaddr, offset, &bytes_read);
+            bool success = exfat_read_file(&g_file_system, filename, g_shm_vaddr + VFS_PAYLOAD_OFFSET, offset, &bytes_read, VFS_PAYLOAD_MAX);
 
             if (success) {
                 seL4_SetMR(0, 0); // Статус: OK
@@ -967,21 +991,60 @@ int main(int argc, char *argv[]) {
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path)); // Спасаем путь
             uint32_t len = seL4_GetMR(1);
-            // len приходит от клиента IPC и не должна превышать размер safe_text_buf
-            if (len > 4096) len = 4096;
+            if (len > VFS_PAYLOAD_MAX) len = VFS_PAYLOAD_MAX;
 
-            // Защита памяти: копируем текст в собственную 6-ю страницу SHM
-            // (BLK_SHM_STAGING_OFFSET, platform.h), чтобы DMA-контроллер не
-            // затёр текст при чтении FAT. Раньше здесь была 3-я страница
-            // (0x2000/8192) — арифметически пересекалась с GENET
-            // rx_buffer_offsets[] (10240-16383), см. platform.h возле
-            // BLK_SHM_STAGING_OFFSET за полным разбором бага.
-            char* safe_text_buf = g_shm_vaddr + BLK_SHM_STAGING_OFFSET;
-            for (int i = 0; i < 4096; i++) safe_text_buf[i] = 0; // Очищаем мусор
-            my_memcpy(safe_text_buf, g_shm_vaddr + 128, len);
-            
-            if (exfat_write_file(&g_file_system, path, safe_text_buf, len)) seL4_SetMR(0, 0);
+            // ЛИШНЕЙ КОПИИ БОЛЬШЕ НЕТ. Раньше текст перекладывался в
+            // приватный staging-буфер драйвера (BLK_SHM_STAGING_OFFSET),
+            // потому что лежал в странице 0 общей памяти — а она же служит
+            // TX-скретчем GENET, и DMA сети могла затереть его прямо во время
+            // записи на диск. С переездом полезной нагрузки в собственную
+            // область (VFS_PAYLOAD_OFFSET, см. platform.h) её не касается
+            // никакой DMA: GENET работает со страницами 0/2/3, блочный DMA и
+            // bounce USB лежат вообще вне SHM.
+            //
+            // Зачем убрали: копия стоила ещё один полный проход по
+            // НЕкэшируемой памяти — столько же, сколько сама запись на диск
+            // (см. разбор у my_memcpy выше). Клиент в это время заблокирован
+            // в seL4_Call и изменить данные не может, другие клиенты
+            // сериализованы vfs_lock.
+            if (exfat_write_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len)) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        }
+
+        else if (cmd == 121) { // SYS_APPEND_FILE — дописывание в конец
+            // Раскладка та же, что у cmd 113 выше; отличие ровно одно —
+            // exfat_append_file() вместо exfat_write_file().
+            char path[256]; // issuse.txt №42
+            my_strlcpy(path, g_shm_vaddr, sizeof(path));
+            uint32_t len = seL4_GetMR(1);
+            if (len > VFS_PAYLOAD_MAX) len = VFS_PAYLOAD_MAX;
+
+            if (exfat_append_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len)) seL4_SetMR(0, 0);
+            else seL4_SetMR(0, -1);
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        }
+
+
+        else if (cmd == 122 || cmd == 123 || cmd == 124) { // ПОТОКОВАЯ ЗАПИСЬ, см. h/exfat.h
+            // Один активный поток на драйвер: характерная нагрузка — один
+            // журнал. Второй open поверх открытого честно отказывает, а не
+            // молча подменяет цель под первым писателем.
+            // Коды различимы, чтобы отказ не приходилось разгадывать по
+            // косвенным признакам: -1 открытие, -2 запись, -3 закрытие,
+            // -4 поток не открыт / уже открыт.
+            int rc = -4;
+            if (cmd == 122) {
+                char path[256]; my_strlcpy(path, g_shm_vaddr, sizeof(path));
+                if (!g_blk_stream.active) rc = exfat_stream_open(&g_file_system, path, (uint64_t)seL4_GetMR(1), &g_blk_stream) ? 0 : -1;
+            } else if (cmd == 123) {
+                uint32_t len = seL4_GetMR(1);
+                if (len > VFS_PAYLOAD_MAX) len = VFS_PAYLOAD_MAX;
+                if (g_blk_stream.active) rc = exfat_stream_write(&g_file_system, &g_blk_stream, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len) ? 0 : -2;
+            } else {
+                if (g_blk_stream.active) rc = exfat_stream_close(&g_file_system, &g_blk_stream) ? 0 : -3;
+            }
+            seL4_SetMR(0, rc);
             blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
@@ -991,7 +1054,7 @@ int main(int argc, char *argv[]) {
 
             // Читаем напрямую в SHM, чтобы shell мог сразу это распечатать
             uint32_t copied = 0;
-            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr, &copied)) {
+            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, &copied)) {
                 seL4_SetMR(0, 0);
                 seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
                 blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));

@@ -284,3 +284,72 @@ sudo mkfs.exfat -n RPI /dev/sdX2   # нужен exfatprogs (apt install exfatpro
 ```
 
 </details>
+
+---
+
+<details>
+<summary><b>🔌 Отладочная машина <code>carto</code> (JTAG) — опционально</b></summary>
+
+Нужна только для отладки под JTAG и для заливки образа в ОЗУ мимо SD-карты. Для обычного цикла «собрал → прошил карту» не требуется вообще — этот раздел можно пропустить.
+
+### Разделение ролей (главное, что путают)
+
+| Машина | Что делает | Чего на ней НЕТ |
+|---|---|---|
+| Сборочный сервер (этот репозиторий) | `build_and_sign.sh`, GDB с символами, скрипты JTAG | физического доступа к плате |
+| `carto` (выделенный Linux-хост) | **только** OpenOCD + физически воткнутый FT232H | дерева сборки — и не должно быть |
+| Машина с картой (обычно macOS) | `rt/flash.sh` | всего остального |
+
+GDB запускается **здесь**, а не на carto: порты OpenOCD пробрасываются SSH-туннелем, символы берутся из локального `build-rpi4/`. Копировать билды на carto не нужно — туда едут только конфиги OpenOCD и (для заливки в ОЗУ) плоский образ.
+
+### Что должно быть на carto
+
+Проверено 2026-08-23 — всё уже было из коробки, руками ничего не ставилось:
+
+```bash
+ssh nikita@carto
+lsusb                # 0403:6014 Future Technology Devices ... FT232H
+openocd --version    # 0.12.0
+which gdb-multiarch  # /usr/bin/gdb-multiarch
+ls /usr/share/openocd/scripts/board/rpi4b.cfg   # готовый, свой не писать
+```
+
+`sudo` для OpenOCD **не нужен** — udev-правило `/lib/udev/rules.d/60-openocd.rules` даёт доступ группе `plugdev`, пользователь в ней состоит.
+
+### Настройка (один раз)
+
+```bash
+uart_wifi_JTAG/load_over_JTAG/file/jtagload.sh --provision
+```
+
+Раскладывает `~/jtag/` на carto: `ft232h-jtag.cfg` (отладка) и `ft232h-jtag-load.cfg` (загрузка в ОЗУ). Каноничные копии обоих лежат в этом репозитории и обновляются на carto при **каждом** запуске `jtagload.sh` — править их прямо на carto бессмысленно, затрёт.
+
+Со стороны платы дополнительно ничего не нужно: `enable_jtag_gpio=1` и `gpio=22-27=np` уже стоят в `load_chain/BOOT/config.txt`. Распиновка (6 проводов + GND, GPIO22-27) — в [uart_wifi_JTAG/debug_of_FT232H/FT232H-jtag-guide.md](../uart_wifi_JTAG/debug_of_FT232H/FT232H-jtag-guide.md), §2.
+
+### Два режима работы
+
+**1. Отладка** — VSCode, панель Run and Debug (`Ctrl+Shift+D`) → `JTAG: RPi4 kernel.elf через FT232H/carto (cpu0)` → `F5`. Туннель и OpenOCD на carto поднимутся сами (`preLaunchTask`). Что нажимать дальше — [debug_of_RP2040/JTAG-GDB-cheatsheet.md](../uart_wifi_JTAG/debug_of_RP2040/JTAG-GDB-cheatsheet.md) (памятка общая, от моста не зависит).
+
+**2. Заливка образа в ОЗУ** — вместо перепрошивки карты. Обновляет ядро, rootserver и драйверы `uart/timer/shell/blk/net/usb`; `wifi.elf`, `/sbin`, `/sbin/tests`, `/service`, `/etc` по-прежнему читаются с карты. Требует, чтобы плата стояла в приглашении U-Boot. Полная методичка — [uart_wifi_JTAG/load_over_JTAG/JTAG-load-guide.md](../uart_wifi_JTAG/load_over_JTAG/JTAG-load-guide.md).
+
+```bash
+uart_wifi_JTAG/load_over_JTAG/file/jtagload.sh -b
+```
+
+### ⚠️ Правило, которое стоит платы
+
+**Всегда `resume` перед тем, как отключаться.** OpenOCD останавливает cpu0 сам, самим фактом старта — ещё до подключения GDB. Убить OpenOCD (Ctrl+C, закрыть панель задач) **не** резюмит цель: остановка защёлкивается в самом ядре и держится, пока кто-то явно не пришлёт `resume`. Симптом — UART и шелл замерли намертво без всякого отладчика.
+
+Спасение без перезагрузки платы:
+
+```bash
+uart_wifi_JTAG/load_over_JTAG/file/jtagload.sh --resume
+```
+
+(или задача VSCode `JTAG: резюмнуть зависший cpu0 (спасение)`).
+
+### Ещё одно, про UART
+
+FT232H на carto один, и одноканальный: он физически либо в JTAG-режиме, либо в async-UART — одновременно никак. Поэтому serial-консоль платы берётся не с него, а отдельным каналом (второй адаптер либо беспроводной мост [debug_of_esp32c3](../uart_wifi_JTAG/debug_of_esp32c3/Esp32c3_wireless_uart_guide.md)). Побочный эффект: после сессии OpenOCD нода `/dev/ttyUSB0` на carto пропадает и сама не возвращается — `sudo modprobe -r ftdi_sio && sudo modprobe ftdi_sio` или физический реплаг.
+
+</details>

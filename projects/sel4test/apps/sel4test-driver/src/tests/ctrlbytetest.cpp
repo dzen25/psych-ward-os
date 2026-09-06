@@ -21,7 +21,7 @@ int main(int argc, char *argv[]) {
     char *shm = env.shm;
 
     char *path_ptr = shm;
-    char *data_ptr = shm + 128;
+    char *data_ptr = shm + VFS_PAYLOAD_OFFSET;
 
     my_strlcpy(path_ptr, path, 128);
 

@@ -223,7 +223,9 @@ static char *next_token(char **cursor) {
 // единственная страница (SHM_PAGE_VFS), которая вообще выдаётся — см.
 // shm_pages_mask_for_role() в main.cpp.
 #define CWD_SIZE 64
-#define SHM_TOTAL_SIZE 16384
+// Размер вида SHM у клиента = вся карта (см. platform.h/SHM_TOTAL_PAGES).
+// Раньше было прибито числом 16384 и разъезжалось с реальной раскладкой.
+#define SHM_TOTAL_SIZE (SHM_TOTAL_PAGES * 4096)
 
 static char g_cwd[CWD_SIZE] = "/root";
 
@@ -367,7 +369,7 @@ static void sys_client_init(SysClientEnv &env) {
     g_vfs_mutex_ep = ipc->msg[BOOT_VFS_MUTEX_NTFN_CAP];
     g_vfs_root_ep = env.root_ep; // issuse.txt №70 — см. vfs_lock()/vfs_unlock() выше
 
-    my_strlcpy(env.arg_buffer, (char*)&ipc->msg[0], (int)sizeof(env.arg_buffer));
+    my_strlcpy(env.arg_buffer, (char*)&ipc->msg[EXEC_ARGS_MSG_SLOT], (int)sizeof(env.arg_buffer));
     env.arg = env.arg_buffer[0] ? env.arg_buffer : nullptr;
 
     // Фаза 9.A (продолжение, см. ROADMAP.md/EXEC_CWD_MSG_SLOT в common.h):

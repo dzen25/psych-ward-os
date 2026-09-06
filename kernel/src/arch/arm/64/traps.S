@@ -144,7 +144,19 @@ BEGIN_FUNC(cur_el_serr)
 #ifdef CONFIG_AARCH64_SERROR_IGNORE
     eret
 #else
-    b       invalid_vector_entry
+    /* Psych Ward OS, issuse.txt №74/в — было "b invalid_vector_entry"
+     * (полностью молча, ни ESR, ни PC, см. kernelSError() в vspace.c за
+     * полным разбором почему это понадобилось). lsp_i нужен ДО вызова
+     * C-функции — она использует SP, а мы попали сюда с SP потока,
+     * который мог быть чем угодно (та же причина, по которой
+     * invalid_vector_entry сама делает lsp_i первым делом).
+     */
+    lsp_i   x19
+#ifdef CONFIG_DEBUG_BUILD
+    mrs     x0, ELR
+    bl      kernelSError
+#endif /* CONFIG_DEBUG_BUILD */
+    b       halt
 #endif
 END_FUNC(cur_el_serr)
 
@@ -233,6 +245,13 @@ BEGIN_FUNC(lower_el_serr)
 #ifdef CONFIG_AARCH64_SERROR_IGNORE
     eret
 #else
-    b       invalid_vector_entry
+    /* Psych Ward OS, issuse.txt №74/в — см. тот же комментарий у
+     * cur_el_serr выше. */
+    lsp_i   x19
+#ifdef CONFIG_DEBUG_BUILD
+    mrs     x0, ELR
+    bl      kernelSError
+#endif /* CONFIG_DEBUG_BUILD */
+    b       halt
 #endif
 END_FUNC(lower_el_serr)

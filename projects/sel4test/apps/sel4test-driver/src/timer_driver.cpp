@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/driver_state.h"
 #include "h/platform.h"
 
 static inline seL4_IPCBuffer* get_local_ipc() {
@@ -64,7 +65,18 @@ constexpr int MAX_PENDING_SLEEPS = 8;
 struct PendingSleep { bool active; uint64_t deadline; int owner_pid; };
 
 static void rearm_timer(const PendingSleep* sleeps, int n,
-                        bool heartbeat_enabled, uint64_t next_heartbeat_deadline) {
+                        bool heartbeat_enabled, uint64_t next_heartbeat_deadline,
+                        // Тик heartbeat-watchdog'а root'а — СОБСТВЕННЫЙ
+                        // дедлайн, независимый от подписки net_driver'а на
+                        // heartbeat. Раньше единственным периодическим
+                        // событием здесь был heartbeat, который включается
+                        // только когда net_driver на него подпишется —
+                        // вешать на такую подписку работоспособность
+                        // сторожа всей системы нельзя (см. common.h/
+                        // ROOT_WATCHDOG_TICK_BADGE: ровно такая скрытая
+                        // связанность и оставила watchdog немым на живом
+                        // железе).
+                        bool wd_tick_enabled = false, uint64_t next_wd_tick_deadline = 0) {
     bool have_deadline = false;
     uint64_t next = 0;
     for (int i = 0; i < n; i++) {
@@ -75,6 +87,10 @@ static void rearm_timer(const PendingSleep* sleeps, int n,
     }
     if (heartbeat_enabled && (!have_deadline || next_heartbeat_deadline < next)) {
         next = next_heartbeat_deadline;
+        have_deadline = true;
+    }
+    if (wd_tick_enabled && (!have_deadline || next_wd_tick_deadline < next)) {
+        next = next_wd_tick_deadline;
         have_deadline = true;
     }
     if (have_deadline) {
@@ -401,6 +417,26 @@ static bool mbox_set_domain_state(uint32_t domain_id, bool want_on, uint32_t *ou
     return true;
 }
 
+// issuse.txt №74/в (см. situation.txt) — тег "VL805 только что аппаратно
+// сброшен, перезалей прошивку" (см. platform.h/MBOX_TAG_NOTIFY_XHCI_RESET
+// про источник/формат/ВАЖНОЕ предупреждение про повторные вызовы).
+// Единственный вызывающий — main.cpp/SYS_PCIE_RESET, ПОСЛЕ успешного
+// root_pcie_fundamental_reset() (линк уже поднят) — этот файл не
+// проверяет ничего, кроме собственно ответа VC, порядок вызова —
+// ответственность root'а.
+static bool mbox_notify_xhci_reset() {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 7 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = MBOX_TAG_NOTIFY_XHCI_RESET;
+    g_mbox_buf[3] = 4; // val_buf_size: запрос — 1 слово (dev_addr), ответа не ждём отдельно
+    g_mbox_buf[4] = 4; // val_len (запрос): dev_addr
+    g_mbox_buf[5] = MBOX_XHCI_RESET_DEV_ADDR;
+    g_mbox_buf[6] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    return g_mbox_buf[1] == MBOX_CODE_RESPONSE_SUCCESS;
+}
+
 struct MboxDomainDef { uint32_t id; const char *name; };
 // Мультимедиа/камера-блоки, не нужные headless serial-only ОС — см. полный
 // список констант и обоснование в platform.h.
@@ -433,6 +469,13 @@ int main(int argc, char *argv[]) {
 
     // 5. Теперь безопасно получаем Capability-индексы
     seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — общая страница состояния PARKED/BUSY, см.
+    // h/driver_state.h. Инициализируем как можно раньше: до первого
+    // seL4_Recv драйвер занят своим bring-up'ом, и root обязан это
+    // видеть, иначе может счесть безопасным суспендить его посреди
+    // инициализации железа.
+    driver_state_init(PLAT_DRIVER_STATE_VADDR, 2, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr my_ep      = ipc->msg[BOOT_TIMER_EP];
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr irq_ep     = ipc->msg[BOOT_IRQ_EP]; // Фаза 4.5: настоящий IRQHandler физического таймера, не общий ни с кем
@@ -465,6 +508,12 @@ int main(int argc, char *argv[]) {
     // blk_driver's главный диспетчер-цикл (TCB-bind, см. main.cpp), чтобы
     // тот мог сам сигналить root'у "я жив" (heartbeat-watchdog).
     seL4_CPtr blk_liveness_tick_ntfn = ipc->msg[BOOT_BLK_LIVENESS_TICK_NTFN_CAP];
+    // Собственный тик heartbeat-watchdog'а root'а — см. развёрнутое
+    // "зачем" у common.h/ROOT_WATCHDOG_TICK_BADGE. Шлём БЕЗУСЛОВНО, на
+    // каждом тике: этот сигнал — единственное, что заводит скан таймаутов
+    // у root'а, и он обязан идти, даже когда ВСЕ наблюдаемые драйверы
+    // молчат (то есть ровно тогда, когда watchdog и нужен).
+    seL4_CPtr root_watchdog_tick_ntfn = ipc->msg[BOOT_ROOT_WATCHDOG_TICK_NTFN_CAP];
 
     if (my_ep == 0) {
         __assert_fail("FATAL: Null Capability #0 Detected!", __FILE__, __LINE__, __func__);
@@ -544,10 +593,20 @@ int main(int argc, char *argv[]) {
     uint64_t heartbeat_period_ticks = 0;
     uint64_t next_heartbeat_deadline = 0;
 
+    // Тик heartbeat-watchdog'а root'а: свой период, своя постановка
+    // дедлайна, никакой зависимости от чужих подписок и от g_timer_stopped
+    // (см. common.h/ROOT_WATCHDOG_TICK_BADGE). Единственное, что его
+    // останавливает, — смерть самого timer_driver, а на этот случай
+    // последний рубеж это аппаратный PM_WDOG, не он.
+    uint64_t wd_tick_period_ticks = ((uint64_t)ROOT_WATCHDOG_TICK_PERIOD_MS * cntfrq) / 1000;
+    uint64_t next_wd_tick_deadline = read_cntvct() + wd_tick_period_ticks;
+
     // Главный цикл обработки IPC-запросов
     while(1) {
         seL4_Word badge = 0;
+        driver_state_parked(); // см. h/driver_state.h — с этой точки root вправе нас суспендить/переносить
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
+        driver_state_busy();   // ДО любых ветвлений/continue ниже
 
         if (badge == TIMER_IRQ_BADGE) {
             // IRQ физического таймера — снимаем условие СРАЗУ (ENABLE=0
@@ -565,7 +624,14 @@ int main(int argc, char *argv[]) {
             // timer_driver'а", а не "сигналы драйверам временно
             // остановлены по команде"). См. подробный разбор у
             // pm_watchdog_kick() выше.
-            pm_watchdog_kick(PM_WDOG_TIMEOUT_MS);
+            // issuse.txt №74/в — WATCHDOG_AUTO_REBOOT_ENABLED (platform.h)
+            // ВРЕМЕННО false на время JTAG-диагностики CAPLENGTH-
+            // зависания: не кормим PM_WDOG вообще, значит он никогда не
+            // взведён и никогда не сработает — иначе плата
+            // перезагрузится раньше, чем JTAG успеет подключиться.
+            // Ручной `reboot` (pm_watchdog_expire_now(), SYS_REBOOT
+            // ниже) НЕ гейтится этим флагом, продолжает работать всегда.
+            if (WATCHDOG_AUTO_REBOOT_ENABLED) pm_watchdog_kick(PM_WDOG_TIMEOUT_MS);
             if (LOG_TIMER) sys_puts(console_ep, "[TIMER] IRQ физического таймера пришёл\n");
 
             // Один компаратор, МНОГО независимых дедлайнов (см. rearm_timer()
@@ -594,7 +660,14 @@ int main(int argc, char *argv[]) {
                 if (blk_liveness_tick_ntfn != 0) seL4_Signal(blk_liveness_tick_ntfn); // Фаза 3b
                 next_heartbeat_deadline = now + heartbeat_period_ticks;
             }
-            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
+            // ВНЕ условия выше — намеренно: ни подписка net_driver'а на
+            // heartbeat, ни `driver timer_driver stop` не должны глушить
+            // сторожа (см. common.h/ROOT_WATCHDOG_TICK_BADGE).
+            if (root_watchdog_tick_ntfn != 0 && now >= next_wd_tick_deadline) {
+                seL4_Signal(root_watchdog_tick_ntfn);
+                next_wd_tick_deadline = now + wd_tick_period_ticks;
+            }
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline, root_watchdog_tick_ntfn != 0, next_wd_tick_deadline);
             continue;
         }
 
@@ -637,6 +710,18 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             pm_watchdog_expire_now();
+            continue;
+        }
+
+        // issuse.txt №74/в (см. situation.txt) — форвард mailbox-тега
+        // XHCI_RESET, единственный вызывающий — main.cpp/SYS_PCIE_RESET.
+        // Admin-check уже сделан в root'е ДО пересылки сюда (тот же
+        // паттерн, что SYS_REBOOT выше). Ответ MR0: 0=VC подтвердил,
+        // ненулевое=не подтвердил (буфер не замаплен ИЛИ property-call
+        // не ответил/не успех).
+        if (sys == SYS_MBOX_XHCI_RESET) {
+            seL4_SetMR(0, mbox_notify_xhci_reset() ? 0 : (seL4_Word)-1);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             continue;
         }
 
@@ -697,7 +782,7 @@ int main(int argc, char *argv[]) {
                 // навсегда — ровно того же рода баг, что уже ловили в
                 // Блоке A/B (см. depth=8 у SaveCaller ниже).
                 seL4_CNode_SaveCaller(SELF_CNODE_SLOT, SLEEP_REPLY_SLOT_BASE + slot, 8); // depth=8, см. урок из uart_driver.cpp
-                rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
+                rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline, root_watchdog_tick_ntfn != 0, next_wd_tick_deadline);
                 if (LOG_TIMER) sys_puts(console_ep, "[TIMER] sleep: взвели физический таймер, ждём IRQ...\n");
                 // Reply НЕ отправляем — см. ветку badge==TIMER_IRQ_BADGE выше.
             }
@@ -708,7 +793,7 @@ int main(int argc, char *argv[]) {
             heartbeat_period_ticks = ((uint64_t)period_ms * cntfrq) / 1000;
             next_heartbeat_deadline = read_cntvct() + heartbeat_period_ticks;
             heartbeat_enabled = (heartbeat_ntfn != 0);
-            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline, root_watchdog_tick_ntfn != 0, next_wd_tick_deadline);
             seL4_SetMR(0, heartbeat_enabled ? 0 : (seL4_Word)-1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else if (sys == SYS_CANCEL_PENDING_FOR_PID) {
@@ -724,7 +809,7 @@ int main(int argc, char *argv[]) {
                     pending_sleeps[i].active = false;
                 }
             }
-            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline);
+            rearm_timer(pending_sleeps, MAX_PENDING_SLEEPS, heartbeat_enabled, next_heartbeat_deadline, root_watchdog_tick_ntfn != 0, next_wd_tick_deadline);
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
         } else if (sys == 10) { // SYS_CPUFREQ_GET (Фаза 7): заявленная/измеренная/мин/макс частота ARM

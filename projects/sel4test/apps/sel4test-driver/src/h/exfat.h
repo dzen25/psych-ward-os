@@ -16,6 +16,12 @@ typedef bool (*block_write_fn)(uint32_t sector, uint32_t count, const void* buff
 
 // Состояние смонтированного exFAT-тома (аналог FAT32_Instance).
 struct EXFAT_Instance {
+    // Сколько секторов драйвер готов перенести за ОДИН вызов read/write_blocks.
+    // Зашитая восьмёрка (4 КБ) жила в пяти местах exfat.cpp и оставалась
+    // единственным потолком даже после расширения bounce-буфера USB до 64 КБ:
+    // запись 64 КБ распадалась на 16 SCSI-команд вместо одной. Значение
+    // выставляет сам драйвер после exfat_init() — у каждого свой буфер.
+    uint32_t max_sectors_per_io = 8;
     block_read_fn read_blocks;
     block_write_fn write_blocks;
 
@@ -66,7 +72,10 @@ bool exfat_free_space(EXFAT_Instance* fs, uint64_t* out_total_bytes, uint64_t* o
 
 bool exfat_format_dir_listing(EXFAT_Instance* fs, uint32_t dir_cluster, char* out_buffer, uint32_t max_len);
 
-bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read);
+// max_chunk — сколько байт максимум вернуть за один вызов. Раньше было
+// зашито 4096 (размер страницы SHM); с расширением области полезной
+// нагрузки (см. VFS_PAYLOAD_MAX в platform.h) вызывающий задаёт сам.
+bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read, uint32_t max_chunk = 4096);
 // out_copied (может быть nullptr) — issuse.txt №56: сколько байт реально
 // скопировано (до nul-терминатора в out_buffer это не учитывает — сам
 // out_buffer '\0'-терминирован ВСЕГДА, даже если в файле встретился
@@ -79,6 +88,98 @@ bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer
 // создавалось (в отличие от возврата false = реальная ошибка).
 bool exfat_create_file(EXFAT_Instance* fs, const char* path, bool* out_existed = nullptr);
 bool exfat_write_file(EXFAT_Instance* fs, const char* path, const char* text, uint32_t len);
+// Дописывание в конец (issuse: до 2026-09-06 append в системе не было вовсе).
+bool exfat_append_file(EXFAT_Instance* fs, const char* path, const char* text, uint32_t len);
+
+// Тег текущей операции exFAT. Драйвер считает блочные операции по тегам —
+// без этого из общих цифр не видно, КТО именно генерирует трафик, и разбор
+// вырождается в перебор версий.
+enum ExfatIoTag {
+    EXFAT_IO_OTHER = 0,
+    EXFAT_IO_STREAM_WRITE,
+    EXFAT_IO_BITMAP_SCAN,
+    EXFAT_IO_BITMAP_SET,
+    EXFAT_IO_DIR_CURSOR,
+    EXFAT_IO_ENTRY_WRITE,
+    EXFAT_IO_COUNT_FREE,
+    EXFAT_IO_READ_EXTENT,
+    EXFAT_IO_FAT,
+    EXFAT_IO_TAG_MAX
+};
+extern uint32_t g_exfat_io_tag;
+extern uint32_t g_exfat_copy_extent_calls;
+extern uint32_t g_exfat_append_slow_calls;
+extern uint32_t g_exfat_append_calls;
+extern uint32_t g_exfat_stream_write_calls;
+
+// Позиция в каталоге. Жила в exfat.cpp, но ExfatStream ниже держит её
+// полем — потоку нужно помнить, КУДА писать длину при сбросе, не
+// пересканируя каталог.
+struct DirCursor {
+    EXFAT_Instance* fs;
+    uint32_t first_cluster;
+    bool no_fat_chain;
+    uint32_t max_clusters;      // значимо только для no_fat_chain (из DataLength)
+    uint32_t cur_cluster;
+    uint32_t clusters_visited;
+    uint32_t sector_in_cluster;
+    int slot_in_sector;         // 0..15
+    char sector_buf[512];
+    bool sector_loaded;
+    // issuse.txt №38: счётчик шагов по FAT-цепочке (только для
+    // no_fat_chain=false — root/чужеродные фрагментированные каталоги) —
+    // см. dir_cursor_advance() ниже.
+    uint32_t fat_chain_steps;
+};
+
+// --- ПОТОКОВАЯ ЗАПИСЬ (журнал/бортовой самописец) ---
+//
+// Зачем отдельно от exfat_append_file(): та на КАЖДЫЙ вызов заново
+// проверяет размер экстента и ПЕРЕЗАПИСЫВАЕТ запись каталога, чтобы длина
+// файла всегда была актуальной. Для журнала это чистая потеря — запись
+// каталога лежит по далёкому адресу, и такая мелкая разбросанная запись
+// для флеш-памяти самая дорогая из возможных.
+//
+// Здесь наоборот: всё, что можно, делается ОДИН раз при открытии —
+// разбор пути, поиск записи, резервирование непрерывного места под весь
+// объём. Дальше exfat_stream_write() только кладёт данные по текущему
+// смещению, не трогая ни битмап, ни каталог.
+//
+// ЦЕНА, которую надо понимать: пока поток не закрыт, в каталоге стоит
+// длина на момент последнего сброса. При внезапном пропадании питания
+// данные на диске есть, но файл будет числиться короче. Для самописца это
+// обычный компромисс, но он именно компромисс, а не бесплатный выигрыш —
+// поэтому сброс вынесен отдельной операцией (exfat_stream_flush), чтобы
+// вызывающий сам решал, как часто платить за него.
+struct ExfatStream {
+    bool     active;
+    char     basename[256];
+    // Позиция записи каталога НЕ кэшируется намеренно. Хранили здесь копию
+    // DirCursor — вместе с ней хранился и СНИМОК сектора каталога, снятый
+    // при открытии. Запись длины при закрытии шла через этот устаревший
+    // снимок, и на железе 2026-09-06 файл после закрытия читался как пустой
+    // (длина в каталог фактически не долетала). Вместо кэша храним данные
+    // родительского каталога и находим запись заново — это один скан на
+    // закрытие, то есть цена, которой не жалко.
+    uint32_t parent_cluster;
+    bool     parent_no_chain;
+    uint64_t parent_len;
+    uint32_t first_cluster;     // начало зарезервированного непрерывного экстента
+    uint32_t reserved_clusters; // сколько кластеров зарезервировано
+    uint64_t length;            // сколько реально записано
+    uint64_t flushed_length;    // что сейчас стоит в каталоге
+};
+
+// Открыть поток. reserve_bytes — под сколько сразу зарезервировать место;
+// превысить его записями нельзя (честный отказ вместо тихого расширения).
+// Существующее содержимое файла отбрасывается.
+bool exfat_stream_open(EXFAT_Instance* fs, const char* path, uint64_t reserve_bytes, ExfatStream* out);
+// Записать по текущему смещению и сдвинуть его. Каталог не трогается.
+bool exfat_stream_write(EXFAT_Instance* fs, ExfatStream* st, const char* data, uint32_t len);
+// Записать актуальную длину в каталог (можно звать сколько угодно раз).
+bool exfat_stream_flush(EXFAT_Instance* fs, ExfatStream* st);
+// Сброс + закрытие.
+bool exfat_stream_close(EXFAT_Instance* fs, ExfatStream* st);
 bool exfat_mkdir(EXFAT_Instance* fs, const char* path, bool* out_existed = nullptr);
 bool exfat_cd(EXFAT_Instance* fs, const char* path);
 bool exfat_delete_file(EXFAT_Instance* fs, const char* path);

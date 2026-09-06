@@ -690,7 +690,9 @@ static void sys_recover(const char* driver_name) {
 // План "Сигналы драйверам" — лёгкая альтернатива sys_recover() (kill+
 // full-respawn) для случая "драйвер жив, просто переинициализировать
 // железо". 1:1 упаковка с sys_recover(), плюс MR5=тип сигнала. Возврат
-// MR0: 0=ok, -1=не найден, -2=admin-check не прошёл, -3=не поддержано.
+// MR0: 0=ok, -1=не найден, -2=admin-check не прошёл, -3=не поддержано,
+// -4=драйвер на не-нулевом ядре не отвечает (issuse.txt №74/б — форвард не
+// сделан намеренно, иначе блокирующий seL4_Call повесил бы root).
 static int sys_driver_signal(seL4_CPtr root_ep, const char* driver_name, int sig) {
     char safe_name[32] = {0};
     my_strncpy(safe_name, driver_name, 31);
@@ -1013,7 +1015,7 @@ static bool wifi_pqw_ensure_file(seL4_CPtr console_ep, seL4_CPtr blk_ep, bool ve
 static bool wifi_pqw_read_all(seL4_CPtr blk_ep, char* out_buf, int out_cap) {
     build_absolute_path(shm_base, PATH_WIFI_PQW, SHM_TOTAL_SIZE);
     if (vfs_syscall(114, blk_ep) != 0) { out_buf[0] = '\0'; return false; }
-    my_strlcpy(out_buf, shm_base, out_cap);
+    my_strlcpy(out_buf, shm_base + VFS_PAYLOAD_OFFSET, out_cap);
     return true;
 }
 
@@ -1087,7 +1089,7 @@ static bool wifi_pqw_rewrite(seL4_CPtr console_ep, seL4_CPtr blk_ep, const char*
     g_pqw_new[out_len] = '\0';
 
     build_absolute_path(shm_base, PATH_WIFI_PQW, 128);
-    my_strlcpy(shm_base + 128, g_pqw_new, SHM_TOTAL_SIZE - 128);
+    my_strlcpy(shm_base + VFS_PAYLOAD_OFFSET, g_pqw_new, SHM_TOTAL_SIZE - VFS_PAYLOAD_OFFSET);
 
     vfs_lock();
     seL4_SetMR(0, 113); // SYS_WRITE_FILE
@@ -1227,10 +1229,13 @@ static void run_cat(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
         file_found = true;
         if (bytes_read == 0) break; // EOF
 
+        // Содержимое лежит в области полезной нагрузки — начало SHM занято
+        // путём, который мы восстанавливаем перед каждым запросом.
+        const char *content = shm + VFS_PAYLOAD_OFFSET;
         int safe_len = 0;
-        while (safe_len < bytes_read && is_safe_terminal_byte((unsigned char)shm[safe_len])) safe_len++;
+        while (safe_len < bytes_read && is_safe_terminal_byte((unsigned char)content[safe_len])) safe_len++;
 
-        if (safe_len > 0) sys_write_n(1, shm, safe_len);
+        if (safe_len > 0) sys_write_n(1, content, safe_len);
 
         if (safe_len < bytes_read) {
             stopped_unsafe = true;
@@ -1464,6 +1469,33 @@ static void run_reboot(seL4_CPtr root_ep) {
     }
 }
 
+// issuse.txt №74/в (см. situation.txt) — точечный, локальный сброс
+// ТОЛЬКО PCIe/VL805-шины (в отличие от `reboot` выше — вся плата).
+// Переэнумерация устройств входит в команду: root форвардит
+// DRIVER_SIGNAL_RESTART на usb_driver сам, ручной `driver usb_driver
+// restart` больше не нужен. Тот же путь (root_usb_full_reset() в main.cpp)
+// запускает и heartbeat-watchdog, когда usb_driver перестаёт отвечать.
+static void run_pcie_reset(seL4_CPtr root_ep) {
+    seL4_SetMR(0, SYS_PCIE_RESET);
+    seL4_Call(root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word status = seL4_GetMR(0);
+    if (status == 0) {
+        sys_puts(0, "usbreset: PCIe-линк поднят, прошивка VL805 перезалита, устройства перечислены заново.\n");
+    } else if (status == (seL4_Word)-1) {
+        sys_puts(0, "usbreset: доступ запрещён (нужны права администратора).\n");
+    } else if (status == (seL4_Word)-2) {
+        sys_puts(0, "usbreset: USB выключен в этой сборке.\n");
+    } else if (status == (seL4_Word)-3) {
+        sys_puts(0, "usbreset: линк НЕ поднялся после сброса — см. лог root'а.\n");
+    } else if (status == (seL4_Word)-4) {
+        sys_puts(0, "usbreset: линк поднялся, но VideoCore не подтвердил перезаливку прошивки VL805.\n");
+    } else if (status == (seL4_Word)-5) {
+        sys_puts(0, "usbreset: шина поднята, но usb_driver не отвечал (завис) — root пересоздал его целиком; проверьте 'ps' и 'usb'.\n");
+    } else {
+        sys_puts(0, "usbreset: неизвестная ошибка.\n");
+    }
+}
+
 static void run_taskset(char *arg, seL4_CPtr root_ep) {
     char *cursor = arg;
     char *pid_str = arg ? next_token(&cursor) : nullptr;
@@ -1486,9 +1518,11 @@ static void run_taskset(char *arg, seL4_CPtr root_ep) {
         case 0: sys_puts(0, "OK.\n"); break;
         case 1: sys_puts(0, "Процесс не найден.\n"); break;
         case 2: sys_puts(0, "root зафиксирован на ядре 0, перенос невозможен.\n"); break;
-        case 3: sys_puts(0, "timer_driver нельзя переносить: держит физический таймер (PPI) через капу, привязанную к ядру 0 — перенос вызовет тихое зависание при следующем перевзведении.\n"); break;
+        case 3: sys_puts(0, "timer_driver нельзя переносить: держит физический таймер (PPI, per-core), кормит аппаратный watchdog и обслуживает SYS_SLEEP_MS всей системы — включая сам механизм безопасного переноса. Остальные драйверы переносить можно.\n"); break;
         case 4: sys_puts(0, "Некорректный номер ядра (0-3).\n"); break;
         case 5: sys_puts(0, "Доступ запрещён: taskset может выполнять только shell/доверенные /sbin-сервисы.\n"); break;
+        case 6: sys_puts(0, "Драйверам ядро 0 запрещено: это ядро rootserver'а. Драйвер, зависший на аппаратной транзакции, уносит своё ядро целиком — на ядре 0 это утащило бы и rootserver, и всю систему.\n"); break;
+        case 7: sys_puts(0, "Драйвер занят работой с железом и не встал в безопасную точку — перенос не выполнен. Повторите, когда он освободится.\n"); break;
         default: sys_puts(0, "Неизвестная ошибка.\n"); break;
     }
 }
@@ -1570,7 +1604,7 @@ int main(int argc, char *argv[]) {
         volatile int* boom = (volatile int*)0x0; *boom = 0; 
     }
 
-    my_strlcpy(arg_buffer, (char*)&ipc->msg[0], (int)sizeof(arg_buffer));
+    my_strlcpy(arg_buffer, (char*)&ipc->msg[EXEC_ARGS_MSG_SLOT], (int)sizeof(arg_buffer));
 
     int cmd_argc = 1;
     char *cmd_argv[16];
@@ -2693,6 +2727,7 @@ int main(int argc, char *argv[]) {
                 else if (status == -1) sys_puts(console_ep, "driver: process not found.\n");
                 else if (status == -2) sys_puts(console_ep, "driver: permission denied.\n");
                 else if (status == -3) sys_puts(console_ep, "driver: signal not supported for this driver yet.\n");
+                else if (status == -4) sys_puts(console_ep, "driver: драйвер работает не на ядре 0 и не отвечает (не встал в PARKED) — сигнал не отправлен, чтобы не повесить rootserver. Если это долгая операция (wifi scan, чтение большого файла с флешки) — дождитесь её конца и повторите; если завис — 'usbreset' для USB, иначе 'recover <name>'.\n");
                 else { sys_puts(console_ep, "driver: unexpected status\n"); }
             }
 
@@ -2757,7 +2792,7 @@ int main(int argc, char *argv[]) {
 
                     char *shm = shm_base;
                     char *path_ptr = shm;
-                    char *text_ptr = shm + 128; // Текст кладем со смещением!
+                    char *text_ptr = shm + VFS_PAYLOAD_OFFSET; // содержимое — в области полезной нагрузки (см. platform.h)
 
                     build_absolute_path(path_ptr, redir, 128);
                     my_strlcpy(text_ptr, arg, SHM_TOTAL_SIZE - 128);
@@ -2786,7 +2821,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, recover, driver (stop/start/restart), exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, recover, driver (stop/start/restart), exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv, balance, reboot, usbreset\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);
@@ -2832,6 +2867,7 @@ int main(int argc, char *argv[]) {
             else if (my_strcmp(cmd_ptr, "free") == 0) { run_free(root_ep); }
             else if (my_strcmp(cmd_ptr, "balance") == 0) { run_balance(root_ep); }
             else if (my_strcmp(cmd_ptr, "reboot") == 0) { run_reboot(root_ep); }
+            else if (my_strcmp(cmd_ptr, "usbreset") == 0) { run_pcie_reset(root_ep); }
             else if (my_strcmp(cmd_ptr, "taskset") == 0) { run_taskset(arg, root_ep); }
             else if (my_strcmp(cmd_ptr, "usb") == 0) { run_usb(root_ep); }
 

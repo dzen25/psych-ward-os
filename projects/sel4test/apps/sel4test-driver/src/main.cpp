@@ -139,7 +139,7 @@ static char* rootserver_shm_base = (char*)0x200A00000ULL;
 // usb_driver'а (USB_SHM_STAGING_OFFSET, platform.h), тот же приём, что и
 // BLK_SHM_STAGING_OFFSET у blk_driver — отдельная страница вместо шаринга
 // с чужим staging, чтобы не повторить класс бага с GENET/BLK-пересечением.
-static seL4_CPtr shm_frames[9]; // Массив Capability для 9 страниц SHM
+static seL4_CPtr shm_frames[SHM_TOTAL_PAGES]; // Капы всех страниц SHM (размер — из platform.h, см. раскладку там)
 
 // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (Фаза 9.B): каждый из четырёх мест, где root
 // читает .elf/текстовый файл целиком в память (SYS_EXEC, SYS_START_WIFI,
@@ -166,7 +166,7 @@ static char g_elf_load_buffer[1024 * 1024];
 // Вызывать после записи (перед тем, как другой процесс должен её увидеть)
 // и/или перед чтением (после того, как другой процесс мог что-то записать).
 static void flush_rootserver_shm() {
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
         seL4_ARM_Page_CleanInvalidate_Data(shm_frames[i], 0, 4096);
     }
 }
@@ -502,29 +502,57 @@ constexpr int SHM_PAGE_USB_STAGING    = 8; // приватный staging-буф�
 // канала (см. план в situation.txt/ROADMAP.md Фаза 5). Права внутри
 // разрешённых страниц — см. shm_page_readonly_for_role() ниже (Фаза 5.3):
 // по умолчанию RW, кроме перечисленных там комбинаций.
-static uint32_t shm_pages_mask_for_role(int is_driver) {
+// Права на ФИКСИРОВАННЫЕ страницы 0..6 (см. раскладку в platform.h). Только
+// они и остались битовой маской: растущие области с масками несовместимы —
+// в uint32_t помещается 32 страницы, а их теперь сотня.
+static uint32_t shm_fixed_mask_for_role(int is_driver) {
     switch (is_driver) {
-        case 0: return 0b00110011; // shell: VFS(0) + net-мейлбоксы(1) + Wi-Fi control(4, пишет SSID/пароль) + link-state(5, читает для "wifi status")
-        case 1: return 0b00000001; // uart_driver: только VFS(0) — легаси fallback для SYS_PUTS
-        case 2: return 0b00000000; // timer_driver: SHM вообще не использует
-        case 3: return 0b10000001; // blk_driver: VFS(0) + свой staging(7)
-        case 4: return 0b01101111; // net_driver: VFS/lock(0,1) + GENET(2,3) + Wi-Fi link-state(5) + TX/RX-мейлбокс(6) — control-plane(4) ему не нужен вообще, там только пароль
-        case 5: return 0b01110011; // wifi_driver: VFS(0, файлы прошивки/NVRAM/CLM) + net_vfs_lock(1) + Wi-Fi control(4) + link-state(5) + TX/RX-мейлбокс(6)
-        // Фаза A (см. ROADMAP.md): доверенные системные утилиты из /sbin
-        // (ps/kill/taskset/top/balance/ls/cat/touch/rm/mv/mkdir, см.
-        // src/sbin/) — ТОЛЬКО VFS(0), этого достаточно и для чтения ответа
-        // root'а (ps/top/balance), и для записи пути-аргумента (ls/cat/...).
-        // Обычный пользовательский exec (254) остаётся fail-closed ниже —
-        // Фаза 5 не ослабляется.
-        case 253: return 0b00000001;
-        // Фаза 14 (Milestone 8): usb_driver получает СВОЙ VFS-диспетчер,
-        // зеркалящий blk_driver — нужна страница VFS(0, путь/данные, тот же
-        // протокол команд 110/112/.../120) + собственный staging(8, echo>
-        // и mv, зеркалит BLK_SHM_STAGING_OFFSET у blk_driver).
-        case 6: return 0b100000001;
-        default: return 0;       // exec-процессы (254) и всё прочее — ни одной страницы по умолчанию (fail closed)
+        case 0: return 0b0110011; // shell: VFS-путь(0) + net-мейлбоксы(1) + Wi-Fi control(4, пишет SSID/пароль) + link-state(5, читает для "wifi status")
+        case 1: return 0b0000001; // uart_driver: только страница пути(0) — легаси fallback для SYS_PUTS
+        case 2: return 0b0000000; // timer_driver: SHM вообще не использует
+        case 3: return 0b0000001; // blk_driver: путь(0); свой staging — отдельной областью ниже
+        case 4: return 0b1101111; // net_driver: VFS/lock(0,1) + GENET(2,3) + Wi-Fi link-state(5) + TX/RX-мейлбокс(6) — control-plane(4) ему не нужен, там только пароль
+        case 5: return 0b1110011; // wifi_driver: путь(0) + net_vfs_lock(1) + Wi-Fi control(4) + link-state(5) + TX/RX-мейлбокс(6)
+        case 6: return 0b0000001; // usb_driver: путь(0); свой staging — отдельной областью ниже
+        case 253: return 0b0000001; // доверенные /sbin-утилиты: путь(0)
+        default: return 0;        // exec-процессы (254) и всё прочее — fail closed, как и было
     }
 }
+
+// Нужна ли роли ОБЛАСТЬ ПОЛЕЗНОЙ НАГРУЗКИ VFS. Отдельно от маски выше:
+// это уже не одна страница, а прогон из SHM_VFS_PAYLOAD_PAGES.
+// Выдаётся только тем, кто реально передаёт содержимое файлов:
+// шелл, оба файловых драйвера, wifi_driver (читает прошивку/NVRAM/CLM),
+// net_driver (VFS-путь) и доверенные /sbin-утилиты. Недоверенному
+// exec'у (254) — по-прежнему ничего.
+static bool shm_role_needs_vfs_payload(int is_driver) {
+    return is_driver == 0 || is_driver == 3 || is_driver == 4 ||
+           is_driver == 5 || is_driver == 6 || is_driver == 253;
+}
+
+// Единая точка ответа "положена ли роли эта страница". Заменила битовую
+// маску: страниц теперь больше, чем битов в маске, и растущие области
+// описываются диапазоном, а не перечислением.
+static bool shm_page_allowed_for_role(int is_driver, int page) {
+    if (page < 0 || page >= SHM_TOTAL_PAGES) return false;
+    if (page < SHM_FIXED_PAGES) return (shm_fixed_mask_for_role(is_driver) >> page) & 1u;
+    // Страницы запаса (SHM_FIXED_RESERVE_PAGES) пока не выдаются никому —
+    // они существуют только чтобы будущая фиксированная страница не
+    // сдвигала адреса растущих областей.
+    if (page < SHM_DYNAMIC_FIRST_PAGE) return false;
+    if (page < SHM_PAGE_BLK_STAGING_FIRST) return shm_role_needs_vfs_payload(is_driver);
+    if (page < SHM_PAGE_USB_STAGING_FIRST) return is_driver == 3; // staging blk_driver — только ему
+    return is_driver == 6;                                        // staging usb_driver — только ему
+}
+
+// Есть ли у роли хоть одна страница — для fail-closed проверки в SYS_SHM_GET.
+static bool shm_role_has_any_pages(int is_driver) {
+    for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
+        if (shm_page_allowed_for_role(is_driver, i)) return true;
+    }
+    return false;
+}
+
 
 // Фаза 5.3: на ARM НЕТ write-only страниц (seL4_CapRights_new с read=0,write=1
 // даёт VMKernelOnly — вообще никакого доступа, проверено по
@@ -769,7 +797,7 @@ struct ProcessControlBlock {
 
     // --- НОВОЕ: Трекинг копий SHM для защиты от утечек ---
     bool has_shm;
-    seL4_CPtr shm_copies[9];
+    seL4_CPtr shm_copies[SHM_TOTAL_PAGES];
 
     // Фаза 6.1 (SMP, см. ROADMAP.md): на каком ядре сейчас реально исполняется
     // этот процесс — проставляется при спавне (0 по умолчанию, 1 для
@@ -921,6 +949,80 @@ static seL4_Word g_driver_last_seen_ms[7] = {0, 0, 0, 0, 0, 0, 0};
 static bool g_auto_restart_enabled[7] = {false, false, false, false, false, false, false};
 static constexpr seL4_Word WATCHDOG_TIMEOUT_MS[7] = {0, 0, 0, 3000, 5000, 45000, 5000};
 
+// issuse.txt №74, часть "б" (адаптивный перенос драйверов между ядрами) —
+// общая страница состояния драйверов. Фрейм создаётся один раз в main(),
+// мапится НЕКЭШИРУЕМО и в root_vspace (PLAT_DRIVER_STATE_ROOT_VADDR), и —
+// копией капы — в каждый драйвер (PLAT_DRIVER_STATE_VADDR /
+// PLAT_DRIVER_STATE_USB_VADDR, см. spawn_process()). Глобал, а не параметр
+// spawn_process(), сознательно: у той уже ~54 позиционных параметра, и
+// добавление ещё одного — известная ловушка этого проекта (см.
+// project_psych_ward_os_gpio_driver в памяти: молча сдвигает чужие
+// аргументы). Читает root ОБЫЧНОЙ инструкцией загрузки — ни syscall'а, ни
+// шанса заблокироваться, что и есть весь смысл механизма.
+static seL4_CPtr g_driver_state_frame = 0;
+static volatile seL4_Word *g_driver_state_page = nullptr;
+
+// Badged-копия mmc_shared_irq_ntfn с ROOT_WATCHDOG_TICK_BADGE — её
+// spawn_process() выдаёт timer_driver'у (is_driver==2), и тот сигналит ею
+// root'у на каждом своём тике. Глобал по той же причине, что и
+// g_driver_state_frame выше: ещё один позиционный параметр у функции с
+// полусотней аргументов — известная ловушка этого проекта.
+static seL4_CPtr g_root_watchdog_tick_badged = 0;
+
+// Копия usb_cmd_ep для generic_recover_process(): та обязана уметь сбросить
+// PCIe-шину ДО того, как начнёт разрушать чей-либо VSpace (см. развёрнутое
+// объяснение у usb_bus_stalled_suspect() ниже). Параметром не тащим — у
+// функции их и так избыток.
+static seL4_CPtr g_usb_cmd_ep = 0;
+
+// Пошаговый watchdog (см. common.h/UsbStep, h/driver_state.h). Индекс =
+// is_driver. last_progress — последнее увиденное значение счётчика
+// прогресса драйвера; progress_seen_ms — когда оно в последний раз
+// менялось. Растущий счётчик означает "занят, но жив и дойдёт до своего
+// таймаута"; замерший при непарковке — "ядро физически не исполняет код
+// драйвера", то есть настоящий аппаратный стопор.
+static seL4_Word g_driver_last_progress[7] = {0, 0, 0, 0, 0, 0, 0};
+static seL4_Word g_driver_progress_seen_ms[7] = {0, 0, 0, 0, 0, 0, 0};
+
+static const char *usb_step_name(seL4_Word step) {
+    switch (step) {
+        case USB_STEP_IDLE:            return "простой (ничего не делает)";
+        case USB_STEP_CONTROLLER_INIT: return "инициализация контроллера xHCI";
+        case USB_STEP_PORT_POLL:       return "опрос корневых портов";
+        case USB_STEP_PORT_RESET:      return "сброс корневого порта";
+        case USB_STEP_ENUMERATE:       return "перечисление устройства";
+        case USB_STEP_ADDRESS_DEVICE:  return "Address Device";
+        case USB_STEP_GET_DESCRIPTOR:  return "чтение дескрипторов";
+        case USB_STEP_SET_CONFIG:      return "SET_CONFIGURATION";
+        case USB_STEP_HUB_POLL:        return "опрос interrupt-эндпоинта хаба";
+        case USB_STEP_HUB_PORT_RESET:  return "сброс порта хаба";
+        case USB_STEP_HUB_ENUMERATE:   return "перечисление устройства за хабом";
+        case USB_STEP_SCSI_COMMAND:    return "SCSI-команда";
+        case USB_STEP_READ_SECTORS:    return "чтение секторов";
+        case USB_STEP_PARTITION_SCAN:  return "поиск раздела (MBR/GPT)";
+        case USB_STEP_EXFAT_MOUNT:     return "монтирование exFAT";
+        case USB_STEP_UNMOUNT:         return "размонтирование";
+        case USB_STEP_BUS_RESET:       return "сброс шины";
+        default:                       return "неизвестный шаг";
+    }
+}
+
+// Сколько раз подряд heartbeat-watchdog делал полный сброс USB-шины, не
+// дождавшись между попытками ни одного признака жизни от usb_driver.
+// Обнуляется первым же пришедшим liveness-сигналом. Нужен, чтобы
+// по-настоящему мёртвая шина не превращалась в бесконечный цикл
+// PERST-дёрганья (см. главный цикл).
+static int g_usb_reset_attempts = 0;
+
+// Сброс шины прошёл, а сказать драйверу "перечисляй заново" было некому:
+// он в этот момент не отвечал. Контроллер после PERST+перезаливки
+// прошивки VL805 стоит с нуля, кольца и слоты драйвера недействительны —
+// без переэнумерации USB останется мёртвым, даже когда драйвер очнётся.
+// Поэтому запоминаем долг и отдаём его на первом же тике, когда драйвер
+// снова окажется припаркован.
+static bool g_usb_restart_pending = false;
+constexpr int USB_RESET_MAX_CONSECUTIVE = 3;
+
 // issuse.txt №70 — PID текущего держателя глобального vfs_mutex_ep (0 =
 // никто), обновляется ТОЛЬКО через case SYS_VFS_LOCK_NOTIFY ниже (клиенты
 // сами сообщают о взятии/отдаче, см. vfs_lock()/vfs_unlock() в shell.cpp/
@@ -975,7 +1077,9 @@ static int read_file_raw_from_disk(seL4_CPtr blk_ep, const char* filename, char*
 
         flush_rootserver_shm(); // иначе можем прочитать устаревшую закэшированную копию вместо свежего ответа blk_driver
         // Копируем полученный безопасный кусок в большой буфер Rootserver'а
-        memcpy(load_buffer + total_read, shm, bytes_read);
+        // Содержимое приходит в область полезной нагрузки, а не в начало
+        // SHM (см. VFS_PAYLOAD_OFFSET в platform.h) — начало занято путём.
+        memcpy(load_buffer + total_read, shm + VFS_PAYLOAD_OFFSET, bytes_read);
         total_read += bytes_read;
     }
     return (int)total_read;
@@ -1225,7 +1329,9 @@ struct UsbDmaSetup {
     seL4_CPtr bulkout_trring_frame[USB_MAX_DEVICES] = {0}; seL4_Word bulkout_trring_paddr[USB_MAX_DEVICES] = {0};
     seL4_CPtr bulkin_trring_frame[USB_MAX_DEVICES] = {0};  seL4_Word bulkin_trring_paddr[USB_MAX_DEVICES] = {0};
     seL4_CPtr cbw_csw_frame[USB_MAX_DEVICES] = {0};        seL4_Word cbw_csw_paddr[USB_MAX_DEVICES] = {0};
-    seL4_CPtr bounce_frame[USB_MAX_DEVICES] = {0};         seL4_Word bounce_paddr[USB_MAX_DEVICES] = {0};
+    // Bounce — единственный ресурс из нескольких СМЕЖНЫХ страниц на устройство
+    // (см. USB_BOUNCE_PAGES в platform.h): [устройство][страница].
+    seL4_CPtr bounce_frame[USB_MAX_DEVICES][USB_BOUNCE_PAGES] = {{0}}; seL4_Word bounce_paddr[USB_MAX_DEVICES] = {0};
 };
 
 // issuse.txt (найдено на живом железе 2026-08-10, при hw-проверке фикса
@@ -1253,6 +1359,342 @@ static UsbDmaSetup usb_dma;
 static seL4_CPtr pcie_rc_frame = 0;
 static seL4_CPtr pcie_err_frame = 0;
 static seL4_CPtr usb_cmd_recv_ep = 0;
+
+// issuse.txt №74/в (см. situation.txt) — точечный, локальный сброс
+// именно PCIe Root Complex (не всей платы, см. SYS_REBOOT), выполняется
+// ЦЕЛИКОМ root'ом, через СОБСТВЕННЫЙ прямой маппинг регистров
+// (PLAT_PCIE_RC_MISC_ROOT_VADDR/PLAT_PCIE_RGR1_ROOT_VADDR, см. main()) —
+// НЕ через usb_driver: сама идея в том, что если usb_driver завис
+// (в т.ч. предельно жёстко, на самой шине — issuse.txt, "АППАРАТНОЕ
+// ОГРАНИЧЕНИЕ"), root не должен зависеть от её ответа, чтобы иметь шанс
+// восстановить шину. Регистровая последовательность 1:1 сверена с
+// реальным исходником Linux (drivers/pci/controller/pcie-brcmstb.c,
+// raspberrypi/linux — brcm_pcie_perst_set_generic()/
+// brcm_pcie_bridge_sw_init_set_generic()/brcm_pcie_setup(),
+// поле brcm_pcie_link_up()) — та же последовательность, что Linux
+// выполняет при пробе контроллера.
+static inline uint32_t pcie_rgr1_read() {
+    return *(volatile uint32_t*)(PLAT_PCIE_RGR1_ROOT_VADDR + PCIE_RGR1_SW_INIT_1_OFFSET);
+}
+static inline void pcie_rgr1_write(uint32_t val) {
+    *(volatile uint32_t*)(PLAT_PCIE_RGR1_ROOT_VADDR + PCIE_RGR1_SW_INIT_1_OFFSET) = val;
+}
+static inline uint32_t pcie_hard_debug_read() {
+    return *(volatile uint32_t*)(PLAT_PCIE_RC_MISC_ROOT_VADDR + PCIE_MISC_HARD_PCIE_HARD_DEBUG_OFFSET);
+}
+static inline void pcie_hard_debug_write(uint32_t val) {
+    *(volatile uint32_t*)(PLAT_PCIE_RC_MISC_ROOT_VADDR + PCIE_MISC_HARD_PCIE_HARD_DEBUG_OFFSET) = val;
+}
+static inline uint32_t pcie_status_read() {
+    return *(volatile uint32_t*)(PLAT_PCIE_RC_MISC_ROOT_VADDR + PCIE_MISC_PCIE_STATUS_OFFSET);
+}
+// issuse.txt №74/в — общий доступ к остальным регистрам ТОЙ ЖЕ страницы
+// PLAT_PCIE_RC_MISC_PADDR (RC_BAR2_CONFIG_LO/HI, MISC_CTRL) — см.
+// root_pcie_fundamental_reset().
+static inline void pcie_rc_misc_write(uintptr_t offset, uint32_t val) {
+    *(volatile uint32_t*)(PLAT_PCIE_RC_MISC_ROOT_VADDR + offset) = val;
+}
+static inline uint32_t pcie_rc_misc_read(uintptr_t offset) {
+    return *(volatile uint32_t*)(PLAT_PCIE_RC_MISC_ROOT_VADDR + offset);
+}
+
+// issuse.txt №74/в — 29-я hw-попытка: точечная диагностика Device Status
+// VL805 (см. PCI_EXPRESS_CAP_VL805_DEVICE_STATUS_OFFSET/platform.h) в
+// НЕСКОЛЬКИХ точках root_pcie_fundamental_reset(), чтобы найти, ПОСЛЕ
+// какого именно нашего обращения к VL805 (BAR0? Command? или он уже
+// взведён СРАЗУ после PERST, ещё до наших обращений) появляются биты
+// Correctable Error/Unsupported Request Detected — 28-я попытка нашла
+// их взведёнными ПОСТФАКТУМ (после краха), 29-я — что они взведены УЖЕ
+// сразу после mailbox-тега и НЕ снимаются ожиданием (RW1C). Требует,
+// чтобы PCIE_EXT_CFG_INDEX уже указывал на VL805 (MBOX_XHCI_RESET_DEV_ADDR)
+// — вызывающая сторона отвечает за это (в root_pcie_fundamental_reset()
+// это уже так с момента первой установки индекса).
+static void pcie_debug_vl805_devstatus(const char *label) {
+    if (!LOG_PCIE_DIAG) return; // см. platform.h — обвязка оставлена, но по умолчанию молчит
+    uint32_t raw = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_EXPRESS_CAP_VL805_DEVICE_STATUS_OFFSET);
+    uint32_t dev_status = (raw >> 16) & 0xFFFFu;
+    uart_puts(label); uart_puthex(dev_status);
+    if (dev_status & (PCIE_DEV_STATUS_CORRECTABLE_ERROR_MASK | PCIE_DEV_STATUS_UNSUPPORTED_REQUEST_MASK)) {
+        uart_puts(" (есть ошибки)\n");
+    } else {
+        uart_puts(" (чисто)\n");
+    }
+}
+
+// issuse.txt №74/в — 31-я hw-попытка: чисто диагностическое чтение
+// RBUS-таймаута (см. PCIE_RGR1_RBUS_TIMEOUT_OFFSET/platform.h) — эта
+// страница (PLAT_PCIE_RGR1_PADDR) доступна ВСЕГДА, включая ДО release
+// PERST/подтверждения линка (в отличие от VL805 config-space).
+static void pcie_debug_rbus_timeout(const char *label) {
+    if (!LOG_PCIE_DIAG) return; // см. platform.h — обвязка оставлена, но по умолчанию молчит
+    uint32_t val = *(volatile uint32_t*)(PLAT_PCIE_RGR1_ROOT_VADDR + PCIE_RGR1_RBUS_TIMEOUT_OFFSET);
+    uart_puts(label); uart_puthex(val); uart_puts("\n");
+}
+
+// Возвращает true, если PHYLINKUP+DL_ACTIVE поднялись до истечения
+// таймаута. НЕ включает сам mailbox-вызов (см. SYS_MBOX_XHCI_RESET/
+// SYS_PCIE_RESET, вызывающая сторона — по предупреждению у
+// MBOX_TAG_NOTIFY_XHCI_RESET/platform.h тег нельзя звать, если линк не
+// поднялся) и НЕ включает повторное перечисление устройств
+// (`driver usb_driver restart`, уже существует — намеренно отдельный
+// шаг, см. situation.txt: сначала проверить на живом железе, что сам
+// сброс шины вообще работает, прежде чем что-либо сцеплять/
+// автоматизировать).
+static bool root_pcie_fundamental_reset(seL4_CPtr timer_ep) {
+    uint32_t tmp;
+
+    // контрольная точка G — RBUS-таймаут ДО чего-либо вообще (истинный
+    // baseline).
+    pcie_debug_rbus_timeout("[ROOT]   DIAG RBUS timeout (G: начало функции) = ");
+
+    // 1. Assert bridge software init.
+    tmp = pcie_rgr1_read();
+    pcie_rgr1_write(tmp | PCIE_RGR1_SW_INIT_1_INIT_GENERIC_MASK);
+
+    // 2. Assert PERST.
+    tmp = pcie_rgr1_read();
+    pcie_rgr1_write(tmp | PCIE_RGR1_SW_INIT_1_PERST_MASK);
+
+    // 3. usleep_range(100, 200) в Linux — root не может звать
+    // SYS_SLEEP_MS с суб-миллисекундной точностью, а держать PERST
+    // ДОЛЬШЕ минимума безопасно (это просто assert-импульс) — 1мс с
+    // честным запросом к timer_ep (root как обычный клиент, тот же
+    // приём, что уже есть в этом файле для SYS_BENCHMARK), а не
+    // некалиброванный busy-spin по счётчику итераций.
+    seL4_SetMR(0, 8); // SYS_SLEEP_MS
+    seL4_SetMR(1, 1);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
+    // 4. Release bridge software init.
+    tmp = pcie_rgr1_read();
+    pcie_rgr1_write(tmp & ~PCIE_RGR1_SW_INIT_1_INIT_GENERIC_MASK);
+
+    // ШЕСТАЯ hw-попытка (issuse.txt №74/в) — эти самые записи, вставленные
+    // ПОКА bridge init был ещё удержан (между assert и release), повесили
+    // систему ЕЩЁ РАНЬШЕ, чем в пятой попытке (до печати ЛЮБОГО следующего
+    // сообщения) — весь PCIE_MISC-блок, судя по всему, физически
+    // недоступен, пока bridge software init удержан, ВКЛЮЧАЯ регистры
+    // (PCIE_MISC_PCIE_STATUS/HARD_PCIE_HARD_DEBUG), которые в ЭТОЙ ЖЕ
+    // функции уже безопасно читаются/пишутся, но ТОЛЬКО ПОСЛЕ release
+    // (см. ниже) — перенесено сюда, ТУДА ЖЕ, где уже проверенно
+    // безопасно (тот же принцип, что SERDES_IDDQ чуть ниже).
+    pcie_rc_misc_write(PCIE_MISC_RC_BAR2_CONFIG_LO_OFFSET, PCIE_MISC_RC_BAR2_CONFIG_LO_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_RC_BAR2_CONFIG_HI_OFFSET, PCIE_MISC_RC_BAR2_CONFIG_HI_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_MISC_CTRL_OFFSET, PCIE_MISC_MISC_CTRL_KNOWN_GOOD);
+
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (диагностика step0_check_link(), сравнение
+    // readback'а на штатной загрузке и после usbreset): bridge software
+    // init стирает и outbound-окно (CPU 0x600000000 -> шина 0xC0000000)
+    // тоже — WIN0_LO 0xc0000000->0, WIN0_BASE_LIMIT 0x3ff00000->0x10,
+    // WIN0_BASE_HI/LIMIT_HI 0x6->0. Без него первое же MMIO-чтение xHCI
+    // ловит асинхронный SError (ESR=0xbf000002) — восстанавливаем той же
+    // техникой и в том же безопасном месте, что и RC_BAR2/MISC_CTRL выше.
+    pcie_rc_misc_write(PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO_OFFSET, PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI_OFFSET, PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_OFFSET, PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI_OFFSET, PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI_KNOWN_GOOD);
+    pcie_rc_misc_write(PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI_OFFSET, PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI_KNOWN_GOOD);
+
+    // НАЙДЕНО НЕЗАВИСИМЫМ РАЗБОРОМ КОДА (issuse.txt №74/в, после 10-й
+    // hw-попытки) — профилактическое восстановление ещё 2 вещей, которые
+    // U-Boot делает БЕЗУСЛОВНО при штатном bring-up (platform.h содержит
+    // разбор смещений/источника). Не hw-подтверждено как ПРИЧИНА SError,
+    // но та же страница уже 3 раза подтверждённо стиралась целиком —
+    // безопасно восстановить заодно, той же техникой.
+    pcie_rc_misc_write(PCIE_MSI_INTR2_MASK_SET_OFFSET, 0xffffffffu); // маскируем все MSI — мы их не обрабатываем
+    pcie_rc_misc_write(PCIE_MSI_INTR2_CLR_OFFSET, 0xffffffffu);      // и чистим всё, что успело накопиться
+    pcie_rc_misc_write(PCIE_MISC_RC_BAR1_CONFIG_LO_OFFSET,
+        pcie_rc_misc_read(PCIE_MISC_RC_BAR1_CONFIG_LO_OFFSET) & ~PCIE_MISC_RC_BAR_CONFIG_LO_SIZE_MASK);
+    pcie_rc_misc_write(PCIE_MISC_RC_BAR3_CONFIG_LO_OFFSET,
+        pcie_rc_misc_read(PCIE_MISC_RC_BAR3_CONFIG_LO_OFFSET) & ~PCIE_MISC_RC_BAR_CONFIG_LO_SIZE_MASK);
+
+    // НАЙДЕНО ЧЕРЕЗ ВНЕШНЕЕ ИССЛЕДОВАНИЕ (issuse.txt №74/в, после 13-й
+    // hw-попытки) — см. подробный разбор в platform.h у самих констант:
+    // если bridge software init стирает эти два таймаута до короткого
+    // POR-дефолта, RC мог молча ретраить/обрывать наши же BAR0/Command
+    // config-чтения на CRS ("устройство ещё не готово"), из-за чего
+    // readback выглядел успешным, хотя реального ответа от VL805 не
+    // было. Восстанавливаем ЗАРАНЕЕ, до BAR0/Command ниже — та же
+    // логика, что и остальной PCIE_MISC-блок выше.
+    pcie_rc_misc_write(PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_OFFSET, PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_GENEROUS);
+    pcie_rc_misc_write(PCIE_MISC_UBUS_TIMEOUT_OFFSET, PCIE_MISC_UBUS_TIMEOUT_GENEROUS);
+
+    // issuse.txt №74/в — Command самого Root Port'а (bus=0) проверялась
+    // отдельно (внешняя консультация + JTAG) как возможная причина
+    // SError — гипотеза НЕ подтвердилась (запись оказалась полным no-op,
+    // бит, вероятно, read-only на этой реализации Broadcom RC). Убрано
+    // (см. память проекта/situation.txt для полного разбора).
+
+    // 5. Снять SERDES_IDDQ.
+    tmp = pcie_hard_debug_read();
+    pcie_hard_debug_write(tmp & ~PCIE_MISC_HARD_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK);
+    seL4_SetMR(0, 8);
+    seL4_SetMR(1, 1);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
+    // 6. Release PERST.
+    tmp = pcie_rgr1_read();
+    pcie_rgr1_write(tmp & ~PCIE_RGR1_SW_INIT_1_PERST_MASK);
+
+    // 7. НАЙДЕНО ЧЕРЕЗ JTAG+код (девятая hw-попытка, issuse.txt №74/в):
+    // этот шаг отсутствовал вообще (нумерация прыгала с 6 на 8). Реальный
+    // U-Boot (drivers/pci/pcie_brcmstb.c/brcm_pcie_probe()) ПОСЛЕ release
+    // PERST делает БЕЗУСЛОВНУЮ mdelay(100) — "Wait for 100ms after PERST#
+    // deassertion; see PCIe CEM specification sections 2.2, PCIe r5.0,
+    // 6.6.1" (комментарий в самом U-Boot) — И ТОЛЬКО ПОТОМ начинает опрос
+    // линка (см. шаг 8 ниже). У нас этой безусловной паузы не было —
+    // опрос линка (и, если он мгновенно вернёт true, вообще всё
+    // дальнейшее) мог начаться сразу после release PERST. Это ДРУГАЯ,
+    // более ранняя точка в последовательности, чем уже проверенная (и не
+    // сработавшая) 500мс-пауза после mailbox-тега (SYS_PCIE_RESET) — та
+    // была про готовность прошивки VL805, эта — про readiness самого
+    // PERST-деассерта по спецификации, до какой-либо проверки линка
+    // вообще. WIN0/RC_BAR2/MISC_CTRL/PCIE_INTR2_CPU_STATUS/ASPM все
+    // подтверждены корректными (readback+JTAG) — SError всё равно
+    // повторялся, что и привело сюда.
+    seL4_SetMR(0, 8); // SYS_SLEEP_MS
+    seL4_SetMR(1, 100);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+
+    // 8. Опрос PHYLINKUP+DL_ACTIVE — та же формула, что проба Linux
+    // (100мс, шаг 5мс: `for (i = 0; i < 100 && !link_up; i += 5)
+    // msleep(5);`).
+    constexpr uint32_t kLinkMask = PCIE_MISC_PCIE_STATUS_PHYLINKUP_MASK | PCIE_MISC_PCIE_STATUS_DL_ACTIVE_MASK;
+    bool link_up = false;
+    for (int waited_ms = 0; waited_ms < 100 && !link_up; waited_ms += 5) {
+        link_up = (pcie_status_read() & kLinkMask) == kLinkMask;
+        if (!link_up) {
+            seL4_SetMR(0, 8);
+            seL4_SetMR(1, 5);
+            seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        }
+    }
+    if (!link_up) link_up = (pcie_status_read() & kLinkMask) == kLinkMask;
+    if (!link_up) return false;
+
+    // ============================================================
+    // issuse.txt №74/в — ПРИЧИНА SError (38-я hw-попытка, доказана живой
+    // JTAG-записью на упавшей плате; полный разбор — platform.h у
+    // PLAT_PCIE_RC_TYPE1_PADDR и situation.txt).
+    //
+    // bridge software init (PCIE_RGR1_SW_INIT_1, шаги 1-4 выше) сбрасывает
+    // Command САМОГО МОСТА (Root Port, шина 0) в 0x0000 — снимая Memory
+    // Space Enable. Без него мост не претендует на адреса собственного
+    // memory-окна, и первое же обращение к PLAT_XHCI_PADDR (0x600000000)
+    // уходит в никуда -> асинхронный SError. Восстанавливаем ЗДЕСЬ —
+    // ПОСЛЕ release bridge sw_init (иначе сброс снял бы биты обратно).
+    //
+    // Доступ ТОЛЬКО напрямую по базе (PLAT_PCIE_RC_TYPE1_ROOT_VADDR), НЕ
+    // через PCIE_EXT_CFG_INDEX/DATA: для шины 0 ECAM-окно не работает
+    // вообще (сверено дословно с U-Boot brcm_pcie_config_address()) —
+    // именно поэтому 16-я hw-попытка сочла эту запись "no-op" и была
+    // ошибочно откачена.
+    //
+    // Запись RW1C-safe: верхние 16 бит (Status) обнуляем, чтобы случайно
+    // не сбросить залипшие статус-биты (тот же приём, что для Command
+    // VL805 ниже).
+    {
+        volatile uint32_t *rc_cmd = (volatile uint32_t*)(PLAT_PCIE_RC_TYPE1_ROOT_VADDR + PCIE_RC_TYPE1_COMMAND_OFFSET);
+        uint32_t rc_cmd_before = *rc_cmd;
+        uart_puts("[ROOT] PCIE RC(мост) Command (до записи) = "); uart_puthex(rc_cmd_before); uart_puts("\n");
+        *rc_cmd = (rc_cmd_before & 0xFFFFu) | PCI_CMD_MEMORY_SPACE_ENABLE | PCI_CMD_BUS_MASTER_ENABLE;
+        uint32_t rc_cmd_after = *rc_cmd;
+        uart_puts("[ROOT] PCIE RC(мост) Command (после записи) = "); uart_puthex(rc_cmd_after); uart_puts("\n");
+        if ((rc_cmd_after & PCI_CMD_MEMORY_SPACE_ENABLE) == 0) {
+            uart_puts("[ROOT] ВНИМАНИЕ: Memory Space Enable у моста НЕ встал — обращение к xHCI MMIO упадёт в SError (см. issuse.txt №74/в).\n");
+        }
+    }
+    // ============================================================
+
+    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (вторая hw-попытка, issuse.txt №74/в) —
+    // PERST сбрасывает конфигурационное пространство САМОГО VL805
+    // (Command register/BAR0) до состояния "только что включили
+    // питание" — без этого шага PHYLINKUP+DL_ACTIVE поднимаются
+    // (физический линк жив), но её BAR0-MMIO (PLAT_XHCI_PADDR, через
+    // УЖЕ настроенное — PERST его не трогает, это регистр RC, не
+    // устройства — outbound-окно) не отвечает вообще: первое же
+    // обращение к нему вешало систему целиком. Сверено с реальным
+    // U-Boot (drivers/pci/pcie_brcmstb.c/brcm_pcie_config_address() +
+    // arch/arm/mach-bcm283x/include/mach/acpi/bcm2711.h) — та же
+    // индиректная ECAM-подобная схема, что и штатная PCI-энумерация:
+    // PCIE_EXT_CFG_INDEX выбирает bus/dev/func VL805 (bus=1,slot=0,
+    // func=0 — MBOX_XHCI_RESET_DEV_ADDR), затем BAR0/Command читаются/
+    // пишутся через PCIE_EXT_CFG_DATA + смещение. BAR0 сначала (пока
+    // Memory Space Enable ещё выключен — safe per PCI spec, не даём
+    // декодировать мусорный адрес во время самой записи), Command —
+    // последним.
+    *(volatile uint32_t*)(PLAT_PCIE_RGR1_ROOT_VADDR + PCIE_EXT_CFG_INDEX_PAGE_OFFSET) = MBOX_XHCI_RESET_DEV_ADDR;
+
+    // 29-я hw-попытка (issuse.txt №74/в) — контрольная точка A: индекс
+    // только что выставлен, к DATA-окну ЕЩЁ НИ РАЗУ не обращались.
+    // Установка индекса — регистр самого RC, TLP на VL805 не уходит,
+    // так что это чистый "до каких-либо обращений к VL805" снимок.
+    pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (A: сразу после установки индекса) = ");
+
+    // ТРЕТЬЯ hw-попытка (issuse.txt №74/в) — BAR0/Command запись САМА
+    // прошла без немедленного краха (usbreset печатает "готово"), но
+    // СЛЕДУЮЩЕЕ реальное обращение к xHCI MMIO из usb_driver'а (в
+    // ДРУГОМ процессе, через её ЕЁ ОДИН собственный vaddr-маппинг —
+    // приход к тем же физическим регистрам, что и всегда) всё равно
+    // виснет — та же самая строка ("Освобождаю Slot ID"), что и до
+    // этого фикса. Гипотеза: BAR0 у VL805 — НИЖНЯЯ половина 64-битного
+    // BAR (тип-биты read-only, наша запись 0xC0000000 их не портит, но
+    // и не задаёт verhний 32-битный BAR1/offset+4 — если он после PERST
+    // остался НЕ нулевым мусором, эффективный 64-битный адрес НЕ равен
+    // RPI4_XHCI_PADDR, устройство просто не декодирует ожидаемый
+    // bus-адрес). НЕ проверено — печатаем ВСЁ (до/после), чтобы
+    // подтвердить или опровергнуть по логу, вместо очередной слепой
+    // догадки (см. память проекта — послойное живое чтение состояния).
+    uint32_t bar0_before = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET);
+    uint32_t bar1_before = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET + 4);
+    uart_puts("[ROOT] PCIE CFG BAR0 (до записи) = "); uart_puthex(bar0_before); uart_puts("\n");
+    uart_puts("[ROOT] PCIE CFG BAR1 (до записи) = "); uart_puthex(bar1_before); uart_puts("\n");
+    // контрольная точка B: после ЧТЕНИЯ BAR0/BAR1 (Configuration Read),
+    // ДО какой-либо ЗАПИСИ в конфиг-пространство VL805.
+    pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (B: после чтения BAR0/BAR1) = ");
+
+    *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET) = (uint32_t)RPI4_XHCI_PADDR;
+    // Явно обнуляем верхнюю половину (на случай 64-битного BAR0/BAR1) —
+    // безопасно и для 32-битного случая (BAR1 тогда просто отдельный,
+    // нами не используемый слот).
+    *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET + 4) = 0;
+
+    uint32_t bar0_after = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET);
+    uint32_t bar1_after = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_BAR0_OFFSET + 4);
+    uart_puts("[ROOT] PCIE CFG BAR0 (после записи) = "); uart_puthex(bar0_after); uart_puts("\n");
+    uart_puts("[ROOT] PCIE CFG BAR1 (после записи) = "); uart_puthex(bar1_after); uart_puts("\n");
+    // контрольная точка C: сразу после ЗАПИСИ BAR0/BAR1 (двух
+    // Configuration Write) — первая наша ЗАПИСЬ в конфиг-пространство
+    // VL805 за весь сброс.
+    pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (C: после записи BAR0/BAR1) = ");
+
+    uint32_t cmd_before = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_COMMAND_OFFSET);
+    uart_puts("[ROOT] PCIE CFG Command (до записи) = "); uart_puthex(cmd_before); uart_puts("\n");
+    // контрольная точка D: после чтения Command (следующая Configuration
+    // Read после точки C).
+    pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (D: после чтения Command) = ");
+    // НАЙДЕНО ПРИ РАЗБОРЕ ЭТОГО ЖЕ КУСКА ЛОГА (issuse.txt №74/в, 12-я
+    // hw-попытка): верхние 16 бит этого же 32-битного слова — Status,
+    // БОЛЬШИНСТВО бит которого RW1C (запись 1 = очистка). Слепой
+    // `cmd_before | ENABLE-биты` переписывал бы Status ТЕМ ЖЕ значением,
+    // что мы только что прочитали — а если бы там оказался реальный бит
+    // ошибки (Received/Signaled Master Abort и т.п.), эта же запись
+    // стёрла бы его до того, как мы успели его увидеть. Обнуляем верхние
+    // 16 бит явно — пишем ТОЛЬКО в Command, Status не трогаем вообще.
+    *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_COMMAND_OFFSET) =
+        (cmd_before & 0x0000ffffu) | PCI_CMD_MEMORY_SPACE_ENABLE | PCI_CMD_BUS_MASTER_ENABLE;
+    uint32_t cmd_after = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_CFG_COMMAND_OFFSET);
+    uart_puts("[ROOT] PCIE CFG Command (после записи) = "); uart_puthex(cmd_after); uart_puts("\n");
+    // контрольная точка E: последнее наше обращение к конфиг-
+    // пространству VL805 в этой функции — сразу после записи Command.
+    pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (E: после записи Command, конец функции) = ");
+    // контрольная точка H — RBUS-таймаут в конце функции: если
+    // отличается от G, bridge software init (или что-то ещё в этой
+    // последовательности) реально его меняет.
+    pcie_debug_rbus_timeout("[ROOT]   DIAG RBUS timeout (H: конец функции) = ");
+
+    return true;
+}
 
 // issuse.txt №9 — базовая раздача ресурсов процесса в spawn_process()
 // (retype CNode/VSpace/PUD/PD/PT, ELF-страницы, стек, IPC-фрейм, TCB) не
@@ -1439,7 +1881,26 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                          // рубеж на случай, если сам CPU застрянет
                          // настолько жёстко (PCIe-транзакция без ответа),
                          // что даже JTAG-halt не проходит.
-                         seL4_CPtr pm_wdog_frame_param = 0) {
+                         seL4_CPtr pm_wdog_frame_param = 0,
+                         // issuse.txt №74/в — 37-я hw-попытка: раньше
+                         // usb_driver просила root прочитать Device Status
+                         // VL805 через IPC (SYS_PCIE_VL805_DEVSTATUS_PROBE) —
+                         // НА ЖИВОМ ЖЕЛЕЗЕ выяснилось, что этот вызов
+                         // выполняется, ПОКА root САМ висит в своём
+                         // seL4_Call на usb_cmd_ep (форвард DRIVER_SIGNAL_
+                         // RESTART) — то есть root не может нормально его
+                         // обслужить, и что-то (не главный switch(syscall_num)
+                         // — тот дал бы -1) эхом отражает MR0 обратно.
+                         // Вместо попытки чинить реентерабельность — тот же
+                         // приём, что pcie_rc_frame_param/pcie_err_frame_param
+                         // выше: даём usb_driver ПРЯМОЙ read-only доступ к
+                         // ОДНОЙ странице PLAT_PCIE_CFG_DATA_PADDR (НЕ ко
+                         // всей PLAT_PCIE_RGR1_PADDR — там PERST/bridge-init
+                         // биты, которые usb_driver трогать не должна;
+                         // PCIE_EXT_CFG_INDEX она НЕ переустанавливает сама,
+                         // полагаясь на то, что root уже выставил его перед
+                         // forward'ом RESTART и больше никто его не меняет).
+                         seL4_CPtr pcie_cfg_data_frame_param = 0) {
 
     char *elf_file = elf_data;
     if (!elf_file) {
@@ -1507,6 +1968,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_Word local_usb_heartbeat_ntfn = 24; // Milestone 11: heartbeat-капа usb_driver'а (только для timer_driver, см. usb_heartbeat_ntfn_param)
     seL4_Word local_liveness_ntfn = 25; // Фаза 3b: капа-"я жив" (только для is_driver 3/4/5/6, см. liveness_ntfn_param)
     seL4_Word local_blk_liveness_tick = 26; // Фаза 3b: тик для blk_driver (только для timer_driver, см. blk_liveness_tick_param)
+    seL4_Word local_root_wd_tick = 27; // тик heartbeat-watchdog'а root'а (только для timer_driver, см. g_root_watchdog_tick_badged)
 
     check_err(seL4_CNode_Copy(child_cnode, local_syscall_ep, 8, root_cnode, badged_ep, seL4_WordBits, seL4_AllRights), "Copy syscall ep");
 
@@ -1553,6 +2015,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     if (usb_cmd_recv_ep_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_recv_ep, 8, root_cnode, usb_cmd_recv_ep_param, seL4_WordBits, seL4_AllRights), "Copy usb recv ep");
     if (liveness_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_liveness_ntfn, 8, root_cnode, liveness_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy liveness ntfn");
     if (blk_liveness_tick_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_blk_liveness_tick, 8, root_cnode, blk_liveness_tick_param, seL4_WordBits, seL4_AllRights), "Copy blk liveness tick ntfn");
+    // Тик heartbeat-watchdog'а root'а — только timer_driver (см.
+    // common.h/ROOT_WATCHDOG_TICK_BADGE). Глобал, а не параметр, — см.
+    // комментарий у самого g_root_watchdog_tick_badged.
+    if (is_driver == 2 && g_root_watchdog_tick_badged != 0) {
+        check_err(seL4_CNode_Copy(child_cnode, local_root_wd_tick, 8, root_cnode, g_root_watchdog_tick_badged, seL4_WordBits, seL4_AllRights), "Copy root watchdog tick ntfn");
+    }
     if (usb_storage_ep_param != 0) check_err(seL4_CNode_Mint(child_cnode, local_usb_storage_ep, 8, root_cnode, usb_storage_ep_param, seL4_WordBits, seL4_AllRights, pid), "Mint usb storage ep");
     if (usb_heartbeat_ntfn_param != 0) check_err(seL4_CNode_Copy(child_cnode, local_usb_heartbeat_ntfn, 8, root_cnode, usb_heartbeat_ntfn_param, seL4_WordBits, seL4_AllRights), "Copy usb heartbeat ntfn");
 
@@ -1683,7 +2151,32 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 if (copy_start < copy_end) {
                     memcpy((void*)(elf_temp_vaddr + (copy_start - page)), elf_file + offset + (copy_start - vaddr), copy_end - copy_start);
                 }
-                seL4_ARM_Page_Clean_Data(frame, 0, 4096);
+                // issuse.txt №3 — ПРИЧИНА ПЛАВАЮЩЕГО ПАДЕНИЯ С PC=0.
+                // Здесь в страницу только что записан КОД, а не данные, и
+                // раньше стоял seL4_ARM_Page_Clean_Data — он сбрасывает
+                // только кэш ДАННЫХ. Кэш ИНСТРУКЦИЙ при этом сохранял
+                // строки предыдущего процесса: все /sbin-бинарники
+                // слинкованы на один и тот же адрес 0x400000, поэтому
+                // свежий процесс исполнял чужой код по своим же адресам.
+                // Unify_Instruction делает то, что нужно для кода: чистит
+                // D-кэш до точки когерентности И инвалидирует I-кэш.
+                //
+                // Почему отказ выглядел плавающим и почему контрольный
+                // опыт его не ловил: если подряд запускать ОДИН И ТОТ ЖЕ
+                // бинарник (100 спавнов /bin/test_app.elf — 100/100 чисто),
+                // устаревшие строки I-кэша совпадают с тем, что там и
+                // должно быть, и вреда нет. Ломается только связка ДВУХ
+                // РАЗНЫХ утилит подряд — ровно та, на которой отказ и
+                // наблюдался.
+                //
+                // Подтверждение из дампа fault'а (2026-09-06, два прогона с
+                // побайтово одинаковыми регистрами): LR=0x403454 — адрес
+                // возврата после `blr x0` в __sel4runtime_run_destructors
+                // ИЗ hotplugtest.elf, хотя падал spawnloop.elf. Код был
+                // чужой (устаревший I-кэш), а данные свои (D-кэш чистился
+                // корректно) — поэтому .fini_array не совпал с кодом и в
+                // x0 пришёл ноль.
+                seL4_ARM_Page_Unify_Instruction(frame, 0, 4096);
                 seL4_ARM_Page_Unmap(frame);
 
                 if (seL4_ARM_Page_Map(frame, child_vspace, page, seL4_AllRights, seL4_ARM_Default_VMAttributes) != seL4_NoError)
@@ -1743,17 +2236,21 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     // 63 символа — `touch /root/<51 символ>` создавал файл КОРОЧЕ на 10
     // символов, потому что клиентские буферы упаковки (shell.cpp
     // exec_payload/app_name_and_args ниже) были ЕЩЁ теснее (64 байта на
-    // "/sbin/<cmd>.elf " + сам аргумент). Расширено до 127 символов —
-    // msg[0..15] (16 слов), безопасный запас ДО EXEC_CWD_MSG_SLOT=16, не
-    // трогая её вообще; msg[7] (BOOT_BLK_EP) внутри этой зоны — но
-    // перезаписывается СВОИМ правильным значением НИЖЕ по этой же
-    // функции (после этого блока), так что временная порча его байт
-    // здесь не наблюдаема снаружи (тот же инвариант, что уже был при 63).
+    // "/sbin/<cmd>.elf " + сам аргумент). Расширено до 127 символов.
+    //
+    // 2026-09-06, найдено на живом железе: зона аргументов ПЕРЕЕХАЛА с
+    // msg[0] на EXEC_ARGS_MSG_SLOT. Обещанные 127 символов на msg[0]
+    // никогда не работали — реальный предел был 55, потому что msg[7]
+    // (BOOT_BLK_EP, он же байты 56..63 строки) записывается СВОИМ
+    // значением ПОЗЖЕ этого блока и рвал строку посередине. Прежний
+    // комментарий здесь это упоминал, но рассуждал только о сохранности
+    // значения msg[7], а не строки. Полный разбор — у EXEC_ARGS_MSG_SLOT
+    // в common.h.
     if (args_payload && args_payload[0] != '\0') {
         size_t args_len = strlen(args_payload);
-        if (args_len > 127) args_len = 127;
-        memcpy((char*)&child_ipc_ptr->msg[0], args_payload, args_len);
-        ((char*)&child_ipc_ptr->msg[0])[args_len] = '\0';
+        if (args_len > EXEC_ARGS_MAX_LEN) args_len = EXEC_ARGS_MAX_LEN;
+        memcpy((char*)&child_ipc_ptr->msg[EXEC_ARGS_MSG_SLOT], args_payload, args_len);
+        ((char*)&child_ipc_ptr->msg[EXEC_ARGS_MSG_SLOT])[args_len] = '\0';
     }
     // Фаза 9.A (см. ROADMAP.md/EXEC_CWD_MSG_SLOT): cwd вызывающего шелла для
     // доверенных /sbin-утилит — отдельный слот, не пересекается ни с
@@ -1906,8 +2403,16 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 seL4_CPtr child_frame = alloc_and_track_cap(alloc, pcb);
                 check_err(seL4_CNode_Copy(root_cnode, child_frame, seL4_WordBits,
                                           root_cnode, frame, seL4_WordBits, seL4_AllRights), "Copy USB DMA Frame Cap");
-                check_err(seL4_ARM_Page_Map(child_frame, child_vspace, vaddr,
-                                            seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map USB DMA Buf to Driver");
+                // Через map_frame_robust, а не голым Page_Map: тот падает с
+                // FailedLookup, если для адреса ещё нет промежуточной таблицы
+                // страниц. Пока bounce-буферы занимали 512 КБ, они целиком
+                // укладывались в уже проложенную таблицу; после расширения до
+                // 1 МБ диапазон перешёл границу 2 МБ, и загрузка встала на
+                // "FATAL: Map USB DMA Buf to Driver -> 6 (FailedLookup)".
+                if (!map_frame_robust(alloc, pcb, child_frame, child_vspace, vaddr, normal_untyped, root_cnode)) {
+                    uart_puts("[ROOT] FATAL: не удалось замапить USB DMA буфер драйверу.\n");
+                    while (1) {}
+                }
             };
             map_usb_dma(usb_dma_param->dcbaa_frame, PLAT_XHCI_DCBAA_VADDR);
             map_usb_dma(usb_dma_param->cmdring_frame, PLAT_XHCI_CMDRING_VADDR);
@@ -1927,7 +2432,12 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkout_trring_frame[i], PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)i * 4096);
             for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkin_trring_frame[i], PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)i * 4096);
             for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->cbw_csw_frame[i], PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)i * 4096);
-            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bounce_frame[i], PLAT_XHCI_BOUNCE_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                for (int pg = 0; pg < USB_BOUNCE_PAGES; pg++) {
+                    map_usb_dma(usb_dma_param->bounce_frame[i][pg],
+                                PLAT_XHCI_BOUNCE_VADDR + ((uintptr_t)i * USB_BOUNCE_PAGES + (uintptr_t)pg) * 4096);
+                }
+            }
         }
         // Пятнадцатая попытка — PCIe RC MISC-регистры, тот же приём, что
         // mbox_regs_frame у timer_driver (одна страница, отдельный vaddr
@@ -1948,6 +2458,45 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             check_err(seL4_ARM_Page_Map(pcie_err_child, child_vspace, PLAT_PCIE_ERR_VADDR,
                                         seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map PCIe ERR Regs to Driver");
         }
+        // 37-я hw-попытка (issuse.txt №74/в) — та же схема, что PCIe RC
+        // MISC/ERR выше, но READ-ONLY (seL4_CanRead, не AllRights) — эта
+        // страница используется только для диагностического чтения Device
+        // Status VL805, писать сюда usb_driver не должна.
+        if (is_driver == 6 && pcie_cfg_data_frame_param != 0) {
+            seL4_CPtr pcie_cfg_data_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, pcie_cfg_data_child, seL4_WordBits,
+                                      root_cnode, pcie_cfg_data_frame_param, seL4_WordBits, seL4_AllRights), "Copy PCIe CFG DATA Frame Cap");
+            check_err(seL4_ARM_Page_Map(pcie_cfg_data_child, child_vspace, PLAT_PCIE_CFG_DATA_USB_VADDR,
+                                        seL4_CanRead, (seL4_ARM_VMAttributes)0), "Map PCIe CFG DATA Regs to Driver");
+        }
+
+        // issuse.txt №74, часть "б" — общая страница состояния драйверов
+        // (см. g_driver_state_frame выше, h/driver_state.h). Одна и та же
+        // физическая страница у всех шести драйверов, у каждого свой слот
+        // по индексу is_driver; usb_driver'у — по своему адресу, т.к. у неё
+        // отдельное 2MB-окно (drv_pud/pd/pt уже созданы выше в обоих
+        // случаях, дополнительная иерархия не нужна). Некэшируемо
+        // ((seL4_ARM_VMAttributes)0) — тот же приём, что у всех страниц
+        // выше в этом блоке: root читает эти слова с другого ядра, и
+        // возиться с кэш-обслуживанием на каждый опрос незачем.
+        if (g_driver_state_frame != 0) {
+            uintptr_t drv_state_vaddr = (is_driver == 6) ? PLAT_DRIVER_STATE_USB_VADDR : PLAT_DRIVER_STATE_VADDR;
+            seL4_CPtr drv_state_child = alloc_and_track_cap(alloc, pcb);
+            check_err(seL4_CNode_Copy(root_cnode, drv_state_child, seL4_WordBits,
+                                      root_cnode, g_driver_state_frame, seL4_WordBits, seL4_AllRights), "Copy Driver State Frame Cap");
+            check_err(seL4_ARM_Page_Map(drv_state_child, child_vspace, drv_state_vaddr,
+                                        seL4_AllRights, (seL4_ARM_VMAttributes)0), "Map Driver State Page to Driver");
+            child_ipc_ptr->msg[BOOT_DRIVER_STATE_PRESENT] = 1;
+            // Слот драйвера обнуляем в BUSY ПРЯМО СЕЙЧАС, из root'а: между
+            // этим моментом и первым driver_state_init() внутри самого
+            // драйвера проходит весь его bring-up, и всё это время слот
+            // обязан честно говорить "занят" (иначе после респавна там
+            // остался бы PARKED от прошлой инкарнации, и root счёл бы
+            // безопасным суспендить процесс посреди инициализации железа).
+            if (g_driver_state_page != nullptr && is_driver >= 1 && is_driver <= 6) {
+                g_driver_state_page[(seL4_Word)is_driver * (DRIVER_STATE_SLOT_STRIDE / sizeof(seL4_Word))] = DRIVER_STATE_BUSY;
+            }
+        }
 
         if (is_driver == 1) { // UART
             // UART driver является сервером для console_ep, он на нем слушает.
@@ -1966,6 +2515,7 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             child_ipc_ptr->msg[BOOT_BLK_HEARTBEAT_NTFN_CAP] = (extra_ntfn3_param != 0) ? local_extra_ntfn3 : 0; // Фикс зависания blk_driver, см. common.h
             child_ipc_ptr->msg[BOOT_USB_HEARTBEAT_NTFN_CAP] = (usb_heartbeat_ntfn_param != 0) ? local_usb_heartbeat_ntfn : 0; // Milestone 11 (доп.), см. common.h
             child_ipc_ptr->msg[BOOT_BLK_LIVENESS_TICK_NTFN_CAP] = (blk_liveness_tick_param != 0) ? local_blk_liveness_tick : 0; // Фаза 3b, см. common.h
+            child_ipc_ptr->msg[BOOT_ROOT_WATCHDOG_TICK_NTFN_CAP] = (g_root_watchdog_tick_badged != 0) ? local_root_wd_tick : 0; // см. common.h/ROOT_WATCHDOG_TICK_BADGE
         } else if (is_driver == 3) { // Block driver - клиент консоли
             child_ipc_ptr->msg[7] = local_blk_ep; // BOOT_BLK_EP
             child_ipc_ptr->msg[BOOT_CONSOLE_EP] = local_console_ep;
@@ -2125,6 +2675,20 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     );
     
     // ИСПРАВЛЕНО: Удален дублирующийся вызов seL4_TCB_Configure, который перезаписывал Fault Endpoint и скрывал падения.
+
+    // issuse.txt №74/в (JTAG-диагностика 2026-08-27) — тот же приём, что
+    // issuse.txt №64 уже использовал для CLONE_THREAD ниже (generic_recover_process()):
+    // без этого КАЖДЫЙ дочерний процесс root'а неотличим в живом JTAG-дампе
+    // ksDebugTCBs от остальных ("child of: 'rootserver'" у всех одинаково) —
+    // при разборе реального зависания (usbreset/restart) не удалось
+    // сопоставить конкретные зависшие TCB с именами процессов (uart_driver/
+    // blk_driver/timer_driver/net_driver/shell), несмотря на полный обход
+    // списка. seL4_DebugNameThread не влияет на поведение, только на имя в
+    // отладочном выводе (CONFIG_DEBUG_BUILD) — здесь именуем КАЖДЫЙ спавн
+    // (не только CLONE_THREAD) РЕАЛЬНЫМ именем процесса, чтобы следующий
+    // JTAG-разбор сразу видел, кто есть кто.
+    seL4_DebugNameThread(tcb, name);
+
     seL4_UserContext regs = {0};
     regs.pc = entry_point;
     regs.sp = child_stack + (uintptr_t)STACK_PAGES * 4096; // = 0x501000 всегда, см. комментарий у STACK_PAGES выше
@@ -2140,35 +2704,29 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     seL4_TCB_SetTLSBase(tcb, child_ipc + 3072);
     seL4_TCB_SetPriority(tcb, seL4_CapInitThreadTCB, 254);
 
-    // Фаза 6 (SMP): wifi_driver — единственный процесс, которого переносим
-    // на второе ядро (см. ROADMAP.md) — его SDIO data-plane уже целиком
+    // Фаза 6 (SMP): wifi_driver и usb_driver стартуют не на ядре 0.
+    // wifi_driver (ядро 1) — потому что его SDIO data-plane целиком
     // busy-poll/PIO (нет in-band IRQ, Фаза 4), а PBKDF2-хендшейк — чистое
-    // вычисление, так что корректность не зависит от чего-либо, доступного
-    // только на ядре 0. Условие на is_driver, а не отдельный параметр —
-    // переживает respawn ("wifi restart") без дополнительного состояния.
-    // Вызывается ДО seL4_TCB_Resume — поток ещё не runnable, просто
-    // выставляет поле affinity, без IPI/remote-stall машинерии ядра.
+    // вычисление: корректность не зависит ни от чего, доступного только на
+    // ядре 0. usb_driver (USB_DRIVER_DEFAULT_CORE, см. platform.h) —
+    // потому что он единственный, кто умеет зависнуть НАСМЕРТЬ на
+    // PCIe-транзакции (аппаратное ограничение, см. issuse.txt), и на ядре 0
+    // утаскивал бы за собой root'а. Условие на is_driver, а не отдельный
+    // параметр — переживает respawn ("wifi restart") без дополнительного
+    // состояния. Вызывается ДО seL4_TCB_Resume — поток ещё не runnable,
+    // просто выставляет поле affinity.
     //
-    // issuse.txt №15 — ПОПЫТКА ОТКАЧЕНА после hw-теста: пробовали также
-    // перенести usb_driver на своё ядро (2), тем же приёмом, что и
-    // wifi_driver (1) — гипотеза была "делит ядро 0 с равным приоритетом,
-    // вытесняет соседей". После переноса watchdog/аварийное восстановление
-    // (generic_recover_process() — seL4_TCB_Suspend/работа с CNode
-    // целевого TCB, см. main.cpp) перестало срабатывать вообще (раньше
-    // хотя бы убивало blk_driver, после переноса — полное зависание
-    // системы, включая ROOT, без единого сообщения). Подозрение — cross-
-    // core seL4_TCB_Suspend() на АКТИВНО выполняющийся (не только что
-    // заспавненный, как у SetAffinity-до-Resume выше, для которого
-    // IPI/remote-stall не нужен) поток ДРУГОГО ядра требует remote-stall
-    // машинерии, которая либо не задействована, либо ведёт себя иначе в
-    // этой сборке — не подтверждено, но совпадение по времени слишком
-    // точное, чтобы держать риск. usb_driver остаётся на ядре 0, как и
-    // был всегда, hw-подтверждённо безопасно для watchdog-восстановления.
-    // Реальный фикс исходной находки (blk_driver терял тик во время
-    // долгих USB-операций) — явный seL4_Yield() в горячих циклах
-    // exfat.cpp (fat_chain_has_cycle() и соседи), НЕ перенос ядра.
-    bool pin_to_own_core = (is_driver == 5);
-    int own_core = 1;
+    // ИСТОРИЯ (issuse.txt №15/№73): ровно этот перенос usb_driver уже
+    // пробовали раньше и ОТКАТЫВАЛИ — после него аварийное восстановление
+    // (generic_recover_process() -> seL4_TCB_Suspend) вешало ВСЮ систему,
+    // включая root. Причину нашли JTAG'ом: Suspend над потоком, реально
+    // исполняющимся на другом ядре, уходит в remoteTCBStall() -> ipi_wait()
+    // без таймаута. Тогда это "починили" запретом переносить драйверы
+    // вообще; теперь (issuse.txt №74, часть "б") сделано по существу —
+    // prepare_driver_for_suspend() ниже гарантирует, что Suspend вызывается
+    // ТОЛЬКО когда поток стоит в своём seL4_Recv и уже возвращён на ядро 0.
+    bool pin_to_own_core = (is_driver == 5) || (is_driver == 6);
+    int own_core = (is_driver == 5) ? 1 : USB_DRIVER_DEFAULT_CORE;
     if (pin_to_own_core) {
         seL4_TCB_SetAffinity(tcb, own_core);
     }
@@ -2187,10 +2745,490 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
     return pid;
 }
 
+// =====================================================================
+// issuse.txt №74, часть "б" — АДАПТИВНЫЙ ПЕРЕНОС ДРАЙВЕРОВ МЕЖДУ ЯДРАМИ.
+// Полный проект механизма — в situation.txt; здесь только реализация.
+//
+// Суть в одном абзаце. Сам перенос (seL4_TCB_SetAffinity) БЕЗОПАСЕН
+// всегда: в ядре это голая запись поля tcbAffinity, без единого IPI (см.
+// kernel/src/model/smp.c/migrateTCB()) — зависнуть на нём невозможно в
+// принципе. Опасен ПОСЛЕДУЮЩИЙ seL4_TCB_Suspend() над потоком, который в
+// этот момент реально исполняется на ДРУГОМ ядре: тогда ядро зовёт
+// remoteTCBStall() -> ipi_wait(), синхронный барьер без таймаута, и root
+// висит навсегда (hw-подтверждено JTAG'ом, issuse.txt №73 — именно из-за
+// этого драйверы и были заперты на ядре 0).
+//
+// Поэтому root перед КАЖДЫМ Suspend'ом процесса с ядром != 0:
+//   1) ждёт, пока драйвер сам объявит PARKED (стоит в своём seL4_Recv) —
+//      честный таймаут на СВОЕЙ стороне, через обычный SYS_SLEEP_MS к
+//      timer_driver, а не опрос зависшего syscall'а;
+//   2) возвращает поток на ядро 0 — после этого условие remoteTCBStall()
+//      (tcbAffinity != текущее ядро) ложно по построению, IPI не будет;
+//   3) даёт старому ядру домолотить до своей ближайшей точки планирования;
+//   4) и только теперь суспендит.
+// Не дождался PARKED — значит драйвер завис ПО-НАСТОЯЩЕМУ (тот самый
+// класс аппаратного стопора PCIe, см. issuse.txt): Suspend НЕ вызывается
+// вообще, восстановление честно отменяется. Софтом такое зависание не
+// лечится, а повесить заодно и root — единственное, чего мы этим
+// добились бы.
+// =====================================================================
+
+// Прочитать слот состояния драйвера. Возвращает DRIVER_STATE_BUSY, если
+// страницы нет, драйвер не из наблюдаемых, или слот ещё не заполнен —
+// консервативно, "не уверен, значит занят".
+static seL4_Word driver_state_read(int is_driver) {
+    if (g_driver_state_page == nullptr) return DRIVER_STATE_BUSY;
+    if (is_driver < 1 || is_driver > 6) return DRIVER_STATE_BUSY;
+    return g_driver_state_page[(seL4_Word)is_driver * (DRIVER_STATE_SLOT_STRIDE / sizeof(seL4_Word))];
+}
+
+// Единственное слово общей страницы, которое пишет root (см.
+// common.h/DRIVER_STATE_WORD_FREEZE).
+static void usb_set_freeze(bool on) {
+    if (g_driver_state_page == nullptr) return;
+    g_driver_state_page[(seL4_Word)6 * (DRIVER_STATE_SLOT_STRIDE / sizeof(seL4_Word)) + DRIVER_STATE_WORD_FREEZE] = on ? 1 : 0;
+}
+
+static bool driver_is_parked(int is_driver) {
+    return driver_state_read(is_driver) == DRIVER_STATE_PARKED;
+}
+
+// Слово слота по индексу (см. common.h/DRIVER_STATE_WORD_*).
+static seL4_Word driver_state_word(int is_driver, int word) {
+    if (g_driver_state_page == nullptr) return 0;
+    if (is_driver < 1 || is_driver > 6) return 0;
+    return g_driver_state_page[(seL4_Word)is_driver * (DRIVER_STATE_SLOT_STRIDE / sizeof(seL4_Word)) + word];
+}
+
+// Ждать PARKED не дольше budget_ms. Спит через timer_driver (SYS_SLEEP_MS)
+// — единственный процесс, который сам ни от кого не зависит; если
+// восстанавливаем ЕГО ЖЕ (is_driver==2) или timer_ep недоступен, ждать
+// нечем, честно возвращаем текущее состояние без сна.
+static bool wait_for_driver_parked(int is_driver, seL4_CPtr timer_ep, seL4_Word budget_ms) {
+    if (driver_is_parked(is_driver)) return true;
+    if (timer_ep == 0 || is_driver == 2) return false;
+    seL4_Word waited = 0;
+    while (waited < budget_ms) {
+        seL4_SetMR(0, 8); // SYS_SLEEP_MS (см. timer_driver.cpp, root как обычный клиент timer_ep)
+        seL4_SetMR(1, DRIVER_PARK_POLL_STEP_MS);
+        seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        waited += DRIVER_PARK_POLL_STEP_MS;
+        if (driver_is_parked(is_driver)) return true;
+    }
+    return false;
+}
+
+// Привести процесс в состояние, в котором seL4_TCB_Suspend() над ним
+// доказуемо не заблокирует root. true — можно суспендить.
+static bool prepare_driver_for_suspend(int pid, seL4_CPtr timer_ep) {
+    if (pid <= 0 || pid >= 256 || !pcbs[pid].active) return false;
+
+    // Ядро 0 — root (приоритет 255) вытесняет там кого угодно, целевой
+    // поток гарантированно не ksCurThread ни на одном ядре, Suspend
+    // безопасен без всяких приготовлений. Это ровно тот случай, который
+    // работал всегда, и трогать его не нужно.
+    if (pcbs[pid].core == 0) return true;
+
+    int is_driver = pcbs[pid].is_driver;
+
+    // Не-драйвер (обычный процесс, разогнанный `balance` по ядрам) не
+    // публикует своё состояние — про него мы ничего не знаем. Для него
+    // остаётся шаг "вернуть домой и дать осесть": он снимает IPI-барьер
+    // (условие remoteTCBStall() перестаёт выполняться), а окно, в котором
+    // поток ещё физически докручивает на старом ядре, закрывается паузой
+    // заметно длиннее кванта планировщика.
+    bool parked = false;
+    if (is_driver >= 1 && is_driver <= 6) {
+        parked = wait_for_driver_parked(is_driver, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS);
+        if (!parked) {
+            uart_puts("[SMP] "); uart_puts(pcbs[pid].name);
+            uart_puts(" (ядро "); uart_putdec(pcbs[pid].core);
+            uart_puts(") не встал в PARKED за "); uart_putdec(DRIVER_PARK_WAIT_BUDGET_MS);
+            uart_puts(" мс — Suspend ОТМЕНЁН (иначе root повис бы в ipi_wait(), issuse.txt №74/б).\n");
+            return false;
+        }
+    }
+
+    // Подтверждённый PARKED сам по себе достаточен: поток, честно
+    // заблокированный в seL4_Recv, не является ksCurThread НИ НА ОДНОМ
+    // ядре, а remoteTCBStall() гейтится именно этим условием — IPI не
+    // будет. Значит возвращать драйвер на ядро 0 не нужно, и не нужно
+    // ставить его туда даже на мгновение: ядро 0 — ядро root'а, и
+    // держать там драйвер, способный намертво застопорить своё ядро на
+    // аппаратной транзакции, противоречит всему смыслу этой работы (см.
+    // core_allowed_for_process()).
+    if (parked) return true;
+
+    // Про не-драйвер мы не знаем ничего — для него остаётся "вернуть
+    // домой и дать осесть": это снимает условие remoteTCBStall(), а окно,
+    // в котором поток ещё докручивает на старом ядре, закрывается паузой
+    // заметно длиннее кванта планировщика.
+    seL4_TCB_SetAffinity(pcbs[pid].tcb, 0);
+    pcbs[pid].core = 0;
+
+    if (timer_ep != 0 && is_driver != 2) {
+        seL4_SetMR(0, 8); // SYS_SLEEP_MS
+        seL4_SetMR(1, DRIVER_SETTLE_AFTER_HOMING_MS);
+        seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    }
+    return true;
+}
+
+// Ядро 0 — ядро root'а, и оно ЗАПОВЕДНОЕ для драйверов.
+//
+// НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ 2026-09-05, регрессия от снятия запрета на
+// перенос драйверов: `balance` выбирает получателем НАИМЕНЕЕ загруженное
+// ядро, и ничто не мешало ему поставить usb_driver на ядро 0. А usb_driver
+// — единственный, кто умеет зависнуть НАСМЕРТЬ на PCIe-транзакции
+// (аппаратное ограничение, см. issuse.txt): ядро, исполняющее такой load,
+// перестаёт исполнять код вообще, его не берёт даже JTAG-halt. Пока это
+// ядро 2 — зависает только USB, root жив и лечит. Стоит балансировщику
+// увести драйвер на ядро 0 — тем же зависанием выносится root, а вместе с
+// ним ВСЯ система: ни watchdog, ни shell, ни единой строчки в лог. Ровно
+// это и наблюдалось: полная тишина после "GPT: найден раздел ...".
+//
+// Смысл всей части "б" (issuse.txt №74) в том, чтобы root пережил
+// зависание драйвера. Разрешать переносить драйвер на ядро root'а —
+// значит своими руками ломать то, ради чего всё делалось.
+static bool core_allowed_for_process(int pid, int core) {
+    if (core < 0 || core > 3) return false;
+    if (pcbs[pid].is_driver == 0) return true; // обычные процессы — куда угодно
+    return core != 0;
+}
+
+// Перенос процесса на ядро core. Возвращает false, если перенос НЕ сделан.
+//
+// Драйвер переносится ТОЛЬКО припаркованным. Сам вызов SetAffinity
+// безопасен всегда (см. шапку блока), но переносить драйвер в середине
+// реальной работы с железом — отдельный риск: у xHCI/EMMC/SDIO в полёте
+// остаются транзакции, чьё завершение драйвер ждёт опросом по wall-clock,
+// а смена ядра меняет тайминги этого опроса. Ничего не теряем, ожидая
+// безопасного момента: `balance` приходит каждые 5с и просто перенесёт в
+// следующий раз.
+static bool migrate_process_to_core(int pid, int core, seL4_CPtr timer_ep) {
+    if (pcbs[pid].core == core) return true; // уже там, делать нечего
+    if (!core_allowed_for_process(pid, core)) return false;
+
+    int is_driver = pcbs[pid].is_driver;
+    if (is_driver >= 1 && is_driver <= 6) {
+        if (!wait_for_driver_parked(is_driver, timer_ep, DRIVER_MIGRATE_WAIT_MS)) {
+            uart_puts("[SMP] "); uart_puts(pcbs[pid].name);
+            uart_puts(" занят работой с железом — перенос отложен до следующего прохода.\n");
+            return false;
+        }
+    }
+    seL4_TCB_SetAffinity(pcbs[pid].tcb, core);
+    pcbs[pid].core = core;
+    return true;
+}
+
+// Можно ли этот процесс переносить между ядрами вообще.
+// timer_driver — нельзя: он единственный владелец ARM generic timer'а,
+// чьи прерывания PPI приходят per-core (см. ROADMAP.md Фаза 6.1), плюс он
+// же кормит PM_WDOG и обслуживает SYS_SLEEP_MS всей системы, включая
+// механизм ожидания PARKED выше — переносить того, на ком держится сама
+// защита, было бы кольцевой зависимостью.
+// Кто из драйверов реально размечает свои шаги (driver_state_step()/
+// driver_state_progress(), см. h/driver_state.h). У остальных слова
+// "шаг" и "прогресс" в слоте просто нули, и трактовать их как "прогресс
+// замер" — ровно та ошибка, что на живом железе положила blk_driver и
+// net_driver в цикл ложных восстановлений (см. issuse.txt №11).
+// =====================================================================
+// НАЙДЕНО JTAG'ом НА МЁРТВОЙ ПЛАТЕ 2026-09-06 — почему зависание USB
+// убивает ВСЮ систему, а не только USB.
+//
+// Снято с зависшей платы, без единой перепрошивки:
+//   - cpu1 и cpu2 остановлены отладчиком штатно, обе в clh_lock_acquire
+//     (большой замок ядра seL4, kernel/include/smp/lock.h);
+//   - cpu0 и cpu3 на запрос halt не отвечают ВООБЩЕ;
+//   - разбор структуры big_kernel_lock показал очередь cpu0 -> cpu2 ->
+//     cpu1, причём myreq у cpu0 всё ещё Pending, то есть ЗАМОК ДЕРЖИТ
+//     cpu0 и не отпускал его;
+//   - PC ядра cpu0, прочитанный через сэмплирующий регистр отладки
+//     EDPCSR (БЕЗ halt, который не проходит), = 0xffffff800001830c.
+//
+// Этот адрес — инструкция `dsb sy` СРАЗУ ПОСЛЕ `tlbi aside1` внутри
+// deleteASID() (kernel/src/arch/arm/64/kernel/vspace.c:1079 ->
+// invalidateTLBByASID -> ... -> invalidateLocalTLB_ASID).
+//
+// Механизм гибели целиком:
+//   1. usb_driver выдаёт транзакцию на PCIe, которую VL805/мост никогда
+//      не завершает (то самое аппаратное ограничение, см. issuse.txt).
+//   2. Root в это время восстанавливает КАКОЙ УГОДНО процесс — в живом
+//      случае это был net_driver, к USB отношения не имеющий. Ядро ОС
+//      сносит его VSpace, а это deleteASID -> tlbi + dsb sy.
+//   3. `dsb sy` ждёт завершения ВСЕХ незавершённых транзакций системы,
+//      включая ту самую застрявшую PCIe-шную. Он не завершается никогда.
+//   4. cpu0 замирает ВНУТРИ ядра ОС, держа большой замок.
+//   5. Любое другое ядро на первом же системном вызове встаёт в очередь
+//      за этим замком. Плата мертва: ни лога, ни watchdog'а, ни шелла.
+//   6. JTAG не может остановить cpu0, потому что halt принимается только
+//      на границе инструкции, а эта инструкция не завершается. Отсюда и
+//      давняя запись в issuse.txt "не берёт даже JTAG-halt" — теперь
+//      известно, ЧТО именно не берётся и почему.
+//
+// ЧТО ЭТО ОПРОВЕРГАЕТ: предпосылку, на которой строилась вся часть "б"
+// (issuse.txt №74) — "драйвер завис на своём ядре, root на ядре 0 жив и
+// лечит". В сборке с большим замком ядра это неверно: замирает ТО ядро,
+// которое первым выполнит dsb sy, чьё бы оно ни было, — и делает это,
+// уже держа замок. Разделение по ядрам от этого класса отказа не спасает
+// вообще.
+//
+// ЧТО ИЗ ЭТОГО СЛЕДУЕТ ПРАКТИЧЕСКИ: разрушать VSpace, пока на шине висит
+// незавершённая транзакция, НЕЛЬЗЯ. Сначала снять причину (fundamental
+// reset PCIe обрывает зависшую транзакцию), и только потом трогать
+// капабилити/VSpace кого бы то ни было.
+// =====================================================================
+static bool usb_bus_stalled_suspect(seL4_CPtr timer_ep) {
+    if (g_driver_state_page == nullptr || g_usb_cmd_ep == 0 || timer_ep == 0) return false;
+    if (g_driver_progress_seen_ms[6] == 0) return false;
+    // Припаркован — значит дошёл до своего Recv, ничего в полёте нет.
+    if (driver_state_read(6) == DRIVER_STATE_PARKED) return false;
+    // Не в шаге — тоже нечему висеть.
+    if (driver_state_word(6, DRIVER_STATE_WORD_STEP) == USB_STEP_IDLE) return false;
+    seL4_SetMR(0, 4); // SYS_GET_UPTIME
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_Word now = seL4_GetMR(0);
+    return (now - g_driver_progress_seen_ms[6]) >= USB_STEP_STUCK_TIMEOUT_MS;
+}
+
+static bool driver_reports_steps(int is_driver) {
+    return is_driver == 6; // пока только usb_driver
+}
+
+static bool process_is_migratable(int pid) {
+    if (pid <= 0 || pid >= 256 || !pcbs[pid].active) return false;
+    if (pcbs[pid].is_driver == 2) return false;
+    return true;
+}
+
+// =====================================================================
+// ПОЛНЫЙ СБРОС USB "С НУЛЯ" — тот самый путь, который закрыл issuse.txt
+// №74/в (команда `usbreset`, 38 hw-попыток): fundamental reset PCIe Root
+// Complex'а + восстановление всего, что стирает bridge software init
+// (включая Command самого моста — ту единственную причину, что пряталась
+// 37 попыток), + перезаливка прошивки VL805 через VideoCore-mailbox, +
+// переэнумерация устройств.
+//
+// Вынесено из case SYS_PCIE_RESET в отдельную функцию, потому что теперь у
+// этого пути ДВА вызывающих: ручной `usbreset` из шелла и АВТОМАТИЧЕСКИЙ
+// heartbeat-watchdog (см. главный цикл). Для usb_driver обычный
+// kill+respawn бесполезен: процесс пересоздаётся, а шина остаётся лежать —
+// лечить нужно железо, а не процесс.
+//
+// Ключевая тонкость, из-за которой это не просто "вызвать то же самое":
+// оба IPC к usb_driver ниже (заморозка и RESTART) — обычные seL4_Call, и
+// если драйвер уже завис на PCIe-транзакции, они повесят root ровно так
+// же. Поэтому каждый из них делается ТОЛЬКО когда драйвер объявил себя
+// PARKED (issuse.txt №74/б, см. driver_is_parked()). Не объявил — сброс
+// шины всё равно выполняется (он root'у ничего не стоит и не требует
+// участия драйвера), а вызывающему возвращается USB_RESET_DRIVER_STUCK:
+// шина поднята, но процесс надо пересоздавать целиком.
+//
+// Коды возврата совпадают с ответом SYS_PCIE_RESET шеллу (см. common.h).
+constexpr seL4_Word USB_RESET_OK           = 0;
+constexpr seL4_Word USB_RESET_NO_LINK      = (seL4_Word)-3;
+constexpr seL4_Word USB_RESET_NO_MAILBOX   = (seL4_Word)-4;
+constexpr seL4_Word USB_RESET_DRIVER_STUCK = (seL4_Word)-5;
+
+static seL4_Word root_usb_full_reset(seL4_CPtr timer_ep, seL4_CPtr usb_cmd_ep) {
+    // Шаг 1. Заморозить usb_driver, если он в состоянии нас услышать.
+    // Зачем вообще: без этого PM_WDOG срабатывал на КАЖДОМ вызове —
+    // usb_driver продолжал свой heartbeat-опрос xHCI MMIO
+    // (hub_conn_async_tick/poll_ports_for_hotplug/poll_hub_interrupts, см.
+    // g_usb_hw_frozen в usb_driver.cpp), ПОКА root дёргал PERST на том же
+    // живом линке — гарантированное "load физически зависает" ровно там,
+    // где драйвер застаёт линк электрически лежащим. Синхронный round-trip
+    // ДОКАЗЫВАЕТ, что драйвер дошёл до Recv и больше не тронет железо,
+    // пока не придёт RESTART.
+    // Ждём PARKED, а не смотрим мгновенное состояние: usb_driver каждые
+    // ~20мс просыпается на heartbeat-тик, и разовая проверка с заметной
+    // вероятностью застала бы его "занятым" на ровном месте — а платой за
+    // ошибку было бы напрасное пересоздание процесса. Просто занятый
+    // драйвер припаркуется за миллисекунды; по-настоящему зависший — не
+    // припаркуется никогда, и бюджет истечёт честно.
+    // Если общей страницы состояния нет вообще (не смогли её создать —
+    // см. main()), возвращаемся к прежнему поведению: звоним вслепую.
+    // Именно так `usbreset` работал до этой правки, и работал успешно.
+    bool driver_reachable = (g_driver_state_page == nullptr) ||
+                            wait_for_driver_parked(6, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS);
+    if (driver_reachable) {
+        uart_puts("[ROOT] USB RESET: замораживаю usb_driver (heartbeat-опрос xHCI MMIO должен остановиться на время сброса моста).\n");
+        seL4_SetMR(0, SYS_PCIE_RESET);
+        seL4_SetMR(1, 1); // freeze
+        seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    } else {
+        uart_puts("[ROOT] USB RESET: usb_driver НЕ припаркован (завис или занят) — заморозку пропускаю, IPC к нему сейчас повесил бы root. Сброс шины это не отменяет.\n");
+    }
+
+    // Заморозка через общую страницу — БЕЗУСЛОВНО, независимо от того,
+    // удался ли IPC выше. Если драйвер сейчас не отвечает, он прочитает
+    // это предупреждение, как только вернётся в свой цикл, и не полезет к
+    // контроллеру, который мы прямо сейчас будем ресетить.
+    usb_set_freeze(true);
+    uart_puts("[ROOT] USB RESET: локальный fundamental reset PCIe RC (issuse.txt №74/в).\n");
+    if (!root_pcie_fundamental_reset(timer_ep)) {
+        uart_puts("[ROOT] USB RESET: линк НЕ поднялся за таймаут — mailbox-тег НЕ вызываю (см. предупреждение у MBOX_TAG_NOTIFY_XHCI_RESET/platform.h).\n");
+        return USB_RESET_NO_LINK;
+    }
+
+    uart_puts("[ROOT] USB RESET: линк поднялся (PHYLINKUP+DL_ACTIVE), форвардю mailbox-тег на timer_driver (перезаливка прошивки VL805).\n");
+    seL4_SetMR(0, SYS_MBOX_XHCI_RESET);
+    seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    if (seL4_GetMR(0) != 0) {
+        uart_puts("[ROOT] USB RESET: mailbox-тег НЕ подтверждён — прошивка VL805 могла не перезалиться.\n");
+        return USB_RESET_NO_MAILBOX;
+    }
+
+    // Диагностическая обвязка расследования №74/в (контрольные точки F/F2):
+    // переустановить ECAM-индекс на VL805 и снять залипшие RW1C-биты
+    // Device Status. Сама переустановка индекса — часть обычной
+    // последовательности (usb_driver на неё полагается и сама его не
+    // трогает), а печать/чтение статуса гейтится LOG_PCIE_DIAG.
+    *(volatile uint32_t*)(PLAT_PCIE_RGR1_ROOT_VADDR + PCIE_EXT_CFG_INDEX_PAGE_OFFSET) = MBOX_XHCI_RESET_DEV_ADDR;
+    if (LOG_PCIE_DIAG) pcie_debug_vl805_devstatus("[ROOT]   DIAG Device Status VL805 (F: после mailbox-тега) = ");
+    {
+        uint32_t raw = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_EXPRESS_CAP_VL805_DEVICE_STATUS_OFFSET);
+        uint32_t dev_status = (raw >> 16) & 0xFFFFu;
+        constexpr uint32_t kErrBits = PCIE_DEV_STATUS_CORRECTABLE_ERROR_MASK | PCIE_DEV_STATUS_UNSUPPORTED_REQUEST_MASK;
+        if (dev_status & kErrBits) {
+            // RW1C — очищаем найденные биты явно, Device Control (нижние
+            // 16 бит того же dword'а) сохраняем как есть.
+            *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + PCI_EXPRESS_CAP_VL805_DEVICE_STATUS_OFFSET) =
+                (raw & 0xFFFFu) | (kErrBits << 16);
+        }
+    }
+    if (LOG_PCIE_DIAG) {
+        uint32_t raw_f2 = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_ROOT_VADDR + 0);
+        uart_puts("[ROOT]   DIAG VendorID/DeviceID VL805 (F2: сразу после F+очистки, без IPC) = "); uart_puthex(raw_f2); uart_puts("\n");
+    }
+
+    // Шаг 2. Перечислить устройства заново. RESTART снимает g_usb_hw_frozen
+    // и целиком повторяет run_bring_up() — то есть xHCI поднимается с нуля,
+    // ровно как при холодной загрузке. Перепроверяем PARKED ещё раз: между
+    // заморозкой и этой точкой прошёл целый сброс шины.
+    if (!driver_reachable ||
+        (g_driver_state_page != nullptr && !wait_for_driver_parked(6, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS))) {
+        uart_puts("[ROOT] USB RESET: шина поднята, но usb_driver недоступен по IPC — переэнумерация отложена до момента, когда он вернётся в свой Recv.\n");
+        g_usb_restart_pending = true;
+        return USB_RESET_DRIVER_STUCK;
+    }
+    usb_set_freeze(false); // сейчас будет переэнумерация — железо снова можно трогать
+    uart_puts("[ROOT] USB RESET: форвардю DRIVER_SIGNAL_RESTART на usb_driver (переэнумерация устройств).\n");
+    seL4_SetMR(0, SYS_DRIVER_SIGNAL);
+    seL4_SetMR(1, DRIVER_SIGNAL_RESTART);
+    seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    uart_puts("[ROOT] USB RESET: DRIVER_SIGNAL_RESTART вернул статус = "); uart_puthex(seL4_GetMR(0)); uart_puts("\n");
+    uart_puts("[ROOT] USB RESET: готово.\n");
+    return USB_RESET_OK;
+}
+
+// --- issuse.txt №3 (плавающее падение тестового процесса с PC=0) ---
+//
+// Три пути завершения процесса делали РАЗНУЮ уборку, и обычный выход был
+// самым бедным из них. generic_recover_process() (kill драйвера/краш) уже
+// освобождала глобальный vfs_mutex_ep, если умирающий был его держателем
+// (issuse.txt №70), а SYS_EXIT/SYS_KILL — нет. И НИ ОДИН из трёх не трогал
+// потоки, созданные умирающим процессом через SYS_CLONE: поле
+// pcb.parent_pid писалось в case SYS_CLONE и читалось РОВНО в одном месте —
+// case SYS_THREAD_EXIT, то есть только когда поток завершался сам.
+//
+// Чем это плохо на практике (последовательность проверена по коду, не
+// предположение): coretest/ТЕСТ 7 запускает поток-читатель, который держит
+// VFS-мьютекс на всё чтение, и имеет четыре пути выхода по ошибке, каждый
+// из которых зовёт sys_exit() — в том числе выход по таймауту, где поток
+// ГАРАНТИРОВАННО ещё жив (именно потому таймаут и наступил). Дальше:
+//   1. root суспендит ТОЛЬКО TCB родителя;
+//   2. revoke+delete+alloc.free() проходит по всем капам родителя, включая
+//      корни его VSpace и CSpace — а поток исполняется именно на них
+//      (SYS_CLONE: pcb.vspace/cspace = родительские) и НЕ суспенднут;
+//   3. PCB потока навсегда остаётся active=true — утечка PID, TCB,
+//      IPC-фрейма и трёх слотов CNode на каждый такой выход;
+//   4. держателем vfs_mutex_ep числится PID этого вечно-живого потока,
+//      так что мьютекс не освободит уже никто и никогда.
+// Пункт 4 сам по себе вешает КАЖДУЮ последующую VFS-команду, пункт 2 —
+// оставляет исполняться поток без адресного пространства.
+//
+// Согласуется с уже собранными наблюдениями: контрольный опыт со 100
+// спавнами /bin/test_app.elf (клонов не делает) прошёл 100/100, а отказ
+// требовал «предшествующего сброса шины» — сброс шины как раз и заставляет
+// чтение в ТЕСТЕ 7 упереться в таймаут, то есть создаёт осиротевший поток.
+//
+// ВАЖНО про порядок вызова: обе функции обязаны отработать ДО того, как
+// вызывающий начнёт удалять свои капы, иначе поток успеет исполниться на
+// уже уничтоженном VSpace.
+static void release_vfs_lock_if_held_by(int pid)
+{
+    if (g_vfs_lock_holder_pid != (seL4_Word)pid) return;
+    if (g_vfs_mutex_ntfn_cap != 0) {
+        seL4_Signal(g_vfs_mutex_ntfn_cap);
+        uart_puts("[KERNEL] Освобождён глобальный vfs_mutex_ep умершего держателя (issuse.txt №3/№70).\n");
+    }
+    g_vfs_lock_holder_pid = 0;
+}
+
+// Убрать все SYS_CLONE-потоки, принадлежащие owner_pid. Тело повторяет
+// уборку из case SYS_THREAD_EXIT — разница лишь в том, что там поток
+// сообщает о себе сам, а здесь его добирает уходящий родитель.
+static void reap_clone_threads_of(int owner_pid, PsychAllocator &alloc, seL4_CPtr root_cnode)
+{
+    if (owner_pid <= 0 || owner_pid >= 256) return;
+
+    for (int t = 1; t < 256; t++) {
+        if (t == owner_pid) continue;
+        if (!pcbs[t].active) continue;
+        if (pcbs[t].parent_pid != owner_pid) continue;
+        // Двойная проверка по имени: parent_pid отличен от нуля только у
+        // клон-потоков (memset в case SYS_CLONE), но полагаться на одно
+        // поле для операции, которая суспендит чужой TCB, не стоит.
+        if (strncmp(pcbs[t].name, "shell_thread", 12) != 0) continue;
+
+        uart_puts("[KERNEL] Уборка осиротевшего SYS_CLONE-потока pid=");
+        uart_putdec(t);
+        uart_puts(" (родитель ");
+        uart_putdec(owner_pid);
+        uart_puts(" завершился, issuse.txt №3).\n");
+
+        // Суспенд ПЕРВЫМ делом — дальше у потока пропадёт адресное
+        // пространство, и до этого момента он исполняться не должен.
+        if (pcbs[t].tcb) seL4_TCB_Suspend(pcbs[t].tcb);
+
+        release_vfs_lock_if_held_by(t);
+
+        for (int i = 0; i < MAX_PIPES; i++) {
+            if (g_pipes[i].active && g_pipes[i].writer_pid == t) {
+                g_pipes[i].eof = true;
+            }
+        }
+
+        if (pcbs[t].thread_ipc_frame) {
+            seL4_ARM_Page_Unmap(pcbs[t].thread_ipc_frame);
+        }
+
+        for (int i = 0; i < pcbs[t].cap_tracker.count; i++) {
+            seL4_CPtr cap_to_free = pcbs[t].cap_tracker.caps[i];
+            seL4_CNode_Revoke(root_cnode, cap_to_free, seL4_WordBits);
+            seL4_CNode_Delete(root_cnode, cap_to_free, seL4_WordBits);
+            alloc.free(cap_to_free);
+        }
+        pcbs[t].cap_tracker.count = 0;
+        pcbs[t].active = false;
+    }
+}
+
 static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, PsychAllocator &alloc,
                                     seL4_CPtr root_cnode, seL4_CPtr root_vspace, seL4_CPtr normal_untyped,
                                     seL4_CPtr shm_frame_root, seL4_CPtr console_ep, seL4_CPtr timer_ep, seL4_CPtr blk_ep,
-                                    bool respawn = true) {
+                                    bool respawn = true,
+                                    // issuse.txt №74/б — true, если процесс попал сюда из
+                                    // обработчика fault'а (VMFault/CapFault). Такой поток
+                                    // ЗАБЛОКИРОВАН ядром на fault-endpoint'е и не исполняется
+                                    // ни на одном ядре — Suspend над ним безопасен без всяких
+                                    // приготовлений, а его слот состояния навсегда застрял в
+                                    // BUSY (до seL4_Recv он уже не дойдёт), так что ожидание
+                                    // PARKED просто сожгло бы бюджет и отменило законное
+                                    // восстановление.
+                                    bool target_faulted = false) {
     if (pid <= 0 || pid >= 256 || !pcbs[pid].active)
         return;
 
@@ -2199,6 +3237,67 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
 
     uart_puts("\n[WATCHDOG] Emergency recovery initiated for PID: "); uart_putdec(pid);
     uart_puts(" ("); uart_puts(meta.name); uart_puts(")\n");
+
+    // issuse.txt №74, часть "б" — ПЕРВЫМ ДЕЛОМ, до единого разрушающего
+    // действия ниже: убедиться, что seL4_TCB_Suspend() над этим процессом
+    // вообще можно звать (см. развёрнутое объяснение у
+    // prepare_driver_for_suspend()). Порядок принципиален: всё, что идёт
+    // дальше — освобождение vfs_mutex, отмена отложенных ответов, спасение
+    // зависшего VFS-клиента — необратимо, и делать это ради восстановления,
+    // которое мы всё равно не имеем права завершить, значит оставить
+    // систему в состоянии хуже исходного.
+    // ПЕРЕД ЛЮБЫМ разрушением: если PCIe-шина похоже застопорена, сперва
+    // снять причину. Иначе deleteASID() ниже по цепочке (снос VSpace
+    // жертвы) выполнит `dsb sy`, тот будет ждать незавершённую
+    // PCIe-транзакцию и заморозит ЭТО ядро внутри ядра ОС, с большим
+    // замком в руках — вся плата умрёт молча. Полный разбор с JTAG'а — у
+    // usb_bus_stalled_suspect() выше. Порядок здесь принципиален: сначала
+    // шина, потом капабилити.
+    // usb_driver НИКОГДА не пересоздаётся (решение пользователя
+    // 2026-09-06). Причина не в удобстве, а в том, что пересоздание —
+    // это снос VSpace, то есть deleteASID -> `dsb sy`, то есть ровно та
+    // инструкция, на которой JTAG поймал замёрзшее ядро с большим замком
+    // ядра ОС в руках (см. usb_bus_stalled_suspect() выше). Для USB
+    // "восстановление" = сброс шины, и только он: root_usb_full_reset()
+    // не трогает ничьи капабилити и потому этой ловушки не содержит.
+    if (meta.is_driver == 6) {
+        if (target_faulted) {
+            // Драйвер УПАЛ (VMFault/CapFault). Сброс шины тут не поможет
+            // — сломан сам процесс. Но и сносить его нельзя по причине
+            // выше. Подвешиваем поток (это безопасно, Suspend не делает
+            // dsb sy) и честно говорим, что USB до перезагрузки не будет:
+            // живая система без USB заведомо лучше мёртвой платы.
+            if (pcbs[pid].tcb) seL4_TCB_Suspend(pcbs[pid].tcb);
+            uart_puts("[WATCHDOG] usb_driver УПАЛ. Пересоздание для него запрещено (снос VSpace вызывает dsb sy, который вешает всю плату при застопоренной шине) — поток остановлен, USB не работает до перезагрузки.\n");
+            return;
+        }
+        uart_puts("[WATCHDOG] usb_driver: вместо пересоздания процесса выполняю полный сброс шины (единственный разрешённый для USB путь восстановления).\n");
+        if (g_usb_cmd_ep != 0) root_usb_full_reset(timer_ep, g_usb_cmd_ep);
+        g_driver_progress_seen_ms[6] = 0;
+        return;
+    }
+
+    if (usb_bus_stalled_suspect(timer_ep)) {
+        uart_puts("[WATCHDOG] PCIe-шина похоже застопорена (usb_driver замер на шаге \"");
+        uart_puts(usb_step_name(driver_state_word(6, DRIVER_STATE_WORD_STEP)));
+        uart_puts("\"). Разрушать VSpace сейчас НЕЛЬЗЯ — dsb sy в deleteASID заморозил бы ядро ОС целиком. Сбрасываю шину первым делом.\n");
+        root_usb_full_reset(timer_ep, g_usb_cmd_ep);
+        // Отсчёт прогресса начинаем заново: сброс либо оживил драйвер,
+        // либо нет — решать это будет следующий тик watchdog'а, а не
+        // этот, уже устаревший, замер.
+        g_driver_progress_seen_ms[6] = 0;
+    }
+
+    if (!target_faulted && !prepare_driver_for_suspend(pid, timer_ep)) {
+        uart_puts("[WATCHDOG] Восстановление "); uart_puts(meta.name);
+        uart_puts(" ОТМЕНЕНО: процесс не на ядре 0 и не отвечает признаком PARKED — это настоящее зависание (аппаратный стопор шины, см. issuse.txt/usb_driver). Программно оно не лечится; последний рубеж — PM_WDOG.\n");
+        return;
+    }
+
+    // issuse.txt №3 — у жертвы могли остаться SYS_CLONE-потоки. Убрать их
+    // ОБЯЗАТЕЛЬНО до цикла по cap_tracker ниже: он уничтожит корни VSpace/
+    // CSpace, на которых эти потоки исполняются (см. reap_clone_threads_of).
+    reap_clone_threads_of(pid, alloc, root_cnode);
 
     // issuse.txt №70 — если жертва оказалась ТЕКУЩИМ держателем глобального
     // vfs_mutex_ep (см. g_vfs_lock_holder_pid/SYS_VFS_LOCK_NOTIFY выше),
@@ -2209,13 +3308,10 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     // ЛЮБОГО процесса в системе — hw-подтверждённый баг, не гипотеза
     // (см. issuse.txt: `kill` фонового `timedread.elf` посреди чтения
     // навсегда повесил `ps` без единого пути восстановления кроме ребута).
-    if (g_vfs_lock_holder_pid == (seL4_Word)pid) {
-        if (g_vfs_mutex_ntfn_cap != 0) {
-            seL4_Signal(g_vfs_mutex_ntfn_cap);
-            uart_puts("[WATCHDOG] Освободил зависший глобальный vfs_mutex_ep (issuse.txt №70).\n");
-        }
-        g_vfs_lock_holder_pid = 0;
-    }
+    // Тело вынесено в release_vfs_lock_if_held_by() (см. выше) — та же
+    // уборка понадобилась SYS_EXIT/SYS_KILL по issuse.txt №3, и держать
+    // две расходящиеся копии одной логики не стоит.
+    release_vfs_lock_if_held_by(pid);
 
     // issuse.txt: если у жертвы был отложенный (deferred-reply) запрос в
     // timer_driver (SYS_SLEEP_MS) или uart_driver (SYS_READ), просим их
@@ -2257,7 +3353,16 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     // проваливается (seL4_FailedLookup), если слот пуст — это НОРМАЛЬНЫЙ,
     // самый частый случай ("жертва была на seL4_Recv, не в процессе
     // VFS-команды"), не ошибка, просто нечего спасать.
-    if (meta.is_driver == 3 || meta.is_driver == 6) {
+    // issuse.txt №74/б (доп., 2026-09-05): спасать нечего, если драйвер
+    // стоит в своём seL4_Recv — PARKED по определению означает, что он уже
+    // ответил предыдущему клиенту и никакой reply-капы в
+    // VFS_PENDING_REPLY_SLOT не держит. Раньше Move звался безусловно и в
+    // этом (самом частом) случае честно проваливался, но КАЖДЫЙ раз печатал
+    // в лог предупреждение самого ядра "CNode Copy/Mint/Move/Mutate: Source
+    // slot invalid or empty" — шум, который вдобавок маскировал бы
+    // настоящую проблему с капами, случись она.
+    bool victim_may_hold_reply = (driver_state_read(meta.is_driver) != DRIVER_STATE_PARKED);
+    if ((meta.is_driver == 3 || meta.is_driver == 6) && victim_may_hold_reply) {
         seL4_CPtr rescue_slot = alloc.alloc_slot();
         if (rescue_slot != 0) {
             seL4_Error rescue_err = seL4_CNode_Move(root_cnode, rescue_slot, seL4_WordBits,
@@ -2323,7 +3428,7 @@ static void generic_recover_process(int pid, seL4_CPtr ep, seL4_CPtr med_ep, Psy
     // Если процесс использовал SHM, уничтожаем копии Capabilities,
     // чтобы вернуть слоты в аллокатор и отмапить память!
     if (meta.has_shm) {
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
             if (meta.shm_copies[i] != 0) {
                 seL4_CNode_Delete(root_cnode, meta.shm_copies[i], seL4_WordBits);
                 alloc.free(meta.shm_copies[i]);
@@ -2944,12 +4049,42 @@ int main(int argc, char *argv[]) {
     // pcie_rc_frame/pcie_err_frame теперь file-scope globals (issuse.txt,
     // см. комментарий у их объявления, найдено на живом железе) — не
     // передекларируем здесь, просто присваиваем.
+    // pcie_rgr1_frame — ОБЫЧНАЯ локальная переменная main() (issuse.txt
+    // №74/в), НЕ file-scope: в отличие от pcie_rc_frame/pcie_err_frame,
+    // эта страница никогда не передаётся дочернему процессу (только root
+    // мапит её в root_vspace, см. ниже) — generic_recover_process() её
+    // никогда не спрашивает, переживать креш usb_driver'а незачем.
+    seL4_CPtr pcie_rgr1_frame = 0;
+    // issuse.txt №74/в — pcie_cfg_data_frame, как и pcie_rgr1_frame,
+    // ОБЫЧНАЯ локальная переменная (см. её же комментарий выше) — только
+    // root мапит её в root_vspace, usb_driver её не получает.
+    seL4_CPtr pcie_cfg_data_frame = 0;
+    // issuse.txt №74/в (38-я hw-попытка, ПРИЧИНА SError) — Type-1 заголовок
+    // САМОГО моста, см. подробный разбор у PLAT_PCIE_RC_TYPE1_PADDR/
+    // platform.h. Тоже только root'овая страница (usb_driver её не
+    // получает — там Command всего моста, ей это трогать незачем).
+    seL4_CPtr pcie_rc_type1_frame = 0;
     if (RPI4_ENABLE_USB) {
+        // ВАЖНО (watermark): PLAT_PCIE_RC_TYPE1_PADDR (0xfd500000) МЕНЬШЕ
+        // всех остальных страниц этого же /scb untyped-региона, поэтому
+        // аллоцируется СТРОГО ПЕРВОЙ (см. alloc_device_frame()).
+        pcie_rc_type1_frame = alloc_device_frame(info, alloc, PLAT_PCIE_RC_TYPE1_PADDR, root_cnode);
         pcie_rc_frame = alloc_device_frame(info, alloc, PLAT_PCIE_RC_MISC_PADDR, root_cnode);
         // PLAT_PCIE_ERR_PADDR (0xfd506000) > PLAT_PCIE_RC_MISC_PADDR
         // (0xfd504000) — сохраняет монотонный порядок watermark'а того же
         // /scb untyped-региона (см. alloc_device_frame()).
         pcie_err_frame = alloc_device_frame(info, alloc, PLAT_PCIE_ERR_PADDR, root_cnode);
+        // issuse.txt №74/в (см. situation.txt) — PLAT_PCIE_CFG_DATA_PADDR
+        // (0xfd508000) > PLAT_PCIE_ERR_PADDR (0xfd506000) И < PLAT_PCIE_RGR1_PADDR
+        // (0xfd509000) — ДОЛЖНА аллоцироваться СТРОГО между ними (watermark).
+        pcie_cfg_data_frame = alloc_device_frame(info, alloc, PLAT_PCIE_CFG_DATA_PADDR, root_cnode);
+        // issuse.txt №74/в (см. situation.txt) — PLAT_PCIE_RGR1_PADDR
+        // (0xfd509000) > PLAT_PCIE_CFG_DATA_PADDR (0xfd508000) — тот же
+        // watermark-приём, следующая по возрастанию страница в том же
+        // /scb untyped-регионе. Только root мапит эту страницу (см. ниже,
+        // root_vspace) — usb_driver её не получает, ей никогда не
+        // передаётся как child-параметр spawn_process().
+        pcie_rgr1_frame = alloc_device_frame(info, alloc, PLAT_PCIE_RGR1_PADDR, root_cnode);
     }
     if (RPI4_ENABLE_NET) {
         for (int i = 0; i < 16; i++) {
@@ -3026,7 +4161,58 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkout_trring_frame[i], usb_dma.bulkout_trring_paddr[i]);
         for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkin_trring_frame[i], usb_dma.bulkin_trring_paddr[i]);
         for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.cbw_csw_frame[i], usb_dma.cbw_csw_paddr[i]);
-        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bounce_frame[i], usb_dma.bounce_paddr[i]);
+        // Bounce-буферы ВСЕХ устройств — ОДИН непрерывный прогон, ВЫРОВНЕННЫЙ
+        // ПО 64 КБ.
+        //
+        // Выравнивание здесь не косметика, а требование xHCI: буфер одного
+        // TRB не может ПЕРЕСЕКАТЬ границу 64 КБ. Прогон, выровненный лишь по
+        // странице (4 КБ), при передаче в 64 КБ такую границу почти всегда
+        // пересекает — контроллер на этом встаёт молча, без кода ошибки
+        // (hw 2026-09-06: usb_driver завис на шаге "SCSI-команда", watchdog
+        // трижды сбросил шину и сдался). При базе, кратной 64 КБ, передача
+        // ровно в 64 КБ заканчивается НА границе, а не пересекает её.
+        //
+        // Один прогон на все устройства, а не по прогону на каждое: драйвер
+        // получает единственный базовый физический адрес и выводит адрес
+        // устройства как база + idx*шаг (см. BOOT_USB_BOUNCE_PADDR). Раздельные
+        // прогоны этот контракт ломают — уже проверено на железе, READ CAPACITY
+        // вернул мусор. Размер слайса устройства (USB_BOUNCE_PAGES*4КБ = 64 КБ)
+        // сам кратен 64 КБ, поэтому выравнивание базы выравнивает и всех.
+        {
+            const int total_pages = USB_MAX_DEVICES * USB_BOUNCE_PAGES;
+            const int align_pages = 16; // 64 КБ / 4 КБ — запас на подгонку базы
+            const int alloc_pages = total_pages + align_pages;
+            static seL4_CPtr bounce_pool[USB_MAX_DEVICES * USB_BOUNCE_PAGES + 16];
+
+            for (int n = 0; n < alloc_pages; n++) bounce_pool[n] = alloc.alloc_slot();
+            // Ретайп одним неразрывным циклом — между двумя ретайпами не должно
+            // вклиниться on-demand создание таблиц страниц, иначе в физической
+            // последовательности появится дыра (тот же приём, что у shm_frames).
+            for (int n = 0; n < alloc_pages; n++) {
+                ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, bounce_pool[n], 1);
+            }
+            seL4_Word pool_base = (seL4_Word)seL4_ARM_Page_GetAddress(bounce_pool[0]).paddr;
+            for (int n = 1; n < alloc_pages; n++) {
+                if ((seL4_Word)seL4_ARM_Page_GetAddress(bounce_pool[n]).paddr != pool_base + (seL4_Word)n * 4096) {
+                    uart_puts("[ROOT] KERNEL PANIC: bounce-буферы USB получились физически разрывными "
+                              "(см. USB_BOUNCE_PAGES в platform.h).\n");
+                    while (1) {}
+                }
+            }
+            // Сдвиг до ближайшей границы 64 КБ.
+            seL4_Word aligned = (pool_base + 0xFFFFu) & ~(seL4_Word)0xFFFFu;
+            int skip = (int)((aligned - pool_base) / 4096);
+            if (skip + total_pages > alloc_pages) {
+                uart_puts("[ROOT] KERNEL PANIC: не удалось выровнять bounce-буферы USB по 64 КБ.\n");
+                while (1) {}
+            }
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                for (int pg = 0; pg < USB_BOUNCE_PAGES; pg++) {
+                    usb_dma.bounce_frame[i][pg] = bounce_pool[skip + i * USB_BOUNCE_PAGES + pg];
+                }
+                usb_dma.bounce_paddr[i] = aligned + (seL4_Word)i * USB_BOUNCE_PAGES * 4096;
+            }
+        }
     }
 
     // ВАЖНО: MMIO должен маппиться некэшируемым (Device memory), иначе CPU
@@ -3041,12 +4227,75 @@ int main(int argc, char *argv[]) {
     seL4_ARM_PageTable_Map(pt, root_vspace, uart_vaddr, (seL4_ARM_VMAttributes)0);
     seL4_ARM_Page_Map(uart_frame, root_vspace, uart_vaddr, seL4_AllRights, (seL4_ARM_VMAttributes)0);
 
+    // issuse.txt №74/в (см. situation.txt) — root мапит PCIe RC-регистры
+    // НАПРЯМУЮ в СВОЙ СОБСТВЕННЫЙ vspace, тем же приёмом, что uart_frame
+    // выше (тот же уже покрытый этой PD/PT парой 2MB-регион — отдельная
+    // seL4_ARM_PageDirectory_Map/PageTable_Map не нужна, только Page_Map
+    // самой страницы). pcie_rc_frame — это ТА ЖЕ физическая страница
+    // (0xfd504000), что уже мапится в usb_driver (см. spawn_process(),
+    // is_driver==6) — один и тот же frame cap МОЖНО мапить в НЕСКОЛЬКО
+    // разных vspace одновременно (стандартный seL4-приём, тот же, что уже
+    // используется для SHM-страниц в этом проекте) — root получает
+    // независимый от usb_driver доступ к тем же регистрам (PCIE_MISC_
+    // PCIE_STATUS/HARD_PCIE_HARD_DEBUG), не идёт через её процесс.
+    // pcie_rgr1_frame — новая страница (см. alloc_device_frame() выше),
+    // мапится ТОЛЬКО сюда, usb_driver её не получает вообще.
+    if (RPI4_ENABLE_USB) {
+        seL4_ARM_Page_Map(pcie_rc_frame, root_vspace, PLAT_PCIE_RC_MISC_ROOT_VADDR, seL4_AllRights, (seL4_ARM_VMAttributes)0);
+        seL4_ARM_Page_Map(pcie_rgr1_frame, root_vspace, PLAT_PCIE_RGR1_ROOT_VADDR, seL4_AllRights, (seL4_ARM_VMAttributes)0);
+        // issuse.txt №74/в — PCIE_EXT_CFG_DATA (см. platform.h), нужна
+        // для переэнумерации PCI config space VL805 (Command/BAR0) после
+        // PERST, ДО первого обращения к её BAR-mapped xHCI MMIO.
+        seL4_ARM_Page_Map(pcie_cfg_data_frame, root_vspace, PLAT_PCIE_CFG_DATA_ROOT_VADDR, seL4_AllRights, (seL4_ARM_VMAttributes)0);
+        // issuse.txt №74/в (38-я hw-попытка) — Type-1 заголовок САМОГО
+        // моста: единственное место, откуда можно вернуть ему Memory Space
+        // Enable после bridge software init (см. platform.h/
+        // PLAT_PCIE_RC_TYPE1_PADDR — полный разбор причины SError).
+        seL4_ARM_Page_Map(pcie_rc_type1_frame, root_vspace, PLAT_PCIE_RC_TYPE1_ROOT_VADDR, seL4_AllRights, (seL4_ARM_VMAttributes)0);
+    }
+
     // Мапим таблицу для временного окна IPC. Адрес должен совпадать с global_ipc_temp_vaddr.
     // Одна таблица покрывает 2MB, чего достаточно для 512 процессов.
     seL4_ARM_PageTable_Map(pt_ipc_temp, root_vspace, 0x200800000ULL, seL4_ARM_Default_VMAttributes);
 
     uart_init((void*)uart_vaddr);
     seL4_DebugPutString((char*)"[BRINGUP] uart_init (mini-UART): done\n");
+
+    // ТАЙМАУТЫ ЗАВЕРШЕНИЯ ТРАНЗАКЦИЙ Root Complex — программируем на
+    // холодной загрузке, а не только внутри usbreset.
+    //
+    // ПОДТВЕРЖДЕНО ЖИВЫМ ЛОГОМ 2026-09-06: сразу после загрузки
+    // RC_CONFIG_RETRY_TIMEOUT = 0x00000000, UBUS_TIMEOUT = 0x00080000.
+    // Он же после нашего собственного сброса шины: 0x0aba0000 и
+    // 0x0b2d0000 — то есть до первого usbreset система жила с НУЛЕВЫМ
+    // таймаутом CRS-ретраев и на два порядка более коротким UBUS. U-Boot
+    // программирует эти регистры только для BCM2712, наш BCM2711 не
+    // трогает вообще, а POR-дефолт оказался именно таким.
+    //
+    // Почему это ровно наш отказ: незавершающаяся транзакция к
+    // устройству, переставшему отвечать, — тот самый механизм, что
+    // замораживает ядро на `dsb sy` и убивает всю плату (см.
+    // usb_bus_stalled_suspect()). Конечный щедрый таймаут превращает
+    // "висит вечно" в "вернулась ошибка", а ошибку драйвер переживает.
+    // Значения — те же, что U-Boot ставит для BCM2712.
+    //
+    // МЕСТО ВЫБРАНО НЕ СЛУЧАЙНО: строго ПОСЛЕ uart_init() и строго ДО
+    // спавна usb_driver. Первая версия этой правки стояла выше по main(),
+    // рядом с маппингом страницы RC, — и первая же строка лога тут же
+    // упала VM fault'ом по адресу 0, потому что UART там ещё не
+    // инициализирован (hw 2026-09-06). Сами регистровые записи там
+    // работали бы (страница уже отображена), убивала именно печать.
+    if (RPI4_ENABLE_USB) {
+        pcie_rc_misc_write(PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_OFFSET, PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_GENEROUS);
+        pcie_rc_misc_write(PCIE_MISC_UBUS_TIMEOUT_OFFSET, PCIE_MISC_UBUS_TIMEOUT_GENEROUS);
+        uart_puts("[ROOT] PCIe: таймауты завершения транзакций (CRS/UBUS) запрограммированы на холодной загрузке — POR-дефолт BCM2711 оставлял CRS-таймаут нулевым.\n");
+    }
+
+    // issuse.txt №74/в — root сам себя не проходит через spawn_process()
+    // (см. её же новый seL4_DebugNameThread(tcb, name) вызов) — именуем
+    // явно, тем же приёмом, чтобы в живом JTAG-дампе ksDebugTCBs root
+    // тоже был узнаваем по имени, а не только "методом исключения".
+    seL4_DebugNameThread(seL4_CapInitThreadTCB, "ROOT");
 
     if (RPI4_ENABLE_TIMER) {
         timer_init(); // ARM generic timer — без device-frame, см. выше
@@ -3103,7 +4352,7 @@ int main(int argc, char *argv[]) {
     // "дырочный" (чужой/неинициализированный) физический адрес вместо
     // настоящей 2-й/3-й страницы SHM — net_driver читал свою страницу и
     // видел одни нули (см. ROADMAP.md 4.5, живой баг ethertype=0).
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
         shm_frames[i] = alloc.alloc_slot();
         seL4_Error err = ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0,
                                              root_cnode, 0, 0, shm_frames[i], 1);
@@ -3112,7 +4361,7 @@ int main(int argc, char *argv[]) {
             while(1);
         }
     }
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
         // Мапим эти физические фреймы в виртуальную память Rootserver'а —
         // ОБЯЗАТЕЛЬНО кэшируемой (seL4_ARM_Default_VMAttributes), в отличие
         // от map_frame_robust() ниже (та мапит некэшируемо ради когерентности
@@ -3239,13 +4488,28 @@ int main(int argc, char *argv[]) {
         ram_retype(normal_untyped, seL4_EndpointObject, 0, root_cnode, 0, 0, usb_cmd_ep, 1);
         seL4_CNode_Copy(root_cnode, usb_cmd_recv_ep, seL4_WordBits,
                         root_cnode, usb_cmd_ep, seL4_WordBits, seL4_CanRead);
+        g_usb_cmd_ep = usb_cmd_ep; // см. usb_bus_stalled_suspect()/generic_recover_process()
 
         seL4_CPtr badged_usb_irq_ntfn = alloc.alloc_slot();
         usb_irq_ntfn = alloc.alloc_slot();
         usb_irq_handler = alloc.alloc_slot();
         ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, usb_irq_ntfn, 1);
         seL4_CNode_Mint(root_cnode, badged_usb_irq_ntfn, seL4_WordBits, root_cnode, usb_irq_ntfn, seL4_WordBits, seL4_AllRights, USB_EVENT_XHCI_IRQ);
-        check_err(seL4_IRQControl_Get(seL4_CapIRQControl, PLAT_XHCI_IRQ, root_cnode, usb_irq_handler, seL4_WordBits), "IRQControl_Get(XHCI)");
+        // issuse.txt №74/в — ВРЕМЕННО, ТОЛЬКО ДЛЯ JTAG-ДИАГНОСТИКИ: до
+        // этой правки IRQ208 (xHCI) ВСЕГДА таргетился GIC'ом на CPU0
+        // (см. platform.h/USB_DRIVER_DEFAULT_CORE) — обычный
+        // seL4_IRQControl_Get() core-обливиозен (жёстко кодирует ядро 0
+        // в кодировку irq_t, kernel/src/object/interrupt.c) и не имеет
+        // способа задать другое ядро. seL4_IRQControl_GetTriggerCore()
+        // (ARM SMP-специфичный вариант, kernel/src/arch/arm/object/
+        // interrupt.c, ARMIRQIssueIRQHandlerTriggerCore) добавляет
+        // ПОСЛЕДНИЙ параметр target — доставляет прерывание физически
+        // на нужное ядро (setIRQTarget() -> GICD_ITARGETSR). Параметр
+        // trigger (здесь 0) НА ЭТОЙ ПЛАТФОРМЕ безопасно игнорируется
+        // ядром (HAVE_SET_TRIGGER не сконфигурирован для bcm2711,
+        // Arch_invokeIRQControl() пропускает setIRQTrigger() целиком) —
+        // меняется ТОЛЬКО таргетинг, не тип триггера.
+        check_err(seL4_IRQControl_GetTriggerCore(seL4_CapIRQControl, PLAT_XHCI_IRQ, 0, root_cnode, usb_irq_handler, seL4_WordBits, USB_DRIVER_DEFAULT_CORE), "IRQControl_GetTriggerCore(XHCI)");
         check_err(seL4_IRQHandler_SetNotification(usb_irq_handler, badged_usb_irq_ntfn), "IRQHandler_SetNotification(xhci)");
         check_err(seL4_IRQHandler_Ack(usb_irq_handler), "IRQHandler_Ack(xhci, initial)");
 
@@ -3266,6 +4530,33 @@ int main(int argc, char *argv[]) {
     seL4_IRQHandler_SetNotification(uart_irq_handler, badged_uart_ntfn); 
     uart_enable_interrupts();
     seL4_IRQHandler_Ack(uart_irq_handler);
+
+    // issuse.txt №74, часть "б" — общая страница состояния драйверов
+    // (PARKED/BUSY). Создаётся ДО первого spawn_process(), потому что та
+    // мапит её в каждый драйвер (см. g_driver_state_frame). Обычная
+    // RAM-страница из normal_untyped, но мапится НЕКЭШИРУЕМО с обеих
+    // сторон: её читает root с ядра 0, а пишут драйверы с других ядер, и
+    // разбираться с кэш-обслуживанием на каждый опрос незачем — данных
+    // одно слово на драйвер.
+    {
+        g_driver_state_frame = alloc.alloc_slot();
+        if (g_driver_state_frame != 0 &&
+            ram_retype(normal_untyped, seL4_ARM_SmallPageObject, 0, root_cnode, 0, 0, g_driver_state_frame, 1) == seL4_NoError &&
+            seL4_ARM_Page_Map(g_driver_state_frame, root_vspace, PLAT_DRIVER_STATE_ROOT_VADDR,
+                              seL4_AllRights, (seL4_ARM_VMAttributes)0) == seL4_NoError) {
+            g_driver_state_page = (volatile seL4_Word *)PLAT_DRIVER_STATE_ROOT_VADDR;
+            for (int i = 0; i < 4096 / (int)sizeof(seL4_Word); i++) g_driver_state_page[i] = DRIVER_STATE_BUSY;
+        } else {
+            // Не смертельно: без страницы механизм просто вырождается в
+            // прежнее поведение — driver_state_read() всегда возвращает
+            // BUSY, значит prepare_driver_for_suspend() откажет любому
+            // драйверу на не-нулевом ядре, а восстановление на ядре 0
+            // (как было до этой работы) продолжит работать как раньше.
+            uart_puts("[ROOT] ВНИМАНИЕ: не удалось создать общую страницу состояния драйверов — перенос между ядрами останется без защиты, Suspend вне ядра 0 будет отклоняться (issuse.txt №74/б).\n");
+            g_driver_state_frame = 0;
+            g_driver_state_page = nullptr;
+        }
+    }
 
     // Запускаем Драйвер UART (is_driver = 1)
     if (spawn_process("uart_driver", nullptr, 0, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0],
@@ -3339,6 +4630,22 @@ int main(int argc, char *argv[]) {
         blk_liveness_tick_badged = alloc.alloc_slot();
         check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, blk_liveness_tick_ntfn, 1), "Retype blk_liveness_tick_ntfn");
         check_err(seL4_CNode_Mint(root_cnode, blk_liveness_tick_badged, seL4_WordBits, root_cnode, blk_liveness_tick_ntfn, seL4_WordBits, seL4_AllRights, BLK_LIVENESS_TICK_BADGE), "Mint blk_liveness_tick_badged");
+    }
+
+    // Собственный тик heartbeat-watchdog'а (см. common.h/
+    // ROOT_WATCHDOG_TICK_BADGE — там же разбор, почему прежняя схема
+    // "скан запускается от сигналов самих наблюдаемых драйверов" не
+    // работает ровно в тот момент, когда нужна). Сам объект нотификации
+    // создаётся ЗДЕСЬ, до спавна timer_driver, — именно порядок
+    // инициализации и был причиной, по которой этот тик когда-то не
+    // завели; остальное (IRQ-обвязка SDIO, TCB-bind к root'у, badged-копии
+    // liveness) по-прежнему настраивается ниже, над этим же объектом.
+    seL4_CPtr mmc_shared_irq_ntfn = 0;
+    if (RPI4_ENABLE_BLK) {
+        mmc_shared_irq_ntfn = alloc.alloc_slot();
+        check_err(ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, mmc_shared_irq_ntfn, 1), "Retype mmc_shared_irq_ntfn");
+        g_root_watchdog_tick_badged = alloc.alloc_slot();
+        check_err(seL4_CNode_Mint(root_cnode, g_root_watchdog_tick_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, ROOT_WATCHDOG_TICK_BADGE), "Mint root_watchdog_tick_badged");
     }
 
     // Фаза 6 (SMP, см. ROADMAP.md/common.h): общий мьютекс на нотификации
@@ -3434,10 +4741,10 @@ int main(int argc, char *argv[]) {
     seL4_CPtr wifi_liveness_badged = 0;
     seL4_CPtr usb_liveness_badged = 0;
     if (RPI4_ENABLE_BLK) {
-        seL4_CPtr mmc_shared_irq_ntfn = alloc.alloc_slot();
+        // Сам объект уже создан ВЫШЕ, до спавна timer_driver (нужен был
+        // раньше, чтобы выдать ему тик watchdog'а) — здесь только обвязка.
         seL4_CPtr mmc_shared_irq_badged = alloc.alloc_slot();
         mmc_shared_irq_handler = alloc.alloc_slot();
-        ram_retype(normal_untyped, seL4_NotificationObject, 0, root_cnode, 0, 0, mmc_shared_irq_ntfn, 1);
         seL4_CNode_Mint(root_cnode, mmc_shared_irq_badged, seL4_WordBits, root_cnode, mmc_shared_irq_ntfn, seL4_WordBits, seL4_AllRights, IRQ_MMC_SHARED_BADGE);
         seL4_IRQControl_Get(seL4_CapIRQControl, RPI4_WIFI_SDIO_IRQ, root_cnode, mmc_shared_irq_handler, seL4_WordBits);
         seL4_IRQHandler_SetNotification(mmc_shared_irq_handler, mmc_shared_irq_badged);
@@ -3523,7 +4830,11 @@ int main(int argc, char *argv[]) {
                       usb_cmd_recv_ep, &usb_dma, pcie_rc_frame, pcie_err_frame,
                       0, // usb_storage_ep_param (не для usb_driver самого)
                       0, // usb_heartbeat_ntfn_param (не для usb_driver самого)
-                      usb_liveness_badged) < 0) { // Фаза 3b: капа-"я жив"
+                      usb_liveness_badged, // Фаза 3b: капа-"я жив"
+                      0, // blk_liveness_tick_param (не для usb_driver)
+                      0, // gpio_frame_param (не для usb_driver)
+                      0, // pm_wdog_frame_param (не для usb_driver)
+                      pcie_cfg_data_frame) < 0) { // issuse.txt №74/в, 37-я hw-попытка (param 54: pcie_cfg_data_frame_param)
         uart_puts("PANIC: USB Driver failed to load!\n"); while(1);
     }
     }
@@ -3622,12 +4933,90 @@ int main(int argc, char *argv[]) {
             if (sender_badge & DRIVER_LIVENESS_BLK_BADGE)  g_driver_last_seen_ms[3] = watchdog_now_ms;
             if (sender_badge & DRIVER_LIVENESS_NET_BADGE)  g_driver_last_seen_ms[4] = watchdog_now_ms;
             if (sender_badge & DRIVER_LIVENESS_WIFI_BADGE) g_driver_last_seen_ms[5] = watchdog_now_ms;
-            if (sender_badge & DRIVER_LIVENESS_USB_BADGE)  g_driver_last_seen_ms[6] = watchdog_now_ms;
+            if (sender_badge & DRIVER_LIVENESS_USB_BADGE) {
+                g_driver_last_seen_ms[6] = watchdog_now_ms;
+                g_usb_reset_attempts = 0; // драйвер жив — счётчик подряд идущих сбросов шины обнуляется
+            }
+
+            // Пошаговый мониторинг (по прямой просьбе пользователя
+            // 2026-09-05). Отдельно от liveness-сигналов: те приходят,
+            // только когда драйвер возвращается в свой Recv или успешно
+            // завершает I/O, — а нас интересует ровно промежуток МЕЖДУ
+            // ними. Счётчик прогресса драйвер крутит внутри всех длинных
+            // циклов ожидания, поэтому:
+            //   счётчик растёт      -> занят делом, не трогать;
+            //   счётчик замер       -> ядро не исполняет его код вообще.
+            for (int d = 3; d <= 6; d++) {
+                if (g_driver_state_page == nullptr) break;
+                if (!driver_reports_steps(d)) continue;
+                seL4_Word prog = driver_state_word(d, DRIVER_STATE_WORD_PROGRESS);
+                // Счётчик стоит на месте ЗАКОННО, пока драйвер не объявил,
+                // что вошёл в шаг: простаивающему двигать нечего. Отсчёт
+                // "как давно не двигался" начинаем заново и на каждом
+                // возврате в простой — иначе к моменту следующей реальной
+                // операции он уже был бы просрочен.
+                seL4_Word step = driver_state_word(d, DRIVER_STATE_WORD_STEP);
+                if (prog != g_driver_last_progress[d] || g_driver_progress_seen_ms[d] == 0 ||
+                    step == USB_STEP_IDLE) {
+                    g_driver_last_progress[d] = prog;
+                    g_driver_progress_seen_ms[d] = watchdog_now_ms;
+                }
+            }
+
+            // Отложенная переэнумерация: сброс шины уже был, а драйвер
+            // тогда не отвечал. Как только он снова припаркован — отдаём
+            // долг, иначе USB так и останется мёртвым при живой плате.
+            if (g_usb_restart_pending && usb_cmd_ep != 0 && driver_is_parked(6)) {
+                g_usb_restart_pending = false;
+                usb_set_freeze(false); // снимаем заморозку ровно перед переэнумерацией
+                uart_puts("[WATCHDOG] usb_driver снова отвечает — отдаю отложенную переэнумерацию после сброса шины.\n");
+                seL4_SetMR(0, SYS_DRIVER_SIGNAL);
+                seL4_SetMR(1, DRIVER_SIGNAL_RESTART);
+                seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                uart_puts("[WATCHDOG] Отложенная переэнумерация вернула статус = "); uart_puthex(seL4_GetMR(0)); uart_puts("\n");
+                g_driver_progress_seen_ms[6] = 0;
+                g_usb_reset_attempts = 0;
+            }
 
             for (int wd_driver = 3; wd_driver <= 6; wd_driver++) {
                 if (!g_auto_restart_enabled[wd_driver]) continue;
                 if (g_driver_last_seen_ms[wd_driver] == 0) continue; // ещё ни разу не спавнился/не инициализирован
-                if (watchdog_now_ms - g_driver_last_seen_ms[wd_driver] < WATCHDOG_TIMEOUT_MS[wd_driver]) continue;
+
+                // Замер ли прогресс? Это ГЛАВНЫЙ признак настоящего
+                // зависания, и он не зависит от того, доходит ли драйвер до
+                // своего Recv.
+                // Все три условия обязательны, и каждое отсекает свой
+                // ложный случай: драйвер должен САМ РАЗМЕЧАТЬ шаги (иначе
+                // нули в слоте читались бы как "замерший прогресс"), он
+                // должен НАХОДИТЬСЯ В ШАГЕ (простой — законная причина не
+                // двигать счётчик) и НЕ быть припаркованным.
+                seL4_Word wd_step = driver_state_word(wd_driver, DRIVER_STATE_WORD_STEP);
+                bool progress_stuck = false;
+                if (g_driver_state_page != nullptr && driver_reports_steps(wd_driver) &&
+                    wd_step != USB_STEP_IDLE &&
+                    g_driver_progress_seen_ms[wd_driver] != 0 &&
+                    driver_state_read(wd_driver) != DRIVER_STATE_PARKED &&
+                    watchdog_now_ms - g_driver_progress_seen_ms[wd_driver] >= USB_STEP_STUCK_TIMEOUT_MS) {
+                    progress_stuck = true;
+                    uart_puts("[WATCHDOG] is_driver="); uart_putdec(wd_driver);
+                    uart_puts(": прогресс замер на шаге \""); uart_puts(usb_step_name(wd_step));
+                    uart_puts("\" уже "); uart_putdec(watchdog_now_ms - g_driver_progress_seen_ms[wd_driver]);
+                    uart_puts(" мс — это не долгая операция, это зависание.\n");
+                }
+
+                if (!progress_stuck) {
+                    if (watchdog_now_ms - g_driver_last_seen_ms[wd_driver] < WATCHDOG_TIMEOUT_MS[wd_driver]) continue;
+                    // Сигнала живости нет, НО счётчик прогресса шевелится —
+                    // драйвер занят реальной длинной работой (перечисление
+                    // устройства, длинная SCSI-операция) и до своего Recv
+                    // просто ещё не дошёл. Раньше такой случай был
+                    // неотличим от зависания и стоил ложных убийств живого
+                    // драйвера (issuse.txt №66); теперь отличим.
+                    if (g_driver_state_page != nullptr && g_driver_progress_seen_ms[wd_driver] != 0 &&
+                        watchdog_now_ms - g_driver_progress_seen_ms[wd_driver] < WATCHDOG_TIMEOUT_MS[wd_driver]) {
+                        continue;
+                    }
+                }
 
                 int wd_target_pid = -1;
                 for (int i = 1; i < 256; i++) {
@@ -3640,8 +5029,68 @@ int main(int argc, char *argv[]) {
                 // появится, spawn_process() сам переинициализирует его.
                 if (wd_target_pid == -1) continue;
 
-                uart_puts("[WATCHDOG] Heartbeat timeout for is_driver="); uart_putdec(wd_driver);
-                uart_puts(" (PID "); uart_putdec(wd_target_pid); uart_puts(") — auto-recovering.\n");
+                // Ограничитель для usb_driver: если шина мертва
+                // по-настоящему, сброс не поможет ни с первого раза, ни с
+                // десятого, а повторять его каждые WATCHDOG_TIMEOUT_MS[6]
+                // значит бесконечно дёргать PERST и забивать лог. Счётчик
+                // обнуляется, как только приходит хоть один настоящий
+                // liveness-сигнал от usb_driver (см. выше по циклу).
+                // Проверяем ДО печати "auto-recovering" — иначе она сама
+                // стала бы тем самым бесконечным потоком в логе.
+                if (wd_driver == 6 && RPI4_ENABLE_USB && g_usb_reset_attempts >= USB_RESET_MAX_CONSECUTIVE) {
+                    if (g_usb_reset_attempts == USB_RESET_MAX_CONSECUTIVE) {
+                        uart_puts("[WATCHDOG] usb_driver не ожил после "); uart_putdec(USB_RESET_MAX_CONSECUTIVE);
+                        uart_puts(" подряд полных сбросов шины — прекращаю автоматические попытки. Ручные `usbreset`/`recover usb_driver` по-прежнему доступны; если и они не помогают, шина требует физической перезагрузки платы.\n");
+                        g_usb_reset_attempts++; // сообщение печатается ровно один раз
+                    }
+                    continue;
+                }
+
+                uart_puts(progress_stuck ? "[WATCHDOG] Зависание на шаге (is_driver="
+                                         : "[WATCHDOG] Heartbeat timeout for is_driver=");
+                uart_putdec(wd_driver);
+                uart_puts(" (PID "); uart_putdec(wd_target_pid); uart_puts(")");
+                // Порог heartbeat'а (5с) короче порога "замер прогресс"
+                // (10с), поэтому для usb_driver почти всегда первым
+                // срабатывает именно heartbeat — и информация о том, НА
+                // КАКОМ ШАГЕ он встал, потерялась бы. Печатаем её здесь.
+                if (driver_reports_steps(wd_driver) && g_driver_state_page != nullptr) {
+                    uart_puts(", шаг: \""); uart_puts(usb_step_name(wd_step)); uart_puts("\"");
+                }
+                uart_puts(" — auto-recovering.\n");
+
+                // usb_driver — особый случай (по прямому решению
+                // пользователя 2026-09-05). Обычный kill+respawn ему не
+                // помогает: он зависает не сам по себе, а вместе с PCIe-
+                // шиной под собой (аппаратное ограничение, см. issuse.txt/
+                // usb_driver.cpp), и пересозданный процесс упирается ровно
+                // в ту же мёртвую шину. Поэтому здесь запускается ТОТ ЖЕ
+                // путь, что и ручной `usbreset`: полная инициализация с
+                // нуля — fundamental reset Root Complex'а, восстановление
+                // всего, что стирает bridge software init, перезаливка
+                // прошивки VL805 через VideoCore-mailbox и переэнумерация.
+                // Пересоздание процесса остаётся запасным вариантом — на
+                // случай, если шину подняли, а сам драйвер так и не ожил.
+                if (wd_driver == 6 && RPI4_ENABLE_USB) {
+                    g_usb_reset_attempts++;
+                    seL4_Word wd_reset_status = root_usb_full_reset(timer_ep, usb_cmd_ep);
+                    g_driver_progress_seen_ms[6] = watchdog_now_ms; // отсчёт заново, иначе следующий тик сработает мгновенно
+                    if (wd_reset_status == USB_RESET_OK) {
+                        // Драйвер жив и переэнумерировал устройства сам —
+                        // отметим его "видели только что", иначе следующий
+                        // же тик снова сочтёт таймаут истёкшим и мы уйдём в
+                        // цикл сбросов, не дав драйверу выйти на связь.
+                        g_driver_last_seen_ms[6] = watchdog_now_ms;
+                        continue;
+                    }
+                    // Пересоздания процесса для USB больше нет вообще
+                    // (см. generic_recover_process()): снос VSpace — это
+                    // dsb sy, который при застопоренной шине вешает плату.
+                    uart_puts("[WATCHDOG] Сброс шины не закрыл вопрос (статус = "); uart_puthex(wd_reset_status);
+                    uart_puts("). Пересоздание процесса для USB запрещено — жду следующей попытки.\n");
+                    continue;
+                }
+
                 generic_recover_process(wd_target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped,
                                         shm_frames[0], console_ep, timer_ep, blk_ep);
                 // last_seen для этого is_driver будет переинициализирован
@@ -3695,9 +5144,36 @@ int main(int argc, char *argv[]) {
                 continue;
             } else {
                 uart_puts("\nFATAL FAULT! PID: "); uart_putdec(sender_pid);
+                uart_puts(" ("); uart_puts(pcbs[sender_pid].name); uart_puts(")");
                 uart_puts("\nPC: "); uart_puthex(pc);
                 uart_puts("\nMem Addr: "); uart_puthex(addr);
                 uart_puts("\n");
+
+                // Полный контекст упавшего потока. Двух чисел (PC и адрес
+                // данных) катастрофически не хватает в самом частом
+                // интересном случае — PC=0: это значит, что поток КУДА-ТО
+                // прыгнул по нулю, и весь вопрос в том, ОТКУДА. Ответ
+                // лежит в x30 (LR, адрес возврата вызвавшего) и в стеке.
+                // Раньше такой отказ приходилось разбирать гаданием
+                // (hotplugtest, 2026-09-06: два прогона подряд умерли с
+                // PC=0, и по двум числам сказать было нечего).
+                // seL4_TCB_ReadRegisters над упавшим потоком безопасен: он
+                // заблокирован ядром на fault-endpoint'е и никуда не
+                // денется. MR'ы при этом затираются — поэтому pc/addr
+                // прочитаны ВЫШЕ, до вызова.
+                if (sender_pid != 0 && pcbs[sender_pid].tcb != 0) {
+                    seL4_UserContext fregs = {0};
+                    if (seL4_TCB_ReadRegisters(pcbs[sender_pid].tcb, false, 0,
+                                               sizeof(seL4_UserContext) / sizeof(seL4_Word), &fregs) == seL4_NoError) {
+                        uart_puts("  SP  = "); uart_puthex(fregs.sp);
+                        uart_puts("\n  LR  (x30, откуда пришли) = "); uart_puthex(fregs.x30);
+                        uart_puts("\n  FP  (x29) = "); uart_puthex(fregs.x29);
+                        uart_puts("\n  x0..x3 = "); uart_puthex(fregs.x0); uart_puts(" ");
+                        uart_puthex(fregs.x1); uart_puts(" ");
+                        uart_puthex(fregs.x2); uart_puts(" ");
+                        uart_puthex(fregs.x3); uart_puts("\n");
+                    }
+                }
 
                 // ДОБАВЛЕНО: Предохранитель от бага неинициализированного TLS/IPC Buffer
                 if (addr == 0x12) {
@@ -3707,7 +5183,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (sender_pid != 0) {
-                    generic_recover_process(sender_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], console_ep, timer_ep, blk_ep);
+                    generic_recover_process(sender_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], console_ep, timer_ep, blk_ep, /*respawn=*/true, /*target_faulted=*/true);
                 }
                 continue;
             }
@@ -3722,7 +5198,7 @@ int main(int argc, char *argv[]) {
             uart_puts(" at PC: "); uart_puthex(pc); uart_puts("\n");
             
             if (sender_pid != 0) {
-                generic_recover_process(sender_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], console_ep, timer_ep, blk_ep);
+                generic_recover_process(sender_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], console_ep, timer_ep, blk_ep, /*respawn=*/true, /*target_faulted=*/true);
             }
             continue; // КРИТИЧНО: Возвращаемся в начало цикла, НЕ делая Reply!
         }
@@ -4438,34 +5914,25 @@ int main(int argc, char *argv[]) {
                     status = 2;
                 } else if (target_pid >= 256 || !pcbs[target_pid].active) {
                     status = 1;
-                } else if (pcbs[target_pid].is_driver != 0) {
-                    // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (JTAG,
-                    // 2026-08-25): раньше здесь исключался только
-                    // timer_driver (PPI-опасность). Любой ДРУГОЙ драйвер,
-                    // перенесённый на не-0 ядро (этой командой или
-                    // SYS_BALANCE ниже) и позже требующий восстановления
-                    // (watchdog ИЛИ ручной `recover`, см. generic_recover_
-                    // process() -> seL4_TCB_Suspend()) — если он к этому
-                    // моменту РЕАЛЬНО активно исполняется на своём (не
-                    // корневом) ядре, seL4 требует IPI remote-stall
-                    // (remoteTCBStall() -> ipi_wait(), см. kernel/src/smp/
-                    // ipi.c) — синхронный barrier БЕЗ таймаута. Живой
-                    // тест: root (ядро 0) застрял в ipi_wait() навсегда
-                    // (полное зависание системы, не только драйвера) —
-                    // usb_driver был перенесён на ядро 3 (этой самой
-                    // командой/SYS_BALANCE) и в момент аварийного
-                    // восстановления реально работал там. Единственный
-                    // безопасный вариант — не давать драйверам вообще
-                    // покидать ядро 0 (кроме wifi_driver, у которого
-                    // ЕСТЬ выделенное ядро 1 с самого спавна, см.
-                    // spawn_process() — трогать его отсюда тоже нельзя,
-                    // ровно та же опасность).
+                } else if (!process_is_migratable(target_pid)) {
+                    // issuse.txt №74, часть "б" — раньше здесь стоял запрет
+                    // на ЛЮБОЙ драйвер (is_driver != 0): "в лоб" от
+                    // cross-core зависания root'а в ipi_wait() при
+                    // последующем Suspend'е (issuse.txt №73, JTAG 2026-08-25).
+                    // Теперь причина устранена по существу —
+                    // prepare_driver_for_suspend() не даёт вызвать Suspend
+                    // над потоком, который может исполняться на чужом ядре, —
+                    // и переносить можно всех, кроме timer_driver'а (см.
+                    // process_is_migratable(): per-core PPI + он же кормит
+                    // PM_WDOG и обслуживает сам механизм ожидания PARKED).
                     status = 3;
                 } else if (target_core > 3) {
                     status = 4;
+                } else if (!core_allowed_for_process((int)target_pid, (int)target_core)) {
+                    status = 6; // драйверам ядро 0 запрещено — см. core_allowed_for_process()
+                } else if (!migrate_process_to_core((int)target_pid, (int)target_core, timer_ep)) {
+                    status = 7; // драйвер занят работой с железом, безопасного момента не дождались
                 } else {
-                    seL4_TCB_SetAffinity(pcbs[target_pid].tcb, target_core);
-                    pcbs[target_pid].core = (int)target_core;
                     status = 0;
                 }
 
@@ -4628,10 +6095,22 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
+                // "Тихий" режим (MR1==1, см. common.h/SYS_BALANCE): отчёт
+                // складываем в собственный буфер root'а вместо общей
+                // SHM-страницы. Нужен автотестам, гоняющим balance
+                // одновременно с длинным чтением файла — та же страница в
+                // этот момент занята данными файла (именно поэтому shell
+                // берёт вокруг balance vfs_lock, но тогда параллельности и
+                // не остаётся). Логика балансировки ниже не меняется ни на
+                // строчку — отличается только адрес, куда пишется текст, и
+                // отсутствие flush_rootserver_shm().
+                bool balance_quiet = (seL4_MessageInfo_get_length(recv_info) >= 2) && (seL4_GetMR(1) == 1);
+
                 LoadSnapshot snap;
                 collect_load_snapshot(snap, console_ep, blk_ep, net_cmd_send_ep, wifi_cmd_send_ep, timer_ep);
 
-                char *shm = rootserver_shm_base;
+                static char balance_quiet_sink[4096]; // тот же размер, что страница SHM — верхняя граница отчёта не меняется
+                char *shm = balance_quiet ? balance_quiet_sink : rootserver_shm_base;
                 int offset = 0;
 
                 // Агрегатный % по ядру. Для ядра без данных (core_enabled
@@ -4683,9 +6162,10 @@ int main(int argc, char *argv[]) {
 
                 if (source < 0) {
                     strcpy(shm, "Балансировать нечего: ни на одном ядре с известной нагрузкой нет более одного процесса.\n");
-                    flush_rootserver_shm();
+                    if (!balance_quiet) flush_rootserver_shm();
                     seL4_SetMR(0, 0);
-                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    seL4_SetMR(1, 0); // перенесено процессов
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
                     break;
                 }
 
@@ -4716,22 +6196,28 @@ int main(int argc, char *argv[]) {
                     if (!pcbs[i].active) continue;
                     if (pcbs[i].core != source) continue;
                     if (i == heavy) continue;
-                    // issuse.txt №15 — см. подробный комментарий у того же
-                    // условия в SYS_SET_AFFINITY выше: ЛЮБОЙ драйвер, не
-                    // только timer_driver, опасно переносить с ядра 0 —
-                    // watchdog/ручной recover() может застать его активно
-                    // работающим на новом ядре и намертво зависнуть в
-                    // remoteTCBStall()/ipi_wait() при попытке Suspend.
-                    if (pcbs[i].is_driver != 0) continue;
+                    // issuse.txt №74, часть "б": драйверы теперь
+                    // РАВНОПРАВНЫЕ участники балансировки — раньше здесь
+                    // отсекался любой is_driver != 0 (см. подробный разбор у
+                    // того же условия в SYS_SET_AFFINITY выше). Исключение
+                    // одно и то же на оба места — process_is_migratable().
+                    if (!process_is_migratable(i)) continue;
 
                     int dest = -1;
                     for (int c = 0; c < 4; c++) {
                         if (c == source) continue;
+                        // Ядро 0 — заповедное для драйверов (см.
+                        // core_allowed_for_process(): зависший на PCIe
+                        // драйвер уносит с собой ядро целиком, и если это
+                        // ядро root'а — всю систему).
+                        if (!core_allowed_for_process(i, c)) continue;
                         if (dest < 0 || working_pct[c] < working_pct[dest]) dest = c;
                     }
+                    if (dest < 0) continue; // разрешённых получателей нет
 
-                    seL4_TCB_SetAffinity(pcbs[i].tcb, dest);
-                    pcbs[i].core = dest;
+                    // Занятый драйвер не переносим — перенесётся следующим
+                    // проходом, когда встанет в свой seL4_Recv.
+                    if (!migrate_process_to_core(i, dest, timer_ep)) continue;
 
                     int contrib_pct = (int)(100 * snap.proc_util[i] / snap.total[source]);
                     working_pct[dest] += contrib_pct;
@@ -4753,9 +6239,10 @@ int main(int argc, char *argv[]) {
                     strcpy(shm + offset, "\n"); offset = strlen(shm);
                 }
 
-                flush_rootserver_shm();
+                if (!balance_quiet) flush_rootserver_shm();
                 seL4_SetMR(0, 0);
-                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                seL4_SetMR(1, (seL4_Word)moved);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
                 break;
             }
 
@@ -4781,6 +6268,52 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            case SYS_PCIE_RESET: {
+                // issuse.txt №74/в (см. situation.txt) — локальный сброс
+                // ТОЛЬКО PCIe/VL805-шины, в отличие от SYS_REBOOT выше
+                // (вся плата). Переэнумерация устройств теперь ВХОДИТ в
+                // команду (34-я hw-попытка: DRIVER_SIGNAL_RESTART
+                // форвардится автоматически) — ручной `driver usb_driver
+                // restart` больше не нужен.
+                if (!is_admin_caller(sender_pid)) {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                if (!RPI4_ENABLE_USB) {
+                    seL4_SetMR(0, (seL4_Word)-2);
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                // Всё тело вынесено в root_usb_full_reset() — тот же путь
+                // теперь запускает и heartbeat-watchdog автоматически (см.
+                // главный цикл), а не только эта команда шелла.
+                seL4_Word reset_status = root_usb_full_reset(timer_ep, usb_cmd_ep);
+                if (reset_status == USB_RESET_DRIVER_STUCK) {
+                    // Шина поднята, но переэнумерировать некому. Раньше
+                    // здесь пересоздавался процесс — теперь нет: снос
+                    // VSpace это deleteASID -> dsb sy, который при
+                    // застопоренной шине замораживает ядро вместе со всей
+                    // платой (JTAG 2026-09-06, см. generic_recover_process()).
+                    uart_puts("[ROOT] SYS_PCIE_RESET: шина поднята, но usb_driver не отозвался. Пересоздание процесса для USB запрещено — повторите usbreset позже.\n");
+                }
+                seL4_SetMR(0, reset_status);
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // issuse.txt №74/в — SYS_PCIE_VL805_DEVSTATUS_PROBE (31-я
+            // hw-попытка) УБРАН (37-я попытка): подтверждено на живом
+            // железе, что этот IPC-вызов от usb_driver (ядро 2) сюда НЕ
+            // мог нормально обслуживаться, пока root САМ висит в своём
+            // seL4_Call на usb_cmd_ep (форвард DRIVER_SIGNAL_RESTART) —
+            // probe-status возвращался = 0x99 = сам номер syscall'а
+            // эхом, не реальный ответ этого case'а. usb_driver теперь
+            // читает Device Status VL805 НАПРЯМУЮ через собственный
+            // read-only маппинг PLAT_PCIE_CFG_DATA_USB_VADDR (см.
+            // spawn_process()/read_vl805_devstatus_direct() в
+            // usb_driver.cpp) — без IPC вообще.
+
             case SYS_KILL: {
                 int target_pid = arg1;
 
@@ -4799,6 +6332,18 @@ int main(int argc, char *argv[]) {
                         uart_puts("\n[KERNEL] Critical process killed manually. Triggering recovery...\n");                        
                         generic_recover_process(target_pid, ep, med_ep, alloc, root_cnode, root_vspace, normal_untyped, shm_frames[0], console_ep, timer_ep, blk_ep);
                     } else {
+                    // issuse.txt №74/б — обычный (не драйверный) процесс тоже
+                    // может оказаться на не-нулевом ядре: `balance` их как раз
+                    // и раскидывает. Для не-драйвера эта функция никогда не
+                    // отказывает — просто возвращает поток на ядро 0 и даёт
+                    // старому ядру осесть, снимая условие remoteTCBStall().
+                    prepare_driver_for_suspend(target_pid, timer_ep);
+                    // issuse.txt №3 — та же уборка, что в SYS_EXIT: убитый
+                    // процесс тоже мог оставить SYS_CLONE-потоки и держать
+                    // VFS-мьютекс. Ветка драйверов выше уходит в
+                    // generic_recover_process(), где это уже сделано.
+                    reap_clone_threads_of(target_pid, alloc, root_cnode);
+                    release_vfs_lock_if_held_by(target_pid);
                     seL4_TCB_Suspend(pcbs[target_pid].tcb);
                     // Отвязываем прерывание, только если оно было привязано (у драйверов)
                     if (pcbs[target_pid].irq_ntfn != 0) {
@@ -4833,7 +6378,7 @@ int main(int argc, char *argv[]) {
                         // /sbin-команды, получившей SHM (is_driver==253), не
                         // освобождал shm_copies[9] вообще.
                         if (pcbs[target_pid].has_shm) {
-                            for (int i = 0; i < 9; i++) {
+                            for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
                                 if (pcbs[target_pid].shm_copies[i] != 0) {
                                     seL4_CNode_Delete(root_cnode, pcbs[target_pid].shm_copies[i], seL4_WordBits);
                                     alloc.free(pcbs[target_pid].shm_copies[i]);
@@ -4853,6 +6398,14 @@ int main(int argc, char *argv[]) {
 
             case SYS_EXIT: {
                 if (sender_pid > 0) {
+                    // issuse.txt №3 — ПЕРВЫМ делом добрать за собой
+                    // SYS_CLONE-потоки и отпустить глобальный VFS-мьютекс.
+                    // Обязательно ДО цикла по cap_tracker ниже: он удаляет
+                    // корни VSpace/CSpace, которые потоки разделяют с этим
+                    // процессом. Разбор — у reap_clone_threads_of().
+                    reap_clone_threads_of((int)sender_pid, alloc, root_cnode);
+                    release_vfs_lock_if_held_by((int)sender_pid);
+
                     // Проверяем, не был ли этот процесс писателем в пайп
                     for (int i = 0; i < MAX_PIPES; i++) {
                         if (g_pipes[i].active && g_pipes[i].writer_pid == sender_pid) {
@@ -4878,6 +6431,32 @@ int main(int argc, char *argv[]) {
                             pcbs[i].reply_cap = 0;
                         }
                     }
+                    // Отменить отложенные ответы, адресованные этому
+                    // процессу, ДО того как его TCB исчезнет.
+                    //
+                    // Ровно это generic_recover_process() делает много лет
+                    // (см. комментарий там же: "иначе когда дедлайн/ввод
+                    // наступит, они попробуют ответить по капе на уже не
+                    // существующий TCB и уронят 'Attempted to invoke a null
+                    // cap'"), а ОБЫЧНЫЙ выход процесса — единственный путь,
+                    // которым завершается КАЖДАЯ /sbin-команда — не делал
+                    // этого никогда. Асимметрия найдена при разборе
+                    // плавающего падения тестового процесса (issuse.txt №3):
+                    // сама она это падение, скорее всего, не объясняет
+                    // (sleep/read у нас блокирующие, и уйти с висящим
+                    // отложенным ответом трудно), но дыра настоящая и
+                    // закрывается одной строкой симметрии.
+                    if (timer_ep != 0 && pcbs[sender_pid].is_driver != 2) {
+                        seL4_SetMR(0, SYS_CANCEL_PENDING_FOR_PID);
+                        seL4_SetMR(1, (seL4_Word)sender_pid);
+                        seL4_Call(timer_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                    }
+                    if (console_ep != 0 && pcbs[sender_pid].is_driver != 1) {
+                        seL4_SetMR(0, SYS_CANCEL_PENDING_FOR_PID);
+                        seL4_SetMR(1, (seL4_Word)sender_pid);
+                        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                    }
+
                     seL4_TCB_Suspend(pcbs[sender_pid].tcb);
                     if (pcbs[sender_pid].irq_ntfn != 0) {
                         seL4_TCB_UnbindNotification(pcbs[sender_pid].tcb);
@@ -4929,7 +6508,7 @@ int main(int argc, char *argv[]) {
                     // получают её при спавне, см. shm_pages_mask_for_role()) —
                     // тоже нигде не освобождалась при обычном выходе.
                     if (pcbs[sender_pid].has_shm) {
-                        for (int i = 0; i < 9; i++) {
+                        for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
                             if (pcbs[sender_pid].shm_copies[i] != 0) {
                                 seL4_CNode_Delete(root_cnode, pcbs[sender_pid].shm_copies[i], seL4_WordBits);
                                 alloc.free(pcbs[sender_pid].shm_copies[i]);
@@ -5040,8 +6619,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                uint32_t allowed_mask = shm_pages_mask_for_role(pcbs[pid].is_driver);
-                if (allowed_mask == 0) {
+                if (!shm_role_has_any_pages(pcbs[pid].is_driver)) {
                     // Fail-closed (Фаза 5.2): этой роли не положено ни одной
                     // страницы — раньше вызывающий всё равно получал обратно
                     // ненулевой vaddr (просто "дыру", без реального маппинга
@@ -5056,14 +6634,18 @@ int main(int argc, char *argv[]) {
                 }
 
                 uintptr_t vaddr = pcbs[pid].vmap_bump_pointer;
-                pcbs[pid].vmap_bump_pointer += 0x9000; // Сдвигаем курсор на 36 КБ (9 страниц, см. shm_frames[9]) — фиксированный шаг для всех ролей, даже если реально маппится меньше страниц (см. маску ниже)
+                // Шаг фиксирован для ВСЕХ ролей, даже если роли положено меньше
+                // страниц: только так смещение внутри SHM (например
+                // VFS_PAYLOAD_OFFSET) означает одно и то же у всех, а не
+                // зависит от того, кому что выдали.
+                pcbs[pid].vmap_bump_pointer += (uintptr_t)SHM_TOTAL_PAGES * 0x1000;
 
                 // Отмечаем, что этот процесс взял SHM
                 pcbs[pid].has_shm = true;
                 bool success = true;
 
-                for (int i = 0; i < 9; i++) {
-                    if (!(allowed_mask & (1u << i))) {
+                for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
+                    if (!shm_page_allowed_for_role(pcbs[pid].is_driver, i)) {
                         // Этой роли эта страница не положена (Фаза 5.2) — не
                         // мапим вообще, слот остаётся пустой дырой в VA-окне
                         // процесса; попытка обратиться туда даст честный
@@ -5115,7 +6697,7 @@ int main(int argc, char *argv[]) {
 
                 if (!success) {
                     uart_puts("[ROOT] FATAL: Failed to dynamically map 36KB SHM!\n");
-                    for (int i = 0; i < 9; i++) {
+                    for (int i = 0; i < SHM_TOTAL_PAGES; i++) {
                         if (pcbs[pid].shm_copies[i] != 0) {
                             seL4_CNode_Delete(root_cnode, pcbs[pid].shm_copies[i], seL4_WordBits);
                             alloc.free(pcbs[pid].shm_copies[i]);
@@ -5175,6 +6757,45 @@ int main(int argc, char *argv[]) {
                     seL4_SetMR(0, (seL4_Word)-1);
                 }
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                break;
+            }
+
+            // Интроспекция процесса по имени — для автотестов (см.
+            // common.h/SYS_PROC_INFO и src/tests/coretest.cpp). Разбор
+            // человекочитаемой таблицы `ps`/`top` из SHM для этого не
+            // годится: формат меняется при любой правке вывода, а тест
+            // обязан давать один и тот же ответ каждый раз. Только
+            // чтение, ничего не меняет — admin-гейта нет, как и у `ps`.
+            case SYS_PROC_INFO: {
+                char info_name[32] = {0};
+                uint64_t* info_name_ptr = (uint64_t*)info_name;
+                info_name_ptr[0] = seL4_GetMR(1);
+                info_name_ptr[1] = seL4_GetMR(2);
+                info_name_ptr[2] = seL4_GetMR(3);
+                info_name_ptr[3] = seL4_GetMR(4);
+                info_name[31] = '\0';
+
+                int info_pid = -1;
+                for (int i = 1; i < 256; i++) {
+                    if (pcbs[i].active && strcmp(pcbs[i].name, info_name) == 0) { info_pid = i; break; }
+                }
+                if (info_pid < 0) {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                    seL4_SetMR(1, 0);
+                    seL4_SetMR(2, 0);
+                    seL4_SetMR(3, DRIVER_STATE_UNKNOWN);
+                } else {
+                    int info_is_driver = pcbs[info_pid].is_driver;
+                    seL4_Word info_state = DRIVER_STATE_UNKNOWN;
+                    if (g_driver_state_page != nullptr && info_is_driver >= 1 && info_is_driver <= 6) {
+                        info_state = driver_state_read(info_is_driver);
+                    }
+                    seL4_SetMR(0, (seL4_Word)info_pid);
+                    seL4_SetMR(1, (seL4_Word)pcbs[info_pid].core);
+                    seL4_SetMR(2, (seL4_Word)info_is_driver);
+                    seL4_SetMR(3, info_state);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 4));
                 break;
             }
 
@@ -5260,6 +6881,25 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
+                // issuse.txt №74/б — форвард это обычный блокирующий
+                // seL4_Call. Пока драйверы жили на ядре 0, зависший драйвер
+                // означал зависшее ядро root'а, и вопрос не стоял. Теперь
+                // драйвер может висеть на СВОЁМ ядре, оставив root живым —
+                // и этот Call утащил бы root за ним. Ждём PARKED (просто
+                // занятый драйвер припаркуется в пределах бюджета), не
+                // дождались — честно отвечаем ошибкой вместо зависания.
+                {
+                    int sig_is_driver = pcbs[sig_target_pid].is_driver;
+                    if (sig_is_driver >= 1 && sig_is_driver <= 6 && pcbs[sig_target_pid].core != 0 &&
+                        !wait_for_driver_parked(sig_is_driver, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS)) {
+                        uart_puts("[ROOT] SYS_DRIVER_SIGNAL: "); uart_puts(sig_driver_name);
+                        uart_puts(" не отвечает (не встал в PARKED) — сигнал НЕ отправлен, иначе root повис бы на seL4_Call.\n");
+                        seL4_SetMR(0, (seL4_Word)-4);
+                        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                        break;
+                    }
+                }
+
                 seL4_SetMR(0, SYS_DRIVER_SIGNAL);
                 seL4_SetMR(1, sig);
                 seL4_Call(sig_target_ep, seL4_MessageInfo_new(0, 0, 0, 2));
@@ -5318,6 +6958,19 @@ int main(int argc, char *argv[]) {
                                   // ROADMAP.md) — синхронный seL4_Call здесь безопасен.
                 if (usb_cmd_ep == 0) {
                     seL4_SetMR(0, 0); // found=0 — USB выключен (RPI4_ENABLE_USB=false)
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+                    break;
+                }
+                // issuse.txt №74/б — синхронный seL4_Call в зависший
+                // драйвер утащил бы root за собой (и вместе с ним всю
+                // систему). Комментарий выше утверждал, что usb_driver
+                // "гарантированно доходит до Recv за ограниченное время" —
+                // живой прогон 2026-09-05 показал, что не гарантированно:
+                // аппаратный стопор PCIe останавливает исполнение кода
+                // драйвера полностью, никакой его собственный таймаут при
+                // этом не срабатывает. Спрашиваем страницу состояния.
+                if (!wait_for_driver_parked(6, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS)) {
+                    seL4_SetMR(0, 0); // found=0 — драйвер не отвечает
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
                     break;
                 }
@@ -5402,7 +7055,9 @@ int main(int argc, char *argv[]) {
                 uint64_t sd_total = seL4_GetMR(0), sd_free = seL4_GetMR(1);
                 offset += df_format_row(shm + offset, "/ (SD)", sd_total, sd_free, "/", human != 0);
 
-                if (usb_cmd_ep != 0) {
+                // Тот же гейт, что у SYS_USB_LIST выше: зависший usb_driver
+                // не должен уносить root'а через обычный `df`.
+                if (usb_cmd_ep != 0 && wait_for_driver_parked(6, timer_ep, DRIVER_PARK_WAIT_BUDGET_MS)) {
                     seL4_SetMR(0, 4); // 4 = USB_CMD_GET_ALL_SPACE, см. usb_driver.cpp
                     seL4_Call(usb_cmd_ep, seL4_MessageInfo_new(0, 0, 0, 1));
                     seL4_Word mask = seL4_GetMR(0);
@@ -5519,7 +7174,7 @@ int main(int argc, char *argv[]) {
 
                 seL4_SetMR(0, status);
                 seL4_SetMR(1, (seL4_Word)bytes_read);
-                for (int32_t i = 0; i < bytes_read; i++) seL4_SetMR(2 + i, (seL4_Word)(uint8_t)shm[i]);
+                for (int32_t i = 0; i < bytes_read; i++) seL4_SetMR(2 + i, (seL4_Word)(uint8_t)shm[VFS_PAYLOAD_OFFSET + i]);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2 + bytes_read));
                 break;
             }

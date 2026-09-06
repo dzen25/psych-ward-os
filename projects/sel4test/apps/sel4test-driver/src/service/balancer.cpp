@@ -28,7 +28,7 @@ static seL4_Word read_configured_interval(SysClientEnv &env) {
     my_strlcpy(env.shm, BALANCER_CONF_PATH, SHM_TOTAL_SIZE); // путь абсолютный, build_absolute_path не нужен
     if (vfs_syscall(114, env.blk_ep) != 0) return BALANCER_DEFAULT_INTERVAL_MS; // файла нет — конфиг опционален
 
-    char *p = env.shm;
+    char *p = env.shm + VFS_PAYLOAD_OFFSET;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
         if (*p == '#' || *p == ';') { while (*p && *p != '\n') p++; continue; }
@@ -61,8 +61,24 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         sys_sleep(timer_ep, interval_ms);
+        // MR1=1 — "тихий" режим (см. common.h/SYS_BALANCE).
+        //
+        // НАЙДЕНО АВТОТЕСТОМ НА ЖИВОМ ЖЕЛЕЗЕ 2026-09-05 (coretest, шаг 7):
+        // до этой правки балансировщик звал SYS_BALANCE в обычном режиме,
+        // и root писал человекочитаемый отчёт в rootserver_shm_base —
+        // страницу 0 общей VFS-SHM. Ту самую, куда blk_driver в этот же
+        // момент кладёт очередной чанк читаемого файла (чанк = ровно 4096
+        // байт = вся страница, отчёт ложится с нулевого смещения). Раз в
+        // interval_ms (по умолчанию 5с) посреди любого длинного чтения
+        // несколько сотен байт данных молча подменялись текстом отчёта:
+        // длина файла сходилась, содержимое — нет. Шелл вокруг `balance`
+        // берёт vfs_lock именно поэтому, но балансировщик его не брал.
+        // Отчёт ему и не нужен — он фоновый сервис, его никто не читает.
+        // Брать вместо этого vfs_lock было бы хуже: сервис вставал бы в
+        // очередь за каждым долгим чтением на все его секунды.
         seL4_SetMR(0, SYS_BALANCE);
-        seL4_Call(env.root_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+        seL4_SetMR(1, 1);
+        seL4_Call(env.root_ep, seL4_MessageInfo_new(0, 0, 0, 2));
     }
 
     return 0; // недостижимо

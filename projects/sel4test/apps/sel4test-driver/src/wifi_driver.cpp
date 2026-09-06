@@ -24,6 +24,7 @@
 
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/driver_state.h"
 #include "h/platform.h"
 
 static inline seL4_IPCBuffer* get_local_ipc() {
@@ -1166,7 +1167,9 @@ static int wifi_read_file(const char *filename, uint8_t *out_buf, uint32_t max_l
         if (bytes_read == 0) { wifi_vfs_unlock(); break; } // EOF
 
         if (total + (uint32_t)bytes_read > max_len) { wifi_vfs_unlock(); return -2; } // буфер мал
-        for (int k = 0; k < bytes_read; k++) out_buf[total + k] = (uint8_t)g_wifi_shm[k];
+        // Содержимое приходит в область полезной нагрузки (platform.h/VFS_PAYLOAD_OFFSET),
+        // начало SHM занято путём.
+        for (int k = 0; k < bytes_read; k++) out_buf[total + k] = (uint8_t)g_wifi_shm[VFS_PAYLOAD_OFFSET + k];
         total += (uint32_t)bytes_read;
         wifi_vfs_unlock();
     }
@@ -3588,6 +3591,13 @@ int main(int argc, char *argv[]) {
     seL4_SetIPCBuffer(ipc);
 
     seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — общая страница состояния PARKED/BUSY, см.
+    // h/driver_state.h. Инициализируем как можно раньше: до первого
+    // seL4_Recv драйвер занят своим bring-up'ом, и root обязан это
+    // видеть, иначе может счесть безопасным суспендить его посреди
+    // инициализации железа.
+    driver_state_init(PLAT_DRIVER_STATE_VADDR, 5, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr my_ep      = ipc->msg[BOOT_WIFI_EP];
     g_wifi_blk_ep         = ipc->msg[7]; // BOOT_BLK_EP (Милстоун 4.2 — чтение прошивки/NVRAM)
@@ -3673,7 +3683,9 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         seL4_Word badge = 0;
+        driver_state_parked(); // см. h/driver_state.h — с этой точки root вправе нас суспендить/переносить
         seL4_Recv(my_ep, &badge);
+        driver_state_busy();   // ДО любых ветвлений/continue ниже
 
         // Оба бита — бейджи ОДНОГО notification-объекта (wifi_wake_ntfn,
         // см. common.h/main.cpp) — seL4 ИЛИт непотреблённые сигналы, значит

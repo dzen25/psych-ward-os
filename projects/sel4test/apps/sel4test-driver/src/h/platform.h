@@ -5,6 +5,118 @@
 // видно в списке клиентов роутера.
 constexpr char DHCP_HOSTNAME[] = "SeL4-CrouN";
 
+// PM_WDOG: false отключает АВТОМАТИЧЕСКУЮ аппаратную перезагрузку
+// (timer_driver.cpp кормит watchdog на каждом тике ТОЛЬКО если этот флаг
+// true). Оставлен false по прямому решению пользователя (2026-09-05):
+// пока идёт отладка адаптивного переноса драйверов между ядрами, плата не
+// должна сама уходить в ребут посреди эксперимента/JTAG-сессии. НЕ трогает
+// ручную команду `reboot` (SYS_REBOOT/pm_watchdog_expire_now()) — та
+// продолжает работать независимо от этого флага. Вернуть в true, когда
+// перенос будет hw-подтверждён — это последний рубеж защиты от зависаний,
+// которые не берёт даже JTAG (см. project_psych_ward_os_hw_watchdog в
+// памяти).
+constexpr bool WATCHDOG_AUTO_REBOOT_ENABLED = false;
+
+// Ядро по умолчанию для usb_driver (main.cpp, spawn_process()).
+// АРХИТЕКТУРНОЕ решение, а не диагностический пин (каким этот же
+// константный слот был во время расследования issuse.txt №74/в): usb_driver
+// единственный, кто умеет зависнуть НАСМЕРТЬ на PCIe-транзакции (см.
+// issuse.txt, раздел usb_driver.cpp — аппаратное ограничение), и держать
+// его на ядре 0 значит забирать вместе с ним root'а. С ядром != 0
+// зависание остаётся локальным: root жив, видит пропажу heartbeat'а и
+// делает полный сброс шины (root_usb_full_reset()).
+// Используется И для самого SetAffinity, И для
+// seL4_IRQControl_GetTriggerCore(PLAT_XHCI_IRQ, ...) (main.cpp, у
+// usb_irq_handler) — до этой правки IRQ208 всегда таргетился на CPU0 (см.
+// gic_dist->targets[52], найдено JTAG'ом). Это НЕ привязка "IRQ обязан
+// приходить на ядро потока" (seL4 умеет разбудить ожидающего на любом
+// ядре), просто разумный дефолт: не будить ядро 0 ради чужого устройства.
+constexpr int USB_DRIVER_DEFAULT_CORE = 2;
+
+// --- Адаптивный перенос драйверов между ядрами (issuse.txt №74, часть
+// "б"; полный проект — в situation.txt). Драйверы БОЛЬШЕ не заперты на
+// ядре 0: и `taskset`, и `balance` могут их переносить. Опасен не сам
+// перенос (seL4_TCB_SetAffinity — голая запись поля, IPI не шлёт вообще,
+// см. kernel/src/model/smp.c/migrateTCB()), а ПОСЛЕДУЮЩИЙ
+// seL4_TCB_Suspend() над потоком, который реально исполняется на ДРУГОМ
+// ядре — тот уходит в remoteTCBStall()/ipi_wait() без таймаута и вешает
+// root НАВСЕГДА (hw-подтверждено JTAG'ом, issuse.txt №73).
+// Защита: драйвер сам публикует своё состояние (PARKED = стоит в
+// seL4_Recv, ничего не делает / BUSY = в середине операции) в общей
+// странице PLAT_DRIVER_STATE_* ниже, а root перед ЛЮБЫМ Suspend'ом
+// не-нулевого ядра ждёт PARKED, возвращает поток на ядро 0 и только
+// потом суспендит. Не дождался — значит драйвер завис по-настоящему,
+// Suspend НЕ вызывается вообще (иначе повесили бы root заодно). ---
+constexpr uint32_t DRIVER_PARK_WAIT_BUDGET_MS = 3000; // сколько ждать PARKED перед Suspend'ом (длинная SCSI/exFAT-операция легально занимает секунды)
+constexpr uint32_t DRIVER_PARK_POLL_STEP_MS   = 20;   // шаг опроса общей страницы состояния (тот же порядок, что heartbeat-тик)
+constexpr uint32_t DRIVER_MIGRATE_WAIT_MS     = 300;  // сколько ждать PARKED перед переносом (сам перенос безопасен всегда, это только чтобы не плодить "устаревшие" ядерные окна)
+constexpr uint32_t DRIVER_SETTLE_AFTER_HOMING_MS = 50; // пауза после возврата на ядро 0 — старому ядру нужно дойти до своей ближайшей точки планирования и снять поток
+
+// Период собственного тика heartbeat-watchdog'а (timer_driver -> root, см.
+// common.h/ROOT_WATCHDOG_TICK_BADGE). Скан таймаутов у root'а дешёвый
+// (чтение нескольких слов из памяти + один SYS_GET_UPTIME), 50мс дают
+// разрешение заметно лучше самого короткого сторожевого таймаута (3с) и
+// при этом не заваливают root пробуждениями.
+constexpr uint32_t ROOT_WATCHDOG_TICK_PERIOD_MS = 50;
+
+// Пошаговый watchdog usb_driver (по прямой просьбе пользователя
+// 2026-09-05). Драйвер объявляет текущий шаг и подкручивает счётчик
+// прогресса внутри КАЖДОГО длинного цикла ожидания (см. h/driver_state.h,
+// common.h/UsbStep). Если счётчик не сдвинулся за это время, а драйвер при
+// этом не припаркован — он не "долго занят", а физически не исполняется:
+// ядро стоит на аппаратной транзакции, которая никогда не завершится.
+// Значение с запасом больше самого длинного одиночного ожидания внутри
+// драйвера (те ограничены единицами секунд каждое) — чтобы легитимная
+// медленная операция никогда не выглядела зависанием.
+constexpr uint32_t USB_STEP_STUCK_TIMEOUT_MS = 10000;
+
+// Карантин корневого порта после трёх неудачных попыток восстановления.
+// Без него получалось вечное колесо: сдались -> устройство по-прежнему не
+// отвечает -> первый же неудачный control-запрос ставит новую заявку ->
+// снова три попытки. На живом железе 2026-09-06 плата уходила в
+// бесконечное дёрганье питания порта и заваливала консоль ошибками.
+// Минута — достаточно, чтобы не мешать работе, и достаточно мало, чтобы
+// воткнутое обратно устройство подхватилось само.
+constexpr uint32_t USB_PORT_QUARANTINE_MS = 60000;
+
+// АВТОМАТИЧЕСКОЕ ПЕРЕПОДКЛЮЧЕНИЕ УСТРОЙСТВА — ВЫКЛЮЧЕНО.
+//
+// Механизм (заявка -> Disable Slot -> обесточивание корневого порта ->
+// перечисление с нуля) написан, отлажен и остаётся в коде, но по
+// умолчанию не работает. Причина — не в его реализации, а в СИГНАЛЕ, на
+// котором он построен.
+//
+// Он запускается по "control-запрос не прошёл дважды подряд". На живом
+// железе 2026-09-06 выяснилось, что это НЕ признак мёртвого устройства:
+// на загрузке хаб штатно не отвечает несколько секунд, драйвер всё это
+// время получает таймауты — и САМ ЖЕ успешно доводит перечисление до
+// конца. В логе это видно дословно: серия таймаутов, затем
+// "Флешка за хабом автоматически смонтирована". Так было всегда, и это
+// работало.
+//
+// А механизм восстановления на тех же таймаутах решал, что устройство
+// мертво, и сносил ПОЛНОСТЬЮ РАБОЧУЮ конфигурацию — вместе со
+// смонтированной флешкой. Снос вызывал новые ошибки, те ставили новую
+// заявку, и всё уходило по кругу. То есть он превращал безобидную
+// задержку в отказ.
+//
+// Что остаётся включённым и проверено полезным: сброс эндпоинта EP0 с
+// одним повтором (локальная операция, ничего не разрушает, именно она
+// вылечила отказ на 34-м цикле переподключений) и ожидание старта
+// устройства за хабом.
+//
+// Включать обратно имеет смысл только вместе с ЧЕСТНЫМ признаком
+// "устройство действительно мертво" — например, после нескольких секунд
+// подряд неудачных обращений, а не после двух подряд.
+constexpr bool USB_AUTO_REENUM_ENABLED = false;
+
+// Диагностическая обвязка расследования issuse.txt №74/в (контрольные
+// точки Device Status VL805 и т.п. в root_pcie_fundamental_reset()/
+// root_usb_full_reset()). Сам код оставлен — он ещё пригодится, если
+// PCIe-шина снова начнёт себя вести странно, — но по умолчанию молчит,
+// чтобы не засорять лог на каждом сбросе шины.
+constexpr bool LOG_PCIE_DIAG = false;
+
 // --- Флаги отладочных логов по компонентам. Гасят только рутинные
 // info/diagnostic-сообщения (регистровые дампы, "X initialized" и т.п.) —
 // ошибки/предупреждения печатаются всегда, независимо от этих флагов.
@@ -16,7 +128,7 @@ constexpr bool LOG_TIMER   = false;
 constexpr bool LOG_BLK     = false;     // blk_driver.cpp: пошаговые дампы регистров EMMC2 при инициализации
 constexpr bool LOG_NET     = false;     // net_driver.cpp — самый свежий/менее обкатанный компонент
 constexpr bool LOG_WIFI    = false;     // wifi_driver.cpp — новые команды (start/stop/scan/connect-lifecycle); включён по умолчанию, т.к. Wi-Fi всё ещё в активной отладке на живом железе
-constexpr bool LOG_USB     = true;      // issuse.txt №15 — временно включено для разбора находки "флешка за хабом определилась как хаб за хабом (VID/PID родителя?)"; usb_driver.cpp — пошаговый xHCI bring-up (Шаги 0-15) и DIAG-дампы; ошибки/предупреждения и сообщения hot-plug (Milestone 11) печатаются всегда, независимо от флага. B1-B4 (HS-хаб) hw-подтверждены полностью; SS-хаб (Milestone B5) — обнаружение/топология работают, адресация устройства за ним не работает (Transaction Error), отложено по решению пользователя — см. ROADMAP.md/память.
+constexpr bool LOG_USB     = false;     // выключено 2026-09-06 — тема USB закрыта (архив в old/situation.old.txt). Включать только если USB снова начнёт себя вести странно
 constexpr bool LOG_ROOT    = false;     // main.cpp: "Fetching ELF from disk / ELF loaded successfully! Spawning..." на каждый спавн /sbin-команды (SYS_EXEC/init.conf) — рутинный шум при обычной работе шелла
 
 // --- Известные пути в пользовательской FAT-файловой системе. ВСЕГДА
@@ -199,6 +311,33 @@ constexpr uintptr_t PLAT_XHCI_PADDR = 0x600000000ULL;
 constexpr uintptr_t PLAT_XHCI_SIZE  = 0x1000ULL;
 constexpr int        PLAT_XHCI_IRQ  = 208;
 
+// НАЙДЕНО ЧЕРЕЗ ВНЕШНЮЮ КОНСУЛЬТАЦИЮ (issuse.txt №74/в, после 15-й
+// hw-попытки, третье независимое мнение) + подтверждено JTAG-readback
+// на реальном железе: физическая страница 0xfd500000 (RPI4_PCIE_PADDR,
+// см. ниже) — это ПРЯМОЙ (не через ECAM) маппинг СТАНДАРТНОГО PCI Type 1
+// (bridge) конфигурационного заголовка САМОГО Root Port'а (bus=0/dev=0/
+// func=0) — Vendor/Device ID (0x271114e4 = Broadcom/BCM2711, подтверждено
+// readback'ом), Command/Status (0x04), Primary/Secondary/Subordinate Bus
+// Number (0x18), Memory Base/Limit (0x20). ЖИВОЕ ЧТЕНИЕ ПОСЛЕ usbreset
+// показало: Bus Numbers (0/1/1) и Memory Base/Limit (0xC0000000-
+// 0xC00FFFFF, покрывает BAR0 VL805) КОРРЕКТНЫ — но Command = 0x0000,
+// Memory Space Enable (бит 1) НЕ установлен. PCI-мост пересылает
+// Configuration-транзакции по номеру шины НЕЗАВИСИМО от своего Command
+// (поэтому config-доступ к VL805 всегда работал), а Memory-транзакции —
+// ТОЛЬКО если у самого моста включён Memory Space Enable (поэтому первое
+// же Memory-чтение, CAPLENGTH, стабильно давало SError, несмотря на то,
+// что ВСЕ остальные регистры — PCIE_MISC, WIN0, VL805-config — уже были
+// подтверждены корректными). Это ОТДЕЛЬНАЯ страница от PLAT_PCIE_RC_MISC_
+// PADDR ниже (0xfd504000 = 0xfd500000+0x4000) — обе внутри одного /scb
+// untyped-региона, эта ФИЗИЧЕСКИ МЕНЬШЕ, значит аллоцировалась бы
+// СТРОГО ДО неё (тот же watermark-приём, main.cpp/alloc_device_frame()).
+// ОБНАРУЖЕНО НА ЖИВОМ ЖЕЛЕЗЕ (16-я hw-попытка): попытка записать сюда
+// Memory Space Enable оказалась ПОЛНЫМ no-op (не применяется даже
+// мгновенно после записи) — бит, вероятно, read-only на этой
+// реализации Broadcom RC. Гипотеза №9 — тупик, откачена (страница/
+// маппинг/константы удалены из кода, см. память проекта/situation.txt
+// для полного разбора).
+
 // Пятнадцатая попытка (продолжение) — физическая страница, покрывающая
 // группу регистров PCIE_MISC_CPU_2_PCIE_MEM_WIN0_* (0x400c..0x408f
 // от RPI4_PCIE_PADDR, см. ниже) одной 4KB-страницей — конкретные смещения/
@@ -207,6 +346,45 @@ constexpr int        PLAT_XHCI_IRQ  = 208;
 // значение продублировано здесь буквально, чтобы не тянуть forward-
 // declaration): 0xfd500000 + 0x4000 = 0xfd504000.
 constexpr uintptr_t PLAT_PCIE_RC_MISC_PADDR = 0xfd504000ULL;
+
+// issuse.txt №74/в — ПРИЧИНА SError НАЙДЕНА (38-я hw-попытка, доказана
+// ЖИВОЙ JTAG-записью на упавшей плате, см. situation.txt).
+// Собственное конфигурационное пространство Root Port'а (Type-1
+// заголовок) лежит по САМОЙ базе RPI4_PCIE_PADDR (0xfd500000), БЕЗ
+// какого-либо смещения — сверено дословно с реальным U-Boot
+// (drivers/pci/pcie_brcmstb.c/brcm_pcie_config_address()):
+//     /* Accesses to the RC go right to the RC registers */
+//     if (pci_bus == 0) { *paddress = pcie->base + offset; return 0; }
+// То есть для ШИНЫ 0 (сам мост) доступ идёт НАПРЯМУЮ, и ECAM-окно
+// PCIE_EXT_CFG_INDEX/DATA (которое используется для шины 1, т.е. для
+// VL805) здесь НЕ РАБОТАЕТ ВООБЩЕ. Именно поэтому 16-я hw-попытка
+// (баг №9) сочла запись Memory Space Enable "полным no-op" и была
+// откачена — она шла по неверному пути доступа, а не потому, что бит
+// read-only. JTAG-запись по 0xfd500004 биты ставит прекрасно.
+//
+// ЧТО ИМЕННО ЛОМАЛОСЬ: bridge software init (PCIE_RGR1_SW_INIT_1)
+// сбрасывает Command самого моста в 0x0000 — снимая Memory Space
+// Enable. Без него мост НЕ ПРЕТЕНДУЕТ на адреса своего же memory-окна,
+// и обращение к PLAT_XHCI_PADDR (0x600000000) уходит в никуда и умирает
+// в шине -> асинхронный SError на CPU. Всё остальное при этом выглядит
+// идеально исправным (и потому 37 попыток ничего не находили): линк
+// поднят (PHYLINKUP+DL_ACTIVE), Type-1 номера шин 0/1/1 корректны,
+// memory base/limit = 0xC000/0xC000 корректно покрывает BAR, class code
+// 0x060400 корректен, WIN0 корректен, config-space VL805 идеально жив
+// (Device Status без единого бита ошибки) — потому что config-доступ к
+// VL805 идёт через ECAM-окно, которое Command моста НЕ гейтит.
+// ДОКАЗАНО НА ЖИВОМ ЖЕЛЕЗЕ: после `mww phys 0xfd500004 0x00000006`
+// чтение 0x600000000 сразу вернуло 0x01000020 (CAPLENGTH=0x20,
+// HCIVERSION=0x0100), 0x600000004 -> 0x05000420 (HCSPARAMS1),
+// 0x600000010 -> 0x002841eb (HCCPARAMS1) — побайтово совпадает с
+// логом штатной холодной загрузки.
+//
+// ВНИМАНИЕ (watermark): 0xfd500000 ФИЗИЧЕСКИ МЕНЬШЕ PLAT_PCIE_RC_MISC_
+// PADDR (0xfd504000) и всех остальных страниц того же /scb untyped-
+// региона — значит должна аллоцироваться СТРОГО ПЕРВОЙ из них (см.
+// alloc_device_frame()/main.cpp).
+constexpr uintptr_t PLAT_PCIE_RC_TYPE1_PADDR = 0xfd500000ULL;
+constexpr uint32_t  PCIE_RC_TYPE1_COMMAND_OFFSET = 0x04u; // стандартный PCI Type-1 заголовок: Command (низкие 16 бит) | Status (верхние 16)
 
 // Двадцать четвёртая попытка (см. ROADMAP.md) — регистры сообщения об
 // ошибках ИСХОДЯЩИХ (от моста НА AXI/UBUS, т.е. включая DMA устройства ->
@@ -270,6 +448,234 @@ constexpr uint32_t  PM_RSTC_WRCFG_FULL_RESET = 0x00000020u;
 // нужно вообще.
 constexpr uint32_t  PM_WDOG_TIMEOUT_MS      = 12000u;
 
+// issuse.txt №74 (часть "в", план — см. situation.txt) — регистр
+// "fundamental reset" самого PCIe Root Complex (BCM2711), НЕ xHCI/VL805
+// напрямую — сверено с реальным исходником Linux
+// (drivers/pci/controller/pcie-brcmstb.c, raspberrypi/linux:
+// brcm_pcie_perst_set_generic()/brcm_pcie_bridge_sw_init_set_generic()):
+// assert/release PERST (бит 0) и bridge software init (бит 1) через
+// ОДИН И ТОТ ЖЕ регистр PCIE_RGR1_SW_INIT_1. Физически RPI4_PCIE_PADDR
+// (0xfd500000) + 0x9210 — НЕЗАВИСИМАЯ страница от PLAT_PCIE_RC_MISC_PADDR
+// (0xfd504000) и PLAT_PCIE_ERR_PADDR (0xfd506000) выше — новая
+// аллокация, физически ПОСЛЕ обеих (0xfd509000 > 0xfd506000), сохраняет
+// монотонный watermark того же /scb untyped-региона (main.cpp,
+// alloc_device_frame()).
+constexpr uintptr_t PLAT_PCIE_RGR1_PADDR = 0xfd509000ULL;
+constexpr uintptr_t PCIE_RGR1_SW_INIT_1_OFFSET = 0x210ULL;
+constexpr uint32_t  PCIE_RGR1_SW_INIT_1_PERST_MASK = 0x1u;
+constexpr uint32_t  PCIE_RGR1_SW_INIT_1_INIT_GENERIC_MASK = 0x2u;
+
+// Тот же файл Linux, brcm_pcie_setup() — после освобождения bridge
+// software init нужно снять SERDES_IDDQ, иначе линк не поднимется.
+// PCIE_MISC_HARD_PCIE_HARD_DEBUG — offset 0x4204, ВНУТРИ уже занятой
+// страницы PLAT_PCIE_RC_MISC_PADDR (0xfd504000, покрывает 0x4000-0x4fff) —
+// отдельная физическая страница не нужна, только смещение внутри неё.
+constexpr uintptr_t PCIE_MISC_HARD_PCIE_HARD_DEBUG_OFFSET = 0x204ULL; // относительно PLAT_PCIE_RC_MISC_PADDR (физически 0xfd504204)
+constexpr uint32_t  PCIE_MISC_HARD_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK = (1u << 27);
+
+// PCIE_MISC_PCIE_STATUS (offset 0x68 относительно PLAT_PCIE_RC_MISC_PADDR,
+// физически 0xfd504068) — уже читается usb_driver.cpp напрямую по числовому
+// литералу (Шестнадцатая попытка, см. комментарий выше в этом файле).
+// Именованные константы заводим здесь отдельно, т.к. новый reset-код
+// (main.cpp, root) читает тот же регистр через СВОЙ СОБСТВЕННЫЙ маппинг,
+// не через usb_driver — см. PLAT_PCIE_RC_MISC_ROOT_VADDR ниже.
+constexpr uintptr_t PCIE_MISC_PCIE_STATUS_OFFSET = 0x68ULL;
+constexpr uint32_t  PCIE_MISC_PCIE_STATUS_PHYLINKUP_MASK = (1u << 4);
+constexpr uint32_t  PCIE_MISC_PCIE_STATUS_DL_ACTIVE_MASK = (1u << 5);
+
+// issuse.txt №74/в — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (вторая hw-попытка):
+// PERST сбрасывает КОНФИГУРАЦИОННОЕ ПРОСТРАНСТВО самого VL805 (Command
+// register/BAR0) до состояния "только что включили питание" — Memory
+// Space Enable снят. Само RC outbound-окно (переводящее CPU-адрес
+// PLAT_XHCI_PADDR в PCI bus-адрес RPI4_XHCI_PADDR) PERST НЕ трогает —
+// это регистр Root Complex, не устройства — но раз устройство само не
+// отвечает (Memory Space выключен), первое же обращение к её BAR0-MMIO
+// после `usbreset` вешало систему (`driver usb_driver restart` ловил
+// это первым, т.к. usbreset сам вообще не трогает BAR-mapped MMIO).
+// U-Boot переэнумерирует PCI config space через ту же самую индиректную
+// ECAM-подобную схему при каждом штатном пробе — сверено С РЕАЛЬНЫМ
+// исходником (/home/nikita/u-boot/drivers/pci/pcie_brcmstb.c,
+// brcm_pcie_config_address()) И с заголовком (arch/arm/mach-bcm283x/
+// include/mach/acpi/bcm2711.h): PCIE_EXT_CFG_INDEX (offset 0x9000 от
+// RPI4_PCIE_PADDR — ВНУТРИ уже занятой PLAT_PCIE_RGR1_PADDR-страницы,
+// offset 0 внутри неё, новая страница не нужна) выбирает bus/dev/func
+// (кодировка bus<<20|dev<<15|func<<12 — 1:1 та же, что уже использует
+// MBOX_XHCI_RESET_DEV_ADDR выше; для VL805 то же самое значение,
+// 0x00100000, переиспользуем константу), затем чтение/запись через
+// PCIE_EXT_CFG_DATA (offset 0x8000 — НОВАЯ страница, физически МЕЖДУ
+// PLAT_PCIE_ERR_PADDR (0xfd506000) и PLAT_PCIE_RGR1_PADDR (0xfd509000) —
+// аллоцировать СТРОГО в этом порядке, см. main.cpp) + смещение
+// стандартного PCI Type-0 заголовка. U-Boot'овский комментарий у этой же
+// схемы: "An access to our HW w/o link-up will cause a CPU Abort" —
+// поэтому этот шаг ТОЛЬКО после подтверждённого PHYLINKUP+DL_ACTIVE (см.
+// root_pcie_fundamental_reset()).
+constexpr uintptr_t PCIE_EXT_CFG_INDEX_PAGE_OFFSET = 0x0ULL; // PCIE_EXT_CFG_INDEX — offset 0 внутри страницы PLAT_PCIE_RGR1_PADDR
+constexpr uintptr_t PLAT_PCIE_CFG_DATA_PADDR = 0xfd508000ULL;
+constexpr uintptr_t PLAT_PCIE_CFG_DATA_ROOT_VADDR = 0x200021000ULL; // root-side, тот же 2MB-регион, что PLAT_PCIE_RGR1_ROOT_VADDR выше
+constexpr uint32_t  PCI_CFG_COMMAND_OFFSET = 0x04u; // стандартный PCI Type-0 заголовок
+constexpr uint32_t  PCI_CFG_BAR0_OFFSET    = 0x10u;
+constexpr uint32_t  PCI_CMD_MEMORY_SPACE_ENABLE = (1u << 1);
+constexpr uint32_t  PCI_CMD_BUS_MASTER_ENABLE   = (1u << 2);
+
+// issuse.txt №74/в — 28-я hw-попытка (JTAG post-mortem): смещение
+// найдено ЖИВЬЁМ обходом capability-цепочки самого VL805 (PM@0x80 ->
+// MSI@0x90 -> PCI Express Capability@0xC4, Next=0 — конец списка).
+// Device Status = ВЕРХНИЕ 16 бит dword'а по offset 0xC4+0x08=0xCC
+// (Device Control — нижние 16 бит, НЕ RW1C, сохранять при записи).
+// 29-я hw-попытка: сразу после mailbox-тега биты 0/3 уже взведены и НЕ
+// снимаются простым ожиданием (RW1C — сами по себе не очищаются, нужен
+// явный write-1-to-clear) — см. situation.txt.
+constexpr uint32_t  PCI_EXPRESS_CAP_VL805_DEVICE_STATUS_OFFSET = 0xCCu;
+constexpr uint32_t  PCIE_DEV_STATUS_CORRECTABLE_ERROR_MASK     = (1u << 0);
+constexpr uint32_t  PCIE_DEV_STATUS_UNSUPPORTED_REQUEST_MASK   = (1u << 3);
+
+// issuse.txt №74/в — 31-я hw-попытка, по наводке внешней консультации
+// (агент "ARM64/интерконнект"): RBUS/внутришинный таймаут, соседний с
+// уже используемым RGR1_SW_INIT_1 (см. PCIE_RGR1_SW_INIT_1_OFFSET=
+// 0x210 — та же страница PLAT_PCIE_RGR1_PADDR, ДОКАЗАННО доступная,
+// читается/пишется каждый usbreset) — САМ этот суб-регистр никогда не
+// трогался. НЕ подтверждено реальным U-Boot (grep по pcie_brcmstb.c —
+// ноль совпадений на "rbus"/"gisb"/этот офсет — либо более новый
+// патч ядра, не попавший в эту версию U-Boot, либо неверный офсет).
+// ЧИСТО ДИАГНОСТИЧЕСКАЯ константа — читаем и печатаем, НЕ пишем
+// вслепую без данных о том, что считается "хорошим" значением.
+constexpr uintptr_t PCIE_RGR1_RBUS_TIMEOUT_OFFSET = 0x208ULL;
+
+// issuse.txt №74/в — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (четвёртая hw-попытка):
+// диагностика usb_driver.cpp/step0_check_link() (та же, что печатается
+// на КАЖДОМ боевом bring-up) показала RC_BAR2_CONFIG_LO/HI И
+// PCIE_MISC_MISC_CTRL ПОЛНОСТЬЮ ОБНУЛЁННЫМИ после usbreset (на штатном
+// холодном боте — ВСЕГДА 0x11/0x04/0x88003400, см. те же диагностические
+// строки в любом логе этого проекта) — "bridge software init"
+// (PCIE_RGR1_SW_INIT_1, бит 1) сбрасывает НЕ ТОЛЬКО состояние самого
+// PERST-пути, а куда более широкий кусок PCIE_MISC-блока, включая
+// ВХОДЯЩЕЕ (xHCI -> RAM DMA) окно (RC_BAR2) и MISC_CTRL.SCB_ACCESS_EN —
+// именно поэтому Шаг 1 (чтение CAPLENGTH) переставал отвечать: RC
+// физически лежит в состоянии "только что включили питание", несмотря
+// на то, что PHYLINKUP+DL_ACTIVE (более низкий, чисто линковый уровень)
+// уже подтверждены. U-Boot настраивает это РОВНО ОДИН РАЗ при своей
+// собственной cold-boot энумерации (см. usb_driver.cpp, комментарий у
+// step0_check_link() — сверено с /home/nikita/u-boot/drivers/pci/
+// pcie_brcmstb.c, brcm_pcie_set_inbound_windows()) — этот проект
+// НИКОГДА не переписывал эти регистры сам, полагаясь на то, что они
+// настроены U-Boot'ом один раз и живут вечно. root_pcie_fundamental_
+// reset() (main.cpp) теперь ВОССТАНАВЛИВАЕТ их в то же самое,
+// многократно (на каждом боте) наблюдаемое значение — это НЕ вывод из
+// спецификации, а буквальное восстановление уже известного рабочего
+// состояния. НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (шестая hw-попытка): делать это,
+// ПОКА bridge software init ещё удержан (по образцу того, что казалось
+// порядком реального U-Boot/Linux-драйвера), вешало систему ещё раньше,
+// чем без этого шага вообще — судя по всему, весь PCIE_MISC-блок
+// физически недоступен, пока bridge init удержан. Запись перенесена
+// ПОСЛЕ release (main.cpp) — та же точка, где уже безопасно читается/
+// пишется PCIE_MISC_HARD_PCIE_HARD_DEBUG (SERDES_IDDQ).
+constexpr uintptr_t PCIE_MISC_RC_BAR2_CONFIG_LO_OFFSET = 0x34ULL; // относительно PLAT_PCIE_RC_MISC_PADDR (физически 0xfd504034)
+constexpr uintptr_t PCIE_MISC_RC_BAR2_CONFIG_HI_OFFSET = 0x38ULL; // физически 0xfd504038
+constexpr uintptr_t PCIE_MISC_MISC_CTRL_OFFSET          = 0x08ULL; // физически 0xfd504008
+constexpr uint32_t  PCIE_MISC_RC_BAR2_CONFIG_LO_KNOWN_GOOD = 0x00000011u;
+constexpr uint32_t  PCIE_MISC_RC_BAR2_CONFIG_HI_KNOWN_GOOD = 0x00000004u;
+constexpr uint32_t  PCIE_MISC_MISC_CTRL_KNOWN_GOOD          = 0x88003400u;
+
+// Outbound-окно (CPU 0x600000000 -> шина PCIe 0xC0000000), WIN0.
+// НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (шестая hw-попытка, issuse.txt №74/в): те же
+// "bridge software init" стирает и это окно тоже — не только RC_BAR2/
+// MISC_CTRL выше. Без него первое же MMIO-чтение xHCI после usbreset
+// ловит асинхронный SError (ESR=0xbf000002) — CPU-адрес 0x600000000
+// (PLAT_XHCI_PADDR) перестаёт транслироваться на шину PCIe вообще.
+// KNOWN_GOOD сняты readback'ом на штатной загрузке (out.log, до
+// usbreset) — та же практика, что и для RC_BAR2/MISC_CTRL: буквальное
+// восстановление уже наблюдавшегося рабочего значения, не вывод из
+// даташита. СЫРЫЕ смещения в U-Boot (/home/nikita/u-boot/arch/arm/
+// mach-bcm283x/include/mach/acpi/bcm2711.h, win=0: 0x400c/0x4010/
+// 0x4070/0x4080/0x4084) заданы относительно базы 0xfd500000, А НЕ
+// PLAT_PCIE_RC_MISC_PADDR (0xfd504000, уже замапленная страница) —
+// разница ровно 0x4000. usb_driver.cpp это учитывает (`- 0x4000` прямо
+// в выражении читателя); здесь, т.к. pcie_rc_misc_write() прибавляет
+// offset НАПРЯМУЮ к PLAT_PCIE_RC_MISC_ROOT_VADDR, поправка на 0x4000
+// сделана здесь, в самих константах — 7-я hw-попытка поймала VM fault
+// (запись за пределы замапленной страницы) от использования сырых
+// значений без этой поправки.
+constexpr uintptr_t PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO_OFFSET         = 0x400cULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI_OFFSET         = 0x4010ULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_OFFSET = 0x4070ULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI_OFFSET    = 0x4080ULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI_OFFSET   = 0x4084ULL - 0x4000ULL;
+constexpr uint32_t  PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO_KNOWN_GOOD         = 0xc0000000u;
+constexpr uint32_t  PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI_KNOWN_GOOD         = 0x00000000u;
+constexpr uint32_t  PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_KNOWN_GOOD = 0x3ff00000u;
+constexpr uint32_t  PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI_KNOWN_GOOD    = 0x00000006u;
+constexpr uint32_t  PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI_KNOWN_GOOD   = 0x00000006u;
+
+// НАЙДЕНО НЕЗАВИСИМЫМ РАЗБОРОМ КОДА (issuse.txt №74/в, после 10-й
+// hw-попытки): U-Boot БЕЗУСЛОВНО (для ЛЮБОГО типа SoC, не только
+// BCM2712 — в отличие от UBUS_CTRL/UBUS_TIMEOUT выше) маскирует ВСЕ
+// MSI-прерывания моста ("Mask all interrupts since we are not handling
+// any yet") и отключает 2 неиспользуемых inbound-окна (RC_BAR1/RC_BAR3,
+// GISB/SCB memory windows) — эта проверка ещё не подтверждена
+// readback'ом (не hw-тестировалось ДО этого коммита), но та же самая
+// страница PLAT_PCIE_RC_MISC_PADDR уже 3 раза подтверждённо сбрасывалась
+// bridge software init целиком (RC_BAR2/MISC_CTRL/WIN0) — восстанавливаем
+// той же техникой профилактически. Смещения — из реального U-Boot
+// (bcm2711.h), та же поправка "-0x4000" от базы 0xfd500000, что и WIN0.
+constexpr uintptr_t PCIE_MISC_RC_BAR1_CONFIG_LO_OFFSET = 0x402cULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_RC_BAR3_CONFIG_LO_OFFSET = 0x403cULL - 0x4000ULL;
+constexpr uint32_t  PCIE_MISC_RC_BAR_CONFIG_LO_SIZE_MASK = 0x1fu;
+constexpr uintptr_t PCIE_MSI_INTR2_CLR_OFFSET      = 0x4508ULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MSI_INTR2_MASK_SET_OFFSET = 0x4510ULL - 0x4000ULL;
+
+// НАЙДЕНО ЧЕРЕЗ ВНЕШНЕЕ ИССЛЕДОВАНИЕ (issuse.txt №74/в, после 13-й
+// hw-попытки): U-Boot настраивает эти два таймаута ТОЛЬКО для BCM2712
+// (наш BCM2711 их не трогает вообще — комментарий U-Boot дословно:
+// "The UBUS timeout also affects CRS completion retries, as the
+// request will get terminated if either timeout expires" — CRS =
+// Configuration Request Retry Status, стандартный PCIe-механизм
+// "устройство ещё не готово"; RC аппаратно ретраит Config-чтения сам,
+// НЕЗАМЕТНО для софта, пока не истечёт ИМЕННО этот таймаут). Гипотеза:
+// bridge software init стирает и эти регистры (та же страница, что уже
+// 5 раз подтверждённо стиралась целиком), а BCM2711 остаётся на
+// аппаратном POR-дефолте — если он короткий, наши BAR0/Command
+// чтения-записи сразу после подъёма линка могли "выглядеть успешными"
+// (самосогласованный readback), пока RC молча ретраил/отбрасывал их
+// внутри, а VL805 физически ещё не была готова отвечать. Memory-чтения
+// (CAPLENGTH) НЕ получают CRS-статуса по спецификации PCIe — оттуда,
+// возможно, и SError именно на первом Memory-чтении, а не раньше.
+// Значения — те же самые, что U-Boot использует для BCM2712 (0xB2D0000/
+// 0xABA0000 тактов на 750МГц, ~250/240мс) — не выведены из даташита под
+// BCM2711 конкретно, а взяты как заведомо щедрый, безопасный минимум
+// (больший таймаут не может ухудшить нормальную работу).
+constexpr uintptr_t PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_OFFSET = 0x405cULL - 0x4000ULL;
+constexpr uintptr_t PCIE_MISC_UBUS_TIMEOUT_OFFSET            = 0x40a8ULL - 0x4000ULL;
+constexpr uint32_t  PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT_GENEROUS = 0x0ABA0000u;
+constexpr uint32_t  PCIE_MISC_UBUS_TIMEOUT_GENEROUS            = 0x0B2D0000u;
+
+// Root-side (НЕ usb_driver'а) прямой маппинг тех же PCIe RC-регистров в
+// root_vspace — см. issuse.txt №74/в, situation.txt часть 2.3: root
+// должен уметь провести fundamental reset САМ, независимо от того, жив
+// ли сейчас usb_driver (тот вполне может быть тем, кто завис). Тот же
+// 2MB-регион, что PLAT_GPIO_VADDR/PLAT_PM_VADDR выше — root уже мапит
+// туда uart_frame НАПРЯМУЮ в root_vspace (main.cpp, прецедент), свободные
+// слоты сразу после PLAT_PM_VADDR.
+constexpr uintptr_t PLAT_PCIE_RC_MISC_ROOT_VADDR = 0x20001f000ULL; // повторный маппинг СУЩЕСТВУЮЩЕГО pcie_rc_frame (0xfd504000) в root_vspace, вторым владельцем той же физической страницы
+constexpr uintptr_t PLAT_PCIE_RGR1_ROOT_VADDR    = 0x200020000ULL; // маппинг НОВОГО pcie_rgr1_frame (PLAT_PCIE_RGR1_PADDR) в root_vspace
+constexpr uintptr_t PLAT_PCIE_RC_TYPE1_ROOT_VADDR = 0x200022000ULL; // issuse.txt №74/в (38-я hw-попытка) — Type-1 заголовок САМОГО моста (PLAT_PCIE_RC_TYPE1_PADDR), только root, следующая свободная страница за PLAT_PCIE_CFG_DATA_ROOT_VADDR
+
+// --- Общая страница состояния драйверов (issuse.txt №74, часть "б").
+// ОДНА обычная RAM-страница, замапленная НЕКЭШИРУЕМО (Device) и в root, и
+// в каждый драйвер: драйвер пишет туда PARKED/BUSY (см. h/driver_state.h),
+// root читает — обычной инструкцией загрузки, БЕЗ единого syscall'а и без
+// малейшего шанса заблокироваться. Почему не нотификация с бейджем (как
+// DRIVER_LIVENESS_*_BADGE): бейджи в seL4 накапливаются побитовым ИЛИ, и
+// пара сигналов "стал занят"/"припарковался", слипшись в одно
+// пробуждение, становится неразличимой по порядку — для решения "можно ли
+// СЕЙЧАС звать Suspend" это недопустимо. Некэшируемо — чтобы вообще не
+// думать о когерентности между ядрами и о кэш-обслуживании на каждый
+// опрос (данных — одно слово на драйвер, скорость тут не важна).
+// ВНИМАНИЕ (см. project_psych_ward_os_shm_alignment в памяти): страница
+// Device-памяти требует ЕСТЕСТВЕННОГО выравнивания доступа — слоты по 64
+// байта, слово состояния всегда 8-байтово выровнено.
+constexpr uintptr_t PLAT_DRIVER_STATE_ROOT_VADDR = 0x200023000ULL; // root-side, следующая свободная страница за PLAT_PCIE_RC_TYPE1_ROOT_VADDR
+constexpr uintptr_t PLAT_DRIVER_STATE_VADDR      = 0x200030000ULL; // drivers 1-5 (uart/timer/blk/net/wifi) — внутри той же 2MB-иерархии drv_pud/pd/pt, что PLAT_UART_VADDR и соседи
+
 // USB (Фаза 14) — отдельное, СОБСТВЕННОЕ 2MB-окно usb_driver'а (не тот же
 // регион, что UART/EMMC/GENET/... выше). Изначально рассчитывалось на 1MB
 // MMIO (см. RPI4_XHCI_SIZE выше — с тех пор исправлено на реальные 4KB,
@@ -286,6 +692,11 @@ constexpr uint32_t  PM_WDOG_TIMEOUT_MS      = 12000u;
 constexpr uintptr_t PLAT_XHCI_VADDR = 0x201000000ULL;             // xHCI MMIO (см. PLAT_XHCI_SIZE)
 constexpr uintptr_t PLAT_PCIE_RC_VADDR = 0x201001000ULL;          // PCIe RC MISC-регистры (см. PLAT_PCIE_RC_MISC_PADDR) — 1 страница сразу за xHCI MMIO, до DMA-страниц на 0x201100000 огромный запас
 constexpr uintptr_t PLAT_PCIE_ERR_VADDR = 0x201002000ULL;         // PCIE_OUTB_ERR_* (см. PLAT_PCIE_ERR_PADDR) — ещё одна страница сразу за PLAT_PCIE_RC_VADDR
+constexpr uintptr_t PLAT_PCIE_CFG_DATA_USB_VADDR = 0x201003000ULL; // issuse.txt №74/в, 37-я hw-попытка — read-only Device Status VL805 (см. PLAT_PCIE_CFG_DATA_PADDR), ещё одна страница сразу за PLAT_PCIE_ERR_VADDR
+// Та же общая страница состояния, что PLAT_DRIVER_STATE_VADDR выше, но у
+// usb_driver своё, отдельное 2MB-окно (см. комментарий над PLAT_XHCI_VADDR)
+// — значит и свой адрес внутри него. Физическая страница ОДНА И ТА ЖЕ.
+constexpr uintptr_t PLAT_DRIVER_STATE_USB_VADDR  = 0x201004000ULL;
 
 // Приватные некэшируемые DMA-страницы usb_driver'а, сразу после MMIO-окна
 // (0x201000000 + 0x100000 = 0x201100000), в ТОМ ЖЕ 2MB-окне — та же схема,
@@ -366,7 +777,25 @@ constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x201148000ULL; // + idx*0
 // страница-"bounce" под данные SCSI-команд (INQUIRY/READ CAPACITY/
 // READ(10)/WRITE(10)) — тот же приём, что ctrlbuf() у EP0.
 constexpr uintptr_t PLAT_XHCI_CBW_CSW_VADDR         = 0x201150000ULL; // + idx*0x1000
-constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201158000ULL; // + idx*0x1000
+// Bounce-буфер данных SCSI. РАСШИРЕН 2026-09-06: была ОДНА страница на
+// устройство, отсюда USB_MAX_SECTORS_PER_IO=8 — потолок 4 КБ на одну
+// SCSI-команду, то есть на один round-trip CBW/данные/CSW. Для чтения
+// больших файлов и для будущих крупных записей это была главная граница.
+//
+// Страницы одного устройства обязаны быть ФИЗИЧЕСКИ НЕПРЕРЫВНЫ (адрес
+// отдаётся контроллеру как один буфер) — root выделяет их одним
+// ram_retype с count=N и ПРОВЕРЯЕТ непрерывность, см. alloc_usb_dma_run()
+// в main.cpp. Шаг между устройствами — USB_BOUNCE_PAGES страниц.
+//
+// Диапазон: 8 устройств * 64 КБ = 512 КБ, 0x201158000..0x2011D8000 —
+// выше ничего не размещено (BOUNCE был последним в карте).
+constexpr int USB_BOUNCE_PAGES = 32;                                       // 128 КБ на устройство —
+// столько же, сколько VFS_PAYLOAD_MAX, чтобы полная запись клиента уходила
+// ОДНОЙ SCSI-командой. Передача больше 64 КБ раскладывается в цепочку TRB
+// (см. bulk_transfer в usb_driver.cpp) — один TRB через границу 64 КБ
+// пройти не может. Слайс устройства кратен 64 КБ, поэтому выравнивание
+// базы прогона по-прежнему выравнивает и всех остальных.
+constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201158000ULL; // + idx*USB_BOUNCE_PAGES*0x1000
 // Последняя занятая страница: 0x201158000 + (USB_MAX_DEVICES-1)*0x1000 =
 // 0x20115F000 — с большим запасом до конца 2MB-окна (0x2011FFFFF).
 
@@ -418,6 +847,24 @@ constexpr uint32_t MBOX_CLOCK_ID_ARM           = 3; // см. firmware wiki: "0x0
 // используем его для диагностики "правда ли DVFS меняет железо", а не только
 // то, что подтвердила прошивка на запрос.
 constexpr uint32_t MBOX_TAG_GET_CLOCK_RATE_MEASURED = 0x00030047;
+
+// issuse.txt №74/в (см. situation.txt) — "VL805 только что аппаратно
+// сброшен (fundamental reset, см. PLAT_PCIE_RGR1_PADDR выше), перезалей
+// прошивку контроллера через свежий PCIe-линк" — сверено с реальным
+// исходником Linux (include/soc/bcm2835/raspberrypi-firmware.h,
+// RPI_FIRMWARE_NOTIFY_XHCI_RESET; drivers/usb/host/xhci-pci.c,
+// usb_vl805_init()). Payload запроса — РОВНО одно 32-битное слово:
+// закодированный PCI-адрес контроллера, (bus<<20)|(slot<<15)|(func<<12).
+// На этой плате VL805 живёт по bus=1,slot=0,func=0 (см. RPI4_XHCI_PADDR
+// ниже — "pci bar 01.00.00" на живом железе, ROADMAP.md) -> 0x00100000.
+// ВАЖНО (raspberrypi/firmware issue #1617, найдено при исследовании):
+// повторные вызовы этого тега БЕЗ предшествующего настоящего
+// PERST-сброса могут рассинхронизировать DMA-окно прошивки с реальной
+// конфигурацией Root Complex — звать ТОЛЬКО сразу после успешного
+// root_pcie_fundamental_reset() (main.cpp), никогда отдельно/повторно
+// "на всякий случай".
+constexpr uint32_t MBOX_TAG_NOTIFY_XHCI_RESET = 0x00030058;
+constexpr uint32_t MBOX_XHCI_RESET_DEV_ADDR = 0x00100000; // bus=1 (<<20) | slot=0 (<<15) | func=0 (<<12)
 
 // Фаза 7 (продолжение) — "новый" интерфейс энергодоменов VideoCore
 // (сверено с Linux drivers/pmdomain/bcm/raspberrypi-power.c —
@@ -1204,18 +1651,72 @@ constexpr uint32_t WIFI_SHM_FRAME_CAP         = 1536;  // максимальны
 constexpr uint32_t WIFI_SHM_CANARY_OFFSET = 27656;
 constexpr uint32_t WIFI_SHM_CANARY_MAGIC  = 0xC0FFEEEEu;
 
+// ============================================================================
+// === РАСКЛАДКА SHM: фиксированное в начале, растущее в конце (2026-09-06) ===
+// ============================================================================
+// Раньше вся карта была из девяти страниц с ЖЁСТКО прописанными смещениями,
+// и любое расширение означало пересчёт всех соседей — на этом проект уже
+// ловил тяжёлые баги пересечений (GENET rx_buffer_offsets[] против
+// staging-буфера blk_driver, см. историю ниже). Теперь порядок такой:
+//
+//   страницы 0..6   — ФИКСИРОВАННЫЕ, маленькие, со стабильными смещениями:
+//                     0 VFS-путь, 1 net-мейлбокс, 2-3 GENET RX (обязаны
+//                     оставаться смежными), 4-6 Wi-Fi control/link-state/
+//                     мейлбокс. Все константы WIFI_SHM_*/GENET выше НЕ
+//                     меняются — это и есть смысл "фиксированного начала".
+//   дальше          — РАСТУЩИЕ области, чьи адреса ВЫЧИСЛЯЮТСЯ из размеров:
+//                     полезная нагрузка VFS, затем staging blk, затем usb.
+//                     Менять размер любой из них можно одной константой.
+//
+// ПОЧЕМУ НЕ "СКОЛЬКО УГОДНО, ХОТЬ 100 МБ": две жёсткие границы, обе
+// архитектурные, а не выдуманные.
+//   1. Дочерний CNode — 8 бит, ВСЕГО 256 слотов, и КАЖДАЯ выданная
+//      SHM-страница занимает там слот наравне с boot-капами. Тысячи
+//      страниц туда физически не влезут.
+//   2. Страницы отображаются при КАЖДОМ спавне процесса. 32 страницы —
+//      это 32 лишних seL4_ARM_Page_Map на каждый `ls`; 25600 страниц
+//      превратили бы запуск любой команды в сотни миллисекунд.
+// 128 КБ выбраны из расчёта: чтобы амортизировать ~1 мс накладных
+// расходов на SCSI-команду до 20 МБ/с, достаточно ~20 КБ за вызов —
+// взято с шестикратным запасом.
+constexpr int SHM_FIXED_PAGES       = 7;   // 0..6, см. выше — трогать только вместе с WIFI_SHM_*/GENET
+// ЗАПАС между фиксированной и растущей частями. Смысл: добавить новую
+// фиксированную страницу (ещё один мейлбокс, ещё одно состояние драйвера)
+// можно будет, увеличив SHM_FIXED_PAGES в пределах запаса — и НИ ОДИН
+// адрес растущих областей при этом не сдвинется. Без запаса любая новая
+// фиксированная страница толкала бы вперёд всё остальное, а это ровно тот
+// класс правок, на котором проект уже ловил баги пересечений.
+constexpr int SHM_FIXED_RESERVE_PAGES = 9; // 7..15 — свободны под будущие фиксированные
+constexpr int SHM_DYNAMIC_FIRST_PAGE  = SHM_FIXED_PAGES + SHM_FIXED_RESERVE_PAGES; // = 16, круглая граница
+constexpr int SHM_VFS_PAYLOAD_PAGES = 32;  // 128 КБ полезной нагрузки VFS за один вызов
+constexpr int SHM_STAGING_PAGES     = 32;  // столько же у staging-буфера каждого из двух драйверов
+constexpr int SHM_TOTAL_PAGES = SHM_DYNAMIC_FIRST_PAGE + SHM_VFS_PAYLOAD_PAGES + 2 * SHM_STAGING_PAGES;
+
+// Полезная нагрузка VFS. Раньше данные лежали в странице 0 со смещения 128,
+// то есть делили страницу с путём И с GENET TX-staging (0x280) — из-за
+// последнего драйверы и вынуждены были копировать текст в свой приватный
+// staging, чтобы DMA не затёр его на лету. Теперь нагрузка живёт в
+// собственной области, которой не касается никакой DMA.
+constexpr uint32_t VFS_PAYLOAD_OFFSET = (uint32_t)SHM_DYNAMIC_FIRST_PAGE * 4096;
+constexpr uint32_t VFS_PAYLOAD_MAX    = (uint32_t)SHM_VFS_PAYLOAD_PAGES * 4096;
+
+// Первая страница растущей области — индексы нужны разрешающей функции
+// shm_page_allowed_for_role() в main.cpp.
+constexpr int SHM_PAGE_VFS_PAYLOAD_FIRST = SHM_DYNAMIC_FIRST_PAGE;
+constexpr int SHM_PAGE_BLK_STAGING_FIRST = SHM_PAGE_VFS_PAYLOAD_FIRST + SHM_VFS_PAYLOAD_PAGES;
+constexpr int SHM_PAGE_USB_STAGING_FIRST = SHM_PAGE_BLK_STAGING_FIRST + SHM_STAGING_PAGES;
+
 // blk_driver'ов staging-буфер (см. комментарий у первого появления этого
-// класса бага — GENET rx_buffer_offsets[] пересечение) — переехал на
-// отдельную страницу (28672-32767), чтобы освободить 20480 под Wi-Fi
-// link-state выше (Фаза 5.3, раскладка страниц пересчитана).
-constexpr uint32_t BLK_SHM_STAGING_OFFSET = 28672;
+// класса бага — GENET rx_buffer_offsets[] пересечение). Адрес больше не
+// прописан числом — вычисляется, поэтому смена размеров выше не требует
+// пересчёта соседей вручную.
+constexpr uint32_t BLK_SHM_STAGING_OFFSET = (uint32_t)SHM_PAGE_BLK_STAGING_FIRST * 4096;
 
 // usb_driver'ов staging-буфер (Фаза 14, Milestone 8) — зеркалит
-// BLK_SHM_STAGING_OFFSET один-в-один: 9-я SHM-страница (32768-36863),
-// отдельная от blk_driver'овской (28672-32767), чтобы echo>/mv на
+// BLK_SHM_STAGING_OFFSET один-в-один, отдельная область, чтобы echo>/mv на
 // /mnt/usb0 не пересекались физической памятью с теми же операциями на
 // SD-карте (тот же класс бага, что уже чинили для GENET/BLK).
-constexpr uint32_t USB_SHM_STAGING_OFFSET = 32768;
+constexpr uint32_t USB_SHM_STAGING_OFFSET = (uint32_t)SHM_PAGE_USB_STAGING_FIRST * 4096;
 
 // BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
 // ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от

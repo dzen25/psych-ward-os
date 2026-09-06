@@ -146,6 +146,23 @@ enum BootIPCSlot {
     // (is_driver==2), тот же принцип, что BOOT_BLK_HEARTBEAT_NTFN_CAP, но на
     // отдельном, не разделяемом ни с чем объекте (см. константу выше).
     BOOT_BLK_LIVENESS_TICK_NTFN_CAP   = 179,
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — НЕ капа, просто seL4_Word 1/0: "root замапил тебе общую
+    // страницу состояния драйверов" (PLAT_DRIVER_STATE_VADDR /
+    // PLAT_DRIVER_STATE_USB_VADDR, см. platform.h и h/driver_state.h).
+    // Отдельный флаг, а не проверка "прочитаем и посмотрим" — читать
+    // незамапленный адрес значит поймать VM fault и уйти в респавн.
+    // 180, а НЕ "свободные на вид" 120..126: те физически совпадают с
+    // userData/caps_or_badges[0..2]/receiveCNode/receiveIndex/receiveDepth
+    // самой структуры seL4_IPCBuffer (см. issuse.txt №59 и подробный
+    // разбор у BOOT_USB_EP выше) — caps_or_badges[0..2] здесь реально
+    // заняты дескрипторами stdin/stdout/stderr (см. spawn_process()).
+    // 180 продолжает уже освоенную зону после конца структуры.
+    BOOT_DRIVER_STATE_PRESENT         = 180,
+    // Тик heartbeat-watchdog'а root'а (badge ROOT_WATCHDOG_TICK_BADGE) —
+    // читает ТОЛЬКО timer_driver (is_driver==2), сигналит им root'у на
+    // каждом своём тике. См. развёрнутое "зачем" у самой константы.
+    BOOT_ROOT_WATCHDOG_TICK_NTFN_CAP  = 181,
 };
 
 // Фаза 9.A (см. ROADMAP.md): индекс msg[]-слова (НЕ капа, НЕ CNode-слот —
@@ -160,6 +177,19 @@ enum BootIPCSlot {
 // exec (см. args_payload/strcpy в spawn_process), msg[100+] — boot-капы;
 // 8 слов (64 байта) начиная с 16 — safe zone между ними.
 constexpr int EXEC_CWD_MSG_SLOT = 16;
+
+// Аргументы exec'а. НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ 2026-09-06: раньше они лежали с
+// msg[0], и комментарий у spawn_process обещал 127 символов — а реальный
+// предел был 55. Причина: msg[7] (BOOT_BLK_EP, он же байты 56..63 строки)
+// записывается СВОИМ значением ПОЗЖЕ копирования аргументов и молча рвёт
+// строку посередине. Прежний комментарий это даже упоминал, но рассуждал
+// только о том, что значение msg[7] не пострадает — про саму строку речи
+// не было. Симптом: `logtest <том> 1500 256 append random stream keep`
+// терял хвост и жаловался на аргумент 'k'.
+// Зона выбрана между cwd (16..23, 64 байта) и boot-капами (100+) — 16 слов
+// = 128 байт, ничем не занятых.
+constexpr int EXEC_ARGS_MSG_SLOT = 24;
+constexpr int EXEC_ARGS_MAX_LEN  = 127; // + завершающий ноль = 128 байт зоны
 
 // Общий IRQ 158 (EMMC2 + Wi-Fi SDIO — одна физическая GIC-линия на обоих
 // контроллерах, см. platform.h/ROADMAP.md 4.5) слушает САМ root, а не
@@ -288,6 +318,81 @@ constexpr seL4_Word DRIVER_LIVENESS_BLK_BADGE  = 0x10000;
 constexpr seL4_Word DRIVER_LIVENESS_NET_BADGE  = 0x20000;
 constexpr seL4_Word DRIVER_LIVENESS_WIFI_BADGE = 0x40000;
 constexpr seL4_Word DRIVER_LIVENESS_USB_BADGE  = 0x80000;
+
+// Собственный тик heartbeat-watchdog'а: timer_driver -> root, на каждом
+// своём тике, БЕЗУСЛОВНО.
+//
+// НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ 2026-09-05. До этого скан таймаутов у root'а
+// запускался ТОЛЬКО при получении liveness-сигнала от одного из
+// наблюдаемых драйверов — то есть сторож питался пульсом тех, кого сам же
+// и сторожил. Пока хоть один из четырёх жив, это работает; но стоит им
+// замолчать одновременно (или замолчать тому единственному, кто в этот
+// момент ещё тикал) — скан не запускается ровно тогда, когда он нужен, и
+// зависание остаётся незамеченным навсегда. Пробел был честно записан в
+// комментарии на месте и признан приемлемым; живой прогон показал, что
+// он не приемлемый. Теперь тик приходит от timer_driver — процесса,
+// который сам ни от кого не зависит и не мониторится (обнаружить
+// собственное зависание тиком, который сам же производишь, нельзя — для
+// timer_driver последний рубеж это аппаратный PM_WDOG).
+constexpr seL4_Word ROOT_WATCHDOG_TICK_BADGE   = 0x100000;
+
+// --- Раскладка 64-байтового слота драйвера в общей странице состояния
+// (см. PLAT_DRIVER_STATE_* в platform.h и h/driver_state.h). Индексы
+// СЛОВ (seL4_Word), не байт. ---
+constexpr int DRIVER_STATE_WORD_STATE    = 0; // DRIVER_STATE_BUSY / DRIVER_STATE_PARKED
+constexpr int DRIVER_STATE_WORD_PROGRESS = 1; // монотонный счётчик: "я всё ещё двигаюсь"
+constexpr int DRIVER_STATE_WORD_STEP     = 2; // на каком шаге драйвер находится (см. UsbStep ниже)
+// Единственное слово, которое пишет ROOT, а читает драйвер: "не трогай
+// железо". Нужно потому, что штатная заморозка (SYS_PCIE_RESET/freeze)
+// идёт по IPC, а зависший драйвер на IPC не отвечает — и тогда root
+// сбрасывает шину, НЕ сумев его предупредить. Драйвер, очнувшись,
+// продолжил бы работать с контроллером, который только что прошёл PERST и
+// перезаливку прошивки: кольца и слоты недействительны, а обращение к
+// такому железу — ровно тот путь, что заканчивается стопором шины.
+// Через общую страницу предупреждение доходит без IPC и ждёт сколько
+// нужно: драйвер увидит его на первой же итерации своего цикла.
+constexpr int DRIVER_STATE_WORD_FREEZE   = 3; // 1 = root просит не трогать железо до переэнумерации
+
+// Шаги usb_driver для пошагового watchdog-мониторинга (по прямой просьбе
+// пользователя 2026-09-05: "добавить мониторинг watchdog'ом на каждый шаг
+// загрузки"). Драйвер объявляет шаг ПЕРЕД тем, как в него войти, и
+// подкручивает счётчик прогресса внутри всех длинных циклов ожидания.
+// Root тогда различает три разных состояния, которые раньше сливались в
+// одно "молчит": (1) драйвер стоит в Recv — всё хорошо; (2) драйвер долго
+// занят, но счётчик растёт — легитимная долгая операция, не трогать;
+// (3) счётчик замер на конкретном шаге — вот это настоящее зависание, и
+// в логе сразу видно, на каком именно шаге.
+enum UsbStep : seL4_Word {
+    USB_STEP_IDLE = 0,
+    USB_STEP_CONTROLLER_INIT,
+    USB_STEP_PORT_POLL,
+    USB_STEP_PORT_RESET,
+    USB_STEP_ENUMERATE,
+    USB_STEP_ADDRESS_DEVICE,
+    USB_STEP_GET_DESCRIPTOR,
+    USB_STEP_SET_CONFIG,
+    USB_STEP_HUB_POLL,
+    USB_STEP_HUB_PORT_RESET,
+    USB_STEP_HUB_ENUMERATE,
+    USB_STEP_SCSI_COMMAND,
+    USB_STEP_READ_SECTORS,
+    USB_STEP_PARTITION_SCAN,
+    USB_STEP_EXFAT_MOUNT,
+    USB_STEP_UNMOUNT,
+    USB_STEP_BUS_RESET,
+    USB_STEP_COUNT
+};
+
+// --- issuse.txt №74, часть "б": состояние драйвера в общей странице
+// PLAT_DRIVER_STATE_* (см. platform.h, h/driver_state.h). ОДНО слово на
+// драйвер, индекс слота = is_driver. Пишет только сам драйвер, читает
+// только root. Ничего, кроме этих двух значений, в слоте не бывает. ---
+constexpr seL4_Word DRIVER_STATE_BUSY   = 0; // где-то в середине операции (или ещё не инициализировался)
+constexpr seL4_Word DRIVER_STATE_PARKED = 1; // стоит в главном seL4_Recv, аппаратуру не трогает — безопасная точка для Suspend/переноса
+// 64 байта на слот: с запасом под будущие поля и, главное, гарантированное
+// 8-байтовое выравнивание слова состояния — страница Device-памяти иначе
+// ловит Alignment Fault (см. project_psych_ward_os_shm_alignment в памяти).
+constexpr seL4_Word DRIVER_STATE_SLOT_STRIDE = 64;
 
 // Слот CSpace процесса, в который ядро минтит capability активного пайпа
 // (см. SYS_PIPE/SYS_PIPE_CLOSE в main.cpp и запрос пайпа в shell.cpp).
@@ -427,6 +532,13 @@ constexpr seL4_Word SYS_BENCHMARK_FINALIZE_LOCAL = 140;
 // те же две защиты, что у SYS_SET_AFFINITY) раскидывает по наименее
 // загруженным другим ядрам. Ответ: MR0=0, текстовый отчёт — в
 // rootserver_shm_base, тем же путём, что SYS_TOP_STATS/SYS_PS.
+// MR1 (необязательный) = 1 -> "тихий" режим: балансировка выполняется, но
+// человекочитаемый отчёт НЕ пишется в rootserver_shm_base. Нужен
+// автотестам, которые гоняют balance ПАРАЛЛЕЛЬНО с длинной VFS-операцией:
+// страница SHM в этот момент занята данными файла, и отчёт затёр бы их
+// (именно ради этого shell берёт vfs_lock вокруг balance — но тогда
+// никакой параллельности и не остаётся). Ответ: MR0 = 0/-1 как обычно,
+// MR1 = сколько процессов реально перенесено.
 constexpr seL4_Word SYS_BALANCE = 141;
 
 // issuse.txt: убитый/восстанавливаемый watchdog'ом процесс мог оставить
@@ -531,6 +643,64 @@ constexpr seL4_Word SYS_VFS_LOCK_NOTIFY = 149;
 // bcm2835_wdt.c) вместо обычных 12с — чип перезагружает всю плату
 // аппаратно, почти мгновенно.
 constexpr seL4_Word SYS_REBOOT = 150;
+
+// issuse.txt №74/в (см. situation.txt) — точечный, локальный сброс
+// именно PCIe/VL805-шины (в отличие от SYS_REBOOT выше — тот сбрасывает
+// ВСЮ плату). Два разных syscall'а:
+//   SYS_MBOX_XHCI_RESET — ВНУТРЕННИЙ тег форварда root -> timer_driver
+//   (единственный процесс с замапленным mailbox), тот же приём, что
+//   SYS_REBOOT форвардит на timer_ep. Не вызывается напрямую из shell.
+//   SYS_PCIE_RESET — публичный, admin-gated (как SYS_REBOOT/SYS_BALANCE)
+//   syscall шелла (`usbreset`): root САМ (main.cpp, root_usb_full_reset()
+//   -> root_pcie_fundamental_reset()) делает PERST-последовательность
+//   через СОБСТВЕННЫЙ прямой маппинг PCIe RC-регистров (не через
+//   usb_driver — тот может быть как раз тем, кто завис), восстанавливает
+//   всё, что стирает bridge software init (включая Command САМОГО моста —
+//   ту единственную причину SError, что пряталась 37 hw-попыток), затем
+//   форвардит SYS_MBOX_XHCI_RESET (перезаливка прошивки VL805) и, наконец,
+//   DRIVER_SIGNAL_RESTART на usb_driver — перечисление устройств ВХОДИТ в
+//   команду, ручной `driver usb_driver restart` больше не нужен.
+//   Тот же root_usb_full_reset() вызывает и heartbeat-watchdog, когда
+//   usb_driver перестаёт подавать признаки жизни: обычный kill+respawn
+//   ему бесполезен (зависает не процесс сам по себе, а PCIe-шина под
+//   ним), лечить надо железо.
+// Ответ MR0 (SYS_PCIE_RESET): 0=ok (линк поднялся, mailbox принял тег,
+// устройства перечислены заново),
+// -1=admin-check не прошёл, -2=USB выключен в этой сборке (RPI4_ENABLE_USB),
+// -3=линк НЕ поднялся за таймаут после PERST (mailbox тег НЕ вызывался —
+// намеренно, см. предупреждение у MBOX_TAG_NOTIFY_XHCI_RESET/platform.h),
+// -4=линк поднялся, но mailbox-тег не подтверждён (VC не ответил
+// успехом) — прошивка VL805 могла не перезалиться,
+// -5=шина поднята, но сам usb_driver не отвечал (не встал в PARKED, см.
+// issuse.txt №74/б) — переэнумерацию делать было некому, root пересоздал
+// процесс целиком.
+constexpr seL4_Word SYS_MBOX_XHCI_RESET = 151;
+constexpr seL4_Word SYS_PCIE_RESET = 152;
+
+// issuse.txt №74/в — 31-я hw-попытка, по наводке внешней консультации
+// (агент "VL805/xHCI"): usb_driver не имеет своего маппинга indirect-
+// ECAM окна (оно только у root, PLAT_PCIE_CFG_DATA_ROOT_VADDR) — этот
+// syscall позволяет usb_driver'у безопасно прочитать (и очистить)
+// Device Status VL805 через root, БЕЗ выдачи usb_driver собственного
+// доступа к config-space/RGR1 (принцип наименьших привилегий). Только
+// для usb_driver (is_driver==6) или admin — драйверам вообще эти
+// операции не нужны (см. is_admin_caller()), но здесь ИМЕННО usb_driver
+// и есть легитимный вызывающий. Ответ MR0=0 (ok)/-1(нет прав), MR1=
+// Device Status (верхние 16 бит регистра по offset 0xC4+0x08).
+constexpr seL4_Word SYS_PCIE_VL805_DEVSTATUS_PROBE = 153;
+
+// Интроспекция процесса по имени — для автотестов (см. src/tests/
+// coretest.cpp). Раньше единственным способом узнать PID/ядро процесса
+// был разбор человекочитаемой таблицы `ps`/`top` из SHM — хрупко и
+// непригодно для теста, который должен давать одинаковый ответ каждый
+// раз. Запрос: MR1-4 = имя (32 байта, та же упаковка, что SYS_RECOVER).
+// Ответ: MR0 = pid (или -1, если не найден), MR1 = ядро, MR2 = is_driver,
+// MR3 = состояние из общей страницы драйверов (DRIVER_STATE_BUSY/
+// DRIVER_STATE_PARKED, или DRIVER_STATE_UNKNOWN, если процесс не драйвер
+// либо страницы нет — см. issuse.txt №74/б). Только чтение, ничего не
+// меняет, поэтому admin-гейта нет (как и у `ps`).
+constexpr seL4_Word SYS_PROC_INFO = 154;
+constexpr seL4_Word DRIVER_STATE_UNKNOWN = 2;
 
 const char* sel4_err_str(seL4_Error err);
 void check_err(seL4_Error err, const char *msg);

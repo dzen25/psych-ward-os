@@ -1,6 +1,7 @@
 // net_driver.cpp
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/driver_state.h"
 #include "h/platform.h"
 #include <stdint.h>
 #include <kernel/gen_config.h>
@@ -2192,7 +2193,7 @@ static void net_log_flush() {
     net_vfs_lock();
     int path_len = my_strlen(NET_LOG_PATH);
     my_memcpy(g_shm_vaddr, NET_LOG_PATH, path_len + 1); // включая нуль-терминатор
-    my_memcpy(g_shm_vaddr + 128, g_udp_log_buf, g_udp_log_len);
+    my_memcpy(g_shm_vaddr + VFS_PAYLOAD_OFFSET, g_udp_log_buf, g_udp_log_len);
     seL4_SetMR(0, 113); // SYS_WRITE_FILE
     seL4_SetMR(1, g_udp_log_len);
     seL4_Call(g_blk_ep, seL4_MessageInfo_new(0, 0, 0, 2));
@@ -2663,6 +2664,13 @@ int main(int argc, char *argv[]) {
     seL4_SetIPCBuffer(ipc);
 
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — общая страница состояния PARKED/BUSY, см.
+    // h/driver_state.h. Инициализируем как можно раньше: до первого
+    // seL4_Recv драйвер занят своим bring-up'ом, и root обязан это
+    // видеть, иначе может счесть безопасным суспендить его посреди
+    // инициализации железа.
+    driver_state_init(PLAT_DRIVER_STATE_VADDR, 4, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr timer_ep   = ipc->msg[BOOT_TIMER_EP];
     seL4_CPtr net_cmd_ep = ipc->msg[BOOT_NET_EP];
     seL4_CPtr root_ep    = ipc->msg[BOOT_ROOT_EP];
@@ -2748,7 +2756,9 @@ int main(int argc, char *argv[]) {
     // будильника, ЛИБО настоящее клиентское сообщение на net_cmd_ep.
     while (1) {
         seL4_Word badge = 0;
+        driver_state_parked(); // см. h/driver_state.h — с этой точки root вправе нас суспендить/переносить
         seL4_MessageInfo_t info = seL4_Recv(net_cmd_ep, &badge);
+        driver_state_busy();   // ДО любых ветвлений/continue ниже
 
         if (badge & (NET_EVENT_GENET_RX | NET_EVENT_HEARTBEAT | NET_EVENT_WIFI_RX)) {
             if (badge & NET_EVENT_GENET_RX) {

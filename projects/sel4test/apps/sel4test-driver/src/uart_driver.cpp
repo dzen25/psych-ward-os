@@ -1,5 +1,6 @@
 #include <sel4/sel4.h>
 #include "h/common.h"
+#include "h/driver_state.h"
 #include "h/platform.h"
 #include <stdint.h>
 
@@ -161,6 +162,13 @@ int main(int argc, char *argv[]) {
 
     // 2. Теперь безопасно получаем root_ep
     seL4_CPtr root_ep = ipc->msg[BOOT_ROOT_EP];
+    // issuse.txt №74, часть "б" (адаптивный перенос драйверов между
+    // ядрами) — общая страница состояния PARKED/BUSY, см.
+    // h/driver_state.h. Инициализируем как можно раньше: до первого
+    // seL4_Recv драйвер занят своим bring-up'ом, и root обязан это
+    // видеть, иначе может счесть безопасным суспендить его посреди
+    // инициализации железа.
+    driver_state_init(PLAT_DRIVER_STATE_VADDR, 1, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr my_ep   = ipc->msg[BOOT_CONSOLE_EP];
     seL4_CPtr irq_ep  = ipc->msg[BOOT_IRQ_EP];
     seL4_CPtr self_tcb = ipc->msg[BOOT_SELF_TCB_CAP]; // Фаза 6.1 (продолжение, см. ROADMAP.md)
@@ -206,7 +214,9 @@ int main(int argc, char *argv[]) {
 
     while(1) {
         seL4_Word badge = 0;
+        driver_state_parked(); // см. h/driver_state.h — с этой точки root вправе нас суспендить/переносить
         seL4_MessageInfo_t info = seL4_Recv(my_ep, &badge);
+        driver_state_busy();   // ДО любых ветвлений/continue ниже
 
         if (badge == UART_KBD_IRQ_BADGE) {
             // Прерывание от клавиатуры — общий с uart_putc() drain (см.

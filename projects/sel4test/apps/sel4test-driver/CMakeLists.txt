@@ -167,7 +167,7 @@ target_link_libraries(test_app sel4 sel4runtime muslc)
 # issuse.txt №62 (расследование) — префикс sbtest_ (не sb_!) — тестовые хуки
 # (см. src/tests/) специально НЕ трогали при слиянии выше, остаются
 # отдельными ELF; build_and_sign.sh раскладывает их в load_chain/RPI/sbin/tests/.
-set(PSYCH_TEST_TOOLS holdshm proxytest recovertest stresstest ctrlbytetest timedread clonetest killwindow)
+set(PSYCH_TEST_TOOLS holdshm proxytest recovertest stresstest ctrlbytetest timedread clonetest killwindow coretest hotplugtest stalltest spawnloop orphantest logtest)
 foreach(tool ${PSYCH_TEST_TOOLS})
     add_executable(sbtest_${tool} src/tests/${tool}.cpp)
     target_include_directories(sbtest_${tool} PRIVATE src "${CMAKE_BINARY_DIR}/libsel4/autoconf" "${CMAKE_BINARY_DIR}/kernel/gen_config" "${CMAKE_BINARY_DIR}/libsel4/gen_config")
