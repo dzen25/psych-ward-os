@@ -943,6 +943,19 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(0, 0);
             blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
+        else if (cmd == 128) { // SYS_STAT — размер/каталог/существование
+            char filename[256];
+            my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
+            uint64_t fsize = 0; bool is_dir = false;
+            if (exfat_stat(&g_file_system, filename, &fsize, &is_dir)) {
+                seL4_SetMR(0, 0);
+                seL4_SetMR(1, (seL4_Word)fsize);
+                seL4_SetMR(2, is_dir ? 1u : 0u);
+            } else {
+                seL4_SetMR(0, (seL4_Word)-1); seL4_SetMR(1, 0); seL4_SetMR(2, 0);
+            }
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 3));
+        }
         else if (cmd == 119) { // SYS_READ_FILE
             uint32_t offset = seL4_GetMR(1);
             uint32_t bytes_read = 0;
@@ -1054,9 +1067,11 @@ int main(int argc, char *argv[]) {
 
             // Читаем напрямую в SHM, чтобы shell мог сразу это распечатать
             uint32_t copied = 0;
-            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, &copied)) {
+            bool truncated = false;
+            if (exfat_read_text_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, &copied, VFS_PAYLOAD_MAX, &truncated)) {
                 seL4_SetMR(0, 0);
                 seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
+                seL4_SetMR(2, truncated ? 1u : 0u); // файл не поместился целиком
                 blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
             } else {
                 seL4_SetMR(0, -1);

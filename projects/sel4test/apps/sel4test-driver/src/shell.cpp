@@ -1146,6 +1146,79 @@ static void run_grep_filter(int input_fd, const char* pattern) {
     }
 }
 
+// grep по ФАЙЛУ, а не по конвейеру.
+//
+// Раньше грепнуть файл напрямую было нельзя: grep существовал только как
+// правая часть пайпа, и приходилось писать `cat f | grep x` — то есть
+// гнать весь файл через пайп ПОБАЙТНО (sys_read_fd на каждый символ),
+// когда рядом есть чтение кусками по 128 КБ.
+//
+// Длинные строки: буфер 256 байт, как у конвейерного варианта. При
+// переполнении строка не отбрасывается молча, а обрабатывается окном —
+// накопленное проверяется на совпадение и печатается, дальше буфер
+// начинается заново. Совпадение, лежащее ровно на стыке окон, при этом
+// потеряется; это честная плата за фиксированный буфер, и она лучше
+// тихого обрезания хвоста.
+static void run_grep_file(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg) { sys_puts(0, "Usage: grep <шаблон> <файл>\n"); return; }
+    char *p = arg;
+    char *pattern = next_token(&p);
+    char *file = next_token(&p);
+    if (!pattern || !file) { sys_puts(0, "Usage: grep <шаблон> <файл>\n"); return; }
+    if (next_token(&p) != nullptr) { sys_puts(0, "grep: слишком много аргументов (нужны шаблон и файл)\n"); return; }
+
+    char pat[128];
+    my_strlcpy(pat, pattern, sizeof(pat));
+
+    char *shm = shm_base;
+    build_absolute_path(shm, file, SHM_TOTAL_SIZE);
+    seL4_CPtr target_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+    char path[256];
+    my_strlcpy(path, shm, sizeof(path)); // shm будет затёрт содержимым файла
+
+    char line[256];
+    int lpos = 0;
+    long matches = 0;
+    bool found_file = false;
+    uint32_t offset = 0;
+
+    auto emit_if_match = [&]() {
+        if (lpos <= 0) return;
+        line[lpos] = '\0';
+        if (my_strstr(line, pat)) { sys_puts(0, line); sys_puts(0, "\n"); matches++; }
+        lpos = 0;
+    };
+
+    vfs_lock(); // на весь цикл — иначе чужая VFS-команда между кусками затрёт SHM
+    while (1) {
+        my_strlcpy(shm, path, 128);
+        seL4_SetMR(0, 119); // SYS_READ_FILE
+        seL4_SetMR(1, offset);
+        seL4_Call(target_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        if ((int)seL4_GetMR(0) != 0) break;
+        found_file = true;
+        int got = (int)seL4_GetMR(1);
+        if (got <= 0) break; // EOF
+
+        const char *data = shm + VFS_PAYLOAD_OFFSET;
+        for (int i = 0; i < got; i++) {
+            char c = data[i];
+            if (c == '\n' || c == '\r') {
+                emit_if_match();
+            } else {
+                if (lpos >= (int)sizeof(line) - 1) emit_if_match(); // окно переполнено, см. шапку
+                line[lpos++] = c;
+            }
+        }
+        offset += (uint32_t)got;
+    }
+    emit_if_match(); // хвост файла без завершающего перевода строки
+    vfs_unlock();
+
+    if (!found_file) { sys_puts(0, "grep: файл не найден или это каталог\n"); return; }
+    if (matches == 0) sys_puts(0, "grep: совпадений нет\n");
+}
+
 // По просьбе пользователя (2026-08-23): все /sbin-команды (кроме
 // /sbin/tests/*, см. src/tests/) слиты обратно в shell.cpp как обычные
 // функции — тот же приём, что уже применён к grep (run_grep_filter()
@@ -1252,6 +1325,120 @@ static void run_cat(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
         if (stopped_unsafe) {
             sys_puts(0, "cat: файл содержит небезопасные для терминала байты (нулевые/control/ANSI) — вывод оборван на первом из них.\n");
         }
+    }
+}
+
+// Копирование файла. Источник читается кусками по VFS_PAYLOAD_MAX и
+// кладётся в приёмник: первый кусок — полной перезаписью (чтобы приёмник
+// гарантированно обнулился, даже если он существовал и был длиннее),
+// остальные — дописыванием.
+//
+// Почему НЕ потоковой записью, которая впятеро быстрее: поток обязан
+// знать размер ЗАРАНЕЕ, чтобы зарезервировать непрерывный экстент, а
+// узнать размер файла в системе сейчас нечем — отдельного вызова "размер
+// файла" нет. Как появится, cp — первый кандидат на перевод (см.
+// таблицу режимов в situation.txt).
+//
+// Блокировка VFS держится на ВЕСЬ цикл, как в run_cat: между чтением
+// куска и его записью в SHM лежат данные, и чужой ls/touch посреди этого
+// их затрёт. Путь пишется в начало SHM, данные живут с
+// VFS_PAYLOAD_OFFSET — они не пересекаются, поэтому смена пути между
+// чтением и записью содержимое куска не портит.
+static void run_cp(char *arg, seL4_CPtr blk_ep, seL4_CPtr usb_storage_ep) {
+    if (!arg) { sys_puts(0, "Usage: cp <src> <dst>\n"); return; }
+    char *p = arg;
+    char *src = next_token(&p);
+    char *dst = next_token(&p);
+    if (!src || !dst) { sys_puts(0, "Usage: cp <src> <dst>\n"); return; }
+    if (next_token(&p) != nullptr) { sys_puts(0, "cp: слишком много аргументов (нужно ровно два)\n"); return; }
+
+    char *shm = shm_base;
+    char src_path[256], dst_path[256];
+    build_absolute_path(shm, src, SHM_TOTAL_SIZE);
+    seL4_CPtr src_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+    my_strlcpy(src_path, shm, sizeof(src_path));
+    build_absolute_path(shm, dst, SHM_TOTAL_SIZE);
+    seL4_CPtr dst_ep = route_vfs_path(shm, blk_ep, usb_storage_ep);
+    my_strlcpy(dst_path, shm, sizeof(dst_path));
+
+    if (my_strcmp(src_path, dst_path) == 0) {
+        sys_puts(0, "cp: источник и приёмник — один и тот же файл\n");
+        return;
+    }
+
+    // Размер источника — через SYS_STAT. От него зависит РЕЖИМ записи:
+    // потоковая запись впятеро быстрее дописывания, но обязана знать
+    // размер заранее, чтобы зарезервировать непрерывный экстент.
+    uint64_t src_size = 0;
+    bool src_is_dir = false, have_size = false;
+    {
+        vfs_lock();
+        my_strlcpy(shm, src_path, 128);
+        seL4_SetMR(0, 128); // SYS_STAT
+        seL4_Call(src_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+        if ((int)seL4_GetMR(0) == 0) {
+            src_size = (uint64_t)seL4_GetMR(1);
+            src_is_dir = (seL4_GetMR(2) != 0);
+            have_size = true;
+        }
+        vfs_unlock();
+    }
+    if (have_size && src_is_dir) { sys_puts(0, "cp: источник — каталог\n"); return; }
+
+    vfs_lock();
+    // Пытаемся открыть поток на приёмнике. Отказ здесь не фатален (может
+    // не быть непрерывного места нужного размера) — тогда идём прежним
+    // путём: перезапись первого куска и дописывание остальных.
+    bool stream = false;
+    if (have_size && src_size > 0) {
+        my_strlcpy(shm, dst_path, 128);
+        seL4_SetMR(0, 122); // SYS_STREAM_OPEN
+        seL4_SetMR(1, (seL4_Word)src_size);
+        seL4_Call(dst_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        stream = ((int)seL4_GetMR(0) == 0);
+    }
+
+    uint32_t offset = 0;
+    bool first_chunk = true, write_ok = true, found = false;
+    while (1) {
+        my_strlcpy(shm, src_path, 128);
+        seL4_SetMR(0, 119); // SYS_READ_FILE
+        seL4_SetMR(1, offset);
+        seL4_Call(src_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        if ((int)seL4_GetMR(0) != 0) break;
+        found = true;
+        int got = (int)seL4_GetMR(1);
+        if (got <= 0) break; // EOF
+
+        my_strlcpy(shm, dst_path, 128);
+        if (stream) {
+            seL4_SetMR(0, 123); // SYS_STREAM_WRITE
+        } else {
+            seL4_SetMR(0, first_chunk ? 113 : 121); // перезапись, затем дописывание
+        }
+        seL4_SetMR(1, (seL4_Word)got);
+        seL4_Call(dst_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+        if ((int)seL4_GetMR(0) != 0) { write_ok = false; break; }
+        first_chunk = false;
+        offset += (uint32_t)got;
+    }
+    if (stream) {
+        // Закрывать поток обязательно даже на ошибке: иначе в записи
+        // каталога останется длина, равная ВСЕМУ резерву, а не тому, что
+        // реально записано.
+        my_strlcpy(shm, dst_path, 128);
+        seL4_SetMR(0, 124); // SYS_STREAM_CLOSE
+        seL4_Call(dst_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+        if ((int)seL4_GetMR(0) != 0) write_ok = false;
+    }
+    vfs_unlock();
+
+    if (!found) { sys_puts(0, "cp: источник не найден или это каталог\n"); return; }
+    if (!write_ok) { sys_puts(0, "cp: запись в приёмник не удалась\n"); return; }
+    if (first_chunk) {
+        // Источник пуст — приёмник всё равно обязан появиться, пустым.
+        build_absolute_path(shm_base, dst, SHM_TOTAL_SIZE);
+        vfs_syscall(112, dst_ep); // SYS_TOUCH (сам берёт блокировку)
     }
 }
 
@@ -2751,7 +2938,14 @@ int main(int argc, char *argv[]) {
                 if (*redir == '>') {
                     *redir = '\0'; // Отрезаем строку текста
                     redir++;       // Сдвигаемся на начало пути к файлу
-                    
+
+                    // ">>" — дописывание в конец вместо полной перезаписи.
+                    // Вызов SYS_APPEND_FILE существовал и работал, но
+                    // добраться до него из шелла было нечем: оператора не
+                    // было, а `echo >` умеет только перезапись целиком.
+                    bool append_mode = false;
+                    if (*redir == '>') { append_mode = true; redir++; }
+
                     // Пропускаем пробелы после '>'
                     while (*redir == ' ') redir++;
 
@@ -2765,7 +2959,8 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (*redir == '\0') {
-                        sys_puts(console_ep, "Parse error: expected file path after '>'\n");
+                        sys_puts(console_ep, append_mode ? "Parse error: expected file path after '>>'\n"
+                                                         : "Parse error: expected file path after '>'\n");
                         continue;
                     }
 
@@ -2796,11 +2991,21 @@ int main(int argc, char *argv[]) {
 
                     build_absolute_path(path_ptr, redir, 128);
                     my_strlcpy(text_ptr, arg, SHM_TOTAL_SIZE - 128);
+                    // Перевод строки в конце — как у обычного echo без
+                    // перенаправления и как во всех привычных оболочках.
+                    // Без него `echo a >> f; echo b >> f` даёт слипшееся
+                    // "ab", и дописывание в журнал теряет смысл.
+                    int text_len = my_strlen(text_ptr);
+                    text_ptr[text_len++] = '\n';
+                    text_ptr[text_len] = '\0';
                     seL4_CPtr target_ep = route_vfs_path(path_ptr, blk_ep, usb_storage_ep); // Milestone 9
 
                     vfs_lock();
-                    seL4_SetMR(0, 113);
-                    seL4_SetMR(1, my_strlen(arg));
+                    // 121 = SYS_APPEND_FILE, 113 = SYS_WRITE_FILE. Если
+                    // файла нет, дописывание само создаёт его (см.
+                    // exfat_append_file), поэтому отдельной ветки не надо.
+                    seL4_SetMR(0, append_mode ? 121 : 113);
+                    seL4_SetMR(1, (seL4_Word)text_len);
 
                     seL4_MessageInfo_t msg = seL4_MessageInfo_new(0, 0, 0, 2); // 2 регистра передано
                     seL4_Call(target_ep, msg);
@@ -2821,7 +3026,7 @@ int main(int argc, char *argv[]) {
             }
 
             else if (my_strcmp(cmd_ptr, "help") == 0) {
-                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, echo, exec, kill, recover, driver (stop/start/restart), exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv, balance, reboot, usbreset\n";
+                const char* help_text = "Available: help, time, uptime, date, temp, mboxprobe, cpufreq, peripherals, sleep, ls, ps, cat, cp, grep, echo (> и >>), exec, kill, recover, driver (stop/start/restart), exit, shm, pid, mkdir, cd, pwd, history, ping, send, sendto, recv, netstat, ntp, wifiprobe, wifi (start/stop/restart/scan/connect/clean/status), touch, rm, mv, balance, reboot, usbreset\n";
                 if (is_piping) {
                     sys_write(pipe_fd, help_text);
                     sys_pipe_wr_close(pipe_fd);
@@ -2856,6 +3061,8 @@ int main(int argc, char *argv[]) {
             // те остаются отдельными ELF, вызываются полным путём.
             else if (my_strcmp(cmd_ptr, "ls") == 0) { run_ls(arg, blk_ep, usb_storage_ep, root_ep); }
             else if (my_strcmp(cmd_ptr, "cat") == 0) { run_cat(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "grep") == 0) { run_grep_file(arg, blk_ep, usb_storage_ep); }
+            else if (my_strcmp(cmd_ptr, "cp") == 0) { run_cp(arg, blk_ep, usb_storage_ep); }
             else if (my_strcmp(cmd_ptr, "touch") == 0) { run_touch(arg, blk_ep, usb_storage_ep); }
             else if (my_strcmp(cmd_ptr, "mkdir") == 0) { run_mkdir(arg, blk_ep, usb_storage_ep); }
             else if (my_strcmp(cmd_ptr, "rm") == 0) { run_rm(arg, blk_ep, usb_storage_ep); }

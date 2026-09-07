@@ -366,6 +366,36 @@ static void scsi_stats_print(long long e2e_bytes, long long e2e_us) {
     sys_puts(0, "  железа; разрыв между ними и есть цена файловой системы.\n");
 }
 
+// Чистый отчёт по ЧТЕНИЮ. Отдельно от scsi_stats_print(), потому что тот
+// про запись, а сравнивать чтение с записью по общей строке нельзя: в
+// общую корзину "крупных чтений" попадали куски и по 128 КБ (сверка), и
+// по 64 КБ (копирование экстента), тогда как записи все по 128 КБ. Здесь
+// замер однородный: один проход по файлу кусками одного размера.
+static void read_stats_print(long long bytes, long long us) {
+    vfs_lock();
+    seL4_SetMR(0, 126);
+    seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    long long cmds = (long long)seL4_GetMR(0);
+    long long rd   = (long long)seL4_GetMR(5);
+    long long rdb  = (long long)seL4_GetMR(6);
+    long long rmax = (long long)seL4_GetMR(9);
+    long long drd  = (long long)seL4_GetMR(16);
+    vfs_unlock();
+    (void)cmds;
+    sys_puts(0, "  --- ЧТЕНИЕ, чистый замер (тот же объём, БЕЗ сравнения байтов) ---\n");
+    sys_puts(0, "        прочитано         "); putdec(bytes);
+    sys_puts(0, " Б за "); putdec(us / 1000); sys_puts(0, " мс\n");
+    if (us > 0) {
+        sys_puts(0, "        [3] программа     "); putdec(bytes * 1000000LL / us / 1024);
+        sys_puts(0, " КБ/с\n");
+    }
+    if (drd > 0 && rdb > 0) {
+        sys_puts(0, "        [1] шина          "); putdec(rdb * 1000000LL / drd / 1024);
+        sys_puts(0, " КБ/с   (команд "); putdec(rd);
+        sys_puts(0, ", макс "); putdec(rmax); sys_puts(0, " секторов)\n");
+    }
+}
+
 static int vfs_touch(void) {
     my_strlcpy(env.shm + PATH_OFFSET, g_path, 128);
     vfs_lock();
@@ -658,6 +688,23 @@ int main(int argc, char *argv[]) {
         // а не первой — первый прогон на железе поймал ровно это
         // расхождение в режиме `random`; при `same` оно не проявлялось,
         // потому что все записи одинаковые.
+        // Сперва ЧИСТЫЙ замер чтения: тот же файл целиком, кусками
+        // одного размера и без побайтового сравнения. Сравнение идёт
+        // следом, отдельным проходом — иначе в замер попало бы время
+        // сравнения 26 МБ в НЕкэшируемой SHM, а это десятки миллисекунд
+        // на мегабайт и к скорости чтения отношения не имеет.
+        {
+            scsi_stats_reset();
+            uint64_t t_rd = now_us();
+            long long rd_bytes = 0;
+            for (long long off = 0; off < file_len; ) {
+                int got = vfs_read_at((uint32_t)off);
+                if (got <= 0) break;
+                rd_bytes += got; off += got;
+            }
+            uint64_t rd_us = now_us() - t_rd;
+            if (rd_bytes > 0 && rd_us > 0) read_stats_print(rd_bytes, (long long)rd_us);
+        }
         if (!verify_whole_file(file_len, g_append ? -1 : (done - 1))) {
             step_fail("итоговое содержимое не совпало с записанным");
             cleanup_and_exit(); return 1;

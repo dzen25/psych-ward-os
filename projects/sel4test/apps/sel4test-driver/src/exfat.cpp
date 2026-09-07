@@ -903,7 +903,49 @@ bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer,
     return true;
 }
 
-bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied) {
+// Размер файла, признак каталога и сам факт существования — одним
+// вызовом, без чтения данных.
+//
+// Зачем понадобился: потоковая запись (самый быстрый режим, впятеро
+// быстрее дописывания) обязана знать размер ЗАРАНЕЕ, чтобы зарезервировать
+// непрерывный экстент. Узнать размер файла в системе было нечем, и из-за
+// этого `cp` приходилось гнать через перезапись+дописывание. Тот же
+// примитив нужен любому будущему автовыбору режима.
+//
+// Пользуется тем же кэшем места файла, что чтение и дописывание, поэтому
+// повторный stat того же пути каталог не сканирует.
+bool exfat_stat(EXFAT_Instance* fs, const char* path, uint64_t* out_size, bool* out_is_dir) {
+    ExfatSlot slot;
+    if (file_loc_same_path(fs, path)) {
+        slot = g_file_loc.slot;
+    } else {
+        char basename[256]; // issuse.txt №42
+        uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
+        if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
+
+        bool parent_no_chain; uint64_t parent_len;
+        resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
+
+        if (!exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) || !slot.found) return false;
+        if (!slot.is_dir && slot.first_cluster != 0 && slot.no_fat_chain) {
+            file_loc_store(fs, path, parent_clus, parent_no_chain, parent_len, basename, slot);
+        }
+    }
+    if (out_size)   *out_size = slot.data_length;
+    if (out_is_dir) *out_is_dir = slot.is_dir;
+    return true;
+}
+
+// max_len — размер буфера ВМЕСТЕ с местом под завершающий ноль.
+//
+// Раньше здесь стоял зашитый потолок 4000 байт, и файл длиннее молча
+// обрезался: вызывающий получал успех и укороченное содержимое, не имея
+// возможности отличить это от короткого файла. На файле знакомых сетей
+// Wi-Fi это означало бы тихую потерю сетей. Потолок теперь задаёт
+// вызывающий (драйверы передают размер области полезной нагрузки), а
+// признак обрезания возвращается отдельно.
+bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied,
+                          uint32_t max_len, bool* out_truncated) {
     char basename[256]; // issuse.txt №42
     uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
     if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
@@ -919,8 +961,15 @@ bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer
         if (out_copied) *out_copied = 0;
         return true;
     }
+    if (max_len < 2) return false;
     uint32_t size = (uint32_t)slot.data_length;
-    if (size > 4000) size = 4000;
+    // Место под завершающий ноль резервируется ЗДЕСЬ. Запись ноля на
+    // границе области нагрузки уже приводила в этом проекте к FATAL FAULT
+    // (см. историю с dst[g_chunk] = 0), повторять нельзя.
+    uint32_t cap = max_len - 1;
+    bool truncated = false;
+    if (size > cap) { size = cap; truncated = true; }
+    if (out_truncated) *out_truncated = truncated;
 
     uint32_t copied = read_extent(fs, slot.first_cluster, slot.no_fat_chain, 0, out_buffer, size);
     out_buffer[copied] = '\0';

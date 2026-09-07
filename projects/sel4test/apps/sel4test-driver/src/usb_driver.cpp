@@ -462,6 +462,12 @@ struct UsbDeviceSlot {
     // streams (см. PLAT_XHCI_UAS_STREAMS_VADDR); труба команд — всегда
     // обычная, потоков она не объявляет.
     bool uas_use_streams = false;
+    // Скорость линка (поле Slot Context Speed: 1=Full, 2=Low, 3=High,
+    // 4=SuperSpeed). Хранится, чтобы итоговая строка про устройство могла
+    // её назвать: раньше "Скорость: ..." печаталась отдельной строкой во
+    // время перечисления и относилась неизвестно к кому — рядом шли строки
+    // хаба и второго накопителя.
+    uint32_t link_speed = 0;
     // per-device paddr'ы (считаются в main() один раз из BOOT_USB_*_PADDR
     // — базового адреса — плюс idx*4096, см. h/platform.h).
     seL4_Word ep0_trring_paddr = 0, ctrl_buf_paddr = 0;
@@ -2019,8 +2025,10 @@ static void step8_get_device_descriptor(seL4_CPtr console_ep, int idx, uint8_t s
     // 64, на Full-Speed — 8/16/32/64. Это единственный байт, который
     // нельзя ни с чем перепутать, в отличие от bcdUSB (тот говорит лишь,
     // какой стандарт устройство поддерживает, а не на чём оно сейчас).
-    sys_puthex32(console_ep, "[USB]   DIAG bcdUSB / bMaxPacketSize0 = ",
-                 ((uint32_t)buf[3] << 24) | ((uint32_t)buf[2] << 16) | buf[7]);
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB]   DIAG bcdUSB / bMaxPacketSize0 = ",
+                     ((uint32_t)buf[3] << 24) | ((uint32_t)buf[2] << 16) | buf[7]);
+    }
 }
 
 // USB-класс, которого ищем в этой фазе: Mass Storage / SCSI Transparent /
@@ -2222,9 +2230,13 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
         // расходятся — мы программируем контексты не под ту скорость.
         // Значения поля Slot Context Speed (xHCI): 1=Full, 2=Low,
         // 3=High, 4=SuperSpeed.
-        sys_puthex32(console_ep, "[USB] DIAG наша port_speed для этого устройства = ", port_speed);
-        sys_puthex32(console_ep, "[USB] DIAG за хабом? (1=да) / ярус = ",
-                     ((uint32_t)(g_usb_devices[idx].behind_hub ? 1u : 0u) << 8) | g_usb_devices[idx].hub_tier);
+        if (LOG_USB) {
+            sys_puthex32(console_ep, "[USB] DIAG наша port_speed для этого устройства = ", port_speed);
+        }
+        if (LOG_USB) {
+            sys_puthex32(console_ep, "[USB] DIAG за хабом? (1=да) / ярус = ",
+                         ((uint32_t)(g_usb_devices[idx].behind_hub ? 1u : 0u) << 8) | g_usb_devices[idx].hub_tier);
+        }
         if (uas_found) {
             bool all_bulk = ((uas.cmd_attr & 0x03u) == 0x02u) && ((uas.status_attr & 0x03u) == 0x02u)
                             && ((uas.in_attr & 0x03u) == 0x02u) && ((uas.out_attr & 0x03u) == 0x02u);
@@ -2232,13 +2244,17 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
             if (uas.cmd_addr && uas.status_addr && uas.in_addr && uas.out_addr && !all_bulk) {
                 sys_puts(console_ep, "[USB] UAS: одна из четырёх труб не bulk — очередь команд не включаем.\n");
             }
-            sys_puthex32(console_ep, "[USB] UAS: устройство ПОДДЕРЖИВАЕТ, интерфейс/alt = ",
+            if (LOG_USB) sys_puthex32(console_ep, "[USB] UAS: устройство ПОДДЕРЖИВАЕТ, интерфейс/alt = ",
                          ((uint32_t)uas_if << 8) | uas_alt);
             if (uas.found) {
-                sys_puthex32(console_ep, "[USB] UAS: трубы cmd/status = ",
-                             ((uint32_t)uas.cmd_addr << 8) | uas.status_addr);
-                sys_puthex32(console_ep, "[USB] UAS: трубы data-in/data-out = ",
-                             ((uint32_t)uas.in_addr << 8) | uas.out_addr);
+                if (LOG_USB) {
+                    sys_puthex32(console_ep, "[USB] UAS: трубы cmd/status = ",
+                                 ((uint32_t)uas.cmd_addr << 8) | uas.status_addr);
+                }
+                if (LOG_USB) {
+                    sys_puthex32(console_ep, "[USB] UAS: трубы data-in/data-out = ",
+                                 ((uint32_t)uas.in_addr << 8) | uas.out_addr);
+                }
             } else {
                 sys_puts(console_ep, "[USB] UAS: не удалось разобрать все четыре трубы — очередь команд не включаем.\n");
             }
@@ -2255,6 +2271,8 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
                 // MaxPacketSize 512, а UAS alt — 1024, то различие в
                 // поведении двух транспортов объясняется этим одним
                 // числом, и искать в протоколе UAS нечего.
+                if (!LOG_USB) { /* сырой дамп дескрипторов — только при включённом логе */ }
+                else {
                 sys_puts(console_ep, "[USB] UAS DIAG: сырая цепочка ВСЕГО дескриптора конфигурации:\n");
                 uint32_t o = 9;
                 while (o + 2 <= parse_limit) {
@@ -2277,10 +2295,11 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
                     }
                     o += dl;
                 }
+                }
             }
             g_usb_devices[idx].uas = uas;
         } else {
-            sys_puts(console_ep, "[USB] UAS: устройство НЕ поддерживает (только Bulk-Only) — очередь команд невозможна.\n");
+            if (LOG_USB) sys_puts(console_ep, "[USB] UAS: устройство НЕ поддерживает (только Bulk-Only) — очередь команд невозможна.\n");
         }
     }
     return true;
@@ -2536,6 +2555,8 @@ static void enumerate_device_behind_hub(seL4_CPtr console_ep, int hub_idx, uint8
 // run_bring_up(), которого мы ещё не достигли". По умолчанию true —
 // поведение ВСЕХ остальных вызывающих не меняется.
 static void unmount_usb_storage(seL4_CPtr console_ep, int idx, bool hardware_alive = true);
+// Итоговая строка про устройство (определена ниже, у step15_mount_filesystem).
+static void usb_print_device_summary(seL4_CPtr console_ep, int idx);
 // ЕДИНСТВЕННЫЙ способ отпустить слот после НЕУДАЧНОГО подключения.
 // Раньше каждая точка отказа чистила поля руками и своим набором (два
 // почти одинаковых блока по 5 присваиваний в разных местах) — а полей у
@@ -2627,7 +2648,7 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
         }
         bool low_speed = (status & USB_PORT_STAT_LOW_SPEED) != 0;
         bool high_speed = (status & USB_PORT_STAT_HIGH_SPEED) != 0;
-        sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
+        if (LOG_USB) sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
                                         : (high_speed ? "[USB]     Скорость: High-Speed\n" : "[USB]     Скорость: Full-Speed\n"));
         if (!high_speed) {
             sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: не High-Speed — Transaction Translator не реализован в этой фазе, монтирование этого устройства невозможно (честное ограничение, см. план).\n");
@@ -2675,9 +2696,7 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
     } else if (!g_usb_devices[child_idx].storage_mounted) {
         usb_slot_release_failed(console_ep, child_idx, "exFAT не смонтировался: не exFAT / повреждён / не тот раздел");
     } else {
-        sys_puts(console_ep, "[USB]     Флешка за хабом автоматически смонтирована: /mnt/");
-        sys_puts(console_ep, g_usb_devices[child_idx].volume_name);
-        sys_puts(console_ep, "\n");
+        usb_print_device_summary(console_ep, child_idx);
     }
 }
 
@@ -2895,7 +2914,7 @@ static void hub_conn_async_tick(seL4_CPtr console_ep) {
         }
         bool low_speed = (g_hub_conn_status & USB_PORT_STAT_LOW_SPEED) != 0;
         bool high_speed = (g_hub_conn_status & USB_PORT_STAT_HIGH_SPEED) != 0;
-        sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
+        if (LOG_USB) sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
                                         : (high_speed ? "[USB]     Скорость: High-Speed\n" : "[USB]     Скорость: Full-Speed\n"));
         if (!high_speed) {
             sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: не High-Speed — Transaction Translator не реализован в этой фазе, монтирование этого устройства невозможно (честное ограничение, см. план).\n");
@@ -2951,9 +2970,7 @@ static void hub_conn_async_tick(seL4_CPtr console_ep) {
             // попытку. Отпускаем полностью.
             usb_slot_release_failed(console_ep, child_idx, "exFAT не смонтировался: не exFAT / повреждён / не тот раздел");
         } else {
-            sys_puts(console_ep, "[USB]     Флешка за хабом автоматически смонтирована: /mnt/");
-            sys_puts(console_ep, g_usb_devices[child_idx].volume_name);
-            sys_puts(console_ep, "\n");
+            usb_print_device_summary(console_ep, child_idx);
         }
         g_hub_conn_state = HubConnSt::IDLE;
         return;
@@ -3940,9 +3957,13 @@ static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int p
         return false;
     }
     dev.uas_use_streams = want_streams;
-    sys_puthex32(console_ep, "[USB] UAS: потоки на трубах status/in/out (log2) = ",
-                 ((uint32_t)u.status_streams << 16) | ((uint32_t)u.in_streams << 8) | u.out_streams);
-    sys_puthex32(console_ep, "[USB] UAS: режим потоков включён (1=да) = ", dev.uas_use_streams ? 1u : 0u);
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: потоки на трубах status/in/out (log2) = ",
+                     ((uint32_t)u.status_streams << 16) | ((uint32_t)u.in_streams << 8) | u.out_streams);
+    }
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: режим потоков включён (1=да) = ", dev.uas_use_streams ? 1u : 0u);
+    }
 
     // Stream Context Array трубы: линейный массив (LSA=1), адресуемый
     // Stream ID напрямую. Вход 0 зарезервирован спекой, вход UAS_STREAM_ID
@@ -4011,16 +4032,24 @@ static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int p
     // РАВЕН DCI (Input Control Context'а там нет), Slot Context = 0.
     {
         volatile uint32_t *dc = devctx_vaddr_for(slot_id);
-        sys_puthex32(console_ep, "[USB] UAS DIAG: Slot Context dword0 = ", read_ctx_dword(dc, 0, 0));
-        sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 data-out/data-in = ",
-                     ((read_ctx_dword(dc, out_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, in_dci, 0) & 0x7u));
-        sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 status/cmd = ",
-                     ((read_ctx_dword(dc, status_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, cmd_dci, 0) & 0x7u));
+        if (LOG_USB) {
+            sys_puthex32(console_ep, "[USB] UAS DIAG: Slot Context dword0 = ", read_ctx_dword(dc, 0, 0));
+        }
+        if (LOG_USB) {
+            sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 data-out/data-in = ",
+                         ((read_ctx_dword(dc, out_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, in_dci, 0) & 0x7u));
+        }
+        if (LOG_USB) {
+            sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 status/cmd = ",
+                         ((read_ctx_dword(dc, status_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, cmd_dci, 0) & 0x7u));
+        }
     }
 
     // И только теперь — сам управляющий запрос переключения интерфейса.
-    sys_puthex32(console_ep, "[USB] UAS: SET_INTERFACE интерфейс/alt = ",
-                 ((uint32_t)u.interface_num << 8) | u.alt_setting);
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: SET_INTERFACE интерфейс/alt = ",
+                     ((uint32_t)u.interface_num << 8) | u.alt_setting);
+    }
     // bmRequestType=0x01 (Host-to-Device|Standard|Interface), bRequest=0x0B
     // (SET_INTERFACE), wValue=alt setting, wIndex=номер интерфейса.
     if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x01, 0x0B, u.alt_setting, u.interface_num)) {
@@ -4048,13 +4077,21 @@ static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int p
         uint32_t got = 0;
         if (ep0_control_in(console_ep, dev.ep0_ring, slot_id, 0x81, 0x0A, 0, u.interface_num, 1,
                             dev.ctrl_buf_paddr, got)) {
-            sys_puthex32(console_ep, "[USB] UAS DIAG: GET_INTERFACE вернул alt = ", cb[0]);
+            if (LOG_USB) {
+                sys_puthex32(console_ep, "[USB] UAS DIAG: GET_INTERFACE вернул alt = ", cb[0]);
+            }
         } else {
-            sys_puts(console_ep, "[USB] UAS DIAG: GET_INTERFACE не удался.\n");
+            if (LOG_USB) {
+                sys_puts(console_ep, "[USB] UAS DIAG: GET_INTERFACE не удался.\n");
+            }
         }
     }
-    sys_puthex32(console_ep, "[USB] UAS: включён. DCI cmd/status = ", ((uint32_t)cmd_dci << 8) | status_dci);
-    sys_puthex32(console_ep, "[USB] UAS: DCI данных in/out = ", ((uint32_t)in_dci << 8) | out_dci);
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: включён. DCI cmd/status = ", ((uint32_t)cmd_dci << 8) | status_dci);
+    }
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: DCI данных in/out = ", ((uint32_t)in_dci << 8) | out_dci);
+    }
     return true;
 }
 
@@ -4066,7 +4103,9 @@ static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int p
 // трубах данных, а в самой трубе статуса или в том, что устройство не в
 // режиме UAS.
 static bool uas_probe_no_data(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
-    sys_puts(console_ep, "[USB] UAS: пробная команда БЕЗ данных (TEST UNIT READY)...\n");
+    if (LOG_USB) {
+        sys_puts(console_ep, "[USB] UAS: пробная команда БЕЗ данных (TEST UNIT READY)...\n");
+    }
     uint8_t cdb[16] = {0};
     cdb[0] = 0x00; // TEST UNIT READY
     uint32_t actual = 0;
@@ -4075,7 +4114,9 @@ static bool uas_probe_no_data(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
         sys_puts(console_ep, "[USB] UAS: пробная команда без данных НЕ прошла — труба статуса не отвечает.\n");
         return false;
     }
-    sys_puthex32(console_ep, "[USB] UAS: пробная команда без данных прошла, SCSI-статус = ", status);
+    if (LOG_USB) {
+        sys_puthex32(console_ep, "[USB] UAS: пробная команда без данных прошла, SCSI-статус = ", status);
+    }
     return true;
 }
 
@@ -4627,6 +4668,59 @@ static void find_usb_exfat_partition(seL4_CPtr console_ep, int idx) {
 // — hardware_usb_read_N/write_N вызываются exfat.cpp БЕЗ параметра idx
 // (фиксированная сигнатура), берут его из того, КАКАЯ ИЗ N ОБЁРТОК была
 // передана exfat_init() ниже.
+// Одна строка на устройство, СОБРАННАЯ ЦЕЛИКОМ и напечатанная ОДНИМ
+// вызовом консоли.
+//
+// Зачем именно так: sys_puthex32() печатает метку и число ДВУМЯ разными
+// вызовами, и между ними в консоль успевает вклиниться другой драйвер —
+// в живом логе "UAS: устройство ПОДДЕРЖИВАЕТ, интерфейс/alt = " и само
+// число оказались в разных местах экрана, а между ними влез [MBOX]. Плюс
+// сведения об устройстве были размазаны по трём строкам (поддержка UAS,
+// скорость, точка монтирования), и при двух накопителях понять, что к
+// чему относится, было нельзя. Здесь всё про одно устройство — одной
+// неразрывной строкой.
+static void usb_print_device_summary(seL4_CPtr console_ep, int idx) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    char line[224];
+    int n = 0;
+    auto put = [&](const char* t) { while (*t && n < (int)sizeof(line) - 1) line[n++] = *t++; };
+    auto put_dec = [&](uint64_t v) {
+        char tmp[24]; int k = 0;
+        if (v == 0) tmp[k++] = '0';
+        while (v > 0 && k < (int)sizeof(tmp)) { tmp[k++] = (char)('0' + (uint32_t)(v % 10)); v /= 10; }
+        while (k > 0 && n < (int)sizeof(line) - 1) line[n++] = tmp[--k];
+    };
+
+    put("[USB] /mnt/");
+    put(dev.volume_name);
+    put("  ");
+    switch (dev.link_speed) {
+        case 4:  put("SuperSpeed"); break;
+        case 3:  put("High-Speed"); break;
+        case 2:  put("Low-Speed");  break;
+        case 1:  put("Full-Speed"); break;
+        default: put("скорость неизвестна"); break;
+    }
+    put(" | ");
+    if (dev.uas_active) {
+        put("UAS, потоков ");
+        put_dec((uint64_t)1u << dev.uas.status_streams);
+    } else if (dev.uas.found) {
+        put("Bulk-Only (UAS объявлен, но не включён)");
+    } else {
+        put("Bulk-Only (UAS не поддерживается)");
+    }
+    if (dev.capacity.found && dev.capacity.block_size > 0) {
+        uint64_t bytes = ((uint64_t)dev.capacity.last_lba + 1ull) * dev.capacity.block_size;
+        put(" | ");
+        put_dec(bytes / (1024ull * 1024ull * 1024ull));
+        put(" ГиБ");
+    }
+    put(dev.behind_hub ? " | за хабом\n" : "\n");
+    line[n] = '\0';
+    sys_puts(console_ep, line);
+}
+
 static void step15_mount_filesystem(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
     driver_state_step(USB_STEP_EXFAT_MOUNT); // пошаговый watchdog, см. common.h/UsbStep
     if (LOG_USB) sys_puts(console_ep, "[USB] Шаг 15: монтирование exFAT (только чтение).\n");
@@ -4679,7 +4773,7 @@ static bool xhci_controller_init(seL4_CPtr console_ep, uint32_t &max_ports) {
     uint8_t caplen; uint32_t hcsparams1, hcsparams2, hccparams1;
     if (!step1_read_capabilities(console_ep, caplen, hcsparams1, hcsparams2, hccparams1)) return false;
     g_max_psa_size = (hccparams1 >> 12) & 0xFu;
-    sys_puthex32(console_ep, "[USB]   Max Primary Stream Array Size (HCCPARAMS1[15:12]) = ", g_max_psa_size);
+    if (LOG_USB) sys_puthex32(console_ep, "[USB]   Max Primary Stream Array Size (HCCPARAMS1[15:12]) = ", g_max_psa_size);
 
     g_op_base = g_xhci_base + caplen;
     if ((caplen % 8) != 0) {
@@ -4787,6 +4881,7 @@ static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, ui
     // переиспользуется без обнуления (см. find_free_device_slot() —
     // освобождение это только in_use=false), и остатки от прежнего
     // накопителя в этом же слоте иначе поехали бы дальше.
+    g_usb_devices[idx].link_speed = port_speed;
     g_usb_devices[idx].uas_active = false;
     g_usb_devices[idx].uas_eps_configured = false;
     g_usb_devices[idx].uas_use_streams = false;
@@ -5428,9 +5523,7 @@ static void poll_ports_for_hotplug(seL4_CPtr console_ep) {
                     // "смонтирована". Разделяем эти два случая явно.
                     sys_puts(console_ep, "[USB]   Устройство перечислено, но exFAT не смонтировался (не exFAT / повреждён / не тот раздел).\n");
                 } else {
-                    sys_puts(console_ep, "[USB]   Флешка автоматически смонтирована: /mnt/");
-                    sys_puts(console_ep, g_usb_devices[idx].volume_name);
-                    sys_puts(console_ep, "\n");
+                    usb_print_device_summary(console_ep, idx);
                 }
             } else {
                 int idx = find_device_by_port((int)p);
@@ -6130,7 +6223,7 @@ int main(int argc, char *argv[]) {
         int dispatch_idx = -1;
 
         if (cmd == 110 || cmd == 112 || cmd == 113 || cmd == 114 || cmd == 121 ||
-            cmd == 122 || cmd == 123 || cmd == 124 ||
+            cmd == 122 || cmd == 123 || cmd == 124 || cmd == 128 ||
             cmd == 116 || cmd == 117 || cmd == 118 || cmd == 119 || cmd == 120) {
             if (!g_shm_vaddr) {
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0)); // нет SHM вообще — как неизвестная команда
@@ -6331,15 +6424,30 @@ int main(int argc, char *argv[]) {
             usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 
+        else if (cmd == 128) { // SYS_STAT — размер/каталог/существование
+            char filename[256]; // issuse.txt №42
+            my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
+            uint64_t fsize = 0; bool is_dir = false;
+            if (exfat_stat(&fs, filename, &fsize, &is_dir)) {
+                seL4_SetMR(0, 0);
+                seL4_SetMR(1, (seL4_Word)fsize);
+                seL4_SetMR(2, is_dir ? 1u : 0u);
+            } else {
+                seL4_SetMR(0, (seL4_Word)-1); seL4_SetMR(1, 0); seL4_SetMR(2, 0);
+            }
+            usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 3));
+        }
         else if (cmd == 114) { // SYS_READ_TEXT_FILE (cat)
             char path[256]; // issuse.txt №42: exFAT-имя до 255 символов, был 64
             my_strlcpy(path, g_shm_vaddr, sizeof(path));
 
             uint32_t copied = 0;
-            if (exfat_read_text_file(&fs, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, &copied)) {
+            bool truncated = false;
+            if (exfat_read_text_file(&fs, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, &copied, VFS_PAYLOAD_MAX, &truncated)) {
                 seL4_SetMR(0, 0);
                 seL4_SetMR(1, copied); // issuse.txt №56: реальный размер, cat сверяет со strlen()
-                usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 2));
+                seL4_SetMR(2, truncated ? 1u : 0u); // файл не поместился целиком
+                usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 3));
             } else {
                 seL4_SetMR(0, (seL4_Word)-1);
                 usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));

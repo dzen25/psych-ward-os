@@ -82,7 +82,14 @@ bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer,
 // нулевой байт раньше конца — вызывающий может сравнить out_copied со
 // strlen(out_buffer), чтобы отличить "весь файл текстовый" от "файл
 // бинарный/оборван на первом нулевом байте").
-bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied = nullptr);
+// Размер/признак каталога/существование одним вызовом — нужен потоковой
+// записи, чтобы знать размер заранее (см. exfat.cpp).
+bool exfat_stat(EXFAT_Instance* fs, const char* path, uint64_t* out_size, bool* out_is_dir);
+// max_len — размер буфера ВМЕСТЕ с местом под завершающий ноль; при
+// превышении содержимое обрезается и out_truncated выставляется в true
+// (раньше потолок был зашит в 4000 байт и обрезание происходило молча).
+bool exfat_read_text_file(EXFAT_Instance* fs, const char* path, char* out_buffer, uint32_t* out_copied = nullptr,
+                          uint32_t max_len = 4000, bool* out_truncated = nullptr);
 
 // out_existed (может быть nullptr) — при true уже существовал, ничего не
 // создавалось (в отличие от возврата false = реальная ошибка).
