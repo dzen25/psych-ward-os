@@ -1307,7 +1307,13 @@ static void collect_load_snapshot(LoadSnapshot &snap, seL4_CPtr console_ep, seL4
 // параметров spawn_process() ещё сильнее без всякой пользы.
 struct UsbDmaSetup {
     seL4_CPtr dcbaa_frame = 0;          seL4_Word dcbaa_paddr = 0;
+    // У КАЖДОГО TRB-кольца вторая страница — обязательный нулевой запас
+    // под переучитывание TRB контроллером VL805 (см. PLAT_XHCI_RING_STRIDE
+    // в platform.h). Как кольцо она не используется никогда: только
+    // выделяется и маппится, чтобы переучитывание попадало в ноль.
     seL4_CPtr cmdring_frame = 0;        seL4_Word cmdring_paddr = 0;
+    seL4_CPtr cmdring_pad_frame = 0;
+    seL4_CPtr evtring_pad_frame = 0;
     seL4_CPtr erst_frame = 0;           seL4_Word erst_paddr = 0;
     seL4_CPtr evtring_frame = 0;        seL4_Word evtring_paddr = 0;
     // Фаза 15 (несколько накопителей, см. ROADMAP.md/план) — Device
@@ -1325,10 +1331,20 @@ struct UsbDmaSetup {
     // USB_MAX_DEVICES страниц каждый, индексируются "нашим" индексом
     // устройства (0..USB_MAX_DEVICES-1), не Slot ID.
     seL4_CPtr ep0_trring_frame[USB_MAX_DEVICES] = {0};     seL4_Word ep0_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr ep0_trring_pad_frame[USB_MAX_DEVICES] = {0};
     seL4_CPtr ctrl_buf_frame[USB_MAX_DEVICES] = {0};       seL4_Word ctrl_buf_paddr[USB_MAX_DEVICES] = {0};
     seL4_CPtr bulkout_trring_frame[USB_MAX_DEVICES] = {0}; seL4_Word bulkout_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr bulkout_trring_pad_frame[USB_MAX_DEVICES] = {0};
     seL4_CPtr bulkin_trring_frame[USB_MAX_DEVICES] = {0};  seL4_Word bulkin_trring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr bulkin_trring_pad_frame[USB_MAX_DEVICES] = {0};
     seL4_CPtr cbw_csw_frame[USB_MAX_DEVICES] = {0};        seL4_Word cbw_csw_paddr[USB_MAX_DEVICES] = {0};
+    // UAS — ещё два per-device кольца (труба команд и труба статуса), см.
+    // PLAT_XHCI_UAS_CMDRING_VADDR/PLAT_XHCI_UAS_STATRING_VADDR в platform.h.
+    seL4_CPtr uas_cmdring_frame[USB_MAX_DEVICES] = {0};    seL4_Word uas_cmdring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr uas_cmdring_pad_frame[USB_MAX_DEVICES] = {0};
+    seL4_CPtr uas_statring_frame[USB_MAX_DEVICES] = {0};   seL4_Word uas_statring_paddr[USB_MAX_DEVICES] = {0};
+    seL4_CPtr uas_statring_pad_frame[USB_MAX_DEVICES] = {0};
+    seL4_CPtr uas_streams_frame[USB_MAX_DEVICES] = {0};    seL4_Word uas_streams_paddr[USB_MAX_DEVICES] = {0};
     // Bounce — единственный ресурс из нескольких СМЕЖНЫХ страниц на устройство
     // (см. USB_BOUNCE_PAGES в platform.h): [устройство][страница].
     seL4_CPtr bounce_frame[USB_MAX_DEVICES][USB_BOUNCE_PAGES] = {{0}}; seL4_Word bounce_paddr[USB_MAX_DEVICES] = {0};
@@ -2416,6 +2432,8 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
             };
             map_usb_dma(usb_dma_param->dcbaa_frame, PLAT_XHCI_DCBAA_VADDR);
             map_usb_dma(usb_dma_param->cmdring_frame, PLAT_XHCI_CMDRING_VADDR);
+            map_usb_dma(usb_dma_param->cmdring_pad_frame, PLAT_XHCI_CMDRING_VADDR + 4096);
+            map_usb_dma(usb_dma_param->evtring_pad_frame, PLAT_XHCI_EVTRING_VADDR + 4096);
             map_usb_dma(usb_dma_param->erst_frame, PLAT_XHCI_ERST_VADDR);
             map_usb_dma(usb_dma_param->evtring_frame, PLAT_XHCI_EVTRING_VADDR);
             for (int i = 0; i < USB_MAX_SLOTS_ENABLED; i++) {
@@ -2427,11 +2445,29 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 map_usb_dma(usb_dma_param->scratchpad_buf_frame[i], PLAT_XHCI_SCRATCHPAD_BUF_VADDR + (uintptr_t)i * 4096);
             }
             // Фаза 15 — шесть per-device ресурсов, USB_MAX_DEVICES страниц каждый.
-            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->ep0_trring_frame[i], PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                map_usb_dma(usb_dma_param->ep0_trring_frame[i],     PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE);
+                map_usb_dma(usb_dma_param->ep0_trring_pad_frame[i], PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE + 4096);
+            }
             for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->ctrl_buf_frame[i], PLAT_XHCI_CTRL_BUF_VADDR + (uintptr_t)i * 4096);
-            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkout_trring_frame[i], PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)i * 4096);
-            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->bulkin_trring_frame[i], PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                map_usb_dma(usb_dma_param->bulkout_trring_frame[i],     PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE);
+                map_usb_dma(usb_dma_param->bulkout_trring_pad_frame[i], PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE + 4096);
+            }
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                map_usb_dma(usb_dma_param->bulkin_trring_frame[i],     PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE);
+                map_usb_dma(usb_dma_param->bulkin_trring_pad_frame[i], PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE + 4096);
+            }
             for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->cbw_csw_frame[i], PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)i * 4096);
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                map_usb_dma(usb_dma_param->uas_cmdring_frame[i],     PLAT_XHCI_UAS_CMDRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE);
+                map_usb_dma(usb_dma_param->uas_cmdring_pad_frame[i], PLAT_XHCI_UAS_CMDRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE + 4096);
+            }
+            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+                map_usb_dma(usb_dma_param->uas_statring_frame[i],     PLAT_XHCI_UAS_STATRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE);
+                map_usb_dma(usb_dma_param->uas_statring_pad_frame[i], PLAT_XHCI_UAS_STATRING_VADDR + (uintptr_t)i * PLAT_XHCI_RING_STRIDE + 4096);
+            }
+            for (int i = 0; i < USB_MAX_DEVICES; i++) map_usb_dma(usb_dma_param->uas_streams_frame[i], PLAT_XHCI_UAS_STREAMS_VADDR + (uintptr_t)i * 4096);
             for (int i = 0; i < USB_MAX_DEVICES; i++) {
                 for (int pg = 0; pg < USB_BOUNCE_PAGES; pg++) {
                     map_usb_dma(usb_dma_param->bounce_frame[i][pg],
@@ -2610,6 +2646,9 @@ static int spawn_process(const char* name, char* elf_data, unsigned long elf_siz
                 child_ipc_ptr->msg[BOOT_USB_BULKIN_TRRING_PADDR]  = usb_dma_param->bulkin_trring_paddr[0];
                 child_ipc_ptr->msg[BOOT_USB_CBW_CSW_PADDR]        = usb_dma_param->cbw_csw_paddr[0];
                 child_ipc_ptr->msg[BOOT_USB_BOUNCE_PADDR]         = usb_dma_param->bounce_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_UAS_CMDRING_PADDR]    = usb_dma_param->uas_cmdring_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_UAS_STATRING_PADDR]   = usb_dma_param->uas_statring_paddr[0];
+                child_ipc_ptr->msg[BOOT_USB_UAS_STREAMS_PADDR]    = usb_dma_param->uas_streams_paddr[0];
             }
             // Фаза 3b: капа-"я жив" — см. common.h/BOOT_USB_LIVENESS_NTFN_CAP.
             child_ipc_ptr->msg[BOOT_USB_LIVENESS_NTFN_CAP] = (liveness_ntfn_param != 0) ? local_liveness_ntfn : 0;
@@ -4133,10 +4172,24 @@ int main(int argc, char *argv[]) {
             seL4_ARM_Page_GetAddress_t res = seL4_ARM_Page_GetAddress(frame_out);
             paddr_out = (seL4_Word)res.paddr;
         };
+        // TRB-кольцо = две смежные страницы: первая под сами TRB, вторая —
+        // нулевой запас под переучитывание VL805 (см. PLAT_XHCI_RING_STRIDE).
+        // Смежность проверяется прямо здесь: драйвер адресует кольца как
+        // база + idx*PLAT_XHCI_RING_STRIDE и на это рассчитывает.
+        auto alloc_usb_ring = [&](seL4_CPtr &frame_out, seL4_CPtr &pad_out, seL4_Word &paddr_out) {
+            alloc_usb_dma_page(frame_out, paddr_out);
+            seL4_Word pad_paddr = 0;
+            alloc_usb_dma_page(pad_out, pad_paddr);
+            if (pad_paddr != paddr_out + 4096) {
+                uart_puts("[ROOT] KERNEL PANIC: запасная страница TRB-кольца легла не следом "
+                          "(см. PLAT_XHCI_RING_STRIDE в platform.h).\n");
+                while (1) {}
+            }
+        };
         alloc_usb_dma_page(usb_dma.dcbaa_frame, usb_dma.dcbaa_paddr);
-        alloc_usb_dma_page(usb_dma.cmdring_frame, usb_dma.cmdring_paddr);
+        alloc_usb_ring(usb_dma.cmdring_frame, usb_dma.cmdring_pad_frame, usb_dma.cmdring_paddr);
         alloc_usb_dma_page(usb_dma.erst_frame, usb_dma.erst_paddr);
-        alloc_usb_dma_page(usb_dma.evtring_frame, usb_dma.evtring_paddr);
+        alloc_usb_ring(usb_dma.evtring_frame, usb_dma.evtring_pad_frame, usb_dma.evtring_paddr);
         // Фаза 15 — по странице на КАЖДЫЙ xHCI Slot ID (не единственная
         // общая страница, см. h/platform.h PLAT_XHCI_DEVCTX_VADDR).
         for (int i = 0; i < USB_MAX_SLOTS_ENABLED; i++) {
@@ -4156,11 +4209,32 @@ int main(int argc, char *argv[]) {
         // PUD/PD/PT (другой аллокатор), и физические страницы окажутся не
         // подряд, а strided-адресация в usb_driver.cpp (base+idx*4096) на
         // это рассчитывает.
-        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.ep0_trring_frame[i], usb_dma.ep0_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_ring(usb_dma.ep0_trring_frame[i], usb_dma.ep0_trring_pad_frame[i], usb_dma.ep0_trring_paddr[i]);
         for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.ctrl_buf_frame[i], usb_dma.ctrl_buf_paddr[i]);
-        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkout_trring_frame[i], usb_dma.bulkout_trring_paddr[i]);
-        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.bulkin_trring_frame[i], usb_dma.bulkin_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_ring(usb_dma.bulkout_trring_frame[i], usb_dma.bulkout_trring_pad_frame[i], usb_dma.bulkout_trring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_ring(usb_dma.bulkin_trring_frame[i], usb_dma.bulkin_trring_pad_frame[i], usb_dma.bulkin_trring_paddr[i]);
         for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.cbw_csw_frame[i], usb_dma.cbw_csw_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_ring(usb_dma.uas_cmdring_frame[i], usb_dma.uas_cmdring_pad_frame[i], usb_dma.uas_cmdring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_ring(usb_dma.uas_statring_frame[i], usb_dma.uas_statring_pad_frame[i], usb_dma.uas_statring_paddr[i]);
+        for (int i = 0; i < USB_MAX_DEVICES; i++) alloc_usb_dma_page(usb_dma.uas_streams_frame[i], usb_dma.uas_streams_paddr[i]);
+        // Драйвер получает только БАЗОВЫЙ физический адрес и адресует кольцо
+        // устройства как база + idx*4096 (см. BOOT_USB_UAS_CMDRING_PADDR) —
+        // значит страницы обязаны лечь физически подряд. Для bounce такая
+        // проверка есть (ниже), для остальных per-device ресурсов её нет, и
+        // разрыв проявился бы только на живом железе, чужой памятью под
+        // кольцом. Для двух НОВЫХ ресурсов проверяем сразу.
+        for (int i = 1; i < USB_MAX_DEVICES; i++) {
+            if (usb_dma.ep0_trring_paddr[i]     != usb_dma.ep0_trring_paddr[0]     + (seL4_Word)i * PLAT_XHCI_RING_STRIDE ||
+                usb_dma.bulkout_trring_paddr[i] != usb_dma.bulkout_trring_paddr[0] + (seL4_Word)i * PLAT_XHCI_RING_STRIDE ||
+                usb_dma.bulkin_trring_paddr[i]  != usb_dma.bulkin_trring_paddr[0]  + (seL4_Word)i * PLAT_XHCI_RING_STRIDE ||
+                usb_dma.uas_cmdring_paddr[i]    != usb_dma.uas_cmdring_paddr[0]    + (seL4_Word)i * PLAT_XHCI_RING_STRIDE ||
+                usb_dma.uas_statring_paddr[i]   != usb_dma.uas_statring_paddr[0]   + (seL4_Word)i * PLAT_XHCI_RING_STRIDE ||
+                usb_dma.uas_streams_paddr[i]    != usb_dma.uas_streams_paddr[0]    + (seL4_Word)i * 4096) {
+                uart_puts("[ROOT] KERNEL PANIC: TRB-кольца USB получились физически разрывными "
+                          "(см. PLAT_XHCI_RING_STRIDE в platform.h).\n");
+                while (1) {}
+            }
+        }
         // Bounce-буферы ВСЕХ устройств — ОДИН непрерывный прогон, ВЫРОВНЕННЫЙ
         // ПО 64 КБ.
         //

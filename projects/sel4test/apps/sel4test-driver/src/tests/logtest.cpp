@@ -95,6 +95,24 @@ static seL4_Word now_ms() {
     return seL4_GetMR(0);
 }
 
+// Микросекундные часы — прямое чтение системного счётчика, без IPC.
+//
+// Зачем: now_ms() имеет разрешение 1 мс И стоит полного IPC к
+// timer_driver. Одна запись в 128 КБ занимает ~0.5 мс, то есть КАЖДЫЙ
+// замер округлялся до 0 или 1 мс, а сумма двухсот таких округлений — уже
+// не измерение. На живом прогоне это дало слой [3] ВЫШЕ слоя [2], чего
+// физически быть не может: под ним лежит тот же обмен плюс накладные
+// расходы. Плюс сам IPC (два на итерацию) попадал внутрь измеряемого
+// интервала. CNTVCT_EL0/CNTFRQ_EL0 читаются из пользовательского режима
+// (так же делает usb_driver), частота берётся один раз.
+static uint64_t g_cntfrq = 0;
+static inline uint64_t now_us() {
+    uint64_t v;
+    if (g_cntfrq == 0) { asm volatile("mrs %0, cntfrq_el0" : "=r"(g_cntfrq)); }
+    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+    return g_cntfrq ? (v * 1000000ull / g_cntfrq) : 0;
+}
+
 // --- содержимое записи ---
 // Псевдослучайность с фиксированным зерном (LCG): важна не «качественная»
 // случайность, а воспроизводимость — ожидаемое содержимое пересчитывается,
@@ -253,7 +271,17 @@ static void scsi_tags_print(void) {
     }
 }
 
-static void scsi_stats_print(void) {
+// Печатает скорость СЛОЯМИ, снизу вверх. Раньше здесь было пять разных
+// чисел вперемешку ("ЧТЕНИЕ", "ЗАПИСЬ", "крупными кусками", "в фазе
+// данных", "скорость записи"), и по ним нельзя было понять, куда
+// смотреть: они меряют РАЗНОЕ и обязаны отличаться. Теперь у каждого
+// числа назван свой слой, а строкой ниже сказано, какое из них
+// характеризует что.
+//
+// e2e_bytes/e2e_us — сквозные данные вызывающего (сколько байт он записал
+// и сколько микросекунд это заняло по его часам): без них верхний слой
+// пришлось бы печатать в другом месте, и сравнивать снова было бы не с чем.
+static void scsi_stats_print(long long e2e_bytes, long long e2e_us) {
     vfs_lock();
     seL4_SetMR(0, 126);
     seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
@@ -294,14 +322,48 @@ static void scsi_stats_print(void) {
     sys_puts(0, "; битмап "); putdec(bmc);
     sys_puts(0, ", корень "); putdec(rtc);
     sys_puts(0, ", всего кластеров "); putdec(ccnt); sys_puts(0, "\n");
-    if (drd > 0) { sys_puts(0, "  ЧТЕНИЕ:  "); putdec(drd / 1000); sys_puts(0, " мс, ");
-        putdec(rdb * 1000000LL / drd / 1024); sys_puts(0, " КБ/с\n"); }
-    if (dwr > 0) { sys_puts(0, "  ЗАПИСЬ:  "); putdec(dwr / 1000); sys_puts(0, " мс, ");
-        putdec(wrb * 1000000LL / dwr / 1024); sys_puts(0, " КБ/с\n"); }
-    if (bru > 0) { sys_puts(0, "  ЧТЕНИЕ крупными кусками: "); putdec(brb * 1000000LL / bru / 1024); sys_puts(0, " КБ/с\n"); }
-    if (dat > 0) {
-        sys_puts(0, "  скорость в фазе данных: "); putdec(byt * 1000000LL / dat / 1024); sys_puts(0, " КБ/с\n");
+
+    sys_puts(0, "\n  --- СКОРОСТЬ ПО СЛОЯМ (снизу вверх) ---\n");
+
+    sys_puts(0, "  [1] ШИНА — только фаза данных, без Command/Sense IU:\n");
+    if (dwr > 0) {
+        sys_puts(0, "        запись            "); putdec(wrb * 1000000LL / dwr / 1024);
+        sys_puts(0, " КБ/с   ("); putdec(dwr / 1000); sys_puts(0, " мс на "); putdec(wrb);
+        sys_puts(0, " Б, команд "); putdec(wr); sys_puts(0, ")\n");
     }
+    if (bru > 0) {
+        sys_puts(0, "        чтение крупное    "); putdec(brb * 1000000LL / bru / 1024);
+        sys_puts(0, " КБ/с   (куски от 16 КБ, "); putdec(brb); sys_puts(0, " Б)\n");
+    }
+    if (drd > 0) {
+        long long small_us = drd - bru, small_b = rdb - brb;
+        if (small_us > 0 && small_b > 0) {
+            sys_puts(0, "        чтение мелкое     "); putdec(small_b * 1000000LL / small_us / 1024);
+            sys_puts(0, " КБ/с   (метаданные; здесь важна не скорость, а ЧИСЛО команд)\n");
+        }
+    }
+
+    // Накладные расходы транспорта делим между чтением и записью по доле
+    // команд: отдельного разбиения Command/Sense IU по направлению драйвер
+    // не ведёт, а пропорция честнее, чем приписать всё одному из них.
+    if (dwr > 0 && cmds > 0 && wr > 0) {
+        long long ovh = (cbw + csw) * wr / cmds;      // мкс накладных расходов, приходящихся на записи
+        long long full = dwr + ovh;
+        sys_puts(0, "  [2] SCSI-КОМАНДА целиком — шина плюс Command IU и Sense IU:\n");
+        sys_puts(0, "        запись            "); putdec(wrb * 1000000LL / full / 1024);
+        sys_puts(0, " КБ/с   (накладные "); putdec(ovh / wr); sys_puts(0, " мкс на команду:");
+        sys_puts(0, " Command IU "); putdec(cbw / cmds);
+        sys_puts(0, " + Sense IU "); putdec(csw / cmds); sys_puts(0, ")\n");
+    }
+
+    if (e2e_us > 0 && e2e_bytes > 0) {
+        sys_puts(0, "  [3] ВЫЗОВ ПРОГРАММЫ — VFS + exFAT + IPC поверх слоя 2:\n");
+        sys_puts(0, "        запись            "); putdec(e2e_bytes * 1000000LL / e2e_us / 1024);
+        sys_puts(0, " КБ/с   ("); putdec(e2e_us / 1000); sys_puts(0, " мс)   <<< ЭТО и видит приложение\n");
+    }
+
+    sys_puts(0, "  Куда смотреть: [3] — реальная скорость программы; [1] — потолок\n");
+    sys_puts(0, "  железа; разрыв между ними и есть цена файловой системы.\n");
 }
 
 static int vfs_touch(void) {
@@ -499,7 +561,7 @@ int main(int argc, char *argv[]) {
                            : "цикл записей с посверкой каждой итерации");
     long done = 0;
     long long total_bytes = 0, file_len = 0;
-    seL4_Word ms_write = 0, ms_read = 0;
+    uint64_t us_write = 0, us_read = 0; // микросекунды: см. now_us()
     {
         if (g_direct) {
             // Резервируем сразу под весь прогон: расширять экстент по ходу
@@ -519,14 +581,14 @@ int main(int argc, char *argv[]) {
         for (long it = 1; it <= iterations; it++) {
             fill_record(it - 1);
 
-            seL4_Word t0 = now_ms();
+            uint64_t t0 = now_us();
             // В потоковом режиме запись идёт через SYS_STREAM_WRITE, а не
             // через обычное дописывание. Эта развилка отсутствовала: замер
             // показал stream_write=0 при append=200, то есть режим `direct`
             // печатался в баннере, но фактически не использовался.
             int rc = g_direct ? vfs_stream_write(g_expect, g_chunk)
                               : vfs_put(g_expect, g_chunk, g_append);
-            ms_write += now_ms() - t0;
+            us_write += now_us() - t0;
             if (rc != 0) {
                 sys_puts(0, "  итерация "); putdec(it); sys_puts(0, ": запись вернула "); putdec(rc); sys_puts(0, "\n");
                 step_fail(g_append ? "дописывание перестало проходить" : "запись перестала проходить");
@@ -538,9 +600,9 @@ int main(int argc, char *argv[]) {
                 // это хвост по смещению (файл уже может быть большим и
                 // перечитывать его целиком значило бы мерить проверку, а не
                 // запись), в rewrite — начало файла.
-                t0 = now_ms();
+                t0 = now_us();
                 int got = vfs_read_at((uint32_t)(g_append ? file_len : 0));
-                ms_read += now_ms() - t0;
+                us_read += now_us() - t0;
                 if (got < 0) {
                     sys_puts(0, "  итерация "); putdec(it); sys_puts(0, ": чтение не удалось\n");
                     step_fail("файл перестал читаться");
@@ -584,7 +646,7 @@ int main(int argc, char *argv[]) {
             }
             sys_puts(0, "  поток закрыт (длина записана в каталог), "); putdec((long long)(now_ms() - t0)); sys_puts(0, " мс\n");
         }
-        scsi_stats_print();
+        scsi_stats_print(total_bytes, (long long)us_write);
         scsi_tags_print();
         step_ok();
     }
@@ -623,17 +685,18 @@ int main(int argc, char *argv[]) {
     sys_puts(0, "ИТОГ: пройдено шагов "); putdec(g_passed); sys_puts(0, " из "); putdec(total_steps); sys_puts(0, ".\n");
     sys_puts(0, "  итераций выполнено: "); putdec(done); sys_puts(0, " из "); putdec(iterations);
     sys_puts(0, "\n  записано суммарно:  "); putdec(total_bytes); sys_puts(0, " Б\n");
-    sys_puts(0, "  время записи:       "); putdec((long long)ms_write); sys_puts(0, " мс\n");
-    if (!g_stream) { sys_puts(0, "  время посверки:     "); putdec((long long)ms_read); sys_puts(0, " мс\n"); }
+    sys_puts(0, "  время записи:       "); putdec((long long)(us_write / 1000)); sys_puts(0, " мс\n");
+    if (!g_stream) { sys_puts(0, "  время посверки:     "); putdec((long long)(us_read / 1000)); sys_puts(0, " мс\n"); }
     if (done > 0) {
-        sys_puts(0, "  на запись:          "); putdec((long long)(ms_write / done)); sys_puts(0, " мс\n");
+        sys_puts(0, "  на запись:          "); putdec((long long)(us_write / (uint64_t)done)); sys_puts(0, " мкс\n");
         if (!g_stream) {
-            sys_puts(0, "  на итерацию:        "); putdec((long long)((ms_write + ms_read) / done));
-            sys_puts(0, " мс (запись+сверка)\n");
+            sys_puts(0, "  на итерацию:        "); putdec((long long)((us_write + us_read) / (uint64_t)done));
+            sys_puts(0, " мкс (запись+сверка)\n");
         }
     }
-    if (ms_write > 0) {
-        sys_puts(0, "  скорость записи:    "); putdec(total_bytes / (long long)ms_write); sys_puts(0, " КБ/с\n");
+    if (us_write > 0) {
+        sys_puts(0, "  скорость записи:    "); putdec(total_bytes * 1000000LL / (long long)us_write / 1024);
+        sys_puts(0, " КБ/с  (слой [3], см. разбор выше)\n");
     }
     sys_puts(0, "==========================================================\n");
 

@@ -724,9 +724,7 @@ constexpr int USB_MAX_DEVICES        = 8;
 constexpr int USB_MAX_SLOTS_ENABLED  = 8;
 
 constexpr uintptr_t PLAT_XHCI_DCBAA_VADDR       = 0x201100000ULL; // Device Context Base Address Array
-constexpr uintptr_t PLAT_XHCI_CMDRING_VADDR     = 0x201101000ULL; // Command Ring, 1 сегмент
 constexpr uintptr_t PLAT_XHCI_ERST_VADDR        = 0x201102000ULL; // Event Ring Segment Table (ERST)
-constexpr uintptr_t PLAT_XHCI_EVTRING_VADDR     = 0x201103000ULL; // Event Ring, 1 сегмент
 // Device Context — БАЗА подряд идущих USB_MAX_SLOTS_ENABLED страниц (по
 // одной на xHCI Slot ID, см. devctx_paddr_for()/usb_driver.cpp) — раньше
 // был единственный слот (см. историю в ROADMAP.md), Фаза 15 требует по
@@ -759,7 +757,6 @@ constexpr int         USB_MAX_SCRATCHPAD_PAGES       = 32; // бюджет эт�
 // СЛЕДУЮЩЕГО ресурса. Раздвинуто на шаг 8 страниц (>= USB_MAX_DEVICES) —
 // с большим запасом до конца 2MB-окна (0x2011FFFFF), см. итоговый
 // комментарий ниже.
-constexpr uintptr_t PLAT_XHCI_EP0_TRRING_VADDR      = 0x201130000ULL; // + idx*0x1000, idx < USB_MAX_DEVICES
 
 // Milestone 2 — буфер данных control-transfer'ов на EP0 (GET_DESCRIPTOR
 // Device/Configuration и т.д.) — одна страница с избытком на устройство.
@@ -769,8 +766,6 @@ constexpr uintptr_t PLAT_XHCI_CTRL_BUF_VADDR        = 0x201138000ULL; // + idx*0
 // интерфейса (найдены в Milestone 3), активируются командой Configure
 // Endpoint. Тот же приём, что EP0 Transfer Ring — отдельная честная
 // страница на каждое кольцо КАЖДОГО устройства.
-constexpr uintptr_t PLAT_XHCI_BULKOUT_TRRING_VADDR  = 0x201140000ULL; // + idx*0x1000
-constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x201148000ULL; // + idx*0x1000
 
 // Milestone 5 — Bulk-Only Transport: CBW(31 байт, offset 0)/CSW(13 байт,
 // offset 64, выровнено) в ОДНОЙ странице на устройство; отдельная
@@ -796,8 +791,79 @@ constexpr int USB_BOUNCE_PAGES = 32;                                       // 12
 // пройти не может. Слайс устройства кратен 64 КБ, поэтому выравнивание
 // базы прогона по-прежнему выравнивает и всех остальных.
 constexpr uintptr_t PLAT_XHCI_BOUNCE_VADDR          = 0x201158000ULL; // + idx*USB_BOUNCE_PAGES*0x1000
-// Последняя занятая страница: 0x201158000 + (USB_MAX_DEVICES-1)*0x1000 =
-// 0x20115F000 — с большим запасом до конца 2MB-окна (0x2011FFFFF).
+// Реально занятый диапазон bounce: 0x201158000 .. 0x201158000 +
+// USB_MAX_DEVICES*USB_BOUNCE_PAGES*4096 = 0x201258000 (1 МБ, 8 устройств
+// по 128 КБ). Прежний комментарий здесь считал шаг равным одной странице
+// и назывался "0x20115F000" — это осталось от однопагового bounce и было
+// неверно с момента расширения; следующий ресурс кладём ПОСЛЕ 0x201258000.
+
+// UAS (USB Attached SCSI) — два ДОПОЛНИТЕЛЬНЫХ Transfer Ring'а на
+// устройство: труба команд (Command IU, bulk OUT) и труба статуса
+// (Sense IU / Read Ready IU / Write Ready IU, bulk IN). Трубы ДАННЫХ у
+// UAS — это те же самые bulk IN/OUT эндпоинты, что и у Bulk-Only
+// Transport (у RTL9210C даже адреса совпадают: 0x81 и 0x02), поэтому
+// bulkin_ring/bulkout_ring переиспользуются как есть и новых страниц под
+// них не нужно. Сами IU (Command IU 32 Б, Sense IU до 112 Б) лежат в
+// свободном хвосте страницы CBW/CSW — BOT занимает в ней только первые
+// 77 байт, см. UAS_CMD_IU_OFFSET/UAS_SENSE_IU_OFFSET в usb_driver.cpp.
+// Stream Context Array'и трёх потоковых труб UAS (статус, данные-IN,
+// данные-OUT) — по одной странице на устройство, три массива внутри неё.
+//
+// Зачем вообще: на SuperSpeed трубы статуса и данных UAS объявляют bulk
+// streams (у RTL9210C — 32 потока, bmAttributes=0x05 в SS Endpoint
+// Companion), и обмен без Stream ID устройство просто не обслуживает —
+// живой отказ 2026-09-07: труба статуса отвечала USB Transaction Error,
+// затем уходила в Halted. В эталоне то же самое: uas_configure_endpoints()
+// при скорости SuperSpeed зовёт usb_alloc_streams() на ТРИ трубы
+// (eps+1: статус, данные-IN, данные-OUT), а труба команд остаётся
+// обычной; uas-detect.h отказывается работать на SuperSpeed без
+// поддержки streams у контроллера ("required by the UAS driver").
+//
+// Массив адресуется Stream ID напрямую (Linear Stream Array, LSA=1);
+// вход 0 зарезервирован спекой. Минимальный размер массива — 4 входа
+// (поле MaxPStreams логарифмическое: p -> 2^(p+1) входов), при глубине
+// очереди 1 занят только вход 1.
+constexpr uintptr_t PLAT_XHCI_UAS_STREAMS_VADDR     = 0x201270000ULL; // + idx*0x1000
+
+// --- ВСЕ TRB-кольца, с обязательным запасом за каждым ---
+//
+// У VL805 (наш контроллер: VIA 0x1106, устройство 0x3483) ядро Linux
+// держит квирк XHCI_TRB_OVERFETCH: контроллер читает TRB ЗА границей
+// сегмента кольца. Лечится выделением памяти с запасом — "Buggy HC
+// prefetches beyond segment bounds - allocate dummy space at the end"
+// (drivers/usb/host/xhci-mem.c, xhci_mem_init: сегменту дают двойной
+// размер и двойное выравнивание).
+//
+// У нас кольцо — 256 TRB по 16 байт, ровно 4 КБ. Раньше кольца лежали
+// вплотную с шагом 4 КБ, то есть сразу за кольцом устройства idx
+// начиналось кольцо idx+1. С ОДНИМ накопителем это сходило с рук
+// (соседняя страница обнулена, нулевой TRB выглядит как "ещё не мой"),
+// а с ДВУМЯ переучитывание попадало в ЖИВОЕ кольцо соседа — с
+// настоящими TRB и подходящим cycle-битом. Это же главный подозреваемый
+// в давно отложенном плавающем зависании при перечислении второго
+// накопителя (см. память проекта).
+//
+// Теперь шаг между кольцами 8 КБ: первые 4 КБ занимают TRB, вторые
+// остаются нулевым запасом, куда переучитывание и попадает.
+constexpr uintptr_t PLAT_XHCI_RING_STRIDE = 0x2000ULL; // 4 КБ TRB + 4 КБ запаса
+constexpr int       PLAT_XHCI_RING_PAGES  = 2;         // страниц на одно кольцо
+
+constexpr uintptr_t PLAT_XHCI_CMDRING_VADDR         = 0x201280000ULL; // Command Ring, 1 сегмент
+constexpr uintptr_t PLAT_XHCI_EVTRING_VADDR         = 0x201282000ULL; // Event Ring, 1 сегмент
+// Пять per-device колец; шаг между устройствами PLAT_XHCI_RING_STRIDE,
+// каждому региону отведено 64 КБ (8 устройств по 8 КБ).
+constexpr uintptr_t PLAT_XHCI_EP0_TRRING_VADDR      = 0x201290000ULL; // + idx*PLAT_XHCI_RING_STRIDE
+constexpr uintptr_t PLAT_XHCI_BULKOUT_TRRING_VADDR  = 0x2012A0000ULL;
+constexpr uintptr_t PLAT_XHCI_BULKIN_TRRING_VADDR   = 0x2012B0000ULL;
+constexpr uintptr_t PLAT_XHCI_UAS_CMDRING_VADDR     = 0x2012C0000ULL;
+constexpr uintptr_t PLAT_XHCI_UAS_STATRING_VADDR    = 0x2012D0000ULL;
+// Последняя занятая страница: 0x2012D0000 + 8*0x2000 = 0x2012E0000.
+constexpr uint32_t  UAS_STREAM_ARRAY_STATUS_OFF   = 0;    // смещения трёх массивов внутри страницы
+constexpr uint32_t  UAS_STREAM_ARRAY_DATA_IN_OFF  = 256;
+constexpr uint32_t  UAS_STREAM_ARRAY_DATA_OUT_OFF = 512;
+// Последняя занятая страница: 0x201268000 + (USB_MAX_DEVICES-1)*0x1000 =
+// 0x20126F000 — внутри второго 2MB-окна (0x201200000..0x2013FFFFF),
+// таблицы страниц под него создаются по требованию (map_frame_robust).
 
 // --- Оффсеты/биты регистров VideoCore mailbox, считаются от MAILBOX_BASE
 // (см. PLAT_MBOX_PADDR — сама страница начинается на 0x880 раньше). ---

@@ -123,6 +123,7 @@ static bool g_scsi_cur_is_read = false;
 // запись данных затирает метаданные, и файл после закрытия читается как
 // пустой — ровно тот симптом, который ловим.
 static uint32_t g_stream_first_cluster = 0;
+static uint64_t g_uas_cmds_ok = 0; // сколько команд UAS отработало до отказа — привязывает сбой к номеру, а не к "через некоторое время"
 // Разбивка блочных операций по тому, кто их вызвал (см. ExfatIoTag).
 static uint64_t g_tag_cmds[EXFAT_IO_TAG_MAX] = {0};
 static uint64_t g_tag_bytes[EXFAT_IO_TAG_MAX] = {0};
@@ -272,6 +273,7 @@ constexpr uint32_t TRB_TYPE_ENABLE_SLOT_CMD     = 9;
 constexpr uint32_t TRB_TYPE_DISABLE_SLOT_CMD    = 10;
 constexpr uint32_t TRB_TYPE_ADDRESS_DEVICE_CMD  = 11;
 constexpr uint32_t TRB_TYPE_CONFIGURE_ENDPOINT_CMD = 12; // Milestone 4
+constexpr uint32_t TRB_TYPE_STOP_ENDPOINT_CMD   = 15; // xHCI 6.4.3.6 — обязателен перед Set TR Dequeue, если эндпоинт НЕ Halted
 constexpr uint32_t TRB_TYPE_RESET_ENDPOINT_CMD  = 14; // Фаза 8 (df) — восстановление bulk-эндпоинта после ошибки, xHCI 6.4.3.9
 constexpr uint32_t TRB_TYPE_SET_TR_DEQUEUE_CMD  = 16; // xHCI 6.4.3.10, идёт СРАЗУ после Reset Endpoint
 constexpr uint32_t TRB_TYPE_NO_OP_CMD           = 23;
@@ -294,6 +296,12 @@ static volatile uint8_t *g_op_base = nullptr;
 static volatile uint8_t *g_rt_base = nullptr;
 static volatile uint8_t *g_db_base = nullptr;
 static int g_ctx_size = 32; // 32 или 64 байта на контекст — см. HCCPARAMS1.CSZ
+// HCCPARAMS1 биты[15:12] — Max Primary Stream Array Size. 0 = контроллер
+// bulk streams НЕ поддерживает вообще; значение p означает, что массив
+// может быть до 2^(p+1) входов. Нужен, чтобы не пытаться включить UAS на
+// SuperSpeed там, где потоков нет (эталон в такой ситуации честно
+// отказывается от UAS — см. uas-detect.h).
+static uint32_t g_max_psa_size = 0;
 
 static inline volatile uint32_t* reg32(volatile uint8_t *base, uintptr_t off) {
     return (volatile uint32_t*)(base + off);
@@ -367,6 +375,20 @@ struct UsbUasPipes {
     bool found = false;
     uint8_t cmd_addr = 0,  status_addr = 0,  in_addr = 0,  out_addr = 0;
     uint16_t cmd_mps = 0,  status_mps = 0,   in_mps = 0,   out_mps = 0;
+    // MaxBurst из SS Endpoint Companion Descriptor КАЖДОЙ трубы отдельно.
+    // Брать его у одноимённых bulk-эндпоинтов Bulk-Only alt-setting'а
+    // нельзя: это другой alt-setting со своими companion-дескрипторами,
+    // совпадение адресов эндпоинта ничего про MaxBurst не гарантирует.
+    uint8_t cmd_burst = 0, status_burst = 0, in_burst = 0, out_burst = 0;
+    // bmAttributes каждой трубы: все четыре обязаны быть Bulk (тип 2).
+    // Разбор идёт по bPipeID и НЕ проверяет тип эндпоинта сам по себе —
+    // без этой проверки не-bulk труба уехала бы в EP Context как bulk.
+    uint8_t cmd_attr = 0, status_attr = 0, in_attr = 0, out_attr = 0;
+    // bmAttributes из SS Endpoint Companion: для bulk биты[4:0] —
+    // ПОКАЗАТЕЛЬ СТЕПЕНИ числа потоков (0 = потоков нет, 5 = 2^5 = 32).
+    // У RTL9210C это 5 на трубах статуса/данных и 0 на трубе команд —
+    // ровно то же деление, что в эталоне (usb_alloc_streams на eps+1).
+    uint8_t cmd_streams = 0, status_streams = 0, in_streams = 0, out_streams = 0;
     uint8_t interface_num = 0, alt_setting = 0;
 };
 constexpr uint8_t USB_DESC_TYPE_PIPE_USAGE = 0x24;
@@ -422,6 +444,24 @@ struct UsbDeviceSlot {
     char volume_name[32] = "usb0";
     uint8_t bulk_out_dci = 0, bulk_in_dci = 0;
     TrbRing ep0_ring, bulkout_ring, bulkin_ring;
+    // UAS — две ДОПОЛНИТЕЛЬНЫЕ трубы (команд и статуса) со своими
+    // кольцами. Трубы ДАННЫХ у UAS — это те же bulkin_ring/bulkout_ring:
+    // отдельные кольца под них не нужны, меняются только DCI (bulk_*_dci
+    // пересчитываются под адреса UAS-эндпоинтов в step_uas_setup()).
+    bool uas_active = false;
+    // Configure Endpoint на трубы UAS уже принят контроллером. Нужен
+    // откату: чтобы вернуться на Bulk-Only, эти трубы надо ЯВНО сбросить
+    // Drop-флагами, а не просто добавить поверх bulk-эндпоинты заново.
+    bool uas_eps_configured = false;
+    uint8_t uas_cmd_dci = 0, uas_status_dci = 0;
+    TrbRing uas_cmd_ring, uas_status_ring;
+    seL4_Word uas_cmdring_paddr = 0, uas_statring_paddr = 0;
+    seL4_Word uas_streams_paddr = 0;
+    uint16_t uas_next_tag = 1; // тег 0 зарезервирован спекой UAS
+    // На SuperSpeed трубы статуса и данных обслуживаются через bulk
+    // streams (см. PLAT_XHCI_UAS_STREAMS_VADDR); труба команд — всегда
+    // обычная, потоков она не объявляет.
+    bool uas_use_streams = false;
     // per-device paddr'ы (считаются в main() один раз из BOOT_USB_*_PADDR
     // — базового адреса — плюс idx*4096, см. h/platform.h).
     seL4_Word ep0_trring_paddr = 0, ctrl_buf_paddr = 0;
@@ -525,6 +565,8 @@ static seL4_Word g_ep0_trring_paddr_base;     // Milestone 1 — настоящ�
 static seL4_Word g_ctrl_buf_paddr_base;       // Milestone 2 — буфер данных control-transfer'ов на EP0
 static seL4_Word g_bulkout_trring_paddr_base, g_bulkin_trring_paddr_base; // Milestone 4
 static seL4_Word g_cbw_csw_paddr_base, g_bounce_paddr_base; // Milestone 5
+static seL4_Word g_uas_cmdring_paddr_base, g_uas_statring_paddr_base; // UAS — кольца труб команд и статуса
+static seL4_Word g_uas_streams_paddr_base; // UAS — страница Stream Context Array'ев
 
 // Двадцать третья попытка (см. ROADMAP.md) — HSE на Шаге 6 объяснился:
 // PCIE_MISC_RC_BAR2_CONFIG_LO/HI (входящее xHCI->RAM окно, читаны на Шаге 0)
@@ -557,12 +599,55 @@ static inline volatile uint64_t* scratchpad_arr() { return (volatile uint64_t*)P
 // Фаза 15 — per-device vaddr/paddr: idx — "наш" индекс устройства
 // (0..USB_MAX_DEVICES-1), НЕ xHCI Slot ID. Все шесть ресурсов ниже —
 // подряд идущие страницы (см. h/platform.h), поэтому просто base+idx*4096.
-static inline volatile Trb*      ep0ring_vaddr(int idx)     { return (volatile Trb*)(PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)idx * 4096); }
+static inline volatile Trb*      ep0ring_vaddr(int idx)     { return (volatile Trb*)(PLAT_XHCI_EP0_TRRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
 static inline volatile uint8_t*  ctrlbuf_vaddr(int idx)     { return (volatile uint8_t*)(PLAT_XHCI_CTRL_BUF_VADDR + (uintptr_t)idx * 4096); }
-static inline volatile Trb*      bulkoutring_vaddr(int idx) { return (volatile Trb*)(PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)idx * 4096); }
-static inline volatile Trb*      bulkinring_vaddr(int idx)  { return (volatile Trb*)(PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)idx * 4096); }
+static inline volatile Trb*      bulkoutring_vaddr(int idx) { return (volatile Trb*)(PLAT_XHCI_BULKOUT_TRRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
+static inline volatile Trb*      bulkinring_vaddr(int idx)  { return (volatile Trb*)(PLAT_XHCI_BULKIN_TRRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
 static inline volatile uint8_t*  cbw_vaddr(int idx)         { return (volatile uint8_t*)(PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)idx * 4096); }
 static inline volatile uint8_t*  csw_vaddr(int idx)         { return (volatile uint8_t*)(PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)idx * 4096 + 64); }
+
+// UAS. Information Unit'ы живут в свободном хвосте ТОЙ ЖЕ страницы, что
+// CBW/CSW — Bulk-Only Transport занимает в ней только первые 77 байт
+// (CBW 0..30, CSW 64..76), остальные ~4 КБ простаивали.
+constexpr uint32_t UAS_CMD_IU_OFFSET   = 512;   // + slot*UAS_CMD_IU_STRIDE
+constexpr uint32_t UAS_CMD_IU_STRIDE   = 32;    // Command IU при CDB <= 16 байт — ровно 32 байта
+constexpr uint32_t UAS_SENSE_IU_OFFSET = 1024;  // + slot*UAS_SENSE_IU_STRIDE
+constexpr uint32_t UAS_SENSE_IU_STRIDE = 512;   // Sense IU реально 16+96=112 Б; 512 — запас, чтобы устройство не могло вызвать babble
+constexpr int      UAS_SENSE_IU_SLOTS  = 6;     // (4096-1024)/512 — хватает на глубину очереди 3 (по два буфера на команду)
+// Глубина очереди этой фазы — ОДНА команда в полёте (тег меняется, но
+// вторая команда не отправляется, пока не пришёл Sense IU первой).
+// Очередь >1 — следующая фаза, см. issuse.txt.
+constexpr uint16_t UAS_MAX_TAGS = 16;
+// Потолок данных на ОДНУ SCSI-команду в режиме UAS, в секторах.
+//
+// Зачем: на живом железе 2026-09-07 запись в 128 КБ изредка (через
+// десятки-тысячи успешных команд) вставала намертво — контроллер доходил
+// до последнего TRB цепочки, оставался Running, события не присылал, а
+// Stopped EDTLA в Stream Context показывал 114688 байт из 131072, причём
+// ОДНО И ТО ЖЕ значение в двух независимых отказах при разной раскладке
+// TRB. Известного ограничения для этого моста в unusual_uas.h ядра Linux
+// нет, поэтому величина подбирается замером, а не берётся из документа.
+// 128 секторов = 64 КБ — первая проверяемая точка.
+// Проверено на железе 2026-09-07: снижение до 128 секторов (64 КБ) отказ
+// НЕ убрало — передача так же вставала, только теперь за 16 КБ до конца
+// 64 КБ вместо 16 КБ до конца 128 КБ. Признак оказался инвариантен к
+// объёму, поэтому потолок возвращён в нерабочее положение (равен общему
+// пределу), а сама механика дробления оставлена как готовая ручка.
+constexpr uint32_t UAS_MAX_XFER_SECTORS = (uint32_t)USB_BOUNCE_PAGES * 8; // то же, что USB_MAX_SECTORS_PER_IO (объявлен ниже по файлу)
+
+static inline volatile Trb*      uas_cmdring_vaddr(int idx)  { return (volatile Trb*)(PLAT_XHCI_UAS_CMDRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
+static inline volatile Trb*      uas_statring_vaddr(int idx) { return (volatile Trb*)(PLAT_XHCI_UAS_STATRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
+static inline volatile uint32_t* uas_streams_vaddr(int idx, uint32_t off) { return (volatile uint32_t*)(PLAT_XHCI_UAS_STREAMS_VADDR + (uintptr_t)idx * 4096 + off); }
+// Один поток (Stream ID 1) — глубина очереди этой фазы. Массив всё равно
+// не может быть меньше четырёх входов: поле MaxPStreams логарифмическое,
+// p -> 2^(p+1). Вход 0 зарезервирован спекой, входы 2-3 остаются нулевыми
+// (контроллер обращается к входу только по нашему доорбеллу либо по
+// Stream ID, который мы сами устройству и назвали).
+constexpr uint32_t UAS_STREAM_ID          = 1;
+constexpr uint32_t UAS_MAX_PSTREAMS       = 1;   // 2^(1+1) = 4 входа
+constexpr uint32_t UAS_STREAM_ARRAY_ENTRIES = 4;
+static inline volatile uint8_t*  uas_cmd_iu_vaddr(int idx, int slot)   { return (volatile uint8_t*)(PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)idx * 4096 + UAS_CMD_IU_OFFSET + (uintptr_t)slot * UAS_CMD_IU_STRIDE); }
+static inline volatile uint8_t*  uas_sense_iu_vaddr(int idx, int slot) { return (volatile uint8_t*)(PLAT_XHCI_CBW_CSW_VADDR + (uintptr_t)idx * 4096 + UAS_SENSE_IU_OFFSET + (uintptr_t)slot * UAS_SENSE_IU_STRIDE); }
 // Шаг — USB_BOUNCE_PAGES страниц (2026-09-06 буфер расширен с одной): при
 // шаге в 4096 устройства накладывались бы друг на друга.
 static inline volatile uint8_t*  bounce_vaddr(int idx)      { return (volatile uint8_t*)(PLAT_XHCI_BOUNCE_VADDR + (uintptr_t)idx * USB_BOUNCE_PAGES * 4096); }
@@ -670,7 +755,17 @@ static uint64_t ring_enqueue_trb(TrbRing &ring, uint64_t parameter, uint32_t sta
         // а не плавающим, и лечился ТОЛЬКО usbreset/перезагрузкой — то есть
         // повторным init_trb_ring(), потому что Reset Endpoint снимает halt,
         // но испорченный Link TRB не чинит.
-        link->control = (link->control & ~TRB_CYCLE) | (ring.pcs & TRB_CYCLE);
+        // Бит Chain на самом Link TRB. Если TD продолжается ЗА заворотом
+        // (крупная передача разложена в цепочку TRB, и заворот пришёлся на
+        // её середину), Link TRB обязан нести Chain=1 — иначе контроллер
+        // считает, что TD кончился на завороте, а оставшиеся TRB
+        // становятся отдельным, никем не ожидаемым TD (xHCI 4.11.7.1).
+        // Ставим ровно тогда, когда только что положенный TRB сам был
+        // звеном цепочки, и снимаем в остальных случаях — Chain на Link
+        // TRB вне TD склеил бы два независимых TD в один.
+        uint32_t link_ctl = (link->control & ~TRB_CYCLE) | (ring.pcs & TRB_CYCLE);
+        if (control_no_cycle & TRB_CH) link_ctl |= TRB_CH; else link_ctl &= ~TRB_CH;
+        link->control = link_ctl;
         ring.pcs ^= 1;
         ring.enqueue_idx = 0;
         // Заворот кольца печатался БЕЗ гейта LOG_USB, пока фикс порядка
@@ -708,8 +803,11 @@ static uint64_t enqueue_command_trb(uint64_t parameter, uint32_t status, uint32_
 // младшем байте — DCI целевого эндпоинта (DCI=1 для EP0, независимо от
 // направления — управляющий эндпоинт двунаправленный; для bulk-эндпоинтов
 // в будущих milestone'ах DCI = 2*номер + (1 если IN иначе 0), см. xHCI 4.5.1).
-static void ring_endpoint_doorbell(uint8_t slot_id, uint8_t dci) {
-    *reg32(g_db_base, (uintptr_t)slot_id * 4) = dci;
+// stream_id != 0 — для потоковых (bulk streams) эндпоинтов: номер потока
+// едет в старшей половине значения доорбелла (xHCI 5.6). Для обычных
+// эндпоинтов остаётся 0, и поведение всех прежних вызовов не меняется.
+static void ring_endpoint_doorbell(uint8_t slot_id, uint8_t dci, uint32_t stream_id = 0) {
+    *reg32(g_db_base, (uintptr_t)slot_id * 4) = (uint32_t)dci | (stream_id << 16);
 }
 
 // Читает следующее событие из Event Ring, если оно готово (cycle-бит
@@ -808,6 +906,63 @@ static bool wait_command_completion(seL4_CPtr console_ep, uint64_t cmd_trb_paddr
 // (Short Packet) — НЕ ошибка (устройство прислало меньше данных, чем мы
 // предложили буфером — законно для GET_DESCRIPTOR/INQUIRY/READ CAPACITY),
 // вызывающий сам решает, считать ли это успехом.
+// Кэш «событие пришло раньше, чем его начали ждать».
+//
+// wait_transfer_completion() ждёт ОДИН конкретный TRB и выбрасывает
+// Transfer Event'ы всех остальных. Для Bulk-Only Transport это безвредно:
+// его три фазы строго последовательны, второго TRB в полёте не бывает. У
+// UAS не так — на трубе статуса ВСЕГДА висит взведённый приёмный TRB,
+// пока идёт передача данных, и его событие законно может лечь в кольцо
+// раньше, чем разобрано событие фазы данных. Выброшенное событие =
+// ожидание Sense IU до полного таймаута на КАЖДОЙ команде.
+//
+// Поэтому wait_transfer_completion() теперь не выбрасывает чужие
+// Transfer Event'ы, а кладёт их сюда. ЧИТАЕТ отсюда только UAS
+// (uas_wait_trb) — путь BOT в кэш не заглядывает вообще, его поведение
+// не меняется ни на бит. Кэш обнуляется в начале каждой UAS-команды,
+// поэтому адрес TRB (слоты кольца переиспользуются по кругу) не может
+// совпасть с записью от прошлой команды.
+constexpr int UAS_EVT_CACHE_SIZE = 8;
+static uint64_t g_uas_evt_addr[UAS_EVT_CACHE_SIZE] = {0};
+static uint8_t  g_uas_evt_cc[UAS_EVT_CACHE_SIZE] = {0};
+static uint32_t g_uas_evt_res[UAS_EVT_CACHE_SIZE] = {0};
+static int      g_uas_evt_put_idx = 0;
+static uint64_t g_uas_evt_dropped = 0; // переполнений кэша — диагностика, в норме 0
+
+static void uas_evt_cache_clear() {
+    for (int i = 0; i < UAS_EVT_CACHE_SIZE; i++) g_uas_evt_addr[i] = 0;
+    g_uas_evt_put_idx = 0;
+}
+static void uas_evt_cache_put(uint64_t addr, uint8_t cc, uint32_t res) {
+    for (int i = 0; i < UAS_EVT_CACHE_SIZE; i++) {
+        if (g_uas_evt_addr[i] == 0) {
+            g_uas_evt_addr[i] = addr; g_uas_evt_cc[i] = cc; g_uas_evt_res[i] = res;
+            return;
+        }
+    }
+    // Кэш полон — затираем по кругу. В штатной работе сюда не попадаем
+    // (в полёте максимум пара TRB). Первый случай печатаем: молча
+    // затирать событие — ровно тот отказ, ради которого кэш и заведён.
+    if (g_uas_evt_dropped == 0 && g_console_ep) {
+        sys_puts(g_console_ep, "[USB]   ПРЕДУПРЕЖДЕНИЕ UAS: кэш событий переполнен — событие затёрто (см. UAS_EVT_CACHE_SIZE).\n");
+    }
+    g_uas_evt_dropped++;
+    g_uas_evt_addr[g_uas_evt_put_idx] = addr;
+    g_uas_evt_cc[g_uas_evt_put_idx] = cc;
+    g_uas_evt_res[g_uas_evt_put_idx] = res;
+    g_uas_evt_put_idx = (g_uas_evt_put_idx + 1) % UAS_EVT_CACHE_SIZE;
+}
+static bool uas_evt_cache_take(uint64_t addr, uint8_t &cc, uint32_t &res) {
+    for (int i = 0; i < UAS_EVT_CACHE_SIZE; i++) {
+        if (g_uas_evt_addr[i] == addr) {
+            cc = g_uas_evt_cc[i]; res = g_uas_evt_res[i];
+            g_uas_evt_addr[i] = 0; // одноразовая запись
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr, uint32_t timeout_ms,
                                       uint8_t &completion_code, uint32_t &residual_len) {
     uint64_t deadline = read_cntvct() + (uint64_t)timeout_ms * g_cntfrq / 1000;
@@ -833,6 +988,14 @@ static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr
             // wait_command_completion() — раньше здесь эта диагностика
             // отсутствовала, что мешало отличить "Event Ring реально
             // молчит" от "события есть, просто не те, что ждём").
+            //
+            // Transfer Event ЧУЖОГО TRB дополнительно кладём в кэш (см.
+            // uas_evt_cache_put выше) — иначе UAS терял бы событие своей
+            // трубы статуса, пришедшее во время фазы данных. Читает кэш
+            // только UAS; для BOT это чистое добавление рядом.
+            if (type == TRB_TYPE_TRANSFER_EVENT) {
+                uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
+            }
             other_events++;
             last_other_type = type;
             last_other_parameter = ev.parameter;
@@ -873,6 +1036,27 @@ static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr
 // wait_transfer_completion(), который держал бы весь usb_driver
 // (единственный процесс, обслуживающий И VFS-команды, И hot-plug)
 // колом до 1с на КАЖДЫЙ тик, даже когда хаб молчит (типичный случай).
+// Хвост Event Ring глазами железа. Нужен ровно на один вопрос: событие
+// нашего TRB вообще было сгенерировано или нет. Если оно в кольце есть, а
+// мы его не увидели — виновата логика сопоставления; если его нет —
+// контроллер TD не завершил. Печатаем окно вокруг текущего курсора, в обе
+// стороны: события ПЕРЕД курсором уже разобраны, ПОСЛЕ — ещё нет.
+static void dump_event_ring_tail(seL4_CPtr console_ep, uint64_t expect_trb) {
+    sys_puthex64(console_ep, "[USB]   EVT: ждали событие TRB по адресу ", expect_trb);
+    sys_puthex32(console_ep, "[USB]   EVT: курсор/CCS = ",
+                 ((uint32_t)g_evt_dequeue_idx << 8) | (g_evt_ccs & 1u));
+    for (int k = -4; k <= 3; k++) {
+        int i = (g_evt_dequeue_idx + k + EVTRING_TRB_COUNT * 2) % EVTRING_TRB_COUNT;
+        volatile Trb *e = &evtring()[i];
+        uint32_t ctrl = e->control;
+        uint32_t type = (ctrl & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        // индекс, тип события, cycle-бит и код завершения — в одном слове
+        sys_puthex32(console_ep, "[USB]   EVT: idx/type/cycle/код = ",
+                     ((uint32_t)i << 24) | (type << 16) | ((ctrl & TRB_CYCLE) << 8) | (uint8_t)(e->status >> 24));
+        sys_puthex64(console_ep, "[USB]   EVT:   parameter = ", e->parameter);
+    }
+}
+
 static bool try_check_transfer_complete(uint64_t trb_dev_addr, uint8_t &completion_code, uint32_t &residual_len) {
     bool found = false;
     Trb ev;
@@ -1581,7 +1765,7 @@ static bool step7_address_device(seL4_CPtr console_ep, int idx, uint8_t slot_id,
 // файлу (recover_bulk_endpoint). Нужно здесь, потому что control-путь
 // EP0 обязан лечиться ровно тем же способом, что и bulk (см. обёртки
 // ep0_control_* ниже).
-static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t dci, TrbRing &ring);
+static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t dci, TrbRing &ring, uint32_t stream_id = 0);
 
 // Milestone 2 (закрытие Фазы 14, см. ROADMAP.md/план) — IN control-transfer
 // на EP0: Setup+Data+Status TRB, ОДИН звонок в doorbell (xHC сам проходит
@@ -1829,6 +2013,14 @@ static void step8_get_device_descriptor(seL4_CPtr console_ep, int idx, uint8_t s
     if (LOG_USB) sys_puthex16(console_ep, "[USB]   idProduct = ", found.product_id);
     if (LOG_USB) sys_puthex32(console_ep, "[USB]   bDeviceClass/SubClass/Protocol = ",
                  ((uint32_t)found.device_class << 16) | ((uint32_t)found.device_subclass << 8) | found.device_protocol);
+    // ДИАГНОСТИКА скорости — печатается всегда. bMaxPacketSize0 (buf[7])
+    // однозначно называет РАБОЧУЮ скорость: на SuperSpeed он обязан быть
+    // 9 (то есть 2^9 = 512 байт, поле логарифмическое), на High-Speed —
+    // 64, на Full-Speed — 8/16/32/64. Это единственный байт, который
+    // нельзя ни с чем перепутать, в отличие от bcdUSB (тот говорит лишь,
+    // какой стандарт устройство поддерживает, а не на чём оно сейчас).
+    sys_puthex32(console_ep, "[USB]   DIAG bcdUSB / bMaxPacketSize0 = ",
+                 ((uint32_t)buf[3] << 24) | ((uint32_t)buf[2] << 16) | buf[7]);
 }
 
 // USB-класс, которого ищем в этой фазе: Mass Storage / SCSI Transparent /
@@ -1848,6 +2040,12 @@ constexpr uint8_t USB_PROTOCOL_BOT       = 0x50;
 // объявлять отдельный интерфейс с этим протоколом — дешёвые USB 2.0
 // флешки часто только BOT, и тогда путь закрыт.
 constexpr uint8_t USB_PROTOCOL_UAS       = 0x62;
+// Транспорт по умолчанию для накопителей, которые объявляют UAS-интерфейс.
+// false — принудительно остаться на Bulk-Only Transport (кнопка отката,
+// если UAS окажется медленнее или нестабильнее на конкретном железе).
+// Отказ ЛЮБОГО шага включения UAS автоматически откатывает устройство на
+// BOT и без этого флага — см. step_uas_setup()/uas_fallback_to_bot().
+constexpr bool USB_UAS_ENABLE = true;
 // Milestone B1 (Фаза 15) — перенесено выше (было объявлено ниже,
 // step9_get_configuration_descriptor() теперь тоже на него ссылается).
 constexpr uint8_t USB_CLASS_HUB = 0x09;
@@ -1908,7 +2106,7 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
     bool uas_found = false; uint8_t uas_if = 0, uas_alt = 0;
     UsbUasPipes uas; // конвейеры UAS-интерфейса, см. UsbUasPipes
     bool in_uas_interface = false;
-    uint8_t last_uas_ep_addr = 0; uint16_t last_uas_ep_mps = 0;
+    uint8_t last_uas_ep_addr = 0; uint16_t last_uas_ep_mps = 0; uint8_t last_uas_ep_burst = 0; uint8_t last_uas_ep_attr = 0; uint8_t last_uas_ep_ss_attr = 0;
     uint32_t off = 9; // сразу после 9-байтного Configuration Descriptor
     while (off + 2 <= parse_limit) {
         uint8_t desc_len = buf[off];
@@ -1944,16 +2142,30 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
             }
         } else if (desc_type == USB_DESC_TYPE_ENDPOINT && desc_len >= 7 && in_uas_interface) {
             // Запоминаем эндпоинт; назначение станет известно из идущего
-            // следом Pipe Usage Descriptor.
+            // следом Pipe Usage Descriptor. Порядок записей в цепочке —
+            // Endpoint, затем (на SuperSpeed) SS Endpoint Companion,
+            // затем Pipe Usage; MaxBurst забираем сразу, здесь, пока
+            // известно, к какому эндпоинту относится companion.
             last_uas_ep_addr = buf[off + 2];
+            last_uas_ep_attr = buf[off + 3];
             last_uas_ep_mps  = (uint16_t)buf[off + 4] | ((uint16_t)buf[off + 5] << 8);
+            last_uas_ep_burst = 0;
+            {
+                uint32_t next_off = off + desc_len;
+                last_uas_ep_ss_attr = 0;
+                if (port_speed >= 4 && next_off + 2 <= parse_limit
+                    && buf[next_off + 1] == USB_DESC_TYPE_SS_EP_COMPANION && buf[next_off] >= 6) {
+                    last_uas_ep_burst = buf[next_off + 2];
+                    last_uas_ep_ss_attr = buf[next_off + 3]; // bmAttributes: биты[4:0] = log2(число потоков)
+                }
+            }
         } else if (desc_type == USB_DESC_TYPE_PIPE_USAGE && desc_len >= 3 && in_uas_interface) {
             uint8_t pipe_id = buf[off + 2];
             switch (pipe_id) {
-                case UAS_PIPE_ID_CMD:      uas.cmd_addr = last_uas_ep_addr;    uas.cmd_mps = last_uas_ep_mps;    break;
-                case UAS_PIPE_ID_STATUS:   uas.status_addr = last_uas_ep_addr; uas.status_mps = last_uas_ep_mps; break;
-                case UAS_PIPE_ID_DATA_IN:  uas.in_addr = last_uas_ep_addr;     uas.in_mps = last_uas_ep_mps;     break;
-                case UAS_PIPE_ID_DATA_OUT: uas.out_addr = last_uas_ep_addr;    uas.out_mps = last_uas_ep_mps;    break;
+                case UAS_PIPE_ID_CMD:      uas.cmd_addr = last_uas_ep_addr;    uas.cmd_mps = last_uas_ep_mps;    uas.cmd_burst = last_uas_ep_burst; uas.cmd_attr = last_uas_ep_attr; uas.cmd_streams = (uint8_t)(last_uas_ep_ss_attr & 0x1Fu);    break;
+                case UAS_PIPE_ID_STATUS:   uas.status_addr = last_uas_ep_addr; uas.status_mps = last_uas_ep_mps; uas.status_burst = last_uas_ep_burst; uas.status_attr = last_uas_ep_attr; uas.status_streams = (uint8_t)(last_uas_ep_ss_attr & 0x1Fu); break;
+                case UAS_PIPE_ID_DATA_IN:  uas.in_addr = last_uas_ep_addr;     uas.in_mps = last_uas_ep_mps;     uas.in_burst = last_uas_ep_burst; uas.in_attr = last_uas_ep_attr; uas.in_streams = (uint8_t)(last_uas_ep_ss_attr & 0x1Fu);     break;
+                case UAS_PIPE_ID_DATA_OUT: uas.out_addr = last_uas_ep_addr;    uas.out_mps = last_uas_ep_mps;    uas.out_burst = last_uas_ep_burst; uas.out_attr = last_uas_ep_attr; uas.out_streams = (uint8_t)(last_uas_ep_ss_attr & 0x1Fu);    break;
                 default: break;
             }
         } else if (desc_type == USB_DESC_TYPE_ENDPOINT && desc_len >= 7 && in_target_interface) {
@@ -2005,8 +2217,21 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
     // USB_PROTOCOL_UAS выше). Пока не увидим здесь "поддерживает" —
     // реализовывать UAS бессмысленно, накопитель его не примет.
     if (!is_hub) {
+        // Скорость, с которой МЫ работаем с этим устройством, и путь
+        // перечисления. Сравнивать с bMaxPacketSize0 из Шага 8: если
+        // расходятся — мы программируем контексты не под ту скорость.
+        // Значения поля Slot Context Speed (xHCI): 1=Full, 2=Low,
+        // 3=High, 4=SuperSpeed.
+        sys_puthex32(console_ep, "[USB] DIAG наша port_speed для этого устройства = ", port_speed);
+        sys_puthex32(console_ep, "[USB] DIAG за хабом? (1=да) / ярус = ",
+                     ((uint32_t)(g_usb_devices[idx].behind_hub ? 1u : 0u) << 8) | g_usb_devices[idx].hub_tier);
         if (uas_found) {
-            uas.found = (uas.cmd_addr && uas.status_addr && uas.in_addr && uas.out_addr);
+            bool all_bulk = ((uas.cmd_attr & 0x03u) == 0x02u) && ((uas.status_attr & 0x03u) == 0x02u)
+                            && ((uas.in_attr & 0x03u) == 0x02u) && ((uas.out_attr & 0x03u) == 0x02u);
+            uas.found = (uas.cmd_addr && uas.status_addr && uas.in_addr && uas.out_addr && all_bulk);
+            if (uas.cmd_addr && uas.status_addr && uas.in_addr && uas.out_addr && !all_bulk) {
+                sys_puts(console_ep, "[USB] UAS: одна из четырёх труб не bulk — очередь команд не включаем.\n");
+            }
             sys_puthex32(console_ep, "[USB] UAS: устройство ПОДДЕРЖИВАЕТ, интерфейс/alt = ",
                          ((uint32_t)uas_if << 8) | uas_alt);
             if (uas.found) {
@@ -2016,6 +2241,42 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
                              ((uint32_t)uas.in_addr << 8) | uas.out_addr);
             } else {
                 sys_puts(console_ep, "[USB] UAS: не удалось разобрать все четыре трубы — очередь команд не включаем.\n");
+            }
+            // ДИАГНОСТИКА (живой отказ 2026-09-07: труба статуса отвечает
+            // USB Transaction Error). Печатаем СЫРУЮ цепочку дескрипторов
+            // UAS-интерфейса, а не только итог разбора: только так видно,
+            // действительно ли bPipeID расставлены так, как мы решили.
+            // Формат слова: bLength<<24 | bDescriptorType<<16 | байт2<<8 | байт3.
+            // Для эндпоинта байт2/3 = bEndpointAddress/bmAttributes,
+            // для Pipe Usage (0x24) байт2 = bPipeID.
+            {
+                // Дамп ВСЕЙ конфигурации, а не только alt-настройки UAS.
+                // Смысл в сравнении: если Bulk-Only alt объявляет
+                // MaxPacketSize 512, а UAS alt — 1024, то различие в
+                // поведении двух транспортов объясняется этим одним
+                // числом, и искать в протоколе UAS нечего.
+                sys_puts(console_ep, "[USB] UAS DIAG: сырая цепочка ВСЕГО дескриптора конфигурации:\n");
+                uint32_t o = 9;
+                while (o + 2 <= parse_limit) {
+                    uint8_t dl = buf[o], dt = buf[o + 1];
+                    if (dl == 0 || o + dl > parse_limit) break;
+                    if (dt == USB_DESC_TYPE_INTERFACE && dl >= 9) {
+                        // номер/alt/число эндпоинтов и класс/подкласс/протокол
+                        sys_puthex32(console_ep, "[USB]   IF num/alt/nEP = ",
+                                     ((uint32_t)buf[o + 2] << 16) | ((uint32_t)buf[o + 3] << 8) | buf[o + 4]);
+                        sys_puthex32(console_ep, "[USB]      class/sub/proto = ",
+                                     ((uint32_t)buf[o + 5] << 16) | ((uint32_t)buf[o + 6] << 8) | buf[o + 7]);
+                    } else {
+                        sys_puthex32(console_ep, "[USB]   len/type/b2/b3 = ",
+                                     ((uint32_t)dl << 24) | ((uint32_t)dt << 16)
+                                     | ((uint32_t)(dl > 2 ? buf[o + 2] : 0) << 8) | (dl > 3 ? buf[o + 3] : 0));
+                        if (dt == USB_DESC_TYPE_ENDPOINT && dl >= 7) {
+                            sys_puthex32(console_ep, "[USB]     wMaxPacketSize = ",
+                                         (uint32_t)buf[o + 4] | ((uint32_t)buf[o + 5] << 8));
+                        }
+                    }
+                    o += dl;
+                }
             }
             g_usb_devices[idx].uas = uas;
         } else {
@@ -2935,7 +3196,15 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
 // 4.5.1 — вычисляется из bEndpointAddress, НЕ жёстко фиксирован (варьируется
 // по устройству/вендору). bulk_out_dci/bulk_in_dci (переиспользуются
 // каждой bulk-передачей, см. Milestone 5) теперь поля g_usb_devices[idx].
-static bool step10_configure_endpoints(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed) {
+// extra_drop_flags — биты A(DCI) эндпоинтов, которые надо СБРОСИТЬ этой
+// же командой. На обычном перечислении 0 (сбрасывать нечего). Нужны
+// откату с UAS: xHCI требует Drop+Add, чтобы переконфигурировать
+// эндпоинт, который сейчас НЕ в Disabled-состоянии — в Linux это прямо
+// оговорено ("Trying to add endpoint without dropping it",
+// drivers/usb/host/xhci.c), а usb_hcd_alloc_bandwidth() при смене
+// alt-настройки сначала дропает эндпоинты старой, потом добавляет новые.
+static bool step10_configure_endpoints(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed,
+                                        uint32_t extra_drop_flags = 0) {
     driver_state_step(USB_STEP_SET_CONFIG); // пошаговый watchdog, см. common.h/UsbStep
     if (LOG_USB) sys_puts(console_ep, "[USB] Шаг 10: Configure Endpoint.\n");
 
@@ -2955,6 +3224,8 @@ static bool step10_configure_endpoints(seL4_CPtr console_ep, int idx, uint8_t sl
     // EP0 (A1) НЕ трогаем — не во флагах, контроллер его текущее
     // состояние не изменит.
     for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), 0, d, 0);
+    // Биты 0 (Slot) и 1 (EP0) в Drop-флагах запрещены спекой — маскируем.
+    write_ctx_dword(inputctx(), 0, 0, extra_drop_flags & ~0x3u);
     write_ctx_dword(inputctx(), 0, 1, (1u << 0) | (1u << out_dci) | (1u << in_dci));
 
     // Slot Context (ctx_index=1) — ПОЛНОСТЬЮ переписывается заново (раз A0
@@ -3036,7 +3307,7 @@ static bool step11_set_configuration(seL4_CPtr console_ep, int idx, uint8_t slot
 // застрял. Best-effort: даже если сама команда вернёт не-успешный код
 // (например, эндпоинт и не был реально Halted) — не фатально, исходная
 // передача уже провалена в любом случае, хуже не станет.
-static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t dci, TrbRing &ring) {
+static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t dci, TrbRing &ring, uint32_t stream_id) {
     // Живой Device Context ДО восстановления — dword0 бит[2:0] = Endpoint
     // State (0=Disabled,1=Running,2=Halted,3=Stopped,4=Error). В Device
     // Context (в отличие от Input Context) префикса Input Control Context
@@ -3060,6 +3331,28 @@ static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t
         }
     }
 
+    // Reset Endpoint снимает ТОЛЬКО Halted. Если эндпоинт застрял, оставаясь
+    // Running (живой отказ 2026-09-07: передача не завершилась за 1с, а
+    // состояние труб 0x0101 — все Running), то и Reset Endpoint, и идущий
+    // следом Set TR Dequeue Pointer завершатся Context State Error и НЕ
+    // сделают ничего: Set TR Dequeue по спеке (xHCI 4.6.10) требует
+    // состояния Stopped или Error. Поэтому не-Halted эндпоинт сначала
+    // ЯВНО останавливаем командой Stop Endpoint (6.4.3.6) — иначе первый
+    // же таймаут отравляет все последующие передачи на этой трубе.
+    {
+        uint32_t ep_state = read_ctx_dword(devctx_vaddr_for(slot_id), dci, 0) & 0x7u;
+        if (ep_state != 2 /*Halted*/ && ep_state != 3 /*Stopped*/) {
+            uint64_t stop_paddr = enqueue_command_trb(0, 0,
+                trb_type(TRB_TYPE_STOP_ENDPOINT_CMD) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24));
+            uint8_t scc = 0, sslot = 0;
+            if (!wait_command_completion(console_ep, stop_paddr, 500, scc, sslot)) {
+                sys_puts(console_ep, "[USB]   DIAG восстановление: Stop Endpoint не завершился за 500мс.\n");
+            } else {
+                sys_puthex32(console_ep, "[USB]   DIAG восстановление: Stop Endpoint код завершения = ", scc);
+            }
+        }
+    }
+
     uint64_t cmd_paddr = enqueue_command_trb(0, 0,
         trb_type(TRB_TYPE_RESET_ENDPOINT_CMD) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24));
     uint8_t cc = 0, ret_slot = 0;
@@ -3071,8 +3364,12 @@ static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t
     if (LOG_USB) sys_puthex32(console_ep, "[USB]   DIAG восстановление: EP dword0 после Reset Endpoint = ", read_ctx_dword(devctx_vaddr_for(slot_id), dci, 0));
 
     uint64_t deq_addr = ring.dev_base + (uint64_t)ring.enqueue_idx * 16;
-    uint64_t param = (deq_addr & ~0xFull) | (ring.pcs & 1u); // DCS в бите 0, SCT=0 (без streams)
-    uint64_t cmd2_paddr = enqueue_command_trb(param, 0,
+    // Биты[3:1] — Stream Context Type: 0 для обычного эндпоинта, 1
+    // (Primary Transfer Ring) для входа линейного массива потоков.
+    // Сам номер потока едет в поле status команды, биты[31:16]
+    // (xHCI 6.4.3.10).
+    uint64_t param = (deq_addr & ~0xFull) | (stream_id ? (1ull << 1) : 0ull) | (ring.pcs & 1u);
+    uint64_t cmd2_paddr = enqueue_command_trb(param, stream_id << 16,
         trb_type(TRB_TYPE_SET_TR_DEQUEUE_CMD) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24));
     if (!wait_command_completion(console_ep, cmd2_paddr, 500, cc, ret_slot)) {
         if (LOG_USB) sys_puts(console_ep, "[USB]   DIAG восстановление: Set TR Dequeue Pointer не завершился за 500мс.\n");
@@ -3088,8 +3385,83 @@ static void recover_bulk_endpoint(seL4_CPtr console_ep, uint8_t slot_id, uint8_t
 // соответствующий доорбелл-таргет (bulk_out_dci/bulk_in_dci, вычислены в
 // Шаге 10). ISP — тот же приём, что Data Stage у control-transfer'ов:
 // получаем событие даже на short packet.
+// defer_recovery — НЕ восстанавливать эндпоинт самому на отказе, оставить
+// это вызывающему. Нужно ровно для одного: recover_bulk_endpoint() делает
+// Set TR Dequeue на наш enqueue_idx и тем самым ЗАТИРАЕТ то состояние, ради
+// чтения которого мы и разбираемся (живая ошибка диагностики 2026-09-07:
+// указатель в Stream Context совпал с enqueue_idx, и это было принято за
+// "контроллер всё дочитал", хотя туда только что записали мы сами).
+// Постановка TD в кольцо + доорбелл, БЕЗ ожидания. Выделена из
+// bulk_transfer(), чтобы фазу данных UAS можно было поставить в поток ДО
+// отправки Command IU — именно такой порядок у эталона (uas_submit_urbs:
+// сперва sense URB, затем data URB'ы, и только потом cmd URB). Иначе есть
+// окно, в котором устройство уже получило команду и просит поток, а TRB в
+// этом потоке ещё нет.
+static uint64_t bulk_enqueue_td(TrbRing &ring, uint8_t slot_id, uint8_t dci,
+                                 uint64_t buffer_paddr, uint32_t length,
+                                 uint32_t stream_id, uint16_t mps, uint32_t &pieces_out) {
+    uint64_t trb_addr = 0;
+    uint32_t pieces = 0;
+    uint64_t pa = buffer_paddr;
+    uint32_t left = length;
+    while (left > 0) {
+        uint32_t to_boundary = (uint32_t)(0x10000u - (uint32_t)(pa & 0xFFFFu));
+        uint32_t piece = left < to_boundary ? left : to_boundary;
+        bool last = (piece == left);
+        uint32_t ctrl = trb_type(TRB_TYPE_NORMAL) | (1u << 2) /*ISP*/;
+        ctrl |= last ? TRB_IOC : TRB_CH;
+        // TD Size (биты[21:17]) — сколько ПАКЕТОВ остаётся после этого TRB;
+        // формула из xhci_td_remainder() ядра Linux для xHCI 1.x, потолок 31.
+        uint32_t td_size = 0;
+        if (!last && mps != 0) {
+            uint32_t total_packets = (length + mps - 1u) / mps;
+            uint32_t done_packets  = ((length - left) + piece) / mps;
+            uint32_t rem = total_packets > done_packets ? total_packets - done_packets : 0u;
+            td_size = rem > 31u ? 31u : rem;
+        }
+        uint64_t a = ring_enqueue_trb(ring, to_dev_addr(pa), piece | (td_size << 17), ctrl);
+        if (last) trb_addr = a; // событие придёт на ПОСЛЕДНИЙ TRB цепочки
+        pieces++;
+        pa += piece;
+        left -= piece;
+    }
+    ring_endpoint_doorbell(slot_id, dci, stream_id);
+    pieces_out = pieces;
+    return trb_addr;
+}
+
+// Объявлена ниже (рядом с кэшем событий UAS): ожидание TRB, которое сперва
+// смотрит в кэш уже разобранных событий, а потом идёт в кольцо.
+static bool uas_wait_trb(seL4_CPtr console_ep, uint64_t trb_addr, uint32_t timeout_ms,
+                          uint8_t &cc, uint32_t &res);
+
+// Ожидание TD, поставленного заранее через bulk_enqueue_td(). Диагностика
+// и трактовка кодов завершения — те же, что у bulk_transfer().
+static bool bulk_wait_td(seL4_CPtr console_ep, uint8_t slot_id, TrbRing &ring, uint8_t dci,
+                          uint64_t trb_addr, uint32_t length, uint32_t &actual_length,
+                          uint32_t stream_id, uint32_t pieces, uint16_t mps, bool defer_recovery) {
+    uint8_t cc = 0;
+    uint32_t residual = 0;
+    if (!uas_wait_trb(console_ep, trb_addr, 1000, cc, residual)) {
+        sys_puts(console_ep, "[USB] ОШИБКА: bulk-передача не завершилась за 1с.\n");
+        sys_puthex32(console_ep, "[USB]   звеньев в цепочке TRB / MaxPacketSize = ", (pieces << 16) | mps);
+        dump_event_ring_tail(console_ep, trb_addr);
+        if (!defer_recovery) recover_bulk_endpoint(console_ep, slot_id, dci, ring, stream_id);
+        return false;
+    }
+    if (cc != 1 && cc != 13) { // 13 = Short Packet, не ошибка
+        sys_puthex32(console_ep, "[USB] ОШИБКА: bulk-передача завершилась с кодом ", cc);
+        if (!defer_recovery) recover_bulk_endpoint(console_ep, slot_id, dci, ring, stream_id);
+        return false;
+    }
+    actual_length = length - residual;
+    return true;
+}
+
 static bool bulk_transfer(seL4_CPtr console_ep, uint8_t slot_id, TrbRing &ring, uint8_t dci,
-                           uint64_t buffer_paddr, uint32_t length, uint32_t &actual_length) {
+                           uint64_t buffer_paddr, uint32_t length, uint32_t &actual_length,
+                           uint32_t stream_id = 0, bool defer_recovery = false,
+                           uint16_t mps = 512) {
     // Передача больше 64 КБ раскладывается в ЦЕПОЧКУ TRB одного TD.
     //
     // Почему нельзя одним TRB: буфер одного TRB не может пересекать границу
@@ -3102,38 +3474,638 @@ static bool bulk_transfer(seL4_CPtr console_ep, uint8_t slot_id, TrbRing &ring, 
     // на каждой команде и ничего не перекрываем — замер дал 10.36 мс на
     // команду, то есть 6.3 МБ/с при паспортных 16. Крупные команды эту
     // задержку амортизируют.
-    uint64_t trb_addr = 0;
-    {
-        uint64_t pa = buffer_paddr;
-        uint32_t left = length;
-        while (left > 0) {
-            uint32_t to_boundary = (uint32_t)(0x10000u - (uint32_t)(pa & 0xFFFFu));
-            uint32_t piece = left < to_boundary ? left : to_boundary;
-            bool last = (piece == left);
-            uint32_t ctrl = trb_type(TRB_TYPE_NORMAL) | (1u << 2) /*ISP*/;
-            ctrl |= last ? TRB_IOC : TRB_CH;
-            uint64_t a = ring_enqueue_trb(ring, to_dev_addr(pa), piece, ctrl);
-            if (last) trb_addr = a; // событие придёт на ПОСЛЕДНИЙ TRB цепочки
-            pa += piece;
-            left -= piece;
-        }
-    }
-    ring_endpoint_doorbell(slot_id, dci);
+    uint32_t pieces = 0; // сколько звеньев вышло в цепочке — печатается на отказе
+    uint64_t trb_addr = bulk_enqueue_td(ring, slot_id, dci, buffer_paddr, length, stream_id, mps, pieces);
 
     uint8_t cc = 0;
     uint32_t residual = 0;
     if (!wait_transfer_completion(console_ep, trb_addr, 1000, cc, residual)) {
         sys_puts(console_ep, "[USB] ОШИБКА: bulk-передача не завершилась за 1с.\n");
-        recover_bulk_endpoint(console_ep, slot_id, dci, ring);
+        // Число звеньев решает судьбу версии про TD Size: у одиночного TRB
+        // это поле обязано быть нулём в любом случае, и тогда оно ни при чём.
+        sys_puthex32(console_ep, "[USB]   звеньев в цепочке TRB / MaxPacketSize = ",
+                     (pieces << 16) | mps);
+        dump_event_ring_tail(console_ep, trb_addr);
+        if (!defer_recovery) recover_bulk_endpoint(console_ep, slot_id, dci, ring, stream_id);
         return false;
     }
     if (cc != 1 && cc != 13) { // 13 = Short Packet, не ошибка
         sys_puthex32(console_ep, "[USB] ОШИБКА: bulk-передача завершилась с кодом ", cc);
-        recover_bulk_endpoint(console_ep, slot_id, dci, ring);
+        if (!defer_recovery) recover_bulk_endpoint(console_ep, slot_id, dci, ring, stream_id);
         return false;
     }
     actual_length = length - residual;
     return true;
+}
+
+// ===================== UAS (USB Attached SCSI) =====================
+//
+// Зачем: Bulk-Only Transport держит РОВНО ОДНУ команду в полёте и гоняет
+// её по двум трубам (OUT: CBW и данные записи, IN: данные чтения и CSW).
+// UAS разводит четыре независимых конвейера — команда, статус, данные-IN,
+// данные-OUT — и помечает каждую команду тегом, так что статус приходит
+// по своей трубе и не занимает трубу данных.
+//
+// Раскладка Information Unit'ов — калька include/linux/usb/uas.h ядра
+// Linux (struct command_iu / struct sense_iu). Поля tag / status_qual /
+// len — BIG-endian (__be16), в отличие от little-endian CBW/CSW у BOT.
+constexpr uint8_t UAS_IU_ID_COMMAND     = 0x01;
+constexpr uint8_t UAS_IU_ID_STATUS      = 0x03;
+constexpr uint8_t UAS_IU_ID_RESPONSE    = 0x04;
+constexpr uint8_t UAS_IU_ID_READ_READY  = 0x06;
+constexpr uint8_t UAS_IU_ID_WRITE_READY = 0x07;
+constexpr uint8_t UAS_TASK_ATTR_SIMPLE  = 0x00; // UAS_SIMPLE_TAG в uas.h
+constexpr uint32_t UAS_CMD_IU_LEN = 32;         // 4 (заголовок) + 4 + 8 (LUN) + 16 (CDB)
+
+// Ставит ОДИН приёмный буфер на трубу статуса и звонит в её звонок.
+// Буферы ставятся по одному, а не пачкой заранее: устройство законно
+// может ответить сразу Sense IU вместо Ready IU (например CHECK
+// CONDITION ещё до передачи данных), и лишний заранее поставленный TRB
+// остался бы висеть в кольце и перехватил бы ответ СЛЕДУЮЩЕЙ команды.
+// Опоздать при этом нельзя: bulk IN — труба, которую опрашивает хост,
+// устройство физически не может прислать данные, пока в кольце нет TRB.
+// Ожидание TRB для UAS: сперва смотрим кэш (событие могло прийти и быть
+// разобрано, пока мы ждали другой TRB — типично для трубы статуса,
+// взведённой на время фазы данных), и только потом идём в кольцо.
+// Неблокирующая проверка: пришло ли событие этого TRB прямо сейчас.
+// В отличие от try_check_transfer_complete() чужие Transfer Event'ы не
+// выбрасывает, а складывает в кэш — иначе опрос трубы статуса съедал бы
+// событие фазы данных.
+static bool uas_poll_trb(uint64_t trb_addr, uint8_t &cc, uint32_t &res) {
+    if (uas_evt_cache_take(trb_addr, cc, res)) return true;
+    bool found = false;
+    Trb ev;
+    int drained = 0;
+    while (dequeue_event_trb(ev)) {
+        update_erdp();
+        uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        if (type == TRB_TYPE_TRANSFER_EVENT) {
+            if (!found && ev.parameter == trb_addr) {
+                cc = (uint8_t)(ev.status >> 24);
+                res = ev.status & 0xFFFFFFu;
+                found = true;
+            } else {
+                uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
+            }
+        }
+        if (++drained >= EVT_RING_DRAIN_SANITY_CAP) break;
+    }
+    return found;
+}
+
+static bool uas_wait_trb(seL4_CPtr console_ep, uint64_t trb_addr, uint32_t timeout_ms,
+                          uint8_t &cc, uint32_t &res) {
+    if (uas_evt_cache_take(trb_addr, cc, res)) return true;
+    return wait_transfer_completion(console_ep, trb_addr, timeout_ms, cc, res);
+}
+
+static uint64_t uas_arm_status(int idx, uint8_t slot_id, int buf_slot) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    uint64_t a = ring_enqueue_trb(dev.uas_status_ring,
+        to_dev_addr(dev.cbw_csw_paddr + UAS_SENSE_IU_OFFSET + (uint64_t)buf_slot * UAS_SENSE_IU_STRIDE),
+        UAS_SENSE_IU_STRIDE,
+        trb_type(TRB_TYPE_NORMAL) | (1u << 2) /*ISP — событие и на коротком пакете*/ | TRB_IOC);
+    ring_endpoint_doorbell(slot_id, dev.uas_status_dci, dev.uas_use_streams ? UAS_STREAM_ID : 0u);
+    return a;
+}
+
+// Полное восстановление всех четырёх труб после сбоя обмена: иначе на
+// трубе статуса остаётся висеть неотработанный приёмный TRB, и ответ
+// следующей команды уедет в чужой буфер.
+// Живое состояние всех четырёх труб из Device Context. dword0 биты[2:0]:
+// 0=Disabled, 1=Running, 2=Halted, 3=Stopped, 4=Error (xHCI 6.2.3). В
+// Device Context (в отличие от Input Context) индекс контекста РАВЕН DCI.
+// Печатается на КАЖДОМ отказе обмена: код завершения говорит, что пошло
+// не так на шине, а это — во что превратился сам эндпоинт.
+static void uas_dump_ep_states(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    volatile uint32_t *dc = devctx_vaddr_for(slot_id);
+    sys_puthex32(console_ep, "[USB]   UAS состояние труб cmd/status = ",
+                 ((read_ctx_dword(dc, dev.uas_cmd_dci, 0) & 0x7u) << 8)
+                 | (read_ctx_dword(dc, dev.uas_status_dci, 0) & 0x7u));
+    sys_puthex32(console_ep, "[USB]   UAS состояние труб data-in/data-out = ",
+                 ((read_ctx_dword(dc, dev.bulk_in_dci, 0) & 0x7u) << 8)
+                 | (read_ctx_dword(dc, dev.bulk_out_dci, 0) & 0x7u));
+}
+
+static void uas_recover_all_pipes(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    uas_evt_cache_clear(); // события отменённых передач больше не относятся ни к чему
+    recover_bulk_endpoint(console_ep, slot_id, dev.uas_cmd_dci, dev.uas_cmd_ring);
+    recover_bulk_endpoint(console_ep, slot_id, dev.uas_status_dci, dev.uas_status_ring,
+                          dev.uas_use_streams ? UAS_STREAM_ID : 0u);
+}
+
+// Один SCSI-обмен по UAS. Порядок «сначала Ready IU от устройства, потом
+// данные» — не наша выдумка: в эталонной реализации
+// (drivers/usb/storage/uas.c) при use_streams == 0 URB'ы данных
+// отправляются ИЗ обработчика IU_ID_READ_READY / IU_ID_WRITE_READY в
+// uas_stat_cmplt(). Bulk streams (единственный способ отправить данные,
+// не дожидаясь Ready) нужны только на SuperSpeed; там же в uas.c для
+// скорости ниже SuperSpeed выставляется use_streams = 0 и глубина 32.
+// Мы идём тем же путём без streams — он работает на любой скорости.
+static bool uas_scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const uint8_t *cdb, uint8_t cdb_len,
+                              bool data_dir_in, uint64_t data_paddr, uint32_t data_len,
+                              uint32_t &actual_data_len, uint8_t &scsi_status) {
+    driver_state_step(USB_STEP_SCSI_COMMAND); // пошаговый watchdog, см. common.h/UsbStep
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    actual_data_len = 0;
+    scsi_status = 0xFFu;
+    // Слоты колец переиспользуются по кругу, поэтому кэш событий не должен
+    // переживать команду: иначе адрес TRB из прошлой команды совпал бы с
+    // адресом нового TRB в том же слоте.
+    uas_evt_cache_clear();
+
+    // В режиме потоков тег команды ОБЯЗАН совпадать со Stream ID: именно
+    // по нему устройство адресует ответные передачи (в эталоне —
+    // urb->stream_id = cmdinfo->uas_tag). При глубине очереди 1 занят
+    // единственный поток, поэтому тег всегда UAS_STREAM_ID.
+    uint16_t tag = dev.uas_use_streams ? (uint16_t)UAS_STREAM_ID : dev.uas_next_tag++;
+    if (dev.uas_next_tag > UAS_MAX_TAGS) dev.uas_next_tag = 1;
+
+    // --- Command IU ---
+    volatile uint8_t *iu = uas_cmd_iu_vaddr(idx, 0);
+    for (uint32_t i = 0; i < UAS_CMD_IU_LEN; i++) iu[i] = 0;
+    iu[0] = UAS_IU_ID_COMMAND;
+    iu[2] = (uint8_t)(tag >> 8); iu[3] = (uint8_t)tag; // big-endian
+    iu[4] = UAS_TASK_ATTR_SIMPLE;
+    iu[6] = 0;   // ADDITIONAL CDB LENGTH — 0 при CDB <= 16 байт (в uas.c: ALIGN(cmd_len-16,4))
+    // iu[8..15] — LUN; int_to_scsilun(0) даёт восемь нулей, уже обнулено выше.
+    for (int i = 0; i < cdb_len && i < 16; i++) iu[16 + i] = cdb[i];
+
+    // Приёмный буфер под ПЕРВЫЙ ответ ставим ДО отправки команды — тот же
+    // порядок, что uas_submit_urbs() в Linux (sense URB раньше cmd URB).
+    uint64_t stat_trb = uas_arm_status(idx, slot_id, 0);
+
+    // ...и в потоковом режиме ТУДА ЖЕ, до команды, ставим TD данных.
+    // Эталон отправляет URB'ы именно в порядке статус -> данные -> команда
+    // (uas_submit_urbs). Прежний порядок (команда, дождались её, потом
+    // данные) оставлял окно: устройство уже получило команду и просит
+    // поток, а TRB в этом потоке ещё нет. Живой отказ 2026-09-07 —
+    // передача вставала, не добрав ровно один burst, при полностью
+    // исправном (Running) эндпоинте и без единого события.
+    uint64_t data_trb = 0;
+    uint32_t data_pieces = 0;
+    uint16_t data_mps = data_dir_in ? dev.uas.in_mps : dev.uas.out_mps;
+    if (data_len > 0 && dev.uas_use_streams) {
+        TrbRing &dr = data_dir_in ? dev.bulkin_ring : dev.bulkout_ring;
+        uint8_t ddci = data_dir_in ? dev.bulk_in_dci : dev.bulk_out_dci;
+        data_trb = bulk_enqueue_td(dr, slot_id, ddci, data_paddr, data_len,
+                                    UAS_STREAM_ID, data_mps, data_pieces);
+    }
+
+    uint64_t t_phase = read_cntvct();
+    uint64_t cmd_trb = ring_enqueue_trb(dev.uas_cmd_ring, to_dev_addr(dev.cbw_csw_paddr + UAS_CMD_IU_OFFSET),
+                                        UAS_CMD_IU_LEN, trb_type(TRB_TYPE_NORMAL) | TRB_IOC);
+    ring_endpoint_doorbell(slot_id, dev.uas_cmd_dci);
+    uint8_t cc = 0; uint32_t residual = 0;
+    cc = 0xFFu; residual = 0xFFFFFFFFu; // 0xFF = события не было вовсе (иначе печатался бы код прошлой фазы)
+    if (!uas_wait_trb(console_ep, cmd_trb, 1000, cc, residual) || (cc != 1 && cc != 13)) {
+        sys_puthex32(console_ep, "[USB] ОШИБКА UAS: Command IU не ушёл, код завершения ", cc);
+        uas_dump_ep_states(console_ep, idx, slot_id);
+        uas_recover_all_pipes(console_ep, idx, slot_id);
+        return false;
+    }
+    g_scsi_us_cbw += scsi_us_since(t_phase); // фаза 1: команда (аналог CBW у BOT)
+
+    // --- фаза данных ---
+    //
+    // РАЗВИЛКА ПО РЕЖИМУ, и она принципиальная. Read Ready / Write Ready
+    // IU — механизм ТОЛЬКО не-потокового режима: без Stream ID устройству
+    // больше нечем связать пакет данных с командой, поэтому оно сначала
+    // отдельным IU разрешает передачу. В потоковом режиме связь даёт сам
+    // Stream ID, и Ready IU не присылается ВООБЩЕ — данные отправляются
+    // вместе с командой. В эталоне это одна строка в uas_queuecommand_lck:
+    //     if (!devinfo->use_streams)
+    //         cmdinfo->state &= ~(SUBMIT_DATA_IN_URB | SUBMIT_DATA_OUT_URB);
+    // то есть флаги отправки данных снимаются ТОЛЬКО без потоков.
+    //
+    // Живой отказ 2026-09-07: в потоковом режиме я всё равно ждал Ready IU
+    // — таймаут, тег оставался занятым на устройстве, и следующая команда
+    // получала Response IU с кодом 0x0a (RC_OVERLAPPED_TAG).
+    t_phase = read_cntvct();
+    int sense_buf = 0; // куда придёт ИТОГОВЫЙ Sense IU
+    if (data_len > 0 && !dev.uas_use_streams) {
+        cc = 0xFFu; residual = 0xFFFFFFFFu; // 0xFF = события не было вовсе (иначе печатался бы код прошлой фазы)
+        if (!uas_wait_trb(console_ep, stat_trb, 1000, cc, residual) || (cc != 1 && cc != 13)) {
+            sys_puthex32(console_ep, "[USB] ОШИБКА UAS: не дождался Ready IU, код завершения ", cc);
+            // Сколько байт устройство всё-таки успело отдать (запрошено
+            // UAS_SENSE_IU_STRIDE) и первые байты буфера — даже частичный
+            // ответ отличает "труба мертва" от "ответ пришёл, но кривой".
+            sys_puthex32(console_ep, "[USB]   UAS: остаток невыбранного буфера = ", residual);
+            {
+                volatile uint8_t *st = uas_sense_iu_vaddr(idx, 0);
+                sys_puthex32(console_ep, "[USB]   UAS: первые 4 байта буфера статуса = ",
+                             ((uint32_t)st[0] << 24) | ((uint32_t)st[1] << 16) | ((uint32_t)st[2] << 8) | st[3]);
+            }
+            uas_dump_ep_states(console_ep, idx, slot_id);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        volatile uint8_t *st = uas_sense_iu_vaddr(idx, 0);
+        uint8_t iu_id = st[0];
+        uint16_t rtag = ((uint16_t)st[2] << 8) | st[3];
+        uint8_t expect = data_dir_in ? UAS_IU_ID_READ_READY : UAS_IU_ID_WRITE_READY;
+        if (iu_id == UAS_IU_ID_STATUS) {
+            // Законный исход: устройство отказало команде ещё до данных
+            // (CHECK CONDITION и т.п.) — Ready IU не будет вовсе.
+            scsi_status = st[6];
+            if (rtag != tag) {
+                sys_puthex32(console_ep, "[USB] ОШИБКА UAS: тег Sense IU не совпал с тегом команды, тег = ", rtag);
+                uas_recover_all_pipes(console_ep, idx, slot_id);
+                return false;
+            }
+            g_scsi_cmds++;
+            return true; // транспорт отработал; ненулевой scsi_status разбирает вызывающий
+        }
+        if (iu_id != expect) {
+            if (iu_id == UAS_IU_ID_RESPONSE) {
+                sys_puthex32(console_ep, "[USB] ОШИБКА UAS: устройство отвергло команду, Response IU код = ", st[7]);
+            } else {
+                sys_puthex32(console_ep, "[USB] ОШИБКА UAS: по трубе статуса пришёл неожиданный IU, id = ", iu_id);
+            }
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        if (rtag != tag) {
+            sys_puthex32(console_ep, "[USB] ОШИБКА UAS: тег Ready IU не совпал с тегом команды, тег = ", rtag);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        // Не-потоковый режим: первый приёмный буфер израсходован на Ready
+        // IU, под итоговый Sense IU нужен следующий. Ставим его ДО
+        // передачи данных — он «взводится» на время всей передачи.
+        sense_buf = 1;
+        stat_trb = uas_arm_status(idx, slot_id, sense_buf);
+    }
+    // Потоковый режим: устройство МОГЛО ответить по трубе статуса ещё до
+    // фазы данных — например, отвергнуть команду Response IU. Тогда
+    // данные ему уже не нужны, и слепая отправка 128 КБ в трубу
+    // заканчивается таймаутом (живой отказ 2026-09-07 на 6554-й команде).
+    // В эталоне это делается само собой: uas_stat_cmplt() на Response IU
+    // отменяет передачи данных. Здесь — явная неблокирующая проверка.
+    if (data_len > 0 && dev.uas_use_streams) {
+        uint8_t pcc = 0; uint32_t pres = 0;
+        if (uas_poll_trb(stat_trb, pcc, pres)) {
+            volatile uint8_t *st = uas_sense_iu_vaddr(idx, sense_buf);
+            uint8_t iu_id = st[0];
+            sys_puthex32(console_ep, "[USB] UAS: труба статуса ответила ДО фазы данных, IU id = ", iu_id);
+            if (iu_id == UAS_IU_ID_RESPONSE) {
+                sys_puthex32(console_ep, "[USB]   UAS: Response IU код = ", st[7]);
+            } else if (iu_id == UAS_IU_ID_STATUS) {
+                scsi_status = st[6];
+                sys_puthex32(console_ep, "[USB]   UAS: SCSI-статус = ", scsi_status);
+            }
+            // Данные не отправляем: устройство их уже не ждёт. Команда
+            // считается неуспешной — вызывающий увидит нулевую длину.
+            uas_dump_ep_states(console_ep, idx, slot_id);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+    }
+    if (data_len > 0) {
+        TrbRing &dring = data_dir_in ? dev.bulkin_ring : dev.bulkout_ring;
+        uint8_t  ddci_ = data_dir_in ? dev.bulk_in_dci : dev.bulk_out_dci;
+        bool ok;
+        if (dev.uas_use_streams) {
+            // TD уже стоит в потоке (см. выше) — осталось дождаться.
+            ok = bulk_wait_td(console_ep, slot_id, dring, ddci_, data_trb, data_len, actual_data_len,
+                               UAS_STREAM_ID, data_pieces, data_mps, /*defer_recovery=*/true);
+        } else {
+            ok = bulk_transfer(console_ep, slot_id, dring, ddci_, data_paddr, data_len, actual_data_len,
+                                0u, /*defer_recovery=*/true, data_mps);
+        }
+        if (!ok) {
+            sys_puts(console_ep, "[USB] ОШИБКА UAS: фаза данных не удалась.\n");
+            sys_puthex64(console_ep, "[USB]   UAS: успешных команд до отказа = ", g_uas_cmds_ok);
+            sys_puthex32(console_ep, "[USB]   UAS: длина передачи = ", data_len);
+            {
+                // Куда смотрит НАШ программный указатель кольца и куда —
+                // аппаратный. Расхождение показывает, что контроллер встал,
+                // а не что устройство молчит.
+                TrbRing &dr = data_dir_in ? dev.bulkin_ring : dev.bulkout_ring;
+                uint8_t ddci = data_dir_in ? dev.bulk_in_dci : dev.bulk_out_dci;
+                sys_puthex32(console_ep, "[USB]   UAS: кольцо данных enqueue_idx/pcs = ",
+                             ((uint32_t)dr.enqueue_idx << 8) | (dr.pcs & 1u));
+                volatile uint32_t *dc = devctx_vaddr_for(slot_id);
+                sys_puthex32(console_ep, "[USB]   UAS: EP dword0 трубы данных (ДО восстановления) = ", read_ctx_dword(dc, ddci, 0));
+                sys_puthex32(console_ep, "[USB]   UAS: EP dword2 (указатель на массив потоков) = ", read_ctx_dword(dc, ddci, 2));
+                // Живой Stream Context потока 1 этой трубы: биты[63:4] —
+                // куда контроллер дочитал, бит0 — DCS.
+                volatile uint32_t *sa = uas_streams_vaddr(idx, data_dir_in ? UAS_STREAM_ARRAY_DATA_IN_OFF
+                                                                          : UAS_STREAM_ARRAY_DATA_OUT_OFF);
+                // ДО восстановления: сюда ещё не писал наш Set TR Dequeue,
+                // поэтому указатель показывает, докуда реально дочитал
+                // контроллер. Сравнивать с адресом кольца + enqueue_idx*16.
+                sys_puthex32(console_ep, "[USB]   UAS: Stream Context[1] dword0 (ДО восстановления) = ", sa[UAS_STREAM_ID * 4 + 0]);
+                sys_puthex32(console_ep, "[USB]   UAS: Stream Context[1] dword2 = ", sa[UAS_STREAM_ID * 4 + 2]);
+                sys_puthex64(console_ep, "[USB]   UAS: база кольца данных (device-адрес) = ", dr.dev_base);
+                // Теперь, когда состояние прочитано, восстанавливаем трубу
+                // данных — bulk_transfer это делать не стал (defer_recovery).
+                recover_bulk_endpoint(console_ep, slot_id, ddci, dr,
+                                      dev.uas_use_streams ? UAS_STREAM_ID : 0u);
+            }
+            uas_dump_ep_states(console_ep, idx, slot_id);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+    }
+    { uint64_t d = scsi_us_since(t_phase); g_scsi_us_data += d;
+      if (g_scsi_cur_is_read) { g_scsi_us_data_rd += d;
+          if (g_scsi_cur_bytes >= 16384u) { g_scsi_big_rd_us += d; g_scsi_big_rd_bytes += g_scsi_cur_bytes; } }
+      else g_scsi_us_data_wr += d; } // фаза 2 завершена
+    g_scsi_bytes += data_len;
+
+    // --- итоговый Sense IU ---
+    // Таймаут больше, чем на остальных фазах: устройство может честно
+    // «думать» уже ПОСЛЕ приёма данных (внутреннее программирование
+    // флеш-памяти), и это не признак зависания.
+    t_phase = read_cntvct();
+    cc = 0xFFu; residual = 0xFFFFFFFFu; // 0xFF = события не было вовсе (иначе печатался бы код прошлой фазы)
+    if (!uas_wait_trb(console_ep, stat_trb, 5000, cc, residual) || (cc != 1 && cc != 13)) {
+        sys_puthex32(console_ep, "[USB] ОШИБКА UAS: не дождался Sense IU, код завершения ", cc);
+        uas_dump_ep_states(console_ep, idx, slot_id);
+        uas_recover_all_pipes(console_ep, idx, slot_id);
+        return false;
+    }
+    {
+        volatile uint8_t *st = uas_sense_iu_vaddr(idx, sense_buf);
+        uint8_t iu_id = st[0];
+        uint16_t rtag = ((uint16_t)st[2] << 8) | st[3];
+        if (iu_id == UAS_IU_ID_RESPONSE) {
+            sys_puthex32(console_ep, "[USB] ОШИБКА UAS: Response IU вместо Sense IU, код = ", st[7]);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        if (iu_id != UAS_IU_ID_STATUS) {
+            sys_puthex32(console_ep, "[USB] ОШИБКА UAS: вместо Sense IU пришёл id = ", iu_id);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        if (rtag != tag) {
+            // Тот же класс отказа, что несовпадение dCSWTag у BOT
+            // (issuse.txt №13): ответ относится не к этой команде,
+            // доверять его статусу нельзя.
+            sys_puthex32(console_ep, "[USB] ОШИБКА UAS: тег Sense IU не совпал с тегом команды, тег = ", rtag);
+            uas_recover_all_pipes(console_ep, idx, slot_id);
+            return false;
+        }
+        scsi_status = st[6]; // SCSI STATUS, 0 = GOOD
+        if (scsi_status != 0) {
+            uint16_t sense_len = ((uint16_t)st[14] << 8) | st[15];
+            sys_puthex32(console_ep, "[USB]   UAS: SCSI-статус не GOOD, статус = ", scsi_status);
+            if (sense_len >= 14) {
+                // Fixed-format sense data (SPC): [2] бит[3:0] = Sense Key,
+                // [12] = ASC, [13] = ASCQ.
+                sys_puthex32(console_ep, "[USB]   UAS: sense key/ASC/ASCQ = ",
+                             ((uint32_t)(st[16 + 2] & 0x0Fu) << 16) | ((uint32_t)st[16 + 12] << 8) | st[16 + 13]);
+            }
+        }
+    }
+    g_scsi_us_csw += scsi_us_since(t_phase); // фаза 3: статус (аналог CSW у BOT)
+    g_scsi_cmds++;
+    g_uas_cmds_ok++;
+    return true;
+}
+
+// Переключение накопителя в режим UAS: SET_INTERFACE на alt-setting
+// UAS-интерфейса + Configure Endpoint уже на ЧЕТЫРЕ трубы вместо двух.
+// Зовётся ПОСЛЕ Шага 11 (SET_CONFIGURATION): до него устройство ещё не в
+// Configured-состоянии и SET_INTERFACE законно отвергается.
+static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed) {
+    driver_state_step(USB_STEP_SET_CONFIG); // пошаговый watchdog, см. common.h/UsbStep
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    const UsbUasPipes &u = dev.uas;
+
+    // DCI = 2*номер эндпоинта + (1 для IN), см. xHCI 4.5.1.
+    uint8_t cmd_dci    = (uint8_t)(2u * (u.cmd_addr    & 0x0Fu));
+    uint8_t status_dci = (uint8_t)(2u * (u.status_addr & 0x0Fu) + 1u);
+    uint8_t in_dci     = (uint8_t)(2u * (u.in_addr     & 0x0Fu) + 1u);
+    uint8_t out_dci    = (uint8_t)(2u * (u.out_addr    & 0x0Fu));
+    uint8_t max_dci = cmd_dci;
+    if (status_dci > max_dci) max_dci = status_dci;
+    if (in_dci  > max_dci) max_dci = in_dci;
+    if (out_dci > max_dci) max_dci = out_dci;
+
+    // ПОРЯДОК ЗДЕСЬ ВАЖЕН И БЫЛ ОБРАТНЫМ — это и был отказ первого живого
+    // прогона (труба статуса возвращала USB Transaction Error, следом
+    // переставал отвечать и EP0). В эталоне (usb_set_interface(),
+    // drivers/usb/core/message.c) управляющий запрос SET_INTERFACE идёт
+    // ПОСЛЕ usb_hcd_alloc_bandwidth(), то есть после Configure Endpoint:
+    // «usb3 hosts configure the interface in usb_hcd_alloc_bandwidth»
+    // — контроллер обязан узнать о новых трубах ДО того, как устройство
+    // на них переключится, иначе есть окно, где устройство уже на alt 1,
+    // а у контроллера сконфигурированы трубы alt 0.
+    init_trb_ring(dev.bulkout_ring,    bulkoutring_vaddr(idx),  dev.bulkout_trring_paddr);
+    init_trb_ring(dev.bulkin_ring,     bulkinring_vaddr(idx),   dev.bulkin_trring_paddr);
+    init_trb_ring(dev.uas_cmd_ring,    uas_cmdring_vaddr(idx),  dev.uas_cmdring_paddr);
+    init_trb_ring(dev.uas_status_ring, uas_statring_vaddr(idx), dev.uas_statring_paddr);
+
+    // Input Control Context: Add = A0 (Slot — обязателен, меняем Context
+    // Entries) + все четыре трубы. Трубы данных перенастраиваются заново
+    // вместе с остальными: их кольца только что переинициализированы, и
+    // аппаратный dequeue-указатель обязан на это переинициализированное
+    // начало и показывать.
+    // Drop — эндпоинты ТЕКУЩЕЙ (Bulk-Only) alt-настройки: они сейчас в
+    // Running-состоянии, а xHCI требует Drop+Add, чтобы переконфигурировать
+    // не-Disabled эндпоинт. Ровно это делает usb_hcd_alloc_bandwidth():
+    // «Drop all the endpoints in the current alt setting» -> «Add all the
+    // endpoints in the new alt setting». Первый живой прогон ставил только
+    // Add — контроллер команду принял (код 1), но трубы остались в
+    // рассогласованном состоянии.
+    uint32_t drop_flags = ((1u << dev.bulk_out_dci) | (1u << dev.bulk_in_dci)) & ~0x3u;
+    for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), 0, d, 0);
+    write_ctx_dword(inputctx(), 0, 0, drop_flags);
+    write_ctx_dword(inputctx(), 0, 1, (1u << 0) | (1u << cmd_dci) | (1u << status_dci) | (1u << in_dci) | (1u << out_dci));
+
+    // Slot Context переписывается ЦЕЛИКОМ (раз A0 установлен) — те же
+    // поля и та же логика Route String, что в step10_configure_endpoints().
+    for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), 1, d, 0);
+    uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
+    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
+    write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
+
+    // Нужны ли bulk streams. Решает НЕ наше желание, а связка "скорость +
+    // что объявило устройство": на SuperSpeed трубы статуса и данных
+    // объявляют потоки, и без Stream ID устройство их обмен не
+    // обслуживает (живой отказ 2026-09-07: труба статуса -> USB
+    // Transaction Error -> Halted). Та же развилка в эталоне:
+    // uas_configure_endpoints() ниже SuperSpeed ставит use_streams=0, на
+    // SuperSpeed зовёт usb_alloc_streams() на три трубы (eps+1).
+    bool want_streams = (port_speed >= 4) && (u.status_streams > 0 || u.in_streams > 0 || u.out_streams > 0);
+    if (want_streams && g_max_psa_size < UAS_MAX_PSTREAMS) {
+        // Тот же отказ, что в uas-detect.h: на SuperSpeed без потоков у
+        // контроллера UAS не поднимают, а честно уходят на Bulk-Only.
+        sys_puts(console_ep, "[USB] UAS: устройство требует bulk streams, а контроллер их не поддерживает — UAS не включаем.\n");
+        return false;
+    }
+    dev.uas_use_streams = want_streams;
+    sys_puthex32(console_ep, "[USB] UAS: потоки на трубах status/in/out (log2) = ",
+                 ((uint32_t)u.status_streams << 16) | ((uint32_t)u.in_streams << 8) | u.out_streams);
+    sys_puthex32(console_ep, "[USB] UAS: режим потоков включён (1=да) = ", dev.uas_use_streams ? 1u : 0u);
+
+    // Stream Context Array трубы: линейный массив (LSA=1), адресуемый
+    // Stream ID напрямую. Вход 0 зарезервирован спекой, вход UAS_STREAM_ID
+    // указывает на кольцо этой трубы, остальные остаются нулевыми.
+    auto build_stream_array = [&](uint32_t array_off, uint64_t trring_dev_base) -> uint64_t {
+        volatile uint32_t *arr = uas_streams_vaddr(idx, array_off);
+        for (uint32_t e = 0; e < UAS_STREAM_ARRAY_ENTRIES * 4; e++) arr[e] = 0;
+        volatile uint32_t *sc = arr + UAS_STREAM_ID * 4;
+        // dword0: биты[63:4] — TR Dequeue Pointer, биты[3:1] — Stream
+        // Context Type (1 = Primary Transfer Ring), бит0 — DCS.
+        sc[0] = (uint32_t)(trring_dev_base & 0xFFFFFFF0u) | (1u << 1) | 1u;
+        sc[1] = (uint32_t)(trring_dev_base >> 32);
+        return to_dev_addr(dev.uas_streams_paddr + array_off);
+    };
+
+    // stream_array_dev_base != 0 — эндпоинт потоковый: TR Dequeue Pointer
+    // указывает не на кольцо, а на Stream Context Array, и в dword0
+    // выставляются MaxPStreams и LSA (xHCI 6.2.3). DCS при MaxPStreams>0
+    // не используется — он свой у каждого Stream Context.
+    auto write_bulk_ep = [&](uint8_t dci, uint32_t ep_type, uint16_t mps, uint8_t max_burst,
+                              uint64_t trring_dev_base, uint64_t stream_array_dev_base) {
+        int ctx_index = (int)dci + 1;
+        for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), ctx_index, d, 0);
+        if (stream_array_dev_base) {
+            write_ctx_dword(inputctx(), ctx_index, 0, (UAS_MAX_PSTREAMS << 10) | (1u << 15) /*LSA*/);
+        }
+        write_ctx_dword(inputctx(), ctx_index, 1,
+                         (3u << 1) /*CErr*/ | (ep_type << 3) | ((uint32_t)max_burst << 8) | ((uint32_t)mps << 16));
+        uint64_t deq = stream_array_dev_base ? stream_array_dev_base : trring_dev_base;
+        write_ctx_dword(inputctx(), ctx_index, 2,
+                         (uint32_t)(deq & 0xFFFFFFFFu) | (stream_array_dev_base ? 0u : 1u /*DCS*/));
+        write_ctx_dword(inputctx(), ctx_index, 3, (uint32_t)(deq >> 32));
+        write_ctx_dword(inputctx(), ctx_index, 4, mps); // Average TRB Length
+    };
+    uint64_t sa_out = 0, sa_in = 0, sa_status = 0;
+    if (dev.uas_use_streams) {
+        sa_out    = build_stream_array(UAS_STREAM_ARRAY_DATA_OUT_OFF, dev.bulkout_ring.dev_base);
+        sa_in     = build_stream_array(UAS_STREAM_ARRAY_DATA_IN_OFF,  dev.bulkin_ring.dev_base);
+        sa_status = build_stream_array(UAS_STREAM_ARRAY_STATUS_OFF,   dev.uas_status_ring.dev_base);
+    }
+    write_bulk_ep(out_dci,    2 /*Bulk Out*/, u.out_mps,    u.out_burst,    dev.bulkout_ring.dev_base,    sa_out);
+    write_bulk_ep(in_dci,     6 /*Bulk In*/,  u.in_mps,     u.in_burst,     dev.bulkin_ring.dev_base,     sa_in);
+    // Труба КОМАНД потоков не объявляет — всегда обычный эндпоинт.
+    write_bulk_ep(cmd_dci,    2 /*Bulk Out*/, u.cmd_mps,    u.cmd_burst,    dev.uas_cmd_ring.dev_base,    0);
+    write_bulk_ep(status_dci, 6 /*Bulk In*/,  u.status_mps, u.status_burst, dev.uas_status_ring.dev_base, sa_status);
+
+    uint64_t cmd_paddr = enqueue_command_trb(to_dev_addr(g_inputctx_paddr), 0,
+                                              trb_type(TRB_TYPE_CONFIGURE_ENDPOINT_CMD) | ((uint32_t)slot_id << 24));
+    uint8_t completion_code = 0, ret_slot = 0;
+    if (!wait_command_completion(console_ep, cmd_paddr, 500, completion_code, ret_slot)) {
+        sys_puts(console_ep, "[USB] ОШИБКА UAS: Configure Endpoint не завершился за 500мс.\n");
+        return false;
+    }
+    if (completion_code != 1) {
+        sys_puthex32(console_ep, "[USB] ОШИБКА UAS: Configure Endpoint завершился с кодом ", completion_code);
+        return false;
+    }
+    // Трубы приняты контроллером — с этого момента откат обязан сбрасывать
+    // их Drop-флагами, даже если SET_INTERFACE ниже провалится.
+    dev.uas_eps_configured = true;
+
+    // ДИАГНОСТИКА: читаем ЖИВОЙ Device Context обратно. Код завершения 1 у
+    // Configure Endpoint говорит только "команда принята"; реальное
+    // состояние эндпоинта — dword0 биты[2:0] (0=Disabled, 1=Running,
+    // 2=Halted, 3=Stopped, 4=Error). В Device Context индекс контекста
+    // РАВЕН DCI (Input Control Context'а там нет), Slot Context = 0.
+    {
+        volatile uint32_t *dc = devctx_vaddr_for(slot_id);
+        sys_puthex32(console_ep, "[USB] UAS DIAG: Slot Context dword0 = ", read_ctx_dword(dc, 0, 0));
+        sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 data-out/data-in = ",
+                     ((read_ctx_dword(dc, out_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, in_dci, 0) & 0x7u));
+        sys_puthex32(console_ep, "[USB] UAS DIAG: EP dword0 status/cmd = ",
+                     ((read_ctx_dword(dc, status_dci, 0) & 0x7u) << 8) | (read_ctx_dword(dc, cmd_dci, 0) & 0x7u));
+    }
+
+    // И только теперь — сам управляющий запрос переключения интерфейса.
+    sys_puthex32(console_ep, "[USB] UAS: SET_INTERFACE интерфейс/alt = ",
+                 ((uint32_t)u.interface_num << 8) | u.alt_setting);
+    // bmRequestType=0x01 (Host-to-Device|Standard|Interface), bRequest=0x0B
+    // (SET_INTERFACE), wValue=alt setting, wIndex=номер интерфейса.
+    if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x01, 0x0B, u.alt_setting, u.interface_num)) {
+        sys_puts(console_ep, "[USB] ОШИБКА UAS: SET_INTERFACE не удался.\n");
+        return false;
+    }
+
+    // Трубы ДАННЫХ у UAS — те же bulk IN/OUT, но номера эндпоинтов берутся
+    // из UAS-дескрипторов, а не из Bulk-Only alt-setting'а: совпадение
+    // адресов у конкретного накопителя ничего не гарантирует.
+    dev.bulk_in_dci  = in_dci;
+    dev.bulk_out_dci = out_dci;
+    dev.uas_cmd_dci    = cmd_dci;
+    dev.uas_status_dci = status_dci;
+    dev.uas_next_tag = 1;
+    dev.uas_active = true;
+    // ДИАГНОСТИКА: спрашиваем У УСТРОЙСТВА, на какой alt-настройке оно
+    // считает себя (GET_INTERFACE, bmRequestType=0x81
+    // Device-to-Host|Standard|Interface, bRequest=0x0A, один байт ответа).
+    // SET_INTERFACE выше вернул успех — но это ответ на управляющий
+    // запрос, а не доказательство, что интерфейс реально переключился.
+    {
+        volatile uint8_t *cb = ctrlbuf_vaddr(idx);
+        cb[0] = 0xEE; // заведомо невозможное значение — чтобы отличить "не записано"
+        uint32_t got = 0;
+        if (ep0_control_in(console_ep, dev.ep0_ring, slot_id, 0x81, 0x0A, 0, u.interface_num, 1,
+                            dev.ctrl_buf_paddr, got)) {
+            sys_puthex32(console_ep, "[USB] UAS DIAG: GET_INTERFACE вернул alt = ", cb[0]);
+        } else {
+            sys_puts(console_ep, "[USB] UAS DIAG: GET_INTERFACE не удался.\n");
+        }
+    }
+    sys_puthex32(console_ep, "[USB] UAS: включён. DCI cmd/status = ", ((uint32_t)cmd_dci << 8) | status_dci);
+    sys_puthex32(console_ep, "[USB] UAS: DCI данных in/out = ", ((uint32_t)in_dci << 8) | out_dci);
+    return true;
+}
+
+// Первая проверка транспорта — команда БЕЗ фазы данных (TEST UNIT READY,
+// шестибайтный CDB, opcode 0x00). Смысл именно в отсутствии данных: тогда
+// устройство обязано ответить по трубе статуса СРАЗУ Sense IU, минуя
+// Ready IU и фазу данных. Так отказ трубы статуса отделяется от всего
+// остального: если не проходит и это, вопрос не в логике Ready IU и не в
+// трубах данных, а в самой трубе статуса или в том, что устройство не в
+// режиме UAS.
+static bool uas_probe_no_data(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
+    sys_puts(console_ep, "[USB] UAS: пробная команда БЕЗ данных (TEST UNIT READY)...\n");
+    uint8_t cdb[16] = {0};
+    cdb[0] = 0x00; // TEST UNIT READY
+    uint32_t actual = 0;
+    uint8_t status = 0xFFu;
+    if (!uas_scsi_command(console_ep, idx, slot_id, cdb, 6, /*data_dir_in=*/false, 0, 0, actual, status)) {
+        sys_puts(console_ep, "[USB] UAS: пробная команда без данных НЕ прошла — труба статуса не отвечает.\n");
+        return false;
+    }
+    sys_puthex32(console_ep, "[USB] UAS: пробная команда без данных прошла, SCSI-статус = ", status);
+    return true;
+}
+
+// Откат на Bulk-Only Transport: SET_INTERFACE обратно на alt 0 и обычный
+// Configure Endpoint на две трубы (step10 сам восстановит bulk_*_dci и
+// переинициализирует кольца). Вызывается, если включение UAS не удалось
+// ИЛИ если первая же SCSI-команда по нему не прошла.
+static void uas_fallback_to_bot(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    dev.uas_active = false;
+    sys_puts(console_ep, "[USB] UAS: откатываюсь на Bulk-Only Transport.\n");
+    // Зеркало step_uas_setup(): сперва Configure Endpoint, сбрасывающий
+    // трубы UAS и возвращающий bulk-эндпоинты, и только потом управляющий
+    // запрос SET_INTERFACE(alt 0) — тот же порядок, что у эталонного
+    // usb_set_interface().
+    uint32_t drop_flags = 0;
+    if (dev.uas_eps_configured) {
+        const UsbUasPipes &u = dev.uas;
+        drop_flags = (1u << (2u * (u.cmd_addr    & 0x0Fu)))
+                   | (1u << (2u * (u.status_addr & 0x0Fu) + 1u))
+                   | (1u << (2u * (u.in_addr     & 0x0Fu) + 1u))
+                   | (1u << (2u * (u.out_addr    & 0x0Fu)));
+        dev.uas_eps_configured = false;
+    }
+    if (!step10_configure_endpoints(console_ep, idx, slot_id, port, port_speed, drop_flags)) {
+        sys_puts(console_ep, "[USB]   ОШИБКА: возврат bulk-эндпоинтов Bulk-Only не удался.\n");
+    }
+    if (!ep0_control_no_data(console_ep, dev.ep0_ring, slot_id, 0x01, 0x0B, 0 /*alt 0*/, dev.uas.interface_num)) {
+        sys_puts(console_ep, "[USB]   ОШИБКА: SET_INTERFACE(alt 0) не удался — устройство может остаться нерабочим.\n");
+    }
 }
 
 constexpr uint32_t BOT_CBW_SIGNATURE = 0x43425355u; // "USBC"
@@ -3174,6 +4146,13 @@ static void bot_reset_recovery(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
 static bool scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const uint8_t *cdb, uint8_t cdb_len,
                           bool data_dir_in, uint64_t data_paddr, uint32_t data_len,
                           uint32_t &actual_data_len, uint8_t &csw_status) {
+    // UAS — тот же SCSI поверх другого транспорта: вся вышележащая
+    // логика (INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) /
+    // WRITE(10)) не меняется ни на строку, подменяется только транспорт.
+    if (g_usb_devices[idx].uas_active) {
+        return uas_scsi_command(console_ep, idx, slot_id, cdb, cdb_len, data_dir_in,
+                                 data_paddr, data_len, actual_data_len, csw_status);
+    }
     driver_state_step(USB_STEP_SCSI_COMMAND); // пошаговый watchdog, см. common.h/UsbStep
     UsbDeviceSlot &dev = g_usb_devices[idx];
     volatile uint8_t *cbw = cbw_vaddr(idx);
@@ -3193,7 +4172,8 @@ static bool scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const u
 
     uint32_t actual = 0;
     uint64_t t_phase = read_cntvct();
-    if (!bulk_transfer(console_ep, slot_id, dev.bulkout_ring, dev.bulk_out_dci, dev.cbw_csw_paddr, 31, actual)) {
+    if (!bulk_transfer(console_ep, slot_id, dev.bulkout_ring, dev.bulk_out_dci, dev.cbw_csw_paddr, 31, actual,
+                        0, false, dev.bulk_eps.bulk_out_mps)) {
         sys_puts(console_ep, "[USB] ОШИБКА: отправка CBW не удалась.\n");
         return false;
     }
@@ -3203,8 +4183,10 @@ static bool scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const u
     actual_data_len = 0;
     if (data_len > 0) {
         bool ok = data_dir_in
-            ? bulk_transfer(console_ep, slot_id, dev.bulkin_ring, dev.bulk_in_dci, data_paddr, data_len, actual_data_len)
-            : bulk_transfer(console_ep, slot_id, dev.bulkout_ring, dev.bulk_out_dci, data_paddr, data_len, actual_data_len);
+            ? bulk_transfer(console_ep, slot_id, dev.bulkin_ring, dev.bulk_in_dci, data_paddr, data_len, actual_data_len,
+                             0, false, dev.bulk_eps.bulk_in_mps)
+            : bulk_transfer(console_ep, slot_id, dev.bulkout_ring, dev.bulk_out_dci, data_paddr, data_len, actual_data_len,
+                             0, false, dev.bulk_eps.bulk_out_mps);
         if (!ok) {
             sys_puts(console_ep, "[USB] ОШИБКА: Data-стадия SCSI-команды не удалась.\n");
             return false;
@@ -3218,7 +4200,8 @@ static bool scsi_command(seL4_CPtr console_ep, int idx, uint8_t slot_id, const u
       else g_scsi_us_data_wr += d; } // фаза 2 завершена
     g_scsi_bytes   += data_len;
     t_phase = read_cntvct();
-    if (!bulk_transfer(console_ep, slot_id, dev.bulkin_ring, dev.bulk_in_dci, dev.cbw_csw_paddr + 64, 13, csw_actual)) {
+    if (!bulk_transfer(console_ep, slot_id, dev.bulkin_ring, dev.bulk_in_dci, dev.cbw_csw_paddr + 64, 13, csw_actual,
+                        0, false, dev.bulk_eps.bulk_in_mps)) {
         sys_puts(console_ep, "[USB] ОШИБКА: приём CSW не удался.\n");
         return false;
     }
@@ -3425,22 +4408,36 @@ static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t coun
     cdb[4] = (uint8_t)(lba >> 8);  cdb[5] = (uint8_t)lba;
     cdb[7] = (uint8_t)(count >> 8); cdb[8] = (uint8_t)count; // Transfer Length, big-endian
 
-    // Зеро-копи: если приёмник уже в SHM, читаем ПРЯМО в него.
-    uint64_t direct_pa = shm_paddr_for(buffer, count * 512u);
-    uint64_t dma_pa = direct_pa ? direct_pa : dev.bounce_paddr;
+    // В режиме UAS крупная передача режется на несколько SCSI-команд (см.
+    // UAS_MAX_XFER_SECTORS). Для Bulk-Only ничего не меняется: предел там
+    // равен самому запросу, и цикл выполняется ровно один раз.
+    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : count;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > max_chunk) n = max_chunk;
+        uint32_t clba = lba + done;
+        cdb[2] = (uint8_t)(clba >> 24); cdb[3] = (uint8_t)(clba >> 16);
+        cdb[4] = (uint8_t)(clba >> 8);  cdb[5] = (uint8_t)clba;
+        cdb[7] = (uint8_t)(n >> 8); cdb[8] = (uint8_t)n;
+        void *dst = (void*)((char*)buffer + (uintptr_t)done * 512u);
 
-    uint32_t actual = 0;
-    uint8_t csw_status = 0xFFu;
-    if (!scsi_command(g_console_ep, idx, dev.slot_id, cdb, 10, /*data_dir_in=*/true, dma_pa,
-                       count * 512u, actual, csw_status)) {
-        return false;
+        // Зеро-копи: если приёмник уже в SHM, читаем ПРЯМО в него.
+        uint64_t direct_pa = shm_paddr_for(dst, n * 512u);
+        uint64_t dma_pa = direct_pa ? direct_pa : dev.bounce_paddr;
+
+        uint32_t actual = 0;
+        uint8_t csw_status = 0xFFu;
+        if (!scsi_command(g_console_ep, idx, dev.slot_id, cdb, 10, /*data_dir_in=*/true, dma_pa,
+                           n * 512u, actual, csw_status)) {
+            return false;
+        }
+        if (csw_status != 0) return false;
+        // issuse.txt №11: короткий пакет означал бы, что хвост
+        // bounce-буфера — не свежие данные, а мусор прошлого вызова.
+        if (actual != n * 512u) return false;
+        if (!direct_pa) my_memcpy(dst, (const void*)bounce_vaddr(idx), (int)(n * 512u));
+        done += n;
     }
-    if (csw_status != 0) return false;
-    // issuse.txt №11: short packet (actual < запрошенного) означало бы, что
-    // хвост bounce-буфера — не свежие данные с устройства, а мусор
-    // предыдущего вызова; раньше это молча копировалось наружу.
-    if (actual != count * 512u) return false;
-    if (!direct_pa) my_memcpy(buffer, (const void*)bounce_vaddr(idx), (int)(count * 512u));
     // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
     // g_usb_liveness_ntfn выше.
     if (g_usb_liveness_ntfn != 0) seL4_Signal(g_usb_liveness_ntfn);
@@ -3459,29 +4456,40 @@ static bool hardware_usb_rw_generic_write(int idx, uint32_t sector, uint32_t cou
     if (!RPI4_USB_ALLOW_WRITE) return false;
     if (count == 0 || count > USB_MAX_SECTORS_PER_IO) return false;
     UsbDeviceSlot &dev = g_usb_devices[idx];
-    // Зеро-копи: если источник уже в SHM, отдаём контроллеру его физический
-    // адрес напрямую и не перекладываем 128 КБ в bounce (см. shm_paddr_for).
-    uint64_t direct_pa = shm_paddr_for(buffer, count * 512u);
-    if (!direct_pa) my_memcpy((void*)bounce_vaddr(idx), buffer, (int)(count * 512u));
-
     uint8_t cdb[16] = {0};
     cdb[0] = 0x2A; // WRITE(10)
     uint32_t lba = dev.partition_start_sector + sector;
-    cdb[2] = (uint8_t)(lba >> 24); cdb[3] = (uint8_t)(lba >> 16);
-    cdb[4] = (uint8_t)(lba >> 8);  cdb[5] = (uint8_t)lba;
-    cdb[7] = (uint8_t)(count >> 8); cdb[8] = (uint8_t)count; // Transfer Length, big-endian
 
-    uint32_t actual = 0;
-    uint8_t csw_status = 0xFFu;
-    if (!scsi_command(g_console_ep, idx, dev.slot_id, cdb, 10, /*data_dir_in=*/false,
-                       direct_pa ? direct_pa : dev.bounce_paddr,
-                       count * 512u, actual, csw_status)) {
-        return false;
+    // Симметрично чтению: в режиме UAS крупная запись режется на несколько
+    // SCSI-команд, для Bulk-Only цикл выполняется один раз.
+    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : count;
+    bool ok = true;
+    for (uint32_t done = 0; done < count && ok; ) {
+        uint32_t n = count - done;
+        if (n > max_chunk) n = max_chunk;
+        uint32_t clba = lba + done;
+        cdb[2] = (uint8_t)(clba >> 24); cdb[3] = (uint8_t)(clba >> 16);
+        cdb[4] = (uint8_t)(clba >> 8);  cdb[5] = (uint8_t)clba;
+        cdb[7] = (uint8_t)(n >> 8); cdb[8] = (uint8_t)n; // Transfer Length, big-endian
+        const void *src = (const void*)((const char*)buffer + (uintptr_t)done * 512u);
+
+        // Зеро-копи: если источник уже в SHM, отдаём контроллеру его
+        // физический адрес напрямую (см. shm_paddr_for).
+        uint64_t direct_pa = shm_paddr_for(src, n * 512u);
+        if (!direct_pa) my_memcpy((void*)bounce_vaddr(idx), src, (int)(n * 512u));
+
+        uint32_t actual = 0;
+        uint8_t csw_status = 0xFFu;
+        if (!scsi_command(g_console_ep, idx, dev.slot_id, cdb, 10, /*data_dir_in=*/false,
+                           direct_pa ? direct_pa : dev.bounce_paddr,
+                           n * 512u, actual, csw_status)) {
+            return false;
+        }
+        // issuse.txt №11: симметрично чтению — приняли меньше запрошенного,
+        // значит запись не полноценная, даже если статус формально 0.
+        ok = (csw_status == 0 && actual == n * 512u);
+        done += n;
     }
-    // issuse.txt №11: симметрично чтению — если устройство приняло меньше
-    // байт, чем запрошено, это не полноценная успешная запись, даже если
-    // CSW status формально 0.
-    bool ok = csw_status == 0 && actual == count * 512u;
     // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
     // g_usb_liveness_ntfn выше.
     if (ok && g_usb_liveness_ntfn != 0) seL4_Signal(g_usb_liveness_ntfn);
@@ -3670,6 +4678,8 @@ static bool xhci_controller_init(seL4_CPtr console_ep, uint32_t &max_ports) {
 
     uint8_t caplen; uint32_t hcsparams1, hcsparams2, hccparams1;
     if (!step1_read_capabilities(console_ep, caplen, hcsparams1, hcsparams2, hccparams1)) return false;
+    g_max_psa_size = (hccparams1 >> 12) & 0xFu;
+    sys_puthex32(console_ep, "[USB]   Max Primary Stream Array Size (HCCPARAMS1[15:12]) = ", g_max_psa_size);
 
     g_op_base = g_xhci_base + caplen;
     if ((caplen % 8) != 0) {
@@ -3773,6 +4783,14 @@ static int resolve_device_by_path(char *path) {
 // enumerate_device_behind_hub() могла переиспользовать его же, а не
 // дублировать 15 строк подряд идущих вызовов.
 static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed) {
+    // Транспорт выбирается заново на КАЖДОМ перечислении: слот
+    // переиспользуется без обнуления (см. find_free_device_slot() —
+    // освобождение это только in_use=false), и остатки от прежнего
+    // накопителя в этом же слоте иначе поехали бы дальше.
+    g_usb_devices[idx].uas_active = false;
+    g_usb_devices[idx].uas_eps_configured = false;
+    g_usb_devices[idx].uas_use_streams = false;
+    g_usb_devices[idx].uas = UsbUasPipes{};
     step8_get_device_descriptor(console_ep, idx, slot_id);
     if (!g_usb_devices[idx].found.found) return;
     // Milestone 3 — bDeviceClass часто 0 (класс на уровне Interface, не
@@ -3812,11 +4830,32 @@ static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, ui
     // диаграмма состояний устройства).
     if (!step10_configure_endpoints(console_ep, idx, slot_id, port, port_speed)) return;
     if (!step11_set_configuration(console_ep, idx, slot_id)) return;
+    // UAS — переключаем транспорт ДО первой SCSI-команды, чтобы INQUIRY/
+    // TEST UNIT READY/READ CAPACITY уже шли по нему и служили его первой
+    // живой проверкой. Любая осечка — откат на Bulk-Only, устройство
+    // остаётся рабочим.
+    if (USB_UAS_ENABLE && g_usb_devices[idx].uas.found) {
+        if (!step_uas_setup(console_ep, idx, slot_id, port, port_speed)) {
+            uas_fallback_to_bot(console_ep, idx, slot_id, port, port_speed);
+        } else if (!uas_probe_no_data(console_ep, idx, slot_id)) {
+            // Транспорт не отвечает даже на команду без данных — дальше
+            // INQUIRY/READ CAPACITY только испортят картину.
+            uas_fallback_to_bot(console_ep, idx, slot_id, port, port_speed);
+        }
+    }
     // Milestone 5 — первая настоящая проверка данных через bulk-эндпоинты.
     step12_inquiry(console_ep, idx, slot_id);
     // Milestone 6 — готовность устройства + ёмкость (нужна для Milestone 7,
     // монтирования exFAT).
-    if (!step13_test_unit_ready(console_ep, idx, slot_id)) return;
+    if (!step13_test_unit_ready(console_ep, idx, slot_id)) {
+        if (!g_usb_devices[idx].uas_active) return;
+        // Первая же команда по UAS не прошла — это ровно тот случай, ради
+        // которого держим откат: возвращаемся на BOT и пробуем ещё раз.
+        sys_puts(console_ep, "[USB] UAS: первая SCSI-команда не прошла.\n");
+        uas_fallback_to_bot(console_ep, idx, slot_id, port, port_speed);
+        step12_inquiry(console_ep, idx, slot_id);
+        if (!step13_test_unit_ready(console_ep, idx, slot_id)) return;
+    }
     if (!step14_read_capacity(console_ep, idx, slot_id)) return;
     // Milestone 7 — монтируем exFAT (только чтение).
     step15_mount_filesystem(console_ep, idx, slot_id);
@@ -4483,15 +5522,21 @@ int main(int argc, char *argv[]) {
     g_bulkout_trring_paddr_base = ipc->msg[BOOT_USB_BULKOUT_TRRING_PADDR];
     g_bulkin_trring_paddr_base  = ipc->msg[BOOT_USB_BULKIN_TRRING_PADDR];
     g_cbw_csw_paddr_base        = ipc->msg[BOOT_USB_CBW_CSW_PADDR];
+    g_uas_cmdring_paddr_base    = ipc->msg[BOOT_USB_UAS_CMDRING_PADDR];
+    g_uas_statring_paddr_base   = ipc->msg[BOOT_USB_UAS_STATRING_PADDR];
+    g_uas_streams_paddr_base    = ipc->msg[BOOT_USB_UAS_STREAMS_PADDR];
     g_bounce_paddr_base         = ipc->msg[BOOT_USB_BOUNCE_PADDR];
     // Фаза 15 — раскладываем базы на per-device paddr'ы, один раз, до
     // bring-up (см. struct UsbDeviceSlot/h/platform.h — страницы подряд,
     // idx-е по 4096 байт).
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
-        g_usb_devices[i].ep0_trring_paddr     = g_ep0_trring_paddr_base     + (seL4_Word)i * 4096;
+        g_usb_devices[i].ep0_trring_paddr     = g_ep0_trring_paddr_base     + (seL4_Word)i * PLAT_XHCI_RING_STRIDE;
         g_usb_devices[i].ctrl_buf_paddr       = g_ctrl_buf_paddr_base       + (seL4_Word)i * 4096;
-        g_usb_devices[i].bulkout_trring_paddr = g_bulkout_trring_paddr_base + (seL4_Word)i * 4096;
-        g_usb_devices[i].bulkin_trring_paddr  = g_bulkin_trring_paddr_base  + (seL4_Word)i * 4096;
+        g_usb_devices[i].uas_cmdring_paddr    = g_uas_cmdring_paddr_base    + (seL4_Word)i * PLAT_XHCI_RING_STRIDE;
+        g_usb_devices[i].uas_statring_paddr   = g_uas_statring_paddr_base   + (seL4_Word)i * PLAT_XHCI_RING_STRIDE;
+        g_usb_devices[i].uas_streams_paddr    = g_uas_streams_paddr_base    + (seL4_Word)i * 4096;
+        g_usb_devices[i].bulkout_trring_paddr = g_bulkout_trring_paddr_base + (seL4_Word)i * PLAT_XHCI_RING_STRIDE;
+        g_usb_devices[i].bulkin_trring_paddr  = g_bulkin_trring_paddr_base  + (seL4_Word)i * PLAT_XHCI_RING_STRIDE;
         g_usb_devices[i].cbw_csw_paddr        = g_cbw_csw_paddr_base        + (seL4_Word)i * 4096;
         // Шаг — USB_BOUNCE_PAGES страниц: буфер расширен 2026-09-06,
         // при прежнем шаге 4096 устройства с idx>0 адресовали чужую
@@ -4545,11 +5590,14 @@ int main(int argc, char *argv[]) {
     if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG bounce_paddr(idx=последний)         = ", worst.bounce_paddr);
     if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG cbw_csw_paddr(idx=последний)        = ", worst.cbw_csw_paddr);
     if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG bulkin_trring_paddr(idx=последний)  = ", worst.bulkin_trring_paddr);
+    if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG uas_cmdring_paddr(idx=последний)    = ", worst.uas_cmdring_paddr);
+    if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG uas_statring_paddr(idx=последний)   = ", worst.uas_statring_paddr);
     if (LOG_USB) sys_puthex64(console_ep, "[USB]   DIAG devctx_paddr(slot=последний)        = ", worst_devctx);
     bool dma_range_bad = (g_cmdring_paddr >= 0xC0000000ULL || g_evtring_paddr >= 0xC0000000ULL ||
                            worst.ep0_trring_paddr >= 0xC0000000ULL || worst.ctrl_buf_paddr >= 0xC0000000ULL ||
                            worst.bulkout_trring_paddr >= 0xC0000000ULL || worst.bulkin_trring_paddr >= 0xC0000000ULL ||
                            worst.cbw_csw_paddr >= 0xC0000000ULL || worst.bounce_paddr >= 0xC0000000ULL ||
+                           worst.uas_cmdring_paddr >= 0xC0000000ULL || worst.uas_statring_paddr >= 0xC0000000ULL ||
                            worst_devctx >= 0xC0000000ULL);
     if (dma_range_bad) {
         if (LOG_USB) sys_puts(console_ep, "[USB]   DIAG ПРЕДУПРЕЖДЕНИЕ: кольцо(а)/per-device DMA-регион(ы) >= 0xC0000000 — ВНЕ dma-ranges PCIe-моста (3GiB), устройство не сможет туда писать/читать.\n");
@@ -5056,11 +6104,21 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(8, (seL4_Word)g_scsi_write_bytes);
             seL4_SetMR(9, (seL4_Word)g_scsi_rmax);
             seL4_SetMR(10, (seL4_Word)g_scsi_wmax);
-            seL4_SetMR(11, (seL4_Word)g_usb_devices[0].fs.max_sectors_per_io);
-            seL4_SetMR(12, (seL4_Word)g_stream_first_cluster);
-            seL4_SetMR(13, (seL4_Word)g_usb_devices[0].fs.bitmap_cluster);
-            seL4_SetMR(14, (seL4_Word)g_usb_devices[0].fs.root_cluster);
-            seL4_SetMR(15, (seL4_Word)g_usb_devices[0].fs.cluster_count);
+            // Статистика тома бралась ЖЁСТКО с индекса 0, а нулевой слот
+            // обычно занят ХАБОМ, а не накопителем — отсюда "лимит тома 8,
+            // битмап 0, корень 0, всего кластеров 0" во всех прошлых логах.
+            // Это врало о настоящем пределе тома и уводило в сторону при
+            // разборе числа команд. Берём первый СМОНТИРОВАННЫЙ том.
+            {
+                int st_idx = first_mounted_device_idx();
+                if (st_idx < 0) st_idx = 0;
+                UsbDeviceSlot &st = g_usb_devices[st_idx];
+                seL4_SetMR(11, (seL4_Word)st.fs.max_sectors_per_io);
+                seL4_SetMR(12, (seL4_Word)g_stream_first_cluster);
+                seL4_SetMR(13, (seL4_Word)st.fs.bitmap_cluster);
+                seL4_SetMR(14, (seL4_Word)st.fs.root_cluster);
+                seL4_SetMR(15, (seL4_Word)st.fs.cluster_count);
+            }
             seL4_SetMR(16, (seL4_Word)g_scsi_us_data_rd);
             seL4_SetMR(17, (seL4_Word)g_scsi_us_data_wr);
             seL4_SetMR(18, (seL4_Word)g_scsi_big_rd_us);

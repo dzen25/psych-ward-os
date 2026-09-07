@@ -54,6 +54,18 @@ static const uint32_t EXFAT_SECTOR_SIZE = 512;
 // раньше молча совпадали с прежним лимитом 8, теперь ограничены явно.
 constexpr uint32_t EXFAT_LOCAL_BUF_SECTORS = 8;
 
+// Отдельный, БОЛЬШОЙ потолок для копирования экстента. Буфер там не
+// стековый, а статический, и ограничение в 8 секторов (4 КБ) к нему
+// отношения не имело — просто досталось по инерции. Замер на железе
+// 2026-09-07: перенос файла на новый экстент (медленный путь дописывания)
+// гнал 16.5 МБ кусками по 4 КБ — 4032 блочные команды из 7540 за прогон.
+constexpr uint32_t EXFAT_COPY_BUF_SECTORS = 128; // 64 КБ
+static inline uint32_t exfat_copy_chunk(EXFAT_Instance* fs, uint32_t want) {
+    uint32_t cap = fs->max_sectors_per_io < EXFAT_COPY_BUF_SECTORS
+                 ? fs->max_sectors_per_io : EXFAT_COPY_BUF_SECTORS;
+    return want > cap ? cap : want;
+}
+
 // min(что может драйвер, что влезает к нам) — для мест с локальным буфером.
 static inline uint32_t exfat_local_chunk(EXFAT_Instance* fs, uint32_t want) {
     uint32_t cap = fs->max_sectors_per_io < EXFAT_LOCAL_BUF_SECTORS
@@ -206,7 +218,19 @@ static void dir_cursor_init(DirCursor* c, EXFAT_Instance* fs, uint32_t first_clu
     c->sector_in_cluster = 0;
     c->slot_in_sector = 0;
     c->sector_loaded = false;
+    c->dirty = false;
     c->fat_chain_steps = 0;
+}
+
+// Сброс изменённого сектора на носитель. Вызывается перед тем, как курсор
+// покинет сектор, и явно в конце записи набора записей.
+static bool dir_cursor_flush(DirCursor* c) {
+    if (!c->dirty) return true;
+    uint32_t sector = cluster_to_sector(c->fs, c->cur_cluster) + c->sector_in_cluster;
+    g_exfat_io_tag = EXFAT_IO_DIR_CURSOR;
+    if (!c->fs->write_blocks(sector, 1, c->sector_buf)) return false;
+    c->dirty = false;
+    return true;
 }
 
 // Указатель на текущий 32-байтный слот (внутри c->sector_buf) или nullptr,
@@ -226,6 +250,9 @@ static uint8_t* dir_cursor_current(DirCursor* c) {
 static bool dir_cursor_advance(DirCursor* c) {
     c->slot_in_sector++;
     if (c->slot_in_sector < 16) return true;
+    // Уходим из сектора — незаписанные правки обязаны уехать на носитель
+    // здесь, иначе они потеряются вместе с буфером.
+    if (!dir_cursor_flush(c)) return false;
     c->slot_in_sector = 0;
     c->sector_in_cluster++;
     c->sector_loaded = false;
@@ -259,13 +286,21 @@ static bool dir_cursor_advance(DirCursor* c) {
 // c->sector_buf загружен и валиден) и сразу сбрасывает изменённый сектор на
 // диск — по одной записи за раз, без батчинга (метаданные каталогов пишутся
 // нечасто, простота важнее).
-static bool dir_cursor_write_current(DirCursor* c, const uint8_t entry[32]) {
+// Правит текущий слот ТОЛЬКО В ПАМЯТИ, помечая сектор изменённым. Сброс —
+// отдельно (dir_cursor_flush), автоматически при уходе из сектора.
+static bool dir_cursor_set_current(DirCursor* c, const uint8_t entry[32]) {
     uint8_t* slot = dir_cursor_current(c);
     if (!slot) return false;
     my_memcpy(slot, entry, 32);
-    uint32_t sector = cluster_to_sector(c->fs, c->cur_cluster) + c->sector_in_cluster;
-    g_exfat_io_tag = EXFAT_IO_DIR_CURSOR;
-    return c->fs->write_blocks(sector, 1, c->sector_buf);
+    c->dirty = true;
+    return true;
+}
+
+// Правка одиночной записи с немедленным сбросом — для мест, где пишется
+// ровно одна запись и батчить нечего.
+static bool dir_cursor_write_current(DirCursor* c, const uint8_t entry[32]) {
+    if (!dir_cursor_set_current(c, entry)) return false;
+    return dir_cursor_flush(c);
 }
 
 // ============================================================================
@@ -830,15 +865,32 @@ static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_
 
 bool exfat_read_file(EXFAT_Instance* fs, const char* filename, char* out_buffer, uint32_t offset, uint32_t* bytes_read, uint32_t max_chunk) {
     *bytes_read = 0;
-    char basename[256]; // issuse.txt №42
-    uint32_t parent_clus = exfat_resolve_parent(fs, filename, basename);
-    if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
-
-    bool parent_no_chain; uint64_t parent_len;
-    resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
-
     ExfatSlot slot;
-    if (!exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) || !slot.found || slot.is_dir) return false;
+
+    // Тот же кэш места файла, что у записи (FileLocCache). Чтение шло мимо
+    // него и каждый раз заново разрешало путь и сканировало каталог: на
+    // замере 2026-09-07 это давало 2200 блочных команд обхода каталога за
+    // 200 чтений — по 11 на каждое, при одной полезной. Доверять кэшу
+    // чтению можно: КАЖДАЯ операция, меняющая размещение или длину файла,
+    // либо сбрасывает кэш (создание, перезапись, поток, удаление,
+    // переименование, mkdir, монтирование), либо обновляет длину в нём
+    // (дописывание) — см. file_loc_invalidate/file_loc_store.
+    if (file_loc_same_path(fs, filename)) {
+        slot = g_file_loc.slot;
+    } else {
+        char basename[256]; // issuse.txt №42
+        uint32_t parent_clus = exfat_resolve_parent(fs, filename, basename);
+        if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
+
+        bool parent_no_chain; uint64_t parent_len;
+        resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
+
+        if (!exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) || !slot.found || slot.is_dir) return false;
+        if (slot.first_cluster != 0 && slot.no_fat_chain) {
+            file_loc_store(fs, filename, parent_clus, parent_no_chain, parent_len, basename, slot);
+        }
+    }
+    if (slot.is_dir) return false;
 
     if (offset >= slot.data_length) return true; // EOF
     uint32_t remaining = (uint32_t)(slot.data_length - offset);
@@ -1529,12 +1581,12 @@ static bool write_extent_at(EXFAT_Instance* fs, uint32_t first_cluster, uint64_t
 // переменной, а копировать надо целиком.
 static bool copy_extent(EXFAT_Instance* fs, uint32_t src_first, uint32_t dst_first, uint64_t bytes) {
     g_exfat_copy_extent_calls++;
-    static char cp_buf[EXFAT_SECTOR_SIZE * 8];
+    static char cp_buf[EXFAT_SECTOR_SIZE * EXFAT_COPY_BUF_SECTORS]; // статический, не стек — см. EXFAT_COPY_BUF_SECTORS
     uint32_t src = cluster_to_sector(fs, src_first);
     uint32_t dst = cluster_to_sector(fs, dst_first);
     uint64_t sectors = (bytes + EXFAT_SECTOR_SIZE - 1) / EXFAT_SECTOR_SIZE;
     while (sectors > 0) {
-        uint32_t chunk = exfat_local_chunk(fs, sectors > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sectors); // cp_buf локальный
+        uint32_t chunk = exfat_copy_chunk(fs, sectors > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sectors); // cp_buf статический, см. EXFAT_COPY_BUF_SECTORS
         g_exfat_io_tag = EXFAT_IO_READ_EXTENT;
         if (!fs->read_blocks(src, chunk, cp_buf)) return false;
         g_exfat_io_tag = EXFAT_IO_READ_EXTENT;
@@ -1623,12 +1675,16 @@ static bool exfat_write_entry_set_at(DirCursor start_cursor, const char* name, u
     entries[2] = (uint8_t)(checksum & 0xFF);
     entries[3] = (uint8_t)(checksum >> 8);
 
+    // Весь набор правится в памяти, а сектор сбрасывается один раз — при
+    // уходе из него (dir_cursor_advance) и в конце. Записи набора почти
+    // всегда лежат в одном секторе, поэтому вместо шести блочных команд
+    // (чтение+запись на каждую из трёх записей) выходит две.
     DirCursor cur = start_cursor;
     for (int e = 0; e < total_entries; e++) {
-        if (!dir_cursor_write_current(&cur, entries + 32 * e)) return false;
+        if (!dir_cursor_set_current(&cur, entries + 32 * e)) return false;
         if (e < total_entries - 1) { if (!dir_cursor_advance(&cur)) return false; }
     }
-    return true;
+    return dir_cursor_flush(&cur);
 }
 
 // Ищет slots_needed подряд идущих свободных 32-байтных слотов, начиная с
@@ -1791,14 +1847,33 @@ bool exfat_append_file(EXFAT_Instance* fs, const char* path, const char* text, u
     if (len == 0) return true;
 
     char basename[256]; // issuse.txt №42
-    uint32_t parent_clus = exfat_resolve_parent(fs, path, basename);
-    if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
-
+    uint32_t parent_clus;
     bool parent_no_chain; uint64_t parent_len;
-    resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
-
     ExfatSlot slot;
-    bool exists = exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) && slot.found;
+    bool exists;
+
+    // Кэш места файла (FileLocCache) здесь РАНЬШЕ ТОЛЬКО ОБНОВЛЯЛСЯ, но не
+    // читался: exfat_write_file() им пользуется, а дописывание каждый раз
+    // заново разрешало путь и сканировало ВЕСЬ каталог. На живом замере это
+    // давало 4200 блочных команд обхода каталога на 200 дописываний — по 21
+    // команде на каждую запись в 128 КБ, при одной полезной. Логика проверки
+    // та же, что в exfat_write_file(): совпал путь — поиск не нужен.
+    if (file_loc_same_path(fs, path)) {
+        parent_clus     = g_file_loc.parent_clus;
+        parent_no_chain = g_file_loc.parent_no_chain;
+        parent_len      = g_file_loc.parent_len;
+        loc_copy(basename, g_file_loc.basename, (int)sizeof(basename));
+        slot            = g_file_loc.slot;
+        exists          = true;
+    } else {
+        parent_clus = exfat_resolve_parent(fs, path, basename);
+        if (parent_clus == 0xFFFFFFFF || basename[0] == '\0') return false;
+        resolve_dir_extent(fs, parent_clus, &parent_no_chain, &parent_len);
+        exists = exfat_dir_scan(fs, parent_clus, parent_no_chain, parent_len, basename, &slot) && slot.found;
+        if (exists && !slot.is_dir && slot.first_cluster != 0 && slot.no_fat_chain) {
+            file_loc_store(fs, path, parent_clus, parent_no_chain, parent_len, basename, slot);
+        }
+    }
     // Файла нет — дописывание в несуществующий файл это просто создание.
     if (!exists) return exfat_write_file(fs, path, text, len);
     if (slot.is_dir) return false;

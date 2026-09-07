@@ -163,6 +163,12 @@ enum BootIPCSlot {
     // читает ТОЛЬКО timer_driver (is_driver==2), сигналит им root'у на
     // каждом своём тике. См. развёрнутое "зачем" у самой константы.
     BOOT_ROOT_WATCHDOG_TICK_NTFN_CAP  = 181,
+    // UAS — базовые физические адреса двух новых per-device наборов
+    // страниц (кольцо команд и кольцо статуса), тот же приём "база +
+    // idx*4096", что у BOOT_USB_BULKOUT_TRRING_PADDR выше.
+    BOOT_USB_UAS_CMDRING_PADDR        = 182,
+    BOOT_USB_UAS_STATRING_PADDR       = 183,
+    BOOT_USB_UAS_STREAMS_PADDR        = 184,
 };
 
 // Фаза 9.A (см. ROADMAP.md): индекс msg[]-слова (НЕ капа, НЕ CNode-слот —
