@@ -61,7 +61,10 @@ constexpr int PATH_OFFSET   = 0;
 constexpr int DATA_OFFSET   = (int)VFS_PAYLOAD_OFFSET; // путь — в странице 0, содержимое — в области нагрузки
 
 static char g_path[256];
-static char g_expect[VFS_WRITE_MAX + 1];
+// aligned(8): и подготовка эталона, и сверка ходят по SHM 8-байтными
+// словами (SHM — Device-память, побайтный доступ к ней стоит на порядок
+// дороже), а невыровненное слово там даёт Alignment Fault.
+static char g_expect[VFS_WRITE_MAX + 1] __attribute__((aligned(8)));
 static seL4_CPtr g_ep = 0;
 
 static int  g_chunk = 256;
@@ -154,17 +157,29 @@ static void fill_record(long record) {
 
 // --- VFS ---
 
+// Разбор round-trip'а дописывания на три части. Появился потому, что
+// замер клиента оказался вдвое больше времени внутри exfat_append_file, а
+// чтение через ту же обёртку показывает разницу в 30 мкс — то есть дело не
+// в IPC как таковом, и надо не гадать, а разделить.
+static uint64_t g_us_lock = 0, g_us_call = 0, g_us_unlock = 0;
+
 static int vfs_put(const char *data, int len, bool append) {
     // Данные уже лежат в SHM — их положил туда fill_record(). Копирования
     // здесь больше нет намеренно, см. комментарий у fill_record.
     (void)data;
+    uint64_t t = now_us();
     my_strlcpy(env.shm + PATH_OFFSET, g_path, 128);
     vfs_lock();
+    g_us_lock += now_us() - t;
+    t = now_us();
     seL4_SetMR(0, append ? 121 : 113); // SYS_APPEND_FILE / SYS_WRITE_FILE
     seL4_SetMR(1, (seL4_Word)len);
     seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 2));
     int rc = (int)seL4_GetMR(0);
+    g_us_call += now_us() - t;
+    t = now_us();
     vfs_unlock();
+    g_us_unlock += now_us() - t;
     return rc;
 }
 
@@ -249,13 +264,26 @@ static void scsi_tags_print(void) {
     my_strlcpy(env.shm + PATH_OFFSET, g_path, 128);
     vfs_lock();
     seL4_SetMR(0, 127);
-    seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
-    long long c[9], b[9];
+    seL4_MessageInfo_t r127 = seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    // Драйвер мог не знать этой команды: тогда ответ короткий, а регистры
+    // сообщения содержат что угодно от прошлого обмена. Раньше тест печатал
+    // их как настоящие цифры — на SD выходило "всего кластеров 187" и
+    // "команд 5245624" вперемешку с осмысленными числами.
+    if (seL4_MessageInfo_get_length(r127) < 3 * 9 + 7) {
+        vfs_unlock();
+        sys_puts(0, "  --- разбивка блочных операций недоступна: драйвер тома не ведёт эту статистику ---\n");
+        return;
+    }
+    long long c[9], b[9], u[9];
     for (int t = 0; t < 9; t++) { c[t] = (long long)seL4_GetMR(2*t); b[t] = (long long)seL4_GetMR(2*t+1); }
     long long cpy = (long long)seL4_GetMR(18);
     long long slw = (long long)seL4_GetMR(19);
     long long apc = (long long)seL4_GetMR(20);
     long long stw = (long long)seL4_GetMR(21);
+    for (int t = 0; t < 9; t++) u[t] = (long long)seL4_GetMR(22 + t);
+    long long ap_us = (long long)seL4_GetMR(31);
+    long long ap_n  = (long long)seL4_GetMR(32);
+    long long h_us  = (long long)seL4_GetMR(33);
     vfs_unlock();
     sys_puts(0, "  --- вызовы ---\n");
     sys_puts(0, "  copy_extent: "); putdec(cpy);
@@ -263,11 +291,31 @@ static void scsi_tags_print(void) {
     sys_puts(0, ", append всего: "); putdec(apc);
     sys_puts(0, ", stream_write: "); putdec(stw); sys_puts(0, "\n");
     sys_puts(0, "  --- кто делает блочные операции ---\n");
+    long long us_all = 0;
+    for (int t = 0; t < 9; t++) us_all += u[t];
     for (int t = 0; t < 9; t++) {
         if (c[t] == 0) continue;
         sys_puts(0, "  "); sys_puts(0, IO_TAG_NAME[t]);
         sys_puts(0, ": команд "); putdec(c[t]);
-        sys_puts(0, ", байт "); putdec(b[t]); sys_puts(0, "\n");
+        sys_puts(0, ", байт "); putdec(b[t]);
+        // Время, а не только количество: команда на 512 байт и команда на
+        // 128 КБ стоят разного, и по счётчикам команд нельзя понять, что
+        // именно съедает время. Доля — сразу видно, за что браться.
+        sys_puts(0, ", мкс "); putdec(u[t]);
+        if (us_all > 0) { sys_puts(0, " ("); putdec(u[t] * 100 / us_all); sys_puts(0, "%)"); }
+        sys_puts(0, "\n");
+    }
+    sys_puts(0, "  ИТОГО в блочных операциях, мкс: "); putdec(us_all); sys_puts(0, "\n");
+    // Три числа рядом отвечают на вопрос "что оптимизировать дальше":
+    // блочные операции -> сколько ждёт диск, exfat_append_file -> плюс CPU
+    // самой ФС, замер клиента -> плюс IPC и маршрутизация VFS.
+    if (ap_n > 0) {
+        sys_puts(0, "  --- где время дописывания, сверху вниз (мкс на "); putdec(ap_n); sys_puts(0, " вызовов) ---\n");
+        sys_puts(0, "  клиент: путь+vfs_lock "); putdec((long long)(g_us_lock));
+        sys_puts(0, ", seL4_Call "); putdec((long long)(g_us_call));
+        sys_puts(0, ", vfs_unlock "); putdec((long long)(g_us_unlock)); sys_puts(0, "\n");
+        sys_puts(0, "  драйвер: весь обработчик cmd 121 "); putdec(h_us);
+        sys_puts(0, ", из него exfat_append_file "); putdec(ap_us); sys_puts(0, "\n");
     }
 }
 
@@ -284,7 +332,21 @@ static void scsi_tags_print(void) {
 static void scsi_stats_print(long long e2e_bytes, long long e2e_us) {
     vfs_lock();
     seL4_SetMR(0, 126);
-    seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_MessageInfo_t r126 = seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    if (seL4_MessageInfo_get_length(r126) < 13) {
+        vfs_unlock();
+        // У SD нет ни CBW, ни CSW — это не SCSI-транспорт, и слои [1]/[2]
+        // для него не определены. Печатаем то единственное, что измерено
+        // честно: сквозную скорость по часам самого вызывающего.
+        sys_puts(0, "\n  --- СКОРОСТЬ ---\n        слои [1] шина и [2] SCSI-команда для этого тома не определены\n");
+        sys_puts(0, "        (драйвер не SCSI: у SD нет фаз CBW/CSW)\n");
+        if (e2e_us > 0) {
+            sys_puts(0, "        [3] вызов программы   ");
+            putdec(e2e_bytes * 1000000LL / e2e_us / 1024); sys_puts(0, " КБ/с   (");
+            putdec(e2e_us / 1000); sys_puts(0, " мс)\n");
+        }
+        return;
+    }
     long long cmds = (long long)seL4_GetMR(0);
     long long cbw  = (long long)seL4_GetMR(1);
     long long dat  = (long long)seL4_GetMR(2);
@@ -374,7 +436,8 @@ static void scsi_stats_print(long long e2e_bytes, long long e2e_us) {
 static void read_stats_print(long long bytes, long long us) {
     vfs_lock();
     seL4_SetMR(0, 126);
-    seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_MessageInfo_t rr = seL4_Call(g_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    bool have_bus = seL4_MessageInfo_get_length(rr) >= 17; // см. проверку в scsi_stats_print
     long long cmds = (long long)seL4_GetMR(0);
     long long rd   = (long long)seL4_GetMR(5);
     long long rdb  = (long long)seL4_GetMR(6);
@@ -389,7 +452,7 @@ static void read_stats_print(long long bytes, long long us) {
         sys_puts(0, "        [3] программа     "); putdec(bytes * 1000000LL / us / 1024);
         sys_puts(0, " КБ/с\n");
     }
-    if (drd > 0 && rdb > 0) {
+    if (have_bus && drd > 0 && rdb > 0) {
         sys_puts(0, "        [1] шина          "); putdec(rdb * 1000000LL / drd / 1024);
         sys_puts(0, " КБ/с   (команд "); putdec(rd);
         sys_puts(0, ", макс "); putdec(rmax); sys_puts(0, " секторов)\n");
@@ -592,6 +655,13 @@ int main(int argc, char *argv[]) {
     long done = 0;
     long long total_bytes = 0, file_len = 0;
     uint64_t us_write = 0, us_read = 0; // микросекунды: см. now_us()
+    // Время, которое тест тратит НА СЕБЯ — подготовку эталона в SHM и
+    // побайтную сверку прочитанного. Раньше оно не попадало ни в один
+    // счётчик, и итог выглядел загадкой: цикл шёл 5188 мс, а запись плюс
+    // посверка объясняли из них 682 мс. Остальное съедала работа с SHM:
+    // это Device-память, и 26 МБ туда-обратно по одному байту стоят
+    // дороже, чем весь дисковый ввод-вывод прогона.
+    uint64_t us_shm = 0;
     {
         if (g_direct) {
             // Резервируем сразу под весь прогон: расширять экстент по ходу
@@ -609,7 +679,9 @@ int main(int argc, char *argv[]) {
         scsi_stats_reset(); // мерим только основной цикл, без подготовки
         seL4_Word t_all = now_ms();
         for (long it = 1; it <= iterations; it++) {
+            uint64_t t_shm = now_us();
             fill_record(it - 1);
+            us_shm += now_us() - t_shm;
 
             uint64_t t0 = now_us();
             // В потоковом режиме запись идёт через SYS_STREAM_WRITE, а не
@@ -647,7 +719,26 @@ int main(int argc, char *argv[]) {
                 int bad = -1;
                 // Прочитанное приходит в ту же область полезной нагрузки,
                 // куда мы пишем (DATA_OFFSET), а не в начало SHM.
-                for (int i = 0; i < g_chunk; i++) if (env.shm[DATA_OFFSET + i] != g_expect[i]) { bad = i; break; }
+                // Сверка идёт 8-байтными словами: SHM — Device-память,
+                // побайтный проход по 128 КБ стоил больше, чем сама
+                // запись на диск, и при этом не попадал ни в один замер.
+                t_shm = now_us();
+                {
+                    const uint64_t *a64 = (const uint64_t *)(env.shm + DATA_OFFSET);
+                    const uint64_t *b64 = (const uint64_t *)g_expect;
+                    int words = g_chunk / 8;
+                    for (int w = 0; w < words; w++) {
+                        if (a64[w] != b64[w]) { // разошлось — сузить до байта уже дёшево
+                            for (int i = w * 8; i < w * 8 + 8; i++)
+                                if (env.shm[DATA_OFFSET + i] != g_expect[i]) { bad = i; break; }
+                            break;
+                        }
+                    }
+                    if (bad < 0)
+                        for (int i = words * 8; i < g_chunk; i++) // хвост, если длина не кратна 8
+                            if (env.shm[DATA_OFFSET + i] != g_expect[i]) { bad = i; break; }
+                }
+                us_shm += now_us() - t_shm;
                 if (bad >= 0) {
                     sys_puts(0, "  итерация "); putdec(it);
                     sys_puts(0, ": расхождение по смещению "); putdec(bad); sys_puts(0, " внутри записи\n");
@@ -734,6 +825,8 @@ int main(int argc, char *argv[]) {
     sys_puts(0, "\n  записано суммарно:  "); putdec(total_bytes); sys_puts(0, " Б\n");
     sys_puts(0, "  время записи:       "); putdec((long long)(us_write / 1000)); sys_puts(0, " мс\n");
     if (!g_stream) { sys_puts(0, "  время посверки:     "); putdec((long long)(us_read / 1000)); sys_puts(0, " мс\n"); }
+    sys_puts(0, "  работа теста с SHM: "); putdec((long long)(us_shm / 1000));
+    sys_puts(0, " мс (эталон + сверка; к скорости ФС не относится)\n");
     if (done > 0) {
         sys_puts(0, "  на запись:          "); putdec((long long)(us_write / (uint64_t)done)); sys_puts(0, " мкс\n");
         if (!g_stream) {

@@ -59,7 +59,11 @@ constexpr uint32_t EXFAT_LOCAL_BUF_SECTORS = 8;
 // отношения не имело — просто досталось по инерции. Замер на железе
 // 2026-09-07: перенос файла на новый экстент (медленный путь дописывания)
 // гнал 16.5 МБ кусками по 4 КБ — 4032 блочные команды из 7540 за прогон.
-constexpr uint32_t EXFAT_COPY_BUF_SECTORS = 128; // 64 КБ
+// 128 КБ — ровно потолок ОДНОЙ команды для НЕ-SHM источника (буфер здесь
+// свой, не в SHM, поэтому едет через bounce драйвера: USB_BOUNCE_SECTORS).
+// Брать больше бессмысленно — драйвер всё равно разложит на куски по
+// размеру bounce; брать меньше значит платить лишние команды на переезде.
+constexpr uint32_t EXFAT_COPY_BUF_SECTORS = 256; // 128 КБ
 static inline uint32_t exfat_copy_chunk(EXFAT_Instance* fs, uint32_t want) {
     uint32_t cap = fs->max_sectors_per_io < EXFAT_COPY_BUF_SECTORS
                  ? fs->max_sectors_per_io : EXFAT_COPY_BUF_SECTORS;
@@ -207,7 +211,16 @@ static bool fat_chain_has_cycle(EXFAT_Instance* fs, uint32_t start_cluster) {
 // идущие кластеры) и NoFatChain=0 (root; чужеродные фрагментированные) ===
 // ============================================================================
 
+// Единственная точка, с которой начинается ЛЮБОЙ обход каталога, — здесь и
+// стоит сброс отложенной длины (см. FileLocCache::entry_dirty). Иначе `ls`,
+// поиск файла или создание соседа увидели бы на диске устаревший размер
+// того файла, в который сейчас идёт дописывание. Флаг рекурсии нужен
+// потому, что сам сброс пишет через курсор (копию, не через init).
+static bool g_file_loc_flushing = false;
+static bool file_loc_flush_entry(void);
+
 static void dir_cursor_init(DirCursor* c, EXFAT_Instance* fs, uint32_t first_cluster, bool no_fat_chain, uint64_t byte_length) {
+    file_loc_flush_entry();
     c->fs = fs;
     c->first_cluster = first_cluster;
     c->no_fat_chain = no_fat_chain;
@@ -351,6 +364,12 @@ struct ExfatDirEntry {
     // тот файл. ls всё равно показывает такие имена (as-is, с '?').
     bool has_lossy_chars;
     bool is_dir;
+    // Полные атрибуты записи 0x85, а не только признак каталога. Нужны,
+    // чтобы дописывание не затирало биты, выставленные другой ОС: раньше
+    // exfat_write_entry_set_at() звалась с жёстко зашитым 0x20, и файл,
+    // помеченный скрытым или read-only, после первого же `>>` становился
+    // обычным.
+    uint16_t attrs;
     uint32_t first_cluster;
     uint64_t data_length;
     bool no_fat_chain;
@@ -439,6 +458,7 @@ static bool exfat_next_dir_entry(DirCursor* cur, ExfatDirEntry* out) {
         (void)advanced;
         out->got_entry = true;
         out->is_dir = (attrs & 0x10) != 0;
+        out->attrs = attrs;
         out->first_cluster = first_cluster;
         out->data_length = data_length;
         out->no_fat_chain = no_chain;
@@ -451,6 +471,7 @@ static bool exfat_next_dir_entry(DirCursor* cur, ExfatDirEntry* out) {
 struct ExfatSlot {
     bool found;
     bool is_dir;
+    uint16_t attrs;      // см. ExfatDirEntry::attrs
     uint32_t first_cluster;
     uint64_t data_length;
     bool no_fat_chain;
@@ -484,8 +505,71 @@ struct FileLocCache {
     char basename[256];
     ExfatSlot slot;
     bool valid;
+    // Запись каталога отстаёт от g_file_loc.slot.data_length и ждёт сброса.
+    // Зачем: измерение на железе (200 дописываний по 128 КБ) показало ТРИ
+    // блочные команды на обход каталога в КАЖДОМ дописывании — набор
+    // записей этого файла лёг через границу сектора, и на каждую правку
+    // длины приходилось поднимать и записывать второй сектор. Эталон
+    // (fs/exfat в Linux) запись каталога на каждое дописывание не пишет
+    // вовсе: mark_inode_dirty(), а до диска доходит на writeback. Здесь то
+    // же самое, только точки сброса явные (см. file_loc_flush_entry).
+    bool entry_dirty;
+    // Сколько кластеров РЕАЛЬНО помечено занятыми в битмапе под этот файл.
+    // Обычно ровно столько, сколько требует длина; больше — после
+    // упреждающей аллокации (см. EXFAT_APPEND_RESERVE_BYTES ниже).
+    uint32_t alloc_clusters;
 };
-static FileLocCache g_file_loc = {nullptr, {0}, 0, false, 0, {0}, {}, false};
+static FileLocCache g_file_loc = {nullptr, {0}, 0, false, 0, {0}, {}, false, false, 0};
+
+// --- Упреждающая аллокация кластеров при дописывании ---
+//
+// Замер на живом железе: дописывание 128 КБ стоило ШЕСТИ блочных команд,
+// из которых полезной была ОДНА. Три уходили в битмап (проверить, что за
+// файлом свободно; прочитать сектор битмапа; записать его обратно) — и так
+// на КАЖДОЕ дописывание, хотя занимался всего один кластер.
+//
+// Эталон (fs/exfat в ядре Linux) спекулятивно кластеры НЕ занимает вообще:
+// exfat_alloc_cluster() берёт ровно num_alloc. Дешёвым дописывание там
+// делает не резерв, а то, что сектор битмапа не доезжает до диска на
+// каждую аллокацию — exfat_update_bh(bh, sync=false) просто помечает буфер
+// грязным, а запись откладывается до writeback. У нас кэша буферов нет,
+// поэтому тот же эффект достигается с другой стороны: занимать кластеры
+// пачкой ВПЕРЁД, чтобы битмап трогался раз в EXFAT_APPEND_RESERVE_BYTES,
+// а не на каждое дописывание.
+//
+// Резерв держится ТОЛЬКО в памяти (в g_file_loc.alloc_clusters) и на диске
+// нигде не отражается: DataLength в записи каталога всегда равна реально
+// записанным байтам, иначе `ls`/`cp`/hashtest увидели бы размер больше
+// настоящего. Отсюда единственная плата: при пропадании питания посреди
+// серии дописываний зарезервированный хвост останется помеченным занятым,
+// хотя его никто не claim'ит — потеря места, ограниченная сверху этой
+// константой, и только до переформатирования. Целостность ФС не страдает:
+// лишний занятый кластер безопасен, в отличие от обратной ошибки (кластер
+// свободен в битмапе, но уже отдан файлу).
+constexpr uint32_t EXFAT_APPEND_RESERVE_MIN_BYTES = 4u * 1024u * 1024u;
+constexpr uint32_t EXFAT_APPEND_RESERVE_MAX_BYTES = 64u * 1024u * 1024u;
+
+// Сколько кластеров занимать ВПЕРЁД. Запас растёт вместе с файлом
+// (удвоение), а не фиксирован: постоянные 4 МБ на журнале в сотни
+// мегабайт означали бы упор в соседа каждые 4 МБ — то есть переезд с
+// полным копированием, и снова O(размер^2). Тот же приём, что
+// speculative preallocation в XFS: запас пропорционален уже занятому,
+// с потолком, чтобы один растущий файл не отъедал полтома.
+static uint32_t append_reserve_clusters(uint32_t bpc, uint32_t alloc_clusters) {
+    uint32_t lo = EXFAT_APPEND_RESERVE_MIN_BYTES / bpc; if (lo == 0) lo = 1;
+    uint32_t hi = EXFAT_APPEND_RESERVE_MAX_BYTES / bpc; if (hi < lo) hi = lo;
+    uint32_t r = alloc_clusters;
+    if (r < lo) r = lo;
+    if (r > hi) r = hi;
+    return r;
+}
+
+// bitmap_free_run() объявлена ниже (ей нужны bitmap_sector_for_byte и
+// таблица секторов битмапа), а нужна уже здесь — освобождение резерва
+// живёт рядом с самим кэшем, чтобы ни один путь инвалидации его не забыл.
+static bool bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t num_clusters);
+static bool exfat_write_entry_set_at(DirCursor start_cursor, const char* name, uint16_t attrs,
+                                     uint32_t first_cluster, uint64_t data_length, bool no_fat_chain);
 
 // Ограниченное копирование: в exfat.cpp есть только неограниченный
 // my_strcpy, а сюда приходят пути из IPC — обрезать безопаснее, чем
@@ -496,7 +580,99 @@ static void loc_copy(char* dst, const char* src, int cap) {
     dst[i] = '\0';
 }
 
-static void file_loc_invalidate(void) { g_file_loc.valid = false; }
+// Отдать зарезервированный хвост обратно в битмап. Вызывается из КАЖДОГО
+// пути инвалидации кэша: пока кэш описывает файл, резерв принадлежит ему,
+// а как только кэш перестал быть верным — резерв больше некому вернуть.
+static void file_loc_release_reserve(void) {
+    EXFAT_Instance* fs = g_file_loc.fs;
+    uint32_t alloc = g_file_loc.alloc_clusters;
+    g_file_loc.alloc_clusters = 0;
+    if (!g_file_loc.valid || fs == nullptr || alloc == 0) return;
+    if (g_file_loc.slot.first_cluster < 2 || !g_file_loc.slot.no_fat_chain) return;
+    uint32_t bpc = EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
+    uint32_t used = (uint32_t)((g_file_loc.slot.data_length + bpc - 1) / bpc);
+    if (alloc > used) bitmap_free_run(fs, g_file_loc.slot.first_cluster + used, alloc - used);
+}
+
+// Дописать отложенную длину в запись каталога. Возвращает false, если
+// сброс не прошёл — флаг при этом НЕ снимается, чтобы следующая точка
+// сброса попробовала снова, а не потеряла длину молча.
+static bool file_loc_flush_entry(void) {
+    if (!g_file_loc.valid || !g_file_loc.entry_dirty || g_file_loc_flushing) return true;
+    g_file_loc_flushing = true; // exfat_write_entry_set_at() курсоров не создаёт, но страховка дешевле разбирательства
+    bool ok = exfat_write_entry_set_at(g_file_loc.slot.entry_start, g_file_loc.basename,
+                                       (uint16_t)(g_file_loc.slot.attrs | 0x20),
+                                       g_file_loc.slot.first_cluster, g_file_loc.slot.data_length, true);
+    g_file_loc_flushing = false;
+    if (ok) g_file_loc.entry_dirty = false;
+    return ok;
+}
+
+// Забыть кэш БЕЗ обращения к диску. Нужен ровно в одном месте — при
+// монтировании: там кэш описывает ПРОШЛЫЙ том, и попытка вернуть резерв
+// пошла бы записью в битмап устройства, которого может уже не быть.
+static void file_loc_forget(void) { g_file_loc.alloc_clusters = 0; g_file_loc.entry_dirty = false; g_file_loc.valid = false; }
+
+// --- Кэш ХВОСТОВОГО сектора файла ---
+//
+// write_extent_at() при невыровненном смещении обязана прочитать сектор,
+// вписать в него кусок и записать обратно — две блочные команды. Для
+// `echo >>` и вообще для журнала, куда пишут по строке, это ВСЯ стоимость
+// операции: сами данные в сектор влезают целиком. А следующая дописка
+// почти всегда идёт в ТОТ ЖЕ сектор.
+//
+// Держим один сектор в памяти. Попадание — ноль команд. Тот же приём и та
+// же плата, что у отложенной записи каталога (FileLocCache::entry_dirty):
+// при обрыве питания теряется несброшенный хвост, целостность ФС не
+// страдает. Сброс — в каждой точке, где кто-то может увидеть устаревший
+// сектор: любое чтение данных, любое копирование, любое освобождение
+// кластеров и любая инвалидация кэша файла.
+struct TailSectorCache {
+    EXFAT_Instance* fs;
+    uint32_t sector;
+    bool dirty;
+    char buf[EXFAT_SECTOR_SIZE];
+};
+static TailSectorCache g_tail = {nullptr, 0, false, {0}};
+
+static bool tail_cache_flush(void) {
+    if (!g_tail.dirty || g_tail.fs == nullptr) { g_tail.dirty = false; return true; }
+    g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
+    bool ok = g_tail.fs->write_blocks(g_tail.sector, 1, g_tail.buf);
+    g_tail.dirty = false; // при отказе повторять нечем: сектор уже не наш
+    return ok;
+}
+
+// Буфер сектора, готовый к правке на месте. Если сектор уже в кэше —
+// без единой блочной команды.
+// need_existing=false означает "в этом секторе заведомо нет данных файла":
+// все вызывающие write_extent_at() пишут РОВНО с конца файла, поэтому
+// сектор, начинающийся за прежней длиной, ещё никем не читался и хранит
+// мусор от прошлого владельца кластера. Читать его перед перезаписью
+// незачем — это ровно половина команд при дописывании по строке.
+static char* tail_cache_get(EXFAT_Instance* fs, uint32_t sector, bool need_existing) {
+    if (g_tail.dirty && g_tail.fs == fs && g_tail.sector == sector) return g_tail.buf;
+    if (!tail_cache_flush()) return nullptr;
+    if (need_existing) {
+        g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
+        if (!fs->read_blocks(sector, 1, g_tail.buf)) return nullptr;
+    } else {
+        for (uint32_t i = 0; i < EXFAT_SECTOR_SIZE; i++) g_tail.buf[i] = 0;
+    }
+    g_tail.fs = fs;
+    g_tail.sector = sector;
+    return g_tail.buf;
+}
+
+static void file_loc_invalidate(void) {
+    tail_cache_flush(); // несброшенный хвост принадлежит ЭТОМУ файлу — см. TailSectorCache
+    // Порядок обязателен: длина сначала уезжает на диск, и только потом
+    // хвост возвращается в битмап. Наоборот — освободить кластеры, в
+    // которых лежат ещё не учтённые записью каталога данные.
+    file_loc_flush_entry();
+    file_loc_release_reserve();
+    g_file_loc.valid = false;
+}
 
 static bool file_loc_same_path(EXFAT_Instance* fs, const char* path) {
     if (!g_file_loc.valid || g_file_loc.fs != fs) return false;
@@ -508,6 +684,9 @@ static bool file_loc_same_path(EXFAT_Instance* fs, const char* path) {
 static void file_loc_store(EXFAT_Instance* fs, const char* path, uint32_t parent_clus,
                            bool parent_no_chain, uint64_t parent_len,
                            const char* basename, const ExfatSlot& slot) {
+    tail_cache_flush();         // и несброшенный хвостовой сектор — см. TailSectorCache
+    file_loc_flush_entry();     // у прошлого файла могла остаться неотданная длина
+    file_loc_release_reserve(); // кэш переезжает на другой файл — хвост прошлого больше не наш
     g_file_loc.fs = fs;
     loc_copy(g_file_loc.path, path, (int)sizeof(g_file_loc.path));
     g_file_loc.parent_clus = parent_clus;
@@ -515,6 +694,8 @@ static void file_loc_store(EXFAT_Instance* fs, const char* path, uint32_t parent
     g_file_loc.parent_len = parent_len;
     loc_copy(g_file_loc.basename, basename, (int)sizeof(g_file_loc.basename));
     g_file_loc.slot = slot;
+    g_file_loc.alloc_clusters = 0; // пока не знаем — посчитается при первом дописывании
+    g_file_loc.entry_dirty = false;
     g_file_loc.valid = true;
 }
 
@@ -545,6 +726,7 @@ static bool exfat_dir_scan(EXFAT_Instance* fs, uint32_t dir_cluster, bool dir_no
         if (match) {
             out->found = true;
             out->is_dir = e.is_dir;
+            out->attrs = e.attrs;
             out->first_cluster = e.first_cluster;
             out->data_length = e.data_length;
             out->no_fat_chain = e.no_fat_chain;
@@ -738,6 +920,7 @@ static uint32_t g_extent_cache_cluster_index = 0;
 static uint32_t g_extent_cache_cluster = 0;
 
 static uint32_t read_extent(EXFAT_Instance* fs, uint32_t first_cluster, bool no_fat_chain, uint32_t offset, char* out_buffer, uint32_t max_len) {
+    tail_cache_flush(); // читатель обязан увидеть то, что ещё лежит в кэше хвоста
     uint32_t bytes_per_cluster = EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
     if (bytes_per_cluster == 0 || first_cluster < 2) return 0;
     // Внутреннего потолка больше нет: размер куска задаёт вызывающий
@@ -1026,7 +1209,7 @@ static void bitmap_sector_table_build(EXFAT_Instance* fs); // см. таблиц
 // === МОНТИРОВАНИЕ ===
 // ============================================================================
 bool exfat_init(EXFAT_Instance* fs, block_read_fn read_func, block_write_fn write_func) {
-    file_loc_invalidate(); // монтирование — кэш от прошлого тома недействителен целиком (см. FileLocCache)
+    file_loc_forget(); // монтирование — кэш от ПРОШЛОГО тома, освобождать его резерв на ЭТОМ диске нельзя (см. file_loc_forget)
     fs->read_blocks = read_func;
     fs->write_blocks = write_func;
 
@@ -1291,6 +1474,10 @@ static bool bitmap_set_bit(EXFAT_Instance* fs, uint32_t cluster, bool value) {
 // bitmap_set_bit() полностью игнорировался, вызывающий не мог узнать,
 // что часть кластеров осталась помечена занятой навсегда.
 static bool bitmap_free_run(EXFAT_Instance* fs, uint32_t first_cluster, uint32_t num_clusters) {
+    // Единственная точка, через которую кластеры возвращаются в общий пул.
+    // Если в кэше висит сектор из освобождаемого пробега, сбросить его
+    // ПОСЛЕ переиспользования кластера значило бы затереть чужой файл.
+    tail_cache_flush();
     bool ok = bitmap_set_run(fs, first_cluster, num_clusters, false); // см. bitmap_set_run()
     // issuse.txt №66 — освобождённые кластеры могут быть переиспользованы
     // ДРУГИМ файлом (bitmap_alloc_run), потенциально с тем же самым
@@ -1591,20 +1778,18 @@ static bool write_extent_data(EXFAT_Instance* fs, uint32_t first_cluster, const 
 // читаются, правятся и пишутся обратно.
 static bool write_extent_at(EXFAT_Instance* fs, uint32_t first_cluster, uint64_t offset,
                             const char* data, uint32_t len) {
-    static char sec_buf[EXFAT_SECTOR_SIZE];
     uint32_t sector = cluster_to_sector(fs, first_cluster) + (uint32_t)(offset / EXFAT_SECTOR_SIZE);
     uint32_t in_sec = (uint32_t)(offset % EXFAT_SECTOR_SIZE);
     const char* p = data;
     uint32_t remaining = len;
 
     if (in_sec != 0) {
-        g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
-        if (!fs->read_blocks(sector, 1, sec_buf)) return false;
+        char* sb = tail_cache_get(fs, sector, true); // начало файла в этом секторе есть — читаем
+        if (!sb) return false;
         uint32_t n = EXFAT_SECTOR_SIZE - in_sec;
         if (n > remaining) n = remaining;
-        for (uint32_t i = 0; i < n; i++) sec_buf[in_sec + i] = p[i];
-        g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
-        if (!fs->write_blocks(sector, 1, sec_buf)) return false;
+        for (uint32_t i = 0; i < n; i++) sb[in_sec + i] = p[i];
+        g_tail.dirty = true;
         p += n; remaining -= n; sector++;
     }
     while (remaining >= EXFAT_SECTOR_SIZE) {
@@ -1616,11 +1801,11 @@ static bool write_extent_at(EXFAT_Instance* fs, uint32_t first_cluster, uint64_t
         p += b; remaining -= b; sector += chunk;
     }
     if (remaining > 0) {
-        g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
-        if (!fs->read_blocks(sector, 1, sec_buf)) return false;
-        for (uint32_t i = 0; i < remaining; i++) sec_buf[i] = p[i];
-        g_exfat_io_tag = EXFAT_IO_STREAM_WRITE;
-        if (!fs->write_blocks(sector, 1, sec_buf)) return false;
+        // Этот сектор начинается ЗА прежним концом файла — читать нечего.
+        char* sb = tail_cache_get(fs, sector, false);
+        if (!sb) return false;
+        for (uint32_t i = 0; i < remaining; i++) sb[i] = p[i];
+        g_tail.dirty = true;
     }
     return true;
 }
@@ -1629,6 +1814,7 @@ static bool write_extent_at(EXFAT_Instance* fs, uint32_t first_cluster, uint64_t
 // маленький — файл может быть сильно больше любой разумной локальной
 // переменной, а копировать надо целиком.
 static bool copy_extent(EXFAT_Instance* fs, uint32_t src_first, uint32_t dst_first, uint64_t bytes) {
+    tail_cache_flush(); // копируем с НОСИТЕЛЯ — хвост обязан быть уже там
     g_exfat_copy_extent_calls++;
     static char cp_buf[EXFAT_SECTOR_SIZE * EXFAT_COPY_BUF_SECTORS]; // статический, не стек — см. EXFAT_COPY_BUF_SECTORS
     uint32_t src = cluster_to_sector(fs, src_first);
@@ -1929,55 +2115,112 @@ bool exfat_append_file(EXFAT_Instance* fs, const char* path, const char* text, u
     // Чужой формат размещения (цепочка FAT) — отказываем, а не портим файл.
     if (slot.first_cluster != 0 && !slot.no_fat_chain) return false;
 
+    // Атрибуты берём у самой записи и лишь взводим Archive (0x20) — файл
+    // изменён. Раньше сюда шла голая константа 0x20, и дописывание снимало
+    // hidden/read-only/system, выставленные другой ОС.
+    uint16_t append_attrs = (uint16_t)(slot.attrs | 0x20);
+
     uint32_t bpc = EXFAT_SECTOR_SIZE << fs->sectors_per_cluster_shift;
     uint64_t old_len = slot.data_length;
     uint64_t new_len = old_len + len;
     uint32_t old_clusters = (uint32_t)((old_len + bpc - 1) / bpc);
     uint32_t need_clusters = (uint32_t)((new_len + bpc - 1) / bpc);
 
-    if (slot.first_cluster != 0 && need_clusters <= old_clusters) {
+    // Резерв виден только через кэш: если файла в нём нет, занимать
+    // вперёд нельзя — хвост будет некому вернуть (file_loc_release_reserve).
+    bool cached = file_loc_same_path(fs, path);
+    uint32_t alloc_clusters = old_clusters;
+    if (cached && g_file_loc.alloc_clusters > old_clusters) alloc_clusters = g_file_loc.alloc_clusters;
+
+    // Данные помещаются в уже занятые кластеры — битмап не трогается
+    // вообще. Раньше сюда попадали только дописывания внутри последнего
+    // кластера; с упреждающей аллокацией — и все те, что легли в резерв.
+    if (slot.first_cluster != 0 && need_clusters <= alloc_clusters) {
         if (!write_extent_at(fs, slot.first_cluster, old_len, text, len)) return false;
-        if (!exfat_write_entry_set_at(slot.entry_start, basename, 0x20, slot.first_cluster, new_len, true)) return false;
-        // Запись каталога осталась на месте — двигать кэш не нужно, только
-        // догнать длину, иначе следующий вызов возьмёт устаревший old_len.
-        if (file_loc_same_path(fs, path)) g_file_loc.slot.data_length = new_len;
-        return true;
+        // Запись каталога здесь НЕ пишется: длина обновляется в кэше, а
+        // сброс откладывается (см. FileLocCache::entry_dirty). Это и есть
+        // основной выигрыш — три блочные команды на КАЖДОЕ дописывание
+        // превращаются в три на резерв. Без кэша откладывать негде.
+        if (cached) { g_file_loc.slot.data_length = new_len; g_file_loc.entry_dirty = true; return true; }
+        return exfat_write_entry_set_at(slot.entry_start, basename, append_attrs, slot.first_cluster, new_len, true);
     }
 
     // СНАЧАЛА пробуем продлить экстент НА МЕСТЕ — за концом файла обычно
     // свободно, и тогда дописывание не стоит вообще ничего сверх записи
     // самих данных. Именно отсутствие этой ветки делало рост журнала
     // квадратичным (см. bitmap_try_alloc_at выше).
-    if (slot.first_cluster != 0 && old_clusters > 0 &&
-        bitmap_try_alloc_at(fs, slot.first_cluster + old_clusters, need_clusters - old_clusters)) {
-        if (!write_extent_at(fs, slot.first_cluster, old_len, text, len)) {
-            bitmap_free_run(fs, slot.first_cluster + old_clusters, need_clusters - old_clusters);
-            return false;
+    if (slot.first_cluster != 0 && old_clusters > 0) {
+        uint32_t want = need_clusters - alloc_clusters;          // строго >= 1: ветка выше уже отсекла равенство
+        uint32_t reserve = append_reserve_clusters(bpc, alloc_clusters);
+        uint32_t grab = (!cached || want > reserve) ? want : reserve;
+        uint32_t got = 0;
+        if (bitmap_try_alloc_at(fs, slot.first_cluster + alloc_clusters, grab)) got = grab;
+        // За файлом не хватило места под ЦЕЛЫЙ резерв — это не повод гнать
+        // файл на переезд с копированием: пробуем ровно то, что нужно сейчас.
+        else if (grab != want && bitmap_try_alloc_at(fs, slot.first_cluster + alloc_clusters, want)) got = want;
+        if (got > 0) {
+            if (!write_extent_at(fs, slot.first_cluster, old_len, text, len)) {
+                bitmap_free_run(fs, slot.first_cluster + alloc_clusters, got);
+                return false;
+            }
+            if (cached) {
+                g_file_loc.slot.data_length = new_len;
+                g_file_loc.alloc_clusters = alloc_clusters + got;
+                g_file_loc.entry_dirty = true;
+                // Граница резерва — естественная точка сброса: длина на диске
+                // догоняет реальность раз в резерв, а не раз в дописывание.
+                // При обрыве питания теряется хвост от последнего расширения,
+                // а не весь прогон.
+                return file_loc_flush_entry();
+            }
+            if (!exfat_write_entry_set_at(slot.entry_start, basename, append_attrs, slot.first_cluster, new_len, true)) {
+                // Длина в каталоге не изменилась — только что занятые кластеры
+                // никто не claim'ит, вернуть их обязаны здесь (раньше этот
+                // путь их терял; с резервом потеря была бы уже не в один кластер).
+                bitmap_free_run(fs, slot.first_cluster + alloc_clusters, got);
+                return false;
+            }
+            return true;
         }
-        if (!exfat_write_entry_set_at(slot.entry_start, basename, 0x20, slot.first_cluster, new_len, true)) return false;
-        if (file_loc_same_path(fs, path)) g_file_loc.slot.data_length = new_len;
-        return true;
     }
 
+    // Файл переезжает целиком. Упреждающий хвост отпускаем ДО поиска
+    // нового места: free_slot_data() ниже освобождает только то, что
+    // покрыто длиной файла, и хвост остался бы занятым навсегда — а заодно
+    // это расширяет выбор для bitmap_alloc_run().
+    if (cached) file_loc_release_reserve();
+
     g_exfat_append_slow_calls++;
-    // Не вышло (за файлом занято) — прежний путь: новый пробег + копирование.
-    uint32_t new_clus = bitmap_alloc_run(fs, need_clusters);
+    // Не вышло (за файлом занято) — новый пробег + копирование. Пробег
+    // берётся С ЗАПАСОМ: раньше здесь запрашивалось РОВНО need_clusters,
+    // и файл снова оказывался впритык к соседу — следующему же
+    // дописыванию опять не хватало одного кластера, и оно снова гнало
+    // файл на переезд. На живом замере (26 МБ журнала, 200 дописываний,
+    // hw 2026-09-08) это дало 7 переездов и 66% всего времени блочных
+    // операций, ушедших в копирование, — при том что сам битмап стоил 2%.
+    uint32_t slow_reserve = cached ? append_reserve_clusters(bpc, need_clusters) : 0;
+    uint32_t grabbed = need_clusters + slow_reserve;
+    uint32_t new_clus = bitmap_alloc_run(fs, grabbed);
+    if (new_clus == 0 && slow_reserve > 0) { // непрерывного места с запасом нет — берём впритык
+        grabbed = need_clusters;
+        new_clus = bitmap_alloc_run(fs, grabbed);
+    }
     if (new_clus == 0) return false;
     if (old_len > 0 && slot.first_cluster != 0) {
         if (!copy_extent(fs, slot.first_cluster, new_clus, old_len)) {
-            bitmap_free_run(fs, new_clus, need_clusters);
+            bitmap_free_run(fs, new_clus, grabbed);
             return false;
         }
     }
     if (!write_extent_at(fs, new_clus, old_len, text, len)) {
-        bitmap_free_run(fs, new_clus, need_clusters);
+        bitmap_free_run(fs, new_clus, grabbed);
         return false;
     }
     // Запись каталога переписывается ПОСЛЕ того, как новые данные легли —
     // тот же порядок, что в exfat_write_file(): при обрыве питания посреди
     // операции файл остаётся прежним, а не половинчатым.
-    if (!exfat_write_entry_set_at(slot.entry_start, basename, 0x20, new_clus, new_len, true)) {
-        bitmap_free_run(fs, new_clus, need_clusters);
+    if (!exfat_write_entry_set_at(slot.entry_start, basename, append_attrs, new_clus, new_len, true)) {
+        bitmap_free_run(fs, new_clus, grabbed);
         return false;
     }
     if (old_len > 0 && slot.first_cluster != 0) free_slot_data(fs, slot);
@@ -1986,6 +2229,8 @@ bool exfat_append_file(EXFAT_Instance* fs, const char* path, const char* text, u
     if (file_loc_same_path(fs, path)) {
         g_file_loc.slot.first_cluster = new_clus;
         g_file_loc.slot.data_length = new_len;
+        g_file_loc.alloc_clusters = grabbed; // включая упреждающий хвост, см. slow_reserve
+        g_file_loc.entry_dirty = false;      // переезд пишет запись каталога сразу — на диске уже правда
     }
     return true;
 }

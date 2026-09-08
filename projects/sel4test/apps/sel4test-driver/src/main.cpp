@@ -540,9 +540,9 @@ static bool shm_page_allowed_for_role(int is_driver, int page) {
     // они существуют только чтобы будущая фиксированная страница не
     // сдвигала адреса растущих областей.
     if (page < SHM_DYNAMIC_FIRST_PAGE) return false;
-    if (page < SHM_PAGE_BLK_STAGING_FIRST) return shm_role_needs_vfs_payload(is_driver);
-    if (page < SHM_PAGE_USB_STAGING_FIRST) return is_driver == 3; // staging blk_driver — только ему
-    return is_driver == 6;                                        // staging usb_driver — только ему
+    // Staging-областей больше нет (см. SHM_STAGING_PAGES в platform.h) —
+    // вся растущая часть это нагрузка VFS.
+    return shm_role_needs_vfs_payload(is_driver);
 }
 
 // Есть ли у роли хоть одна страница — для fail-closed проверки в SYS_SHM_GET.

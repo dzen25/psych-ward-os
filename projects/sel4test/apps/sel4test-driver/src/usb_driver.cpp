@@ -127,11 +127,26 @@ static uint64_t g_uas_cmds_ok = 0; // сколько команд UAS отраб
 // Разбивка блочных операций по тому, кто их вызвал (см. ExfatIoTag).
 static uint64_t g_tag_cmds[EXFAT_IO_TAG_MAX] = {0};
 static uint64_t g_tag_bytes[EXFAT_IO_TAG_MAX] = {0};
+static uint64_t g_tag_us[EXFAT_IO_TAG_MAX] = {0};
+// Время ВНУТРИ exfat_append_file(). Вместе с замером клиента даёт разбор,
+// которого не хватало: клиент видит полный round-trip, теги — только
+// блочные операции, а разница между ними (IPC, маршрутизация пути,
+// vfs_lock) до сих пор нигде не была видна и оценивалась на глаз.
+static uint64_t g_append_us = 0;
+static uint64_t g_append_n = 0;
+// Время ВСЕГО пути cmd 121 внутри драйвера — от разбора пути до ответа.
+// Нужно, чтобы отделить "драйвер работает" от "сообщение едет": замер
+// клиента (1044 мкс) вдвое больше exfat_append_file (514 мкс), а у чтения
+// при той же обёртке vfs_lock/seL4_Call/vfs_unlock разница всего 30 мкс.
+// Значит дело не в IPC вообще, и гадать, в чём, второй раз не стоит.
+static uint64_t g_vfs_t0 = 0;
+static uint64_t g_cmd121_us = 0;
 
 static inline uint64_t scsi_us_since(uint64_t t0) {
     if (g_cntfrq == 0) return 0;
     return (read_cntvct() - t0) * 1000000ull / g_cntfrq;
 }
+
 
 
 static inline seL4_IPCBuffer* get_local_ipc() {
@@ -639,7 +654,11 @@ constexpr uint16_t UAS_MAX_TAGS = 16;
 // 64 КБ вместо 16 КБ до конца 128 КБ. Признак оказался инвариантен к
 // объёму, поэтому потолок возвращён в нерабочее положение (равен общему
 // пределу), а сама механика дробления оставлена как готовая ручка.
-constexpr uint32_t UAS_MAX_XFER_SECTORS = (uint32_t)USB_BOUNCE_PAGES * 8; // то же, что USB_MAX_SECTORS_PER_IO (объявлен ниже по файлу)
+// Секторов за ОДНУ SCSI-команду. Больше не привязано к bounce-буферу:
+// передача из/в SHM идёт zero-copy (shm_paddr_for), bounce в ней не
+// участвует вообще, и его размер её не ограничивает. Потолок задаёт
+// область нагрузки VFS — больше неё за один вызов всё равно не приходит.
+constexpr uint32_t UAS_MAX_XFER_SECTORS = VFS_PAYLOAD_MAX / 512u;
 
 static inline volatile Trb*      uas_cmdring_vaddr(int idx)  { return (volatile Trb*)(PLAT_XHCI_UAS_CMDRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
 static inline volatile Trb*      uas_statring_vaddr(int idx) { return (volatile Trb*)(PLAT_XHCI_UAS_STATRING_VADDR + (uintptr_t)idx * PLAT_XHCI_RING_STRIDE); }
@@ -4347,7 +4366,11 @@ static bool step13_test_unit_ready(seL4_CPtr console_ep, int idx, uint8_t slot_i
 // перехватывает мутирующие VFS-команды ДО exfat.cpp, пока флаг false —
 // см. комментарий в главном цикле ниже про находку "touch вешал шелл".
 constexpr bool RPI4_USB_ALLOW_WRITE = true;
-constexpr uint32_t USB_MAX_SECTORS_PER_IO = (uint32_t)USB_BOUNCE_PAGES * 8; // = размер bounce-буфера (USB_BOUNCE_PAGES стр. по 4КБ) / 512
+constexpr uint32_t USB_MAX_SECTORS_PER_IO = VFS_PAYLOAD_MAX / 512u;        // см. UAS_MAX_XFER_SECTORS выше
+// А вот НЕ-SHM источник/приёмник (буфер copy_extent, сектор битмапа,
+// запись каталога) по-прежнему едет через bounce, и кусок обязан в него
+// влезть. Раньше эти два потолка совпадали и путать их было нечем.
+constexpr uint32_t USB_BOUNCE_SECTORS = (uint32_t)USB_BOUNCE_PAGES * 8;
 
 // hardware_usb_read/write вызываются exfat.cpp БЕЗ возможности передать ни
 // console_ep, ни "какое устройство" (сигнатура block_read_fn/
@@ -4435,7 +4458,21 @@ static uint64_t shm_paddr_for(const void* p, uint32_t len) {
     return g_shm_paddr + off;
 }
 
+static bool hardware_usb_rw_generic_read_inner(int idx, uint32_t sector, uint32_t count, void* buffer);
+// Обёртка ради ОДНОГО: времени, разложенного по вызывающему (см. ExfatIoTag).
+// Счётчиков команд для выбора, что оптимизировать, не хватает — команда на
+// 512 байт и команда на 128 КБ стоят разного, и по количествам нельзя
+// понять, где уходит время. Отдельной функцией, а не RAII-таймером внутри:
+// деструктор тянет за собой раскрутку стека (__gxx_personality_v0), а
+// образ линкуется -nostdlib, без поддержки исключений.
 static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t count, void* buffer) {
+    uint32_t tag = g_exfat_io_tag;
+    uint64_t t0 = read_cntvct();
+    bool ok = hardware_usb_rw_generic_read_inner(idx, sector, count, buffer);
+    if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += scsi_us_since(t0);
+    return ok;
+}
+static bool hardware_usb_rw_generic_read_inner(int idx, uint32_t sector, uint32_t count, void* buffer) {
     g_scsi_reads++; g_scsi_read_bytes += (uint64_t)count * 512u; if (count > g_scsi_rmax) g_scsi_rmax = count;
     g_scsi_cur_is_read = true; g_scsi_cur_bytes = count * 512u;
     if (g_exfat_io_tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[g_exfat_io_tag]++; g_tag_bytes[g_exfat_io_tag] += (uint64_t)count * 512u; }
@@ -4452,7 +4489,11 @@ static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t coun
     // В режиме UAS крупная передача режется на несколько SCSI-команд (см.
     // UAS_MAX_XFER_SECTORS). Для Bulk-Only ничего не меняется: предел там
     // равен самому запросу, и цикл выполняется ровно один раз.
-    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : count;
+    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : USB_BOUNCE_SECTORS;
+    // Zero-copy возможен, только если ВЕСЬ буфер лежит в SHM. Иначе кусок
+    // поедет через bounce и обязан в него влезть — потолки разошлись, см.
+    // USB_BOUNCE_SECTORS.
+    if (!shm_paddr_for(buffer, (uint64_t)count * 512u) && max_chunk > USB_BOUNCE_SECTORS) max_chunk = USB_BOUNCE_SECTORS;
     for (uint32_t done = 0; done < count; ) {
         uint32_t n = count - done;
         if (n > max_chunk) n = max_chunk;
@@ -4490,7 +4531,21 @@ static bool hardware_usb_rw_generic_read(int idx, uint32_t sector, uint32_t coun
 // (opcode 0x2A) и data_dir_in=false — scsi_command() уже умеет OUT-
 // направление (см. bulk_transfer на bulkout_ring, используется и для
 // CBW/CDB), реализовывать его отдельно не нужно.
+static bool hardware_usb_rw_generic_write_inner(int idx, uint32_t sector, uint32_t count, const void* buffer);
+// Обёртка ради ОДНОГО: времени, разложенного по вызывающему (см. ExfatIoTag).
+// Счётчиков команд для выбора, что оптимизировать, не хватает — команда на
+// 512 байт и команда на 128 КБ стоят разного, и по количествам нельзя
+// понять, где уходит время. Отдельной функцией, а не RAII-таймером внутри:
+// деструктор тянет за собой раскрутку стека (__gxx_personality_v0), а
+// образ линкуется -nostdlib, без поддержки исключений.
 static bool hardware_usb_rw_generic_write(int idx, uint32_t sector, uint32_t count, const void* buffer) {
+    uint32_t tag = g_exfat_io_tag;
+    uint64_t t0 = read_cntvct();
+    bool ok = hardware_usb_rw_generic_write_inner(idx, sector, count, buffer);
+    if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += scsi_us_since(t0);
+    return ok;
+}
+static bool hardware_usb_rw_generic_write_inner(int idx, uint32_t sector, uint32_t count, const void* buffer) {
     g_scsi_writes++; g_scsi_write_bytes += (uint64_t)count * 512u; if (count > g_scsi_wmax) g_scsi_wmax = count;
     g_scsi_cur_is_read = false; g_scsi_cur_bytes = count * 512u;
     if (g_exfat_io_tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[g_exfat_io_tag]++; g_tag_bytes[g_exfat_io_tag] += (uint64_t)count * 512u; }
@@ -4503,7 +4558,11 @@ static bool hardware_usb_rw_generic_write(int idx, uint32_t sector, uint32_t cou
 
     // Симметрично чтению: в режиме UAS крупная запись режется на несколько
     // SCSI-команд, для Bulk-Only цикл выполняется один раз.
-    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : count;
+    uint32_t max_chunk = dev.uas_active ? UAS_MAX_XFER_SECTORS : USB_BOUNCE_SECTORS;
+    // Zero-copy возможен, только если ВЕСЬ буфер лежит в SHM. Иначе кусок
+    // поедет через bounce и обязан в него влезть — потолки разошлись, см.
+    // USB_BOUNCE_SECTORS.
+    if (!shm_paddr_for(buffer, (uint64_t)count * 512u) && max_chunk > USB_BOUNCE_SECTORS) max_chunk = USB_BOUNCE_SECTORS;
     bool ok = true;
     for (uint32_t done = 0; done < count && ok; ) {
         uint32_t n = count - done;
@@ -6166,7 +6225,8 @@ int main(int argc, char *argv[]) {
             g_scsi_wmax = g_scsi_rmax = 0;
             g_scsi_us_data_rd = g_scsi_us_data_wr = 0;
             g_scsi_big_rd_us = g_scsi_big_rd_bytes = 0;
-            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) { g_tag_cmds[t] = 0; g_tag_bytes[t] = 0; }
+            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) { g_tag_cmds[t] = 0; g_tag_bytes[t] = 0; g_tag_us[t] = 0; }
+            g_append_us = 0; g_append_n = 0; g_cmd121_us = 0;
             g_exfat_copy_extent_calls = g_exfat_append_slow_calls = 0;
             g_exfat_append_calls = g_exfat_stream_write_calls = 0;
             seL4_SetMR(0, 0);
@@ -6182,7 +6242,11 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 1, (seL4_Word)g_exfat_append_slow_calls);
             seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 2, (seL4_Word)g_exfat_append_calls);
             seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 3, (seL4_Word)g_exfat_stream_write_calls);
-            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2 * EXFAT_IO_TAG_MAX + 4));
+            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 4 + t, (seL4_Word)g_tag_us[t]);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 4, (seL4_Word)g_append_us);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 5, (seL4_Word)g_append_n);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 6, (seL4_Word)g_cmd121_us);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 3 * EXFAT_IO_TAG_MAX + 7));
             continue;
         }
         if (cmd == 126) {
@@ -6222,6 +6286,7 @@ int main(int argc, char *argv[]) {
 
         int dispatch_idx = -1;
 
+        g_vfs_t0 = read_cntvct(); // см. g_cmd121_us
         if (cmd == 110 || cmd == 112 || cmd == 113 || cmd == 114 || cmd == 121 ||
             cmd == 122 || cmd == 123 || cmd == 124 || cmd == 128 ||
             cmd == 116 || cmd == 117 || cmd == 118 || cmd == 119 || cmd == 120) {
@@ -6394,8 +6459,12 @@ int main(int argc, char *argv[]) {
             // (см. разбор у my_memcpy выше). Клиент в это время заблокирован
             // в seL4_Call и изменить данные не может, другие клиенты
             // сериализованы vfs_lock.
-            if (exfat_append_file(&fs, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len)) seL4_SetMR(0, 0);
+            uint64_t t_ap = read_cntvct();
+            bool ap_ok = exfat_append_file(&fs, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len);
+            g_append_us += scsi_us_since(t_ap); g_append_n++;
+            if (ap_ok) seL4_SetMR(0, 0);
             else seL4_SetMR(0, (seL4_Word)-1);
+            g_cmd121_us += scsi_us_since(g_vfs_t0);
             usb_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
 

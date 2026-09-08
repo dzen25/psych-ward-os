@@ -1046,7 +1046,13 @@ constexpr uint32_t EMMC_INT_ERROR_MASK = 0xFFFF0000u; // Любая ошибка
 constexpr uint32_t EMMC_INT_ALL_EN     = 0xFFFFFFFFu; // Маска "разрешить всё" для IRPT_MASK (статус-биты) и, начиная с Фазы 4.5, для IRPT_EN тоже (реальный GIC IRQ, см. blk_driver.cpp)
 
 // CONTROL0 (0x28) — базовая настройка хоста
-constexpr uint32_t EMMC_C0_USE_4BIT    = (1u << 1);   // Ширина шины 4 бита (не используется в первой версии — см. план)
+constexpr uint32_t EMMC_C0_USE_4BIT    = (1u << 1);   // Ширина шины 4 бита (включается в emmc_init после ACMD6, 2026-09-08)
+// High Speed Enable (бит 2 того же Host Control 1). Меняет фронт, по
+// которому хост защёлкивает данные, — обязателен вместе с частотой выше
+// 25 МГц. Ставится ТОЛЬКО после того, как сама карта переведена в High
+// Speed через CMD6 (SWITCH_FUNC), иначе хост и карта разойдутся по
+// таймингу и любое чтение начнёт валиться по CRC.
+constexpr uint32_t EMMC_C0_HS_EN       = (1u << 2);
 // SD Bus Power (bits 8-11 в CONTROL0, аналог legacy SDHCI "Power Control"
 // байта на 0x29): SRST_HC гасит питание шины, найдено эмпирически на живом
 // железе (до сброса bits 8-11 = 0xF, после — 0x0) — без этого CMD_INHIBIT
@@ -1108,6 +1114,11 @@ constexpr uint32_t EMMC_CMD_SEND_REL_ADDR  = 3;   // CMD3,  R6 (как R1/48bit)
 constexpr uint32_t EMMC_CMD_SEND_CSD       = 9;   // CMD9,  R2/136bit
 constexpr uint32_t EMMC_CMD_SELECT_CARD    = 7;   // CMD7,  R1b/48bit+busy
 constexpr uint32_t EMMC_CMD_APP_CMD        = 55;  // CMD55, R1/48bit — префикс для ACMDn
+constexpr uint32_t EMMC_CMD_SET_BUS_WIDTH  = 6;   // ACMD6 (после CMD55), аргумент 0x2 = 4 бита
+// ВНИМАНИЕ: тот же индекс 6. Различает их ТОЛЬКО префикс CMD55: с ним это
+// ACMD6 (SET_BUS_WIDTH), без него — CMD6 (SWITCH_FUNC). Отдельное имя
+// заведено, чтобы в коде было видно, какая из двух команд имеется в виду.
+constexpr uint32_t EMMC_CMD_SWITCH_FUNC    = 6;   // CMD6, R1/48bit + 64 байта данных
 constexpr uint32_t EMMC_ACMD_SD_SEND_OP_COND = 41; // ACMD41 (после CMD55), R3/48bit (без CRC)
 constexpr uint32_t EMMC_CMD_READ_SINGLE    = 17;  // CMD17, R1/48bit + данные (host<-card)
 constexpr uint32_t EMMC_CMD_READ_MULTI     = 18;  // CMD18, R1/48bit + данные, multi-block
@@ -1742,9 +1753,11 @@ constexpr uint32_t WIFI_SHM_CANARY_MAGIC  = 0xC0FFEEEEu;
 //   2. Страницы отображаются при КАЖДОМ спавне процесса. 32 страницы —
 //      это 32 лишних seL4_ARM_Page_Map на каждый `ls`; 25600 страниц
 //      превратили бы запуск любой команды в сотни миллисекунд.
-// 128 КБ выбраны из расчёта: чтобы амортизировать ~1 мс накладных
-// расходов на SCSI-команду до 20 МБ/с, достаточно ~20 КБ за вызов —
-// взято с шестикратным запасом.
+// ПОПРАВКА к пункту 1 (проверено по коду 2026-09-08): SHM-капы копируются
+// в CNode РУТСЕРВЕРА (alloc.alloc_slot(), удаляются через root_cnode), а
+// не в 8-битный CNode ребёнка — страницы отображаются ему в VSpace, но
+// слота у него не занимают. Реальная цена страницы — слот аллокатора root
+// и один seL4_ARM_Page_Map на спавн, то есть пункт 2, а не пункт 1.
 constexpr int SHM_FIXED_PAGES       = 7;   // 0..6, см. выше — трогать только вместе с WIFI_SHM_*/GENET
 // ЗАПАС между фиксированной и растущей частями. Смысл: добавить новую
 // фиксированную страницу (ещё один мейлбокс, ещё одно состояние драйвера)
@@ -1754,8 +1767,32 @@ constexpr int SHM_FIXED_PAGES       = 7;   // 0..6, см. выше — трог�
 // класс правок, на котором проект уже ловил баги пересечений.
 constexpr int SHM_FIXED_RESERVE_PAGES = 9; // 7..15 — свободны под будущие фиксированные
 constexpr int SHM_DYNAMIC_FIRST_PAGE  = SHM_FIXED_PAGES + SHM_FIXED_RESERVE_PAGES; // = 16, круглая граница
-constexpr int SHM_VFS_PAYLOAD_PAGES = 32;  // 128 КБ полезной нагрузки VFS за один вызов
-constexpr int SHM_STAGING_PAGES     = 32;  // столько же у staging-буфера каждого из двух драйверов
+constexpr int SHM_VFS_PAYLOAD_PAGES = 64;  // 256 КБ полезной нагрузки VFS за один вызов
+// STAGING-ОБЛАСТИ УПРАЗДНЕНЫ (2026-09-08). Они появились, когда нагрузка
+// лежала в странице 0 вместе с TX-скретчем GENET, и драйверы обязаны были
+// копировать текст к себе, чтобы DMA сети не затёрла его на лету. С
+// переездом нагрузки в собственную область копия была убрана, а сами
+// области остались: 64 страницы (256 КБ) выделялись, отображались в оба
+// драйвера при каждом спавне и НЕ читались и НЕ писались ни одной строкой
+// кода — только упоминались в комментариях. Отданы под нагрузку VFS:
+// один вызов вырос со 128 КБ до 256 КБ, а суммарный размер SHM при этом
+// не вырос, а УПАЛ (112 страниц -> 80).
+//
+// Зачем нагрузке быть больше: накладные расходы SCSI-команды (Command IU
+// 28 мкс + Sense IU 10-19 мкс) и весь путь VFS/IPC/exFAT (~41 мкс)
+// платятся РАЗ НА ВЫЗОВ, а фаза данных линейна по объёму (445 мкс на
+// 128 КБ). Вдвое больший вызов делит те же ~115 мкс на вдвое больший
+// объём. Замер 2026-09-08: 216 МБ/с при 128 КБ, расчёт 254 МБ/с при
+// 256 КБ, замер дал 247. ДАЛЬШЕ РАСТИТЬ НЕ СТОИТ, проверено на железе
+// 2026-09-08: 384 КБ дали внутри драйвера 269 МБ/с против 267 при 256 КБ,
+// то есть +0.8%, а не расчётные 4% — фиксированная часть к этому моменту
+// уже размазана, делить дальше почти нечего. Цена же реальная: +32
+// seL4_ARM_Page_Map на спавн каждого процесса и +128 КБ BSS в каждой
+// утилите с буфером на VFS_PAYLOAD_MAX. Откачено обратно на 64.
+// Это тот же выигрыш, за которым шла бы очередь команд
+// (issuse.txt №6), но без второго кольца TRB на поток и без асинхронного
+// владения буфером.
+constexpr int SHM_STAGING_PAGES     = 0;   // см. блок выше — области упразднены
 constexpr int SHM_TOTAL_PAGES = SHM_DYNAMIC_FIRST_PAGE + SHM_VFS_PAYLOAD_PAGES + 2 * SHM_STAGING_PAGES;
 
 // Полезная нагрузка VFS. Раньше данные лежали в странице 0 со смещения 128,
@@ -1772,17 +1809,9 @@ constexpr int SHM_PAGE_VFS_PAYLOAD_FIRST = SHM_DYNAMIC_FIRST_PAGE;
 constexpr int SHM_PAGE_BLK_STAGING_FIRST = SHM_PAGE_VFS_PAYLOAD_FIRST + SHM_VFS_PAYLOAD_PAGES;
 constexpr int SHM_PAGE_USB_STAGING_FIRST = SHM_PAGE_BLK_STAGING_FIRST + SHM_STAGING_PAGES;
 
-// blk_driver'ов staging-буфер (см. комментарий у первого появления этого
-// класса бага — GENET rx_buffer_offsets[] пересечение). Адрес больше не
-// прописан числом — вычисляется, поэтому смена размеров выше не требует
-// пересчёта соседей вручную.
-constexpr uint32_t BLK_SHM_STAGING_OFFSET = (uint32_t)SHM_PAGE_BLK_STAGING_FIRST * 4096;
-
-// usb_driver'ов staging-буфер (Фаза 14, Milestone 8) — зеркалит
-// BLK_SHM_STAGING_OFFSET один-в-один, отдельная область, чтобы echo>/mv на
-// /mnt/usb0 не пересекались физической памятью с теми же операциями на
-// SD-карте (тот же класс бага, что уже чинили для GENET/BLK).
-constexpr uint32_t USB_SHM_STAGING_OFFSET = (uint32_t)SHM_PAGE_USB_STAGING_FIRST * 4096;
+// Staging-области драйверов упразднены — см. SHM_STAGING_PAGES выше.
+// Константы адресов удалены намеренно: пока они существовали, их можно было
+// случайно использовать и получить запись за пределы SHM.
 
 // BCDC data-заголовок (4 байта: flags/priority/flags2/data_offset) — идёт
 // ПЕРЕД полезной нагрузкой на DATA(2)/EVENT(1) sdpcm-каналах, в отличие от

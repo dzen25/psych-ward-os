@@ -70,9 +70,58 @@ static uint32_t g_emmc_rca = 0; // Relative Card Address, получаем в em
 static uint32_t g_blk_dma_paddr = 0;
 static uint32_t g_blk_dma2_paddr = 0;
 constexpr uintptr_t BLK_DMA_BUF_OFFSET = 0;
+// DMA bounce-буфер — ОДНА страница, отсюда и потолок в 8 секторов, который
+// до 2026-09-08 был потолком ВСЕГО блочного ввода-вывода SD-карты: exFAT
+// брал значение по умолчанию (h/exfat.h, max_sectors_per_io = 8), то есть
+// 4 КБ за команду, тогда как usb_driver ставит себе 768. Вся работа по
+// укрупнению передач на SD-путь просто не распространялась.
+constexpr uint32_t BLK_BOUNCE_SECTORS = 8;
+// Потолок ОДНОЙ команды при zero-copy. Ограничение — 16-битное поле length
+// в дескрипторе ADMA2: 127 * 512 = 65024 влезает, 128 * 512 = 65536 уже нет.
+// Цепочку дескрипторов не строим намеренно: 127 секторов это уже в 16 раз
+// меньше команд, а цепочка — новый код на пути, от которого зависит
+// загрузка системы (root читает load_chain и /sbin именно отсюда).
+constexpr uint32_t BLK_MAX_SECTORS_PER_IO = 127;
 static inline volatile uint8_t* blk_dma_buf() {
     return (volatile uint8_t*)(PLAT_BLK_DMA_VADDR + BLK_DMA_BUF_OFFSET);
 }
+static uint64_t g_shm_paddr = 0;
+
+// Разбивка блочных операций по вызывающему (см. ExfatIoTag) — ровно то же,
+// что усb_driver считает у себя. Без неё logtest на SD печатал ЧИСЛА,
+// которых никто не считал: команды 125/126/127 здесь не обрабатывались,
+// ответ приходил пустой, а тест читал регистры сообщения как есть и выдавал
+// "всего кластеров 187" и "команд 5245624" наравне с настоящими цифрами.
+static uint64_t g_tag_cmds[EXFAT_IO_TAG_MAX] = {0};
+static uint64_t g_tag_bytes[EXFAT_IO_TAG_MAX] = {0};
+static uint64_t g_tag_us[EXFAT_IO_TAG_MAX] = {0};
+static uint64_t g_append_us = 0;
+static uint64_t g_append_n = 0;
+
+static inline uint64_t blk_us_since(uint64_t t0) {
+    if (g_cntfrq == 0) return 0;
+    return (read_cntvct() - t0) * 1000000ull / g_cntfrq;
+}
+
+// Физический адрес буфера, ЕСЛИ он лежит в SHM. Тогда ADMA2 читает и пишет
+// прямо туда, минуя bounce и его memcpy — тот же приём, что уже работает
+// у usb_driver (shm_paddr_for). SHM отображается процессам некэшируемо
+// (map_frame_robust, VMAttributes=0), так что для DMA он пригоден без
+// обслуживания кэша.
+static uint64_t blk_shm_paddr_for(const void* p, uint32_t len) {
+    if (g_shm_paddr == 0 || g_shm_vaddr == nullptr || p == nullptr) return 0;
+    const char* c = (const char*)p;
+    if (c < g_shm_vaddr) return 0;
+    uint64_t off = (uint64_t)(c - g_shm_vaddr);
+    if (off + len > (uint64_t)SHM_TOTAL_PAGES * 4096ull) return 0;
+    uint64_t pa = g_shm_paddr + off;
+    // Адрес в дескрипторе ADMA2 32-битный: всё, что выше 4 ГБ, он не
+    // адресует. На плате с 8 ГБ буфер может оказаться там — тогда честно
+    // возвращаемся на bounce, а не пишем DMA по обрезанному адресу.
+    if (pa + len > 0x100000000ull) return 0;
+    return pa;
+}
+
 static inline volatile Adma2Descriptor32* blk_dma_desc() {
     return (volatile Adma2Descriptor32*)(PLAT_BLK_DMA_VADDR + 0x1000);
 }
@@ -326,6 +375,34 @@ static void emmc_set_clock_divider(uint32_t divisor) {
     *emmc_reg(EMMC_CONTROL1_OFFSET) = *emmc_reg(EMMC_CONTROL1_OFFSET) | EMMC_C1_CLK_EN;
 }
 
+// Определена ниже — нужна здесь для контрольного чтения после перехода
+// на 50 МГц (см. конец emmc_init).
+bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer);
+
+// CMD6 (SWITCH_FUNC) — единственная в драйвере команда с данными, у которой
+// размер блока НЕ 512, а 64 байта, поэтому отдельно от emmc_xfer_one().
+// Ответ — 64-байтная структура "SWITCH function status" (Physical Layer
+// Spec): маски поддержки по шести группам функций и то, что реально
+// выбрано. Читаем в тот же ADMA2 bounce-буфер.
+static bool emmc_switch_func(uint32_t arg, uint8_t out[64]) {
+    if (g_blk_dma_paddr == 0 || g_blk_dma2_paddr == 0) return false;
+    volatile Adma2Descriptor32* desc = blk_dma_desc();
+    desc->attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN);
+    desc->length = 64;
+    desc->addr = g_blk_dma_paddr + BLK_DMA_BUF_OFFSET;
+
+    if (!emmc_wait_dat_ready()) return false;
+    *emmc_reg(EMMC_ADMA_SYSADDR_OFFSET) = g_blk_dma2_paddr;
+    *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (1u << 16) | 64u;
+
+    uint32_t flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
+                   | EMMC_CMD_ISDATA | EMMC_TM_DAT_DIR_READ | EMMC_TM_DMA_EN;
+    if (!emmc_send_cmd(flags, EMMC_CMD_SWITCH_FUNC, arg)) return false;
+    if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+    my_memcpy(out, (const void*)blk_dma_buf(), 64);
+    return true;
+}
+
 // Стандартная последовательность инициализации SD-карты (см. план Фазы 3.3):
 // software reset -> идентификационный клок (~400kHz) -> CMD0 -> CMD8 ->
 // ACMD41 (ждём готовности OCR) -> CMD2 -> CMD3 (получаем RCA) -> CMD7
@@ -481,16 +558,89 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     }
     if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] CMD7 OK, card selected\n");
 
-    // 0x02 -> 100MHz/(2*2) = 25MHz (рабочая стадия, standard speed).
-    emmc_set_clock_divider(0x02);
-
-    // Фаза 4.5/ADMA2 (см. ROADMAP.md) — режим DMA-select персистентный (не
-    // per-команда, как EMMC_TM_DMA_EN), поэтому включаем один раз здесь, до
-    // ЛЮБОГО реального чтения/записи сектора (find_exfat_partition() дёргает
-    // hardware_emmc_read() сразу после emmc_init(), см. main()). На обычные
-    // безданные команды (CMD0/CMD2/CMD3/CMD7 выше) DMA Select не влияет —
-    // учитывается контроллером только вместе с EMMC_CMD_ISDATA+DMA_EN.
+    // Фаза 4.5/ADMA2 — режим DMA-select персистентный (не per-команда, как
+    // EMMC_TM_DMA_EN), включается один раз. Стоять он обязан ДО ПЕРВОЙ
+    // КОМАНДЫ С ДАННЫМИ, а не просто до первого чтения сектора: CMD6
+    // (SWITCH_FUNC) ниже — тоже команда с данными, и когда эта строка стояла
+    // после неё, контроллер был ещё в SDMA (00), передача не проходила и
+    // high speed молча не включался. На безданные команды (CMD0/CMD2/CMD3/
+    // CMD7 выше) DMA Select не влияет.
     *emmc_reg(EMMC_CONTROL0_OFFSET) = (*emmc_reg(EMMC_CONTROL0_OFFSET) & ~EMMC_C0_DMA_SEL_MASK) | EMMC_C0_DMA_SEL_ADMA2_32;
+
+    // ШИРИНА ШИНЫ. До 2026-09-08 карта работала в ОДИН бит: константа
+    // EMMC_C0_USE_4BIT была объявлена в platform.h и нигде не использовалась,
+    // ACMD6 не отправлялась вообще. При 25 МГц один бит даёт ~3.1 МБ/с
+    // теоретического потолка — и замер показал 2.6 МБ/с на запись и 2.9 на
+    // чтение, то есть шина была занята почти полностью и укрупнение передач
+    // упиралось именно в неё.
+    //
+    // Порядок обязателен и тот же, что уже описан в platform.h для SDIO:
+    // СНАЧАЛА карта (ACMD6 уходит ещё по одному биту), ПОТОМ хост. Если
+    // поменять местами, хост начнёт слушать четыре линии, пока карта отвечает
+    // по одной. При отказе ACMD6 хост НЕ переключаем — остаёмся на рабочем
+    // одном бите, а не получаем нечитаемую карту.
+    bool four_bit = false;
+    if (emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_CMD_APP_CMD, g_emmc_rca)) {
+        if (emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_CMD_SET_BUS_WIDTH, 0x2)) four_bit = true;
+    }
+    if (four_bit) {
+        *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) | EMMC_C0_USE_4BIT;
+        if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] шина 4 бита\n");
+    } else {
+        sys_puts(console_ep, "[BLK][EMMC] ACMD6 не прошла — остаёмся на 1-битной шине\n");
+    }
+
+    // HIGH SPEED (50 МГц). Карта переводится командой CMD6 (SWITCH_FUNC),
+    // хост — битом EMMC_C0_HS_EN и делителем 0x01. Порядок тот же, что у
+    // ширины шины: сначала карта, потом хост.
+    //
+    // Сначала СПРАШИВАЕМ (mode=0), поддерживает ли карта функцию 1 группы 1,
+    // и только потом переключаем (mode=1). Аргумент: бит 31 = режим,
+    // остальные ниббли по группам, 0xF = "не менять", группа 1 в младшем.
+    bool high_speed = false;
+    if (four_bit) { // на одном бите за скоростью не гонимся — сначала пусть заработает база
+        uint8_t sw[64];
+        if (!emmc_switch_func(0x00FFFFF1u, sw)) {
+            sys_puts(console_ep, "[BLK][EMMC] CMD6 (опрос функций) не прошла — остаёмся на 25 МГц\n");
+        } else {
+            // Байты 12-13 — маска поддерживаемых функций группы 1 (big-endian),
+            // бит 1 = High Speed. Байт 16, младший ниббл — что реально выбрано.
+            uint16_t grp1_supported = (uint16_t)(((uint16_t)sw[12] << 8) | sw[13]);
+            if (!(grp1_supported & 0x0002u)) {
+                sys_puthex32(console_ep, "[BLK][EMMC] карта не заявила High Speed, маска группы 1 = ", grp1_supported);
+            } else if (!emmc_switch_func(0x80FFFFF1u, sw)) {
+                sys_puts(console_ep, "[BLK][EMMC] CMD6 (переключение) не прошла — остаёмся на 25 МГц\n");
+            } else if ((sw[16] & 0x0Fu) != 1u) {
+                sys_puthex32(console_ep, "[BLK][EMMC] карта не приняла High Speed, выбранная функция = ", sw[16] & 0x0Fu);
+            } else {
+                high_speed = true;
+            }
+        }
+    }
+    if (high_speed) {
+        *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) | EMMC_C0_HS_EN;
+        emmc_set_clock_divider(0x01); // 100MHz/(2*1) = 50MHz
+    } else {
+        // 0x02 -> 100MHz/(2*2) = 25MHz (рабочая стадия, standard speed).
+        emmc_set_clock_divider(0x02);
+    }
+
+
+    // ОТКАТ ПО ФАКТУ, а не по вере. Карта может сказать "поддерживаю
+    // High Speed", а на 50 МГц читаться с ошибками CRC — тогда система
+    // просто не загрузится: root читает отсюда load_chain и /sbin.
+    // Пробуем настоящее чтение и при отказе возвращаемся на 25 МГц.
+    if (high_speed) {
+        uint8_t probe[512];
+        if (!hardware_emmc_read(0, 1, probe)) {
+            sys_puts(console_ep, "[BLK][EMMC] 50 МГц не читается — откат на 25 МГц\n");
+            *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) & ~EMMC_C0_HS_EN;
+            emmc_set_clock_divider(0x02);
+            high_speed = false;
+        }
+    }
+    sys_puts(console_ep, high_speed ? "[BLK][EMMC] шина 4 бита, 50 МГц (high speed)\n"
+                                    : "[BLK][EMMC] шина 25 МГц\n");
 
     return true;
 }
@@ -514,51 +664,15 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
 // через EMMC_DATA. Один memcpy на весь диапазон между bounce-буфером и
 // buffer вызывающего (может быть на стеке fat32.cpp) — дёшево по сравнению с
 // самим SD-обменом.
-bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
-    if (count == 0 || count > 8) return false;
-    if (g_blk_dma_paddr == 0 || g_blk_dma2_paddr == 0) return false;
-
+// Одна команда SD: дескриптор ADMA2 на dma_pa, CMD17/18 или CMD24/25,
+// ожидание конца переноса. Вынесено из hardware_emmc_read/write, потому что
+// с появлением zero-copy у каждой из них стало ДВА пути (прямо в буфер
+// вызывающего и через bounce кусками) с одинаковой серединой.
+static bool emmc_xfer_one(uint32_t sector, uint32_t count, uint32_t dma_pa, bool is_read) {
     volatile Adma2Descriptor32* desc = blk_dma_desc();
     desc->attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN);
     desc->length = (uint16_t)(count * 512);
-    desc->addr = g_blk_dma_paddr + BLK_DMA_BUF_OFFSET;
-
-    if (!emmc_wait_dat_ready()) return false;
-    *emmc_reg(EMMC_ADMA_SYSADDR_OFFSET) = g_blk_dma2_paddr;
-    *emmc_reg(EMMC_BLKSIZECNT_OFFSET) = (count << 16) | 512;
-
-    uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
-                        | EMMC_CMD_ISDATA | EMMC_TM_DAT_DIR_READ | EMMC_TM_DMA_EN;
-    uint32_t cmd_index = EMMC_CMD_READ_SINGLE;
-    if (count > 1) {
-        cmd_flags |= EMMC_TM_MULTI_BLOCK | EMMC_TM_BLKCNT_EN | EMMC_TM_AUTO_CMD12;
-        cmd_index = EMMC_CMD_READ_MULTI;
-    }
-    if (!emmc_send_cmd(cmd_flags, cmd_index, g_partition_start_sector + sector)) return false;
-
-    // ADMA2 сам гоняет данные между картой и памятью — READ_RDY (чисто
-    // PIO-семантика "слово готово в FIFO") здесь не ждём, только конец
-    // всего переноса.
-    if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
-
-    my_memcpy(buffer, (const void*)blk_dma_buf(), count * 512);
-    // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
-    // g_blk_liveness_ntfn выше.
-    if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
-    return true;
-}
-
-bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
-    if (!RPI4_EMMC_ALLOW_WRITE) return false;
-    if (count == 0 || count > 8) return false;
-    if (g_blk_dma_paddr == 0 || g_blk_dma2_paddr == 0) return false;
-
-    my_memcpy((void*)blk_dma_buf(), buffer, count * 512);
-
-    volatile Adma2Descriptor32* desc = blk_dma_desc();
-    desc->attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN);
-    desc->length = (uint16_t)(count * 512);
-    desc->addr = g_blk_dma_paddr + BLK_DMA_BUF_OFFSET;
+    desc->addr = dma_pa;
 
     if (!emmc_wait_dat_ready()) return false;
     *emmc_reg(EMMC_ADMA_SYSADDR_OFFSET) = g_blk_dma2_paddr;
@@ -566,16 +680,86 @@ bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
 
     uint32_t cmd_flags = EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN
                         | EMMC_CMD_ISDATA | EMMC_TM_DMA_EN;
-    uint32_t cmd_index = EMMC_CMD_WRITE_SINGLE;
+    if (is_read) cmd_flags |= EMMC_TM_DAT_DIR_READ;
+    uint32_t cmd_index = is_read ? EMMC_CMD_READ_SINGLE : EMMC_CMD_WRITE_SINGLE;
     if (count > 1) {
+        // count==1 остаётся на отдельно проверенном single-block пути
+        // (CMD17/24, без AUTO_CMD12) — самый частый случай, минимальный риск.
         cmd_flags |= EMMC_TM_MULTI_BLOCK | EMMC_TM_BLKCNT_EN | EMMC_TM_AUTO_CMD12;
-        cmd_index = EMMC_CMD_WRITE_MULTI;
+        cmd_index = is_read ? EMMC_CMD_READ_MULTI : EMMC_CMD_WRITE_MULTI;
     }
     if (!emmc_send_cmd(cmd_flags, cmd_index, g_partition_start_sector + sector)) return false;
+    // ADMA2 сам гоняет данные между картой и памятью — READ_RDY (чисто
+    // PIO-семантика "слово готово в FIFO") здесь не ждём, только конец
+    // всего переноса.
+    return emmc_wait_irpt_bit(EMMC_INT_DATA_DONE);
+}
 
-    if (!emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return false;
+bool hardware_emmc_read_inner(uint32_t sector, uint32_t count, void* buffer);
+// Обёртка ради учёта времени по вызывающему (см. g_tag_us). Отдельной
+// функцией, а не RAII-таймером: деструктор тянет раскрутку стека, а образ
+// линкуется -nostdlib.
+bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
+    uint32_t tag = g_exfat_io_tag;
+    uint64_t t0 = read_cntvct();
+    if (tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[tag]++; g_tag_bytes[tag] += (uint64_t)count * 512u; }
+    bool ok = hardware_emmc_read_inner(sector, count, buffer);
+    if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += blk_us_since(t0);
+    return ok;
+}
+bool hardware_emmc_read_inner(uint32_t sector, uint32_t count, void* buffer) {
+    if (count == 0 || count > BLK_MAX_SECTORS_PER_IO) return false;
+    if (g_blk_dma_paddr == 0 || g_blk_dma2_paddr == 0) return false;
+
+    uint64_t direct_pa = blk_shm_paddr_for(buffer, count * 512u);
+    if (direct_pa) {
+        if (!emmc_xfer_one(sector, count, (uint32_t)direct_pa, true)) return false;
+    } else {
+        // Буфер не в SHM (сектор битмапа, запись каталога, буфер copy_extent)
+        // — едет через bounce, а тот всего одна страница.
+        for (uint32_t done = 0; done < count; ) {
+            uint32_t n = count - done;
+            if (n > BLK_BOUNCE_SECTORS) n = BLK_BOUNCE_SECTORS;
+            if (!emmc_xfer_one(sector + done, n, g_blk_dma_paddr + BLK_DMA_BUF_OFFSET, true)) return false;
+            my_memcpy((char*)buffer + (uintptr_t)done * 512u, (const void*)blk_dma_buf(), n * 512);
+            done += n;
+        }
+    }
     // issuse.txt №66 — "занят, но жив" для watchdog'а, см. комментарий у
     // g_blk_liveness_ntfn выше.
+    if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
+    return true;
+}
+
+bool hardware_emmc_write_inner(uint32_t sector, uint32_t count, const void* buffer);
+// Обёртка ради учёта времени по вызывающему (см. g_tag_us). Отдельной
+// функцией, а не RAII-таймером: деструктор тянет раскрутку стека, а образ
+// линкуется -nostdlib.
+bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
+    uint32_t tag = g_exfat_io_tag;
+    uint64_t t0 = read_cntvct();
+    if (tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[tag]++; g_tag_bytes[tag] += (uint64_t)count * 512u; }
+    bool ok = hardware_emmc_write_inner(sector, count, buffer);
+    if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += blk_us_since(t0);
+    return ok;
+}
+bool hardware_emmc_write_inner(uint32_t sector, uint32_t count, const void* buffer) {
+    if (!RPI4_EMMC_ALLOW_WRITE) return false;
+    if (count == 0 || count > BLK_MAX_SECTORS_PER_IO) return false;
+    if (g_blk_dma_paddr == 0 || g_blk_dma2_paddr == 0) return false;
+
+    uint64_t direct_pa = blk_shm_paddr_for(buffer, count * 512u);
+    if (direct_pa) {
+        if (!emmc_xfer_one(sector, count, (uint32_t)direct_pa, false)) return false;
+    } else {
+        for (uint32_t done = 0; done < count; ) {
+            uint32_t n = count - done;
+            if (n > BLK_BOUNCE_SECTORS) n = BLK_BOUNCE_SECTORS;
+            my_memcpy((void*)blk_dma_buf(), (const char*)buffer + (uintptr_t)done * 512u, n * 512);
+            if (!emmc_xfer_one(sector + done, n, g_blk_dma_paddr + BLK_DMA_BUF_OFFSET, false)) return false;
+            done += n;
+        }
+    }
     if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
     return true;
 }
@@ -636,6 +820,9 @@ static bool blk_mount_exfat(seL4_CPtr console_ep) {
     // не тот сектор.
     find_exfat_partition(console_ep);
 
+    // До 2026-09-08 здесь не выставлялось ничего, и exFAT работал со
+    // значением по умолчанию из h/exfat.h — 8 секторов (4 КБ) за команду.
+    g_file_system.max_sectors_per_io = BLK_MAX_SECTORS_PER_IO;
     if (exfat_init(&g_file_system, hardware_emmc_read, hardware_emmc_write)) {
         if (LOG_BLK) {
             sys_puts(console_ep, "[BLK] exFAT mounted.\n");
@@ -740,6 +927,7 @@ int main(int argc, char *argv[]) {
     seL4_Call(root_ep, msg);
 
     g_shm_vaddr = (char*)seL4_GetMR(0);
+    g_shm_paddr = (uint64_t)seL4_GetMR(1); // тот же ответ root'а, что уже читает usb_driver — см. blk_shm_paddr_for()
 
     if (!g_shm_vaddr) {
         sys_puts(console_ep, "[BLK] FATAL: Failed to get dynamic SHM!\n");
@@ -943,6 +1131,34 @@ int main(int argc, char *argv[]) {
             seL4_SetMR(0, 0);
             blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
+        // Статистика exFAT — тот же протокол, что у usb_driver (125 сброс,
+        // 127 разбивка по вызывающему). Команду 126 (фазы SCSI: CBW/данные/
+        // CSW) здесь НЕ реализуем намеренно: у SD никаких CBW и CSW нет,
+        // это не SCSI-транспорт. Вызывающий обязан отличать "нет ответа" от
+        // "ответ с нулями" — см. проверку длины ответа в logtest.
+        else if (cmd == 125) {
+            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) { g_tag_cmds[t] = 0; g_tag_bytes[t] = 0; g_tag_us[t] = 0; }
+            g_exfat_copy_extent_calls = g_exfat_append_slow_calls = 0;
+            g_exfat_append_calls = g_exfat_stream_write_calls = 0;
+            g_append_us = 0; g_append_n = 0;
+            seL4_SetMR(0, 0);
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        }
+        else if (cmd == 127) {
+            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) {
+                seL4_SetMR(2 * t,     (seL4_Word)g_tag_cmds[t]);
+                seL4_SetMR(2 * t + 1, (seL4_Word)g_tag_bytes[t]);
+            }
+            seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 0, (seL4_Word)g_exfat_copy_extent_calls);
+            seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 1, (seL4_Word)g_exfat_append_slow_calls);
+            seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 2, (seL4_Word)g_exfat_append_calls);
+            seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 3, (seL4_Word)g_exfat_stream_write_calls);
+            for (int t = 0; t < EXFAT_IO_TAG_MAX; t++) seL4_SetMR(2 * EXFAT_IO_TAG_MAX + 4 + t, (seL4_Word)g_tag_us[t]);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 4, (seL4_Word)g_append_us);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 5, (seL4_Word)g_append_n);
+            seL4_SetMR(3 * EXFAT_IO_TAG_MAX + 6, 0); // обработчик целиком не меряем — см. usb_driver/g_cmd121_us
+            blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 3 * EXFAT_IO_TAG_MAX + 7));
+        }
         else if (cmd == 128) { // SYS_STAT — размер/каталог/существование
             char filename[256];
             my_strlcpy(filename, g_shm_vaddr, sizeof(filename));
@@ -1033,7 +1249,10 @@ int main(int argc, char *argv[]) {
             uint32_t len = seL4_GetMR(1);
             if (len > VFS_PAYLOAD_MAX) len = VFS_PAYLOAD_MAX;
 
-            if (exfat_append_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len)) seL4_SetMR(0, 0);
+            uint64_t t_ap = read_cntvct();
+            bool ap_ok = exfat_append_file(&g_file_system, path, g_shm_vaddr + VFS_PAYLOAD_OFFSET, len);
+            g_append_us += blk_us_since(t_ap); g_append_n++;
+            if (ap_ok) seL4_SetMR(0, 0);
             else seL4_SetMR(0, -1);
             blk_vfs_reply(seL4_MessageInfo_new(0, 0, 0, 1));
         }
