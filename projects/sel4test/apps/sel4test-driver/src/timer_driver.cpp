@@ -417,6 +417,32 @@ static bool mbox_set_domain_state(uint32_t domain_id, bool want_on, uint32_t *ou
     return true;
 }
 
+// Пин расширителя expgpio через мейлбокс (issuse.txt №7). Владелец
+// мейлбокса — этот драйвер, а нужны пины blk_driver'у (переключение
+// сигнальной линии SD на 1.8 В и питание карты), поэтому доступ выдаётся
+// командой IPC, а не вторым отображением мейлбокса: timer_driver
+// поднимается раньше blk_driver, а лишнее отображение означало бы правку
+// spawn_process с её полусотней позиционных аргументов и состоянием для
+// респавна.
+static bool mbox_gpio_state(uint32_t pin, bool is_set, uint32_t *io_state) {
+    if (g_mbox_buf == nullptr || g_mbox_buf_paddr == 0) return false;
+    g_mbox_buf[0] = 8 * 4;
+    g_mbox_buf[1] = MBOX_CODE_REQUEST;
+    g_mbox_buf[2] = is_set ? MBOX_TAG_SET_GPIO_STATE : MBOX_TAG_GET_GPIO_STATE;
+    g_mbox_buf[3] = 8;
+    g_mbox_buf[4] = 8;
+    g_mbox_buf[5] = RPI_EXP_GPIO_BASE + pin;
+    g_mbox_buf[6] = is_set ? (*io_state ? 1u : 0u) : 0u;
+    g_mbox_buf[7] = MBOX_TAG_LAST;
+    if (!mbox_call(mbox_bus_addr(), 2000000)) return false;
+    if (g_mbox_buf[1] != MBOX_CODE_RESPONSE_SUCCESS) return false;
+    // Прошивка обнуляет первое слово ответа, если запрос принят. Ненулевое
+    // значение = отказ, и без этой проверки он выглядел бы как успех.
+    if (g_mbox_buf[5] != 0) return false;
+    *io_state = g_mbox_buf[6];
+    return true;
+}
+
 // issuse.txt №74/в (см. situation.txt) — тег "VL805 только что аппаратно
 // сброшен, перезалей прошивку" (см. platform.h/MBOX_TAG_NOTIFY_XHCI_RESET
 // про источник/формат/ВАЖНОЕ предупреждение про повторные вызовы).
@@ -852,6 +878,15 @@ int main(int argc, char *argv[]) {
             }
             seL4_SetMR(0, 0);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+        } else if (sys == 14) { // SYS_EXP_GPIO (issuse.txt №7): MR1=пин expgpio, MR2=0 чтение/1 запись,
+                                //  MR3=значение для записи -> MR0=0/-1, MR1=состояние
+            uint32_t pin = (uint32_t)seL4_GetMR(1);
+            bool is_set = (seL4_GetMR(2) != 0);
+            uint32_t st = (uint32_t)seL4_GetMR(3);
+            bool ok = mbox_gpio_state(pin, is_set, &st);
+            seL4_SetMR(0, ok ? 0 : (seL4_Word)-1);
+            seL4_SetMR(1, (seL4_Word)st);
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 2));
         } else if (sys == 13) { // SYS_MBOX_DOMAIN_GET (Фаза 7): MR1=domain id -> MR0=ok, MR1=state (0/1)
             uint32_t state = 0;
             bool ok = g_cpufreq_available && mbox_get_domain_state((uint32_t)seL4_GetMR(1), &state);

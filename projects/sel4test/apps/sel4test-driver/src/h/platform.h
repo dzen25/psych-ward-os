@@ -7,7 +7,7 @@ constexpr char DHCP_HOSTNAME[] = "SeL4-CrouN";
 
 // PM_WDOG: false отключает АВТОМАТИЧЕСКУЮ аппаратную перезагрузку
 // (timer_driver.cpp кормит watchdog на каждом тике ТОЛЬКО если этот флаг
-// true). Оставлен false по прямому решению пользователя (2026-09-05):
+// true). Оставлен false
 // пока идёт отладка адаптивного переноса драйверов между ядрами, плата не
 // должна сама уходить в ребут посреди эксперимента/JTAG-сессии. НЕ трогает
 // ручную команду `reboot` (SYS_REBOOT/pm_watchdog_expire_now()) — та
@@ -948,6 +948,27 @@ constexpr uint32_t MBOX_XHCI_RESET_DEV_ADDR = 0x00100000; // bus=1 (<<20) | slot
 // так не запитан за ненадобностью, а "VPU1" — неочевидное название, может
 // быть завязано на сам VideoCore, который держит наш же mailbox-канал).
 constexpr uint32_t MBOX_TAG_GET_DOMAIN_STATE = 0x00030030;
+
+// Расширитель GPIO на RPi4 (&expgpio в bcm2711-rpi-4-b.dts,
+// compatible = "raspberrypi,firmware-gpio"). Это НЕ ARM-контроллер GPIO
+// (см. RPI4_GPIO_PADDR/h/gpio.h) — пины расширителя доступны только через
+// мейлбокс VideoCore. Формат полезной нагрузки у обоих тегов одинаковый и
+// такой же, как у *_DOMAIN_STATE выше: два слова {номер, состояние};
+// в ответе первое слово ОБЯЗАНО стать нулём, иначе прошивка запрос не
+// приняла (так же проверяет эталон — drivers/gpio/gpio-raspberrypi-exp.c).
+constexpr uint32_t MBOX_TAG_GET_GPIO_STATE = 0x00030041;
+constexpr uint32_t MBOX_TAG_SET_GPIO_STATE = 0x00038041;
+// Нумерация: прошивка адресует пины расширителя со смещением 128
+// (RPI_EXP_GPIO_BASE в том же эталоне), то есть пин 4 это GPIO 132.
+constexpr uint32_t RPI_EXP_GPIO_BASE = 128;
+// Два пина, ради которых всё это заведено (issuse.txt №7, UHS-I):
+//   4 — переключатель сигнальной линии SD между 3.3 В и 1.8 В
+//       (vqmmc-supply = <&sd_io_1v8_reg>, состояние 1 = 1.8 В);
+//   6 — питание самой карты (vmmc-supply = <&sd_vcc_reg>, 1 = включено).
+// Второй важнее первого: он единственный способ вернуть карту с 1.8 В
+// обратно, если переключение не удалось — снять питание и поднять заново.
+constexpr uint32_t RPI_EXP_GPIO_SD_IO_1V8 = 4;
+constexpr uint32_t RPI_EXP_GPIO_SD_VDD    = 6;
 constexpr uint32_t MBOX_TAG_SET_DOMAIN_STATE = 0x00038030;
 constexpr uint32_t MBOX_DOMAIN_HDMI       = 6;
 constexpr uint32_t MBOX_DOMAIN_VEC        = 8;  // composite video
@@ -1013,6 +1034,19 @@ constexpr uintptr_t EMMC_INTERRUPT_OFFSET  = 0x30;  // write-1-to-clear
 constexpr uintptr_t EMMC_IRPT_MASK_OFFSET  = 0x34;
 constexpr uintptr_t EMMC_IRPT_EN_OFFSET    = 0x38;
 constexpr uintptr_t EMMC_CAP0_OFFSET       = 0x40;  // Capabilities: [13:8] = base clock frequency (МГц)
+// Capabilities_1 (0x44) — вторая половина того же 64-битного регистра
+// возможностей, появилась в SDHCI 3.0. Младшие три бита — поддержка
+// режимов UHS-I, ВСЕ они требуют сигнальной линии 1.8 В: без переключения
+// напряжения (CMD11 + регулятор) они недостижимы, даже если объявлены.
+constexpr uintptr_t EMMC_CAP1_OFFSET       = 0x44;
+constexpr uint32_t  EMMC_CAP1_SDR50        = (1u << 0);
+constexpr uint32_t  EMMC_CAP1_SDR104       = (1u << 1);
+constexpr uint32_t  EMMC_CAP1_DDR50        = (1u << 2);
+// Capabilities (0x40), бит 26: контроллер умеет выдавать 1.8 В. У BCM2711
+// стоит (caps=0x45ee6432, проверено 2026-09-11), но это только про
+// контроллер — саму линию переключает GPIO 4 расширителя expgpio через
+// мейлбокс VideoCore, см. vqmmc-supply в bcm2711-rpi-4-b.dts.
+constexpr uint32_t  EMMC_CAP0_VDD_180      = (1u << 26);
 constexpr uint32_t EMMC_CAP0_ADMA2_SUPPORT = (1u << 19); // Фаза 4.5/ADMA2 (см. ROADMAP.md) — если этот бит не выставлен, ADMA2 контроллером не поддерживается вообще
 constexpr uintptr_t EMMC_ADMA_SYSADDR_OFFSET = 0x58; // ADMA System Address (32-бит, см. ROADMAP.md 4.5/ADMA2) — физический адрес таблицы дескрипторов
 constexpr uintptr_t EMMC_SLOTISR_VER_OFFSET = 0xFC; // [23:16] = Host Controller Version (0=v1,1=v2,2=v3)
@@ -1021,6 +1055,20 @@ constexpr uintptr_t EMMC_SLOTISR_VER_OFFSET = 0xFC; // [23:16] = Host Controller
 constexpr uint32_t EMMC_STATUS_CMD_INHIBIT = (1u << 0);  // Нельзя слать новую команду
 constexpr uint32_t EMMC_STATUS_DAT_INHIBIT = (1u << 1);  // Линия DAT занята
 constexpr uint32_t EMMC_STATUS_DAT_ACTIVE  = (1u << 2);
+// Present State (0x24), биты [23:20] — УРОВЕНЬ линий DAT[3:0]. На время
+// смены напряжения карта прижимает их к нулю и отпускает, когда переход
+// завершён. Это единственный способ узнать, удался он или нет.
+constexpr uint32_t EMMC_STATUS_DAT_LEVEL_SHIFT = 20;
+constexpr uint32_t EMMC_STATUS_DAT_LEVEL_MASK  = (0xFu << 20);
+
+// CONTROL2 (0x3C) в терминах Broadcom — это ДВА стандартных регистра SDHCI
+// в одном слове: "Auto CMD Error Status" в младших 16 битах и "Host
+// Control 2" в старших. Поэтому все биты Host Control 2 ниже сдвинуты на
+// 16 относительно того, как они пронумерованы в спецификации SDHCI.
+constexpr uintptr_t EMMC_CONTROL2_OFFSET  = 0x3C;
+constexpr uint32_t EMMC_C2_UHS_MODE_MASK  = (0x7u << 16); // Host Control 2 [2:0]
+constexpr uint32_t EMMC_C2_UHS_DDR50      = (0x4u << 16);
+constexpr uint32_t EMMC_C2_1V8_SIGNALING  = (1u   << 19); // Host Control 2 бит 3
 
 // CONTROL1 (0x2C) — тактирование + software reset
 constexpr uint32_t EMMC_C1_CLK_INTLEN   = (1u << 0);      // Включить внутренний клок
@@ -1109,6 +1157,12 @@ struct __attribute__((packed)) Adma2Descriptor32 {
 // Коды SD-команд (используются как (CMDn << EMMC_CMD_INDEX_SHIFT) | response type | флаги)
 constexpr uint32_t EMMC_CMD_GO_IDLE        = 0;   // CMD0,  без ответа
 constexpr uint32_t EMMC_CMD_SEND_IF_COND   = 8;   // CMD8,  R7 (как R1/48bit)
+// CMD13, R1 — состояние карты. Используется как ПРОБА ПРИСУТСТВИЯ: на
+// RPi4 линии card-detect нет вообще (в DT у mmc@7e340000 стоит broken-cd,
+// а в слоте microSD платы нет механического контакта), поэтому
+// единственный способ узнать, на месте ли карта, — попробовать с ней
+// поговорить.
+constexpr uint32_t EMMC_CMD_SEND_STATUS    = 13;
 constexpr uint32_t EMMC_CMD_ALL_SEND_CID   = 2;   // CMD2,  R2/136bit
 constexpr uint32_t EMMC_CMD_SEND_REL_ADDR  = 3;   // CMD3,  R6 (как R1/48bit)
 constexpr uint32_t EMMC_CMD_SEND_CSD       = 9;   // CMD9,  R2/136bit
@@ -1119,6 +1173,7 @@ constexpr uint32_t EMMC_CMD_SET_BUS_WIDTH  = 6;   // ACMD6 (после CMD55), �
 // ACMD6 (SET_BUS_WIDTH), без него — CMD6 (SWITCH_FUNC). Отдельное имя
 // заведено, чтобы в коде было видно, какая из двух команд имеется в виду.
 constexpr uint32_t EMMC_CMD_SWITCH_FUNC    = 6;   // CMD6, R1/48bit + 64 байта данных
+constexpr uint32_t EMMC_CMD_VOLTAGE_SWITCH = 11;  // CMD11, R1 — начало перехода на 1.8 В
 constexpr uint32_t EMMC_ACMD_SD_SEND_OP_COND = 41; // ACMD41 (после CMD55), R3/48bit (без CRC)
 constexpr uint32_t EMMC_CMD_READ_SINGLE    = 17;  // CMD17, R1/48bit + данные (host<-card)
 constexpr uint32_t EMMC_CMD_READ_MULTI     = 18;  // CMD18, R1/48bit + данные, multi-block
@@ -1129,6 +1184,15 @@ constexpr uint32_t EMMC_CMD_WRITE_MULTI    = 25;  // CMD25, R1/48bit + данн�
 constexpr uint32_t EMMC_ACMD41_HCS      = (1u << 30);
 constexpr uint32_t EMMC_ACMD41_VOLTAGE  = 0x00FF8000u; // 3.2-3.4V window
 constexpr uint32_t EMMC_OCR_READY       = (1u << 31);
+// S18R (бит 24 АРГУМЕНТА ACMD41) — «хост умеет 1.8 В, предлагаю перейти».
+// S18A (бит 24 ОТВЕТА, того же OCR) — «карта согласна». Это единственный
+// достоверный признак поддержки UHS-I у карты: маска функций из CMD6 на
+// 3.3 В режимы UHS не показывает, они объявляются только ПОСЛЕ перехода.
+// ВАЖНО: получив S18A=1, хост обязан продолжить процедурой CMD11 либо
+// снять с карты питание — оставлять её в этом состоянии нельзя (эталон,
+// drivers/mmc/core/sd.c, на неудаче делает именно power cycle).
+constexpr uint32_t EMMC_ACMD41_S18R     = (1u << 24);
+constexpr uint32_t EMMC_OCR_S18A        = (1u << 24);
 
 // --- GENET v5 (BCM2711 Ethernet MAC) — регистровая карта, смещения от
 // PLAT_GENET_PADDR. Адаптировано 1:1 из проверенного рабочего референса —

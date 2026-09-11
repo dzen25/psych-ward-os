@@ -288,6 +288,7 @@ constexpr uint32_t TRB_TYPE_ENABLE_SLOT_CMD     = 9;
 constexpr uint32_t TRB_TYPE_DISABLE_SLOT_CMD    = 10;
 constexpr uint32_t TRB_TYPE_ADDRESS_DEVICE_CMD  = 11;
 constexpr uint32_t TRB_TYPE_CONFIGURE_ENDPOINT_CMD = 12; // Milestone 4
+constexpr uint32_t TRB_TYPE_EVALUATE_CONTEXT_CMD  = 13; // обновление EP0 MaxPacketSize у Full Speed, см. ep0_update_max_packet()
 constexpr uint32_t TRB_TYPE_STOP_ENDPOINT_CMD   = 15; // xHCI 6.4.3.6 — обязателен перед Set TR Dequeue, если эндпоинт НЕ Halted
 constexpr uint32_t TRB_TYPE_RESET_ENDPOINT_CMD  = 14; // Фаза 8 (df) — восстановление bulk-эндпоинта после ошибки, xHCI 6.4.3.9
 constexpr uint32_t TRB_TYPE_SET_TR_DEQUEUE_CMD  = 16; // xHCI 6.4.3.10, идёт СРАЗУ после Reset Endpoint
@@ -512,6 +513,30 @@ struct UsbDeviceSlot {
     uint8_t hub_int_ep_interval = 0;
     uint8_t hub_int_dci = 0; // вычислен в step_hub_configure_slot(), нужен B4 для доорбелла опроса
     uint64_t hub_int_pending_trb = 0; // Milestone B4 — device-адрес "слушающего" TRB, ждём его Transfer Event не блокируясь (try_check_transfer_complete)
+    uint8_t hub_int_errors = 0;       // подряд идущие ошибки interrupt-передачи хаба, см. usb_int_recover_tick
+    uint8_t hub_int_err_cc = 0;
+    uint64_t hub_recover_at = 0;      // CNTVCT, когда восстанавливать эндпоинт; 0 — не нужно
+
+    // USB HID-клавиатура (boot protocol) — см. step_kbd_configure().
+    // Устроена так же, как Interrupt-эндпоинт хаба выше: одна "слушающая"
+    // TRB, событие приходит прерыванием, после обработки перевооружается.
+    // Кольцо и буфер приземления тоже те же — bulkin_ring и bounce_paddr:
+    // у клавиатуры нет bulk-эндпоинтов, эти страницы иначе простаивали бы.
+    bool kbd = false;
+    uint8_t kbd_if = 0;
+    uint8_t kbd_ep_addr = 0;
+    uint16_t kbd_ep_mps = 0;
+    uint8_t kbd_ep_interval = 0;
+    uint8_t kbd_dci = 0;
+    uint64_t kbd_pending_trb = 0;
+    uint8_t kbd_old[8] = {0};     // прошлый отчёт — новые нажатия это разность с ним
+    uint8_t kbd_locks = 0;        // CapsLock / NumLock
+    uint8_t kbd_repeat_key = 0;   // зажатая клавиша для автоповтора
+    uint8_t kbd_repeat_mods = 0;
+    uint64_t kbd_repeat_at = 0;   // CNTVCT следующего повтора
+    uint8_t kbd_errors = 0;       // подряд идущие ошибки отчёта, см. poll_hub_interrupts
+    uint8_t kbd_err_cc = 0;       // код последней ошибки — для сообщения при восстановлении
+    uint64_t kbd_recover_at = 0;  // CNTVCT, когда восстанавливать эндпоинт; 0 — не нужно
 
     // Milestone B3 (Фаза 15) — если это устройство ЗА хабом (не на
     // корневом порту): parent_hub_idx — индекс ХАБА в этом же массиве,
@@ -525,6 +550,11 @@ struct UsbDeviceSlot {
     uint8_t parent_hub_slot_id = 0;
     uint8_t parent_port_number = 0;
     bool parent_multi_tt = false;
+    // Transaction Translator, через который ходит это Full/Low Speed
+    // устройство: Slot ID хаба с TT и номер его порта (0 — TT не нужен).
+    // НЕ всегда непосредственный родитель — см. enumerate_device_behind_hub.
+    uint8_t tt_hub_slot_id = 0;
+    uint8_t tt_port = 0;
     uint8_t parent_tt_think_time = 0;
     // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: parent_port_number один
     // сам по себе достаточен ТОЛЬКО для устройства на 1 уровне вложенности
@@ -831,7 +861,37 @@ static uint64_t enqueue_command_trb(uint64_t parameter, uint32_t status, uint32_
 // stream_id != 0 — для потоковых (bulk streams) эндпоинтов: номер потока
 // едет в старшей половине значения доорбелла (xHCI 5.6). Для обычных
 // эндпоинтов остаётся 0, и поведение всех прежних вызовов не меняется.
+// Ошибка VL805 с прошивкой старше 0x0138C0 (ядро Raspberry Pi,
+// XHCI_VLI_HUB_TT_QUIRK / xhci_vl805_hub_tt_quirk()): TD, поставленный в
+// простаивающее кольцо Full Speed устройства, которое сидит прямо на
+// встроенном хабе (через его TT), рискует вызвать babble на порту хаба,
+// если доорбелл пришёлся на конец микрокадра 7. Эталон ждёт, пока
+// MFINDEX уйдёт из микрокадра 0 (MFINDEX указывает на СЛЕДУЮЩИЙ SOF), не
+// дольше 20 x 10 мкс. В Linux через этот путь идут и control, и bulk, и
+// interrupt (xhci_queue_intr_tx -> xhci_queue_bulk_tx). У нас каждое
+// кольцо держит ровно один TD, то есть в момент доорбелла оно всегда
+// простаивает. Флаг выставляет xhci_controller_init() по версии прошивки.
+static bool g_vl805_hub_tt_quirk = false;
+constexpr uint32_t VL805_FW_VER_0138C0 = 0x0138C0u;
+constexpr uintptr_t XHCI_RT_MFINDEX = 0x00; // Microframe Index, от базы Runtime-регистров
+
+static void vl805_hub_tt_quirk_wait(uint8_t slot_id) {
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        const UsbDeviceSlot &d = g_usb_devices[i];
+        if (!d.in_use || d.slot_id != slot_id) continue;
+        // Условие эталона: speed == FULL и route & 0xffff0 == 0, то есть
+        // устройство прямо на порту хаба первого яруса (встроенного).
+        if (d.link_speed != 1 || !d.behind_hub || d.hub_tier != 1) return;
+        for (int t = 0; t < 20 && (*reg32(g_rt_base, XHCI_RT_MFINDEX) & 0x7u) == 0; t++) {
+            uint64_t until = read_cntvct() + (uint64_t)g_cntfrq / 100000; // 10 мкс
+            while (read_cntvct() < until) {}
+        }
+        return;
+    }
+}
+
 static void ring_endpoint_doorbell(uint8_t slot_id, uint8_t dci, uint32_t stream_id = 0) {
+    if (g_vl805_hub_tt_quirk && slot_id != 0) vl805_hub_tt_quirk_wait(slot_id);
     *reg32(g_db_base, (uintptr_t)slot_id * 4) = (uint32_t)dci | (stream_id << 16);
 }
 
@@ -861,6 +921,49 @@ static void update_erdp() {
     reg64_write_split(g_rt_base, XHCI_RT_IR0 + XHCI_IR_ERDP, addr | ERDP_EHB);
 }
 
+// Адрес — взведённая "слушающая" TRB асинхронного Interrupt-эндпоинта
+// (хаб, клавиатура)? Их Transfer Event забирает ТОЛЬКО poll_hub_interrupts(),
+// и если любой другой дренаж кольца его выбросит, TRB никто не
+// перевооружит — эндпоинт замолчит навсегда. Поэтому все дренажи кладут
+// такие события в кэш (uas_evt_cache_put), а не в мусор. Ровно такие,
+// а не все подряд чужие: события ничьих TRB (например, отменённых
+// командой Stop Endpoint) засоряли бы 8-местный кэш навсегда.
+// TRB асинхронного control-запроса (AsyncCtrl — последовательность
+// подключения за хабом, см. hub_conn_async_tick): Data и Status Stage.
+// Такой же слушатель: его события забирает только async_ctrl_tick(), а
+// между его тиками кольцо вычитывают и другие (опрос хабов и клавиатуры —
+// на КАЖДОМ тике). Живой отказ 2026-09-11: как только опрос стал
+// ежетиковым, он начал съедать события сброса порта — "SET_PORT_FEATURE
+// (RESET) не удался", "порт не сообщил о завершении сброса". 0 — нет.
+static uint64_t g_async_ctrl_data_trb = 0;
+static uint64_t g_async_ctrl_status_trb = 0;
+
+static bool is_async_listener_trb(uint64_t addr) {
+    if (addr == 0) return false;
+    if (addr == g_async_ctrl_data_trb || addr == g_async_ctrl_status_trb) return true;
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        const UsbDeviceSlot &d = g_usb_devices[i];
+        if (!d.in_use) continue;
+        if (d.hub_int_pending_trb == addr) return true;
+        if (d.kbd && d.kbd_pending_trb == addr) return true;
+    }
+    return false;
+}
+static void uas_evt_cache_put(uint64_t addr, uint8_t cc, uint32_t res);
+
+// Port Status Change Event, вычитанный из кольца НЕ основным дренажем
+// (любое ожидание команды/передачи, опрос хаба, асинхронный control)
+// раньше выбрасывался — подключение в корневом порту в такой момент
+// замечал только редкий страховочный опрос. Теперь такие дренажи
+// запоминают номер порта здесь, а разбирает его usb_service_event_ring()
+// в чистой точке главного цикла (handle_port_status_change сам читает
+// живой PORTSC, так что отложить его безопасно).
+static uint32_t g_psc_pending_mask = 0;
+static inline void note_port_status_change(const Trb &ev) {
+    uint32_t port = (uint32_t)(ev.parameter >> 24) & 0xFFu;
+    if (port >= 1 && port <= 32) g_psc_pending_mask |= 1u << (port - 1);
+}
+
 // Опрашивает Event Ring, пока не найдёт Command Completion Event (по
 // адресу конкретного TRB команды) либо не истечёт таймаут. Используется
 // ТОЛЬКО во время bring-up (шаги 6-7) — синхронно, с понятным таймаутом,
@@ -883,6 +986,17 @@ static bool wait_command_completion(seL4_CPtr console_ep, uint64_t cmd_trb_paddr
                 slot_id = (uint8_t)(ev.control >> 24);
                 return true;
             }
+            // Событие слушающей TRB хаба/клавиатуры — в кэш, а не в мусор
+            // (см. is_async_listener_trb). Команды идут при КАЖДОМ
+            // перечислении и отключении любого устройства: без этого нажатие
+            // клавиши в момент вставки флешки убивало бы клавиатуру, а
+            // изменение порта хаба в тот же момент — горячее подключение за
+            // этим хабом.
+            if (type == TRB_TYPE_TRANSFER_EVENT && is_async_listener_trb(ev.parameter)) {
+                uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
+                continue;
+            }
+            if (type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) note_port_status_change(ev);
             // Port Status Change Event и прочее — на этом этапе игнорируем,
             // просто продвигаем ERDP (уже сделано выше), чтобы не заблокировать
             // очередь событий. Считаем и запоминаем ВСЕ поля — пригодится в
@@ -955,7 +1069,12 @@ static int      g_uas_evt_put_idx = 0;
 static uint64_t g_uas_evt_dropped = 0; // переполнений кэша — диагностика, в норме 0
 
 static void uas_evt_cache_clear() {
-    for (int i = 0; i < UAS_EVT_CACHE_SIZE; i++) g_uas_evt_addr[i] = 0;
+    // События слушающих TRB хаба/клавиатуры не стираем: они лежат в
+    // кольцах других устройств и совпасть с TRB команды UAS не могут, а
+    // стереть их = клавиатура замолчала бы от нажатия во время
+    // копирования на UAS-диск (кэш чистится в начале КАЖДОЙ команды).
+    for (int i = 0; i < UAS_EVT_CACHE_SIZE; i++)
+        if (!is_async_listener_trb(g_uas_evt_addr[i])) g_uas_evt_addr[i] = 0;
     g_uas_evt_put_idx = 0;
 }
 static void uas_evt_cache_put(uint64_t addr, uint8_t cc, uint32_t res) {
@@ -1021,6 +1140,7 @@ static bool wait_transfer_completion(seL4_CPtr console_ep, uint64_t trb_dev_addr
             if (type == TRB_TYPE_TRANSFER_EVENT) {
                 uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
             }
+            if (type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) note_port_status_change(ev);
             other_events++;
             last_other_type = type;
             last_other_parameter = ev.parameter;
@@ -1134,6 +1254,11 @@ struct AsyncCtrl {
     bool data_done = false;       // true сразу при старте, если Data Stage нет вообще
     uint8_t data_cc = 0;
     uint32_t data_residual = 0;
+    // Событие Status Stage может прийти (или быть взятым из кэша) в одном
+    // тике, а решение по нему принимается, когда готов и Data Stage, —
+    // поэтому храним его здесь, а не в локальной переменной тика.
+    bool status_done = false;
+    uint8_t status_cc = 0;
 };
 
 // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: Data и Status TRB енкьюжатся
@@ -1160,6 +1285,11 @@ static void async_ctrl_in_start(AsyncCtrl &x, TrbRing &ep0_ring, uint8_t slot_id
                       trb_type(TRB_TYPE_DATA_STAGE) | (1u << 16) /*DIR=IN*/ | (1u << 2) /*ISP*/ | TRB_IOC);
     x.status_trb_addr = ring_enqueue_trb(ep0_ring, 0, 0,
                       trb_type(TRB_TYPE_STATUS_STAGE) | TRB_IOC);
+    // Объявить TRB слушателями ДО доорбелла: событие может лечь в кольцо
+    // сразу, и первый же чужой дренаж должен его сохранить.
+    g_async_ctrl_data_trb = x.data_trb_addr;
+    g_async_ctrl_status_trb = x.status_trb_addr;
+    x.status_done = false;
     ring_endpoint_doorbell(slot_id, 1);
     x.wlength = wLength;
     x.data_done = false;
@@ -1176,6 +1306,9 @@ static void async_ctrl_no_data_start(AsyncCtrl &x, TrbRing &ep0_ring, uint8_t sl
     x.data_trb_addr = 0;
     x.status_trb_addr = ring_enqueue_trb(ep0_ring, 0, 0,
                       trb_type(TRB_TYPE_STATUS_STAGE) | (1u << 16) /*DIR=IN — обязателен без Data Stage*/ | TRB_IOC);
+    g_async_ctrl_data_trb = 0;
+    g_async_ctrl_status_trb = x.status_trb_addr; // см. async_ctrl_in_start
+    x.status_done = false;
     ring_endpoint_doorbell(slot_id, 1);
     x.data_done = true; // нет Data Stage — нечего ждать
     x.deadline = read_cntvct() + 500ull * g_cntfrq / 1000;
@@ -1191,22 +1324,36 @@ static void async_ctrl_no_data_start(AsyncCtrl &x, TrbRing &ep0_ring, uint8_t sl
 static bool async_ctrl_tick(AsyncCtrl &x) {
     if (x.state != AsyncCtrl::WAITING) return true; // IDLE/DONE/FAILED — уже терминально
 
-    bool status_done = false;
-    uint8_t status_cc = 0; uint32_t status_residual = 0;
+    // Событие могло быть вычитано чужим дренажем и лежать в кэше (см.
+    // g_async_ctrl_data_trb). Data Stage — первым: Status физически
+    // завершается после него.
+    {
+        uint8_t ccc = 0; uint32_t rres = 0;
+        if (!x.data_done && x.data_trb_addr != 0 && uas_evt_cache_take(x.data_trb_addr, ccc, rres)) {
+            x.data_done = true; x.data_cc = ccc; x.data_residual = rres;
+        }
+        if (!x.status_done && uas_evt_cache_take(x.status_trb_addr, ccc, rres)) {
+            x.status_done = true; x.status_cc = ccc;
+        }
+    }
     Trb ev;
     int drained = 0;
     while (dequeue_event_trb(ev)) {
         update_erdp();
         uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        if (type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) note_port_status_change(ev);
         if (type != TRB_TYPE_TRANSFER_EVENT) continue;
         if (!x.data_done && x.data_trb_addr != 0 && ev.parameter == x.data_trb_addr) {
             x.data_done = true;
             x.data_cc = (uint8_t)(ev.status >> 24);
             x.data_residual = ev.status & 0xFFFFFFu;
-        } else if (ev.parameter == x.status_trb_addr) {
-            status_done = true;
-            status_cc = (uint8_t)(ev.status >> 24);
-            status_residual = ev.status & 0xFFFFFFu;
+        } else if (!x.status_done && ev.parameter == x.status_trb_addr) {
+            x.status_done = true;
+            x.status_cc = (uint8_t)(ev.status >> 24);
+        } else if (is_async_listener_trb(ev.parameter)) {
+            // Отчёт клавиатуры / событие другого хаба посреди подключения
+            // за хабом — не выбрасываем, заберёт poll_hub_interrupts().
+            uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
         }
         if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
             sys_puts(g_console_ep, "[USB]   ОШИБКА: дренаж event ring (async_ctrl_tick) превысил защитный потолок — обрываю.\n");
@@ -1214,20 +1361,26 @@ static bool async_ctrl_tick(AsyncCtrl &x) {
         }
     }
 
+    AsyncCtrl::St result;
     if (!x.data_done) {
-        if (read_cntvct() >= x.deadline) { x.state = AsyncCtrl::FAILED; return true; }
-        return false; // Data Stage ещё не завершился — Status физически не мог завершиться раньше
+        if (read_cntvct() < x.deadline) return false; // Data Stage ещё не завершился
+        result = AsyncCtrl::FAILED;
+    } else if (x.data_trb_addr != 0 && x.data_cc != 1 && x.data_cc != 13) { // код см. ep0_control_in()
+        result = AsyncCtrl::FAILED;
+    } else {
+        if (x.data_trb_addr != 0) x.actual_length = x.wlength - x.data_residual;
+        if (!x.status_done) {
+            if (read_cntvct() < x.deadline) return false;
+            result = AsyncCtrl::FAILED;
+        } else {
+            result = (x.status_cc == 1) ? AsyncCtrl::DONE : AsyncCtrl::FAILED;
+        }
     }
-    if (x.data_trb_addr != 0 && x.data_cc != 1 && x.data_cc != 13) { // код см. ep0_control_in()
-        x.state = AsyncCtrl::FAILED; return true;
-    }
-    if (x.data_trb_addr != 0) x.actual_length = x.wlength - x.data_residual;
-
-    if (!status_done) {
-        if (read_cntvct() >= x.deadline) { x.state = AsyncCtrl::FAILED; return true; }
-        return false;
-    }
-    x.state = (status_cc == 1) ? AsyncCtrl::DONE : AsyncCtrl::FAILED;
+    // Запрос завершён — его TRB больше не слушатели: запоздавшее событие
+    // после таймаута должно выбрасываться, а не копиться в кэше.
+    g_async_ctrl_data_trb = 0;
+    g_async_ctrl_status_trb = 0;
+    x.state = result;
     return true;
 }
 
@@ -1678,6 +1831,57 @@ static uint32_t ep0_max_packet_size_for_speed(uint32_t speed) {
 
 // Шаг 7: Address Device — минимальный Input Context (Slot + EP0), команда
 // Address Device, control-эндпоинт 0 становится рабочим.
+// --- Transaction Translator ---
+// Full/Low Speed устройство за High Speed хабом ходит через TT этого хаба
+// (split-транзакции), и xHCI должен знать, через какой именно: Slot
+// Context dword2 [7:0] = Slot ID хаба с TT, [15:8] = номер его downstream-
+// порта (xHCI 1.1, раздел 6.2.2).
+//
+// ДЛЯ HIGH/SUPER SPEED УСТРОЙСТВА ЭТИ ПОЛЯ ОБЯЗАНЫ БЫТЬ НУЛЁМ — это не
+// предосторожность, а находка на железе (Milestone B3, см. step7 и
+// step10): прямое сравнение Input Context рабочего и падающего случаев
+// показало, что заполненный dword2 у High Speed устройства за хабом
+// ломает Address Device. Поэтому helper возвращает не ноль ТОЛЬКО для
+// Full/Low Speed, и путь накопителей не меняется ни на бит.
+static inline uint32_t slot_ctx_tt(const UsbDeviceSlot &d, uint32_t port_speed) {
+    if (!d.behind_hub || !(port_speed == 1 || port_speed == 2)) return 0;
+    return (uint32_t)d.tt_hub_slot_id | ((uint32_t)d.tt_port << 8);
+}
+
+// Поле Interval контекста Interrupt-эндпоинта (xHCI 6.2.3.6), единицы —
+// 2^Interval * 125 мкс. У High/Super Speed bInterval уже степень двойки в
+// микрокадрах: поле = bInterval - 1 (xhci_parse_microframe_interval в
+// Linux). У Full/Low Speed bInterval — МИЛЛИСЕКУНДЫ (кадры): поле =
+// floor(log2(8 * bInterval)) в пределах [3, 10] (xhci_parse_frame_interval).
+// Формула High Speed на Full Speed устройстве дала бы вместо 8 мс опроса
+// 64 мс (bInterval 10) — или, у Full Speed хаба с bInterval 255, поле 15,
+// вне допустимых для Full/Low Speed 3..10.
+static uint32_t xhci_int_interval_field(uint8_t bInterval, uint32_t port_speed) {
+    if (port_speed == 1 || port_speed == 2) {
+        uint32_t v = 8u * (bInterval ? bInterval : 1u);
+        uint32_t fls = 0;
+        while (v) { fls++; v >>= 1; }
+        uint32_t f = fls ? fls - 1 : 0;
+        if (f < 3) f = 3;
+        if (f > 10) f = 10;
+        return f;
+    }
+    uint32_t f = bInterval ? (uint32_t)bInterval - 1u : 0u;
+    return f > 15 ? 15 : f;
+}
+
+// Бит MTT (dword0 [25]) у Full/Low Speed устройства обязан отражать режим,
+// в котором хаб РАБОТАЕТ, а не тот, который он умеет: multi-TT включается
+// только SET_INTERFACE на альтернативную настройку 1 (так делает Linux в
+// hub_configure()), а мы её не делаем — хаб остаётся в single-TT, и MTT
+// для его Full/Low Speed детей должен быть 0. У High/Super Speed устройств
+// бит смысла не имеет — для них оставлено прежнее поведение.
+static inline uint32_t slot_ctx_mtt(const UsbDeviceSlot &d, uint32_t port_speed) {
+    if (!d.behind_hub || !d.parent_multi_tt) return 0;
+    if (port_speed == 1 || port_speed == 2) return 0;
+    return 1u << 25;
+}
+
 static bool step7_address_device(seL4_CPtr console_ep, int idx, uint8_t slot_id, int port, uint32_t port_speed) {
     driver_state_step(USB_STEP_ADDRESS_DEVICE); // пошаговый watchdog, см. common.h/UsbStep
     if (LOG_USB) sys_puts(console_ep, "[USB] Шаг 7: Address Device.\n");
@@ -1708,8 +1912,9 @@ static bool step7_address_device(seL4_CPtr console_ep, int idx, uint8_t slot_id,
     // раньше здесь пересчитывался ЗАНОВО из одного parent_port_number,
     // что верно только для 1 яруса.
     uint32_t route_string = self.behind_hub ? self.route_string_full : 0;
-    write_ctx_dword(inputctx(), 1, 0, route_string | (1u << 27) | ((port_speed & 0xF) << 20) | (self.behind_hub && self.parent_multi_tt ? (1u << 25) : 0));
+    write_ctx_dword(inputctx(), 1, 0, route_string | (1u << 27) | ((port_speed & 0xF) << 20) | slot_ctx_mtt(self, port_speed));
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
+    write_ctx_dword(inputctx(), 1, 2, slot_ctx_tt(self, port_speed)); // ноль для всех, кроме Full/Low Speed за хабом
     // Milestone B3 (Фаза 15) — dword2: Parent Hub Slot ID [7:0], Parent
     // Port Number [15:8], TT Think Time [17:16] — НАЙДЕНО НА ЖИВОМ
     // ЖЕЛЕЗЕ (Milestone B3, прямое сравнение Input Context РАБОЧЕГО
@@ -2009,11 +2214,54 @@ static bool ep0_control_in(seL4_CPtr console_ep, TrbRing &ep0_ring, uint8_t slot
 // Device Descriptor (18 байт, см. USB 2.0 спецификацию 9.6.1):
 //   offset 4=bDeviceClass, 5=bDeviceSubClass, 6=bDeviceProtocol,
 //   8-9=idVendor(LE), 10-11=idProduct(LE).
+// Обновить MaxPacketSize у EP0 командой Evaluate Context. Нужна только
+// Full Speed: у неё bMaxPacketSize0 бывает 8, 16, 32 или 64 и становится
+// известен лишь после чтения дескриптора, а step7 выставляет 8. У Low Speed
+// он всегда 8, у High Speed всегда 64, у Super Speed всегда 512 — там
+// обновлять нечего.
+//
+// EP0 Context копируется из ВЫХОДНОГО контекста устройства и меняется
+// только поле размера пакета — ровно так делает Linux
+// (xhci_check_maxpacket): контроллеру отдают его же текущий контекст, а не
+// собранный заново, чтобы не зависеть от того, какие ещё поля он
+// проверяет.
+static bool ep0_update_max_packet(seL4_CPtr console_ep, uint8_t slot_id, uint32_t mps) {
+    volatile uint32_t *out = devctx_vaddr_for(slot_id);
+    for (int i = 0; i < 3; i++) for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), i, d, 0);
+    write_ctx_dword(inputctx(), 0, 1, 1u << 1); // A1 — только EP0 (в выходном контексте он под индексом 1)
+    for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), 2, d, read_ctx_dword(out, 1, d));
+    uint32_t d1 = read_ctx_dword(inputctx(), 2, 1);
+    write_ctx_dword(inputctx(), 2, 1, (d1 & 0x0000FFFFu) | (mps << 16));
+    uint64_t cmd = enqueue_command_trb(to_dev_addr(g_inputctx_paddr), 0,
+                                        trb_type(TRB_TYPE_EVALUATE_CONTEXT_CMD) | ((uint32_t)slot_id << 24));
+    uint8_t cc = 0, rs = 0;
+    if (!wait_command_completion(console_ep, cmd, 500, cc, rs)) return false;
+    return cc == 1;
+}
+
 static void step8_get_device_descriptor(seL4_CPtr console_ep, int idx, uint8_t slot_id) {
     driver_state_step(USB_STEP_GET_DESCRIPTOR); // пошаговый watchdog, см. common.h/UsbStep
     if (LOG_USB) sys_puts(console_ep, "[USB] Шаг 8: GET_DESCRIPTOR(Device).\n");
     volatile uint8_t *buf = ctrlbuf_vaddr(idx);
     for (int i = 0; i < 18; i++) buf[i] = 0;
+
+    // FULL SPEED: настоящий размер пакета EP0 до чтения дескриптора
+    // неизвестен, а step7 выставил 8. Если устройство на самом деле шлёт по
+    // 64, хост, ждущий 8, получит babble уже на полном 18-байтном чтении
+    // ниже. Эталонный порядок (Linux): сначала 8 байт — они влезают в пакет
+    // любого размера, — из них bMaxPacketSize0, обновление EP0, и только
+    // потом полный дескриптор. Касается и корневого порта, не только хаба:
+    // клавиатуры бывают Full Speed с пакетом 64.
+    if (g_usb_devices[idx].link_speed == 1) {
+        uint32_t got8 = 0;
+        if (ep0_control_in(console_ep, g_usb_devices[idx].ep0_ring, slot_id, 0x80, 0x06, (0x01u << 8), 0, 8,
+                           g_usb_devices[idx].ctrl_buf_paddr, got8) && got8 >= 8) {
+            uint32_t mps0 = buf[7];
+            if ((mps0 == 16 || mps0 == 32 || mps0 == 64) && !ep0_update_max_packet(console_ep, slot_id, mps0))
+                sys_puthex32(console_ep, "[USB] не удалось обновить размер пакета EP0 до ", mps0);
+        }
+        for (int i = 0; i < 18; i++) buf[i] = 0;
+    }
 
     uint32_t actual = 0;
     UsbFoundDevice &found = g_usb_devices[idx].found;
@@ -2076,6 +2324,17 @@ constexpr bool USB_UAS_ENABLE = true;
 // Milestone B1 (Фаза 15) — перенесено выше (было объявлено ниже,
 // step9_get_configuration_descriptor() теперь тоже на него ссылается).
 constexpr uint8_t USB_CLASS_HUB = 0x09;
+// HID boot-клавиатура (USB HID 1.11, раздел 4.2 и приложение B): класс 3,
+// подкласс 1 (Boot Interface), протокол 1 (Keyboard). Boot-протокол даёт
+// фиксированный 8-байтный отчёт [модификаторы, резерв, 6 кодов клавиш] и
+// избавляет от разбора HID Report Descriptor — ровно так работает и
+// common/usb_kbd.c в U-Boot, который уже обслуживает эту клавиатуру на
+// этой плате ("In: serial,usbkbd" в логе загрузки).
+constexpr uint8_t USB_CLASS_HID          = 0x03;
+constexpr uint8_t USB_SUBCLASS_HID_BOOT  = 0x01;
+constexpr uint8_t USB_PROTOCOL_KEYBOARD  = 0x01;
+constexpr uint8_t USB_HID_REQ_SET_IDLE     = 0x0A;
+constexpr uint8_t USB_HID_REQ_SET_PROTOCOL = 0x0B;
 
 constexpr uint8_t USB_DESC_TYPE_CONFIGURATION   = 0x02;
 constexpr uint8_t USB_DESC_TYPE_INTERFACE       = 0x04;
@@ -2133,6 +2392,7 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
     bool uas_found = false; uint8_t uas_if = 0, uas_alt = 0;
     UsbUasPipes uas; // конвейеры UAS-интерфейса, см. UsbUasPipes
     bool in_uas_interface = false;
+    bool in_kbd_interface = false; // HID boot-клавиатура, см. USB_CLASS_HID
     uint8_t last_uas_ep_addr = 0; uint16_t last_uas_ep_mps = 0; uint8_t last_uas_ep_burst = 0; uint8_t last_uas_ep_attr = 0; uint8_t last_uas_ep_ss_attr = 0;
     uint32_t off = 9; // сразу после 9-байтного Configuration Descriptor
     while (off + 2 <= parse_limit) {
@@ -2155,6 +2415,9 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
             // Mass Storage (проверка ниже осмысленна только для
             // накопителей) — нужен его Interrupt-эндпоинт (см. ниже), не
             // bulk, поэтому для is_hub считаем интерфейс "целевым" всегда.
+            in_kbd_interface = (!is_hub && if_class == USB_CLASS_HID
+                                && if_subclass == USB_SUBCLASS_HID_BOOT && if_protocol == USB_PROTOCOL_KEYBOARD);
+            if (in_kbd_interface) g_usb_devices[idx].kbd_if = if_num;
             in_uas_interface = (!is_hub && if_class == USB_CLASS_MASS_STORAGE
                                 && if_subclass == USB_SUBCLASS_SCSI && if_protocol == USB_PROTOCOL_UAS);
             if (in_uas_interface) {
@@ -2195,6 +2458,19 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
                 case UAS_PIPE_ID_DATA_OUT: uas.out_addr = last_uas_ep_addr;    uas.out_mps = last_uas_ep_mps;    uas.out_burst = last_uas_ep_burst; uas.out_attr = last_uas_ep_attr; uas.out_streams = (uint8_t)(last_uas_ep_ss_attr & 0x1Fu);    break;
                 default: break;
             }
+        } else if (desc_type == USB_DESC_TYPE_ENDPOINT && desc_len >= 7 && in_kbd_interface) {
+            // У клавиатуры нужен ровно один — первый Interrupt IN. Бывают
+            // клавиатуры с Interrupt OUT для лампочек; его не трогаем.
+            uint8_t ep_addr = buf[off + 2];
+            uint8_t ep_attr = buf[off + 3];
+            if ((ep_attr & 0x03u) == 0x03u && (ep_addr & 0x80u) && g_usb_devices[idx].kbd_ep_addr == 0) {
+                g_usb_devices[idx].kbd_ep_addr = ep_addr;
+                // Биты [12:11] wMaxPacketSize у High Speed — число доп.
+                // транзакций за микрокадр, не размер (usb_endpoint_maxp()
+                // в Linux маскирует так же).
+                g_usb_devices[idx].kbd_ep_mps = ((uint16_t)buf[off + 4] | ((uint16_t)buf[off + 5] << 8)) & 0x7FFu;
+                g_usb_devices[idx].kbd_ep_interval = buf[off + 6];
+            }
         } else if (desc_type == USB_DESC_TYPE_ENDPOINT && desc_len >= 7 && in_target_interface) {
             uint8_t ep_addr = buf[off + 2];
             uint8_t ep_attr = buf[off + 3];
@@ -2230,13 +2506,21 @@ static bool step9_get_configuration_descriptor(seL4_CPtr console_ep, int idx, ui
     }
 
     bulk_eps.found = (bulk_eps.bulk_in_addr != 0 && bulk_eps.bulk_out_addr != 0);
+    // Накопитель важнее клавиатуры. Бывают флешки с дополнительным HID-
+    // интерфейсом (аппаратные ключи, "автозапуск"); ветка клавиатуры в
+    // continue_enumeration_after_address() идёт раньше накопителя и
+    // заканчивается return — без этого условия такая флешка перестала бы
+    // монтироваться, став "клавиатурой".
+    g_usb_devices[idx].kbd = (g_usb_devices[idx].kbd_ep_addr != 0) && !bulk_eps.found;
     if (!bulk_eps.found) {
         // Milestone B1 (Фаза 15) — у хаба ЗАКОНОМЕРНО нет Mass Storage
         // bulk-эндпоинтов (не ошибка) — вызывающий уже знает это по
         // device_class и пойдёт своей веткой (step_hub_enumerate()), не
         // печатаем вводящую в заблуждение "ОШИБКУ". bConfigurationValue
         // (buf[5], записан выше) остаётся валидным в любом случае.
-        if (!is_hub) sys_puts(console_ep, "[USB] ОШИБКА: не нашёл оба bulk-эндпоинта (IN и OUT) у Mass Storage интерфейса.\n");
+        // У клавиатуры bulk-эндпоинтов тоже законно нет — та же логика, что у хаба.
+        if (!is_hub && !g_usb_devices[idx].kbd)
+            sys_puts(console_ep, "[USB] ОШИБКА: не нашёл оба bulk-эндпоинта (IN и OUT) у Mass Storage интерфейса.\n");
         return false;
     }
     // Печатается БЕЗ гейта LOG_USB и один раз на устройство: это ответ на
@@ -2425,14 +2709,34 @@ static bool step_hub_configure_slot(seL4_CPtr console_ep, int idx, uint8_t slot_
 
     for (int i = 0; i < 3; i++) for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), i, d, 0);
     write_ctx_dword(inputctx(), 0, 1, (1u << 0) | (have_int_ep ? (1u << int_dci) : 0)); // A0 (Slot) [+ A(int_dci)]
-    write_ctx_dword(inputctx(), 1, 0, route_string | (ctx_entries << 27) | ((port_speed & 0xF) << 20) | (1u << 26) /*Hub*/
-                     | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
+    // MTT у СЛОТА ХАБА — режим самого этого хаба, а не его родителя
+    // (xHCI 6.2.2): "High-speed hub, который поддерживает Multiple TT И у
+    // которого multi-TT включён ПО". Включается он только SET_INTERFACE на
+    // альтернативную настройку 1 (Linux: hub_configure() -> tt.multi = 1,
+    // затем xhci_update_hub_device() ставит DEV_MTT лишь при tt->multi), а
+    // мы её не делаем ни одному хабу — значит 0. Раньше бит брался от
+    // родителя: хаб пользователя за multi-TT хабом объявлялся multi-TT, а
+    // его Full/Low Speed дети (slot_ctx_mtt) — single-TT, и контроллер
+    // получал противоречивую картину TT. High Speed устройства за хабом TT
+    // не используют, для них ничего не меняется.
+    write_ctx_dword(inputctx(), 1, 0, route_string | (ctx_entries << 27) | ((port_speed & 0xF) << 20) | (1u << 26) /*Hub*/);
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)root_port << 16) | ((uint32_t)dev.hub_num_ports << 24));
+    // dword2: TT Think Time [17:16] — только у High Speed хаба (xHCI 1.0:
+    // "0, если это не High-speed hub"), значение прямо из wHubCharacteristics
+    // [6:5] (0 = 8 FS bit times ... 3 = 32) — ровно так делает
+    // xhci_update_hub_device() в Linux. По этому времени контроллер
+    // расставляет split-транзакции Full/Low Speed детей; оставленный ноль
+    // для хаба с большим временем = split'ы чаще, чем TT успевает.
+    // Плюс адрес TT, если это Full Speed хаб за High Speed хабом
+    // (slot_ctx_tt; для High Speed там ноль — см. находку у slot_ctx_tt).
+    write_ctx_dword(inputctx(), 1, 2, slot_ctx_tt(dev, port_speed)
+                     | (port_speed == 3 ? ((uint32_t)dev.hub_tt_think_time << 16) : 0u));
 
     if (have_int_ep) {
         init_trb_ring(dev.bulkin_ring, bulkinring_vaddr(idx), dev.bulkin_trring_paddr);
-        uint32_t interval_field = (dev.hub_int_ep_interval >= 1) ? ((uint32_t)dev.hub_int_ep_interval - 1) : 0;
-        if (interval_field > 15) interval_field = 15;
+        // Для High/Super Speed хаба — прежняя формула бит в бит; Full Speed
+        // хаб (за High Speed, через TT) считается по кадрам.
+        uint32_t interval_field = xhci_int_interval_field(dev.hub_int_ep_interval, port_speed);
         int ctx_index = (int)int_dci + 1;
         for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), ctx_index, d, 0);
         write_ctx_dword(inputctx(), ctx_index, 0, interval_field << 16); // Interval, см. xHCI EP Context dword0
@@ -2499,6 +2803,180 @@ static void hub_enqueue_interrupt_listen(int idx) {
     ring_endpoint_doorbell(dev.slot_id, dev.hub_int_dci);
 }
 
+// ============================================================================
+// === USB HID-КЛАВИАТУРА (boot protocol) ===
+// ============================================================================
+// Нажатия уходят в uart_driver (SYS_KBD_INJECT) — в тот же кольцевой буфер,
+// куда падают байты с UART RX. Шелл и любая программа, читающая stdin, не
+// отличают эту клавиатуру от набора в minicom, и именно это требовалось.
+
+// Одна "слушающая" TRB на Interrupt IN клавиатуры — та же схема, что у хаба
+// (hub_enqueue_interrupt_listen выше). Длина — min(MaxPacketSize, 8): boot-
+// отчёт ровно 8 байт, так делает и U-Boot.
+// Сколько байт просим у клавиатуры: min(MaxPacketSize, 8), boot-отчёт
+// ровно 8 байт. Вынесено, потому что нужно и при вооружении, и при
+// разборе ответа (фактическая длина = запрошенная - остаток).
+static inline uint32_t kbd_report_len(const UsbDeviceSlot &dev) {
+    uint32_t len = dev.kbd_ep_mps ? dev.kbd_ep_mps : 8;
+    return len > 8 ? 8 : len;
+}
+
+static void kbd_enqueue_listen(int idx) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    if (dev.kbd_dci == 0) return;
+    uint32_t len = kbd_report_len(dev);
+    // Обнуляем буфер приземления ДО вооружения. Это страница bounce слота,
+    // и в ней может лежать всё что угодно от прежнего устройства в этом
+    // слоте (например, сектор накопителя). Короткий или пустой отчёт иначе
+    // был бы разобран вместе с этими остатками — фантомные нажатия.
+    volatile uint8_t *landing = bounce_vaddr(idx);
+    for (uint32_t i = 0; i < 8; i++) landing[i] = 0;
+    uint64_t trb_addr = ring_enqueue_trb(dev.bulkin_ring, to_dev_addr(dev.bounce_paddr), len,
+                                          trb_type(TRB_TYPE_NORMAL) | (1u << 2) /*ISP*/ | TRB_IOC);
+    dev.kbd_pending_trb = trb_addr;
+    ring_endpoint_doorbell(dev.slot_id, dev.kbd_dci);
+}
+
+// Байты — в консоль. Кусками по 16: столько заведомо влезает в регистры
+// сообщения seL4 вместе с номером команды.
+static void kbd_inject(const char *buf, int n) {
+    if (!g_console_ep) return;
+    while (n > 0) {
+        int chunk = n > 16 ? 16 : n;
+        seL4_SetMR(0, SYS_KBD_INJECT);
+        for (int i = 0; i < chunk; i++) seL4_SetMR(i + 1, (seL4_Word)(uint8_t)buf[i]);
+        seL4_Call(g_console_ep, seL4_MessageInfo_new(0, 0, 0, (seL4_Word)(chunk + 1)));
+        buf += chunk; n -= chunk;
+    }
+}
+
+// Таблицы кодов — из common/usb_kbd.c U-Boot, с ОДНОЙ правкой: Backspace
+// даёт 0x7F, а не '\b'. Именно 0x7F по умолчанию шлёт minicom, а задача в
+// том, чтобы клавиатура была от него неотличима (шелл понимает оба).
+// Индекс = код клавиши - 0x1E.
+static const char kbd_numkey[] = {
+    '1','2','3','4','5','6','7','8','9','0',
+    '\r', 0x1b, 0x7f, '\t', ' ', '-', '=', '[', ']', '\\', '#', ';', '\'', '`', ',', '.', '/' };
+static const char kbd_numkey_shift[] = {
+    '!','@','#','$','%','^','&','*','(',')',
+    '\r', 0x1b, 0x7f, '\t', ' ', '_', '+', '{', '}', '|', '~', ':', '"', '~', '<', '>', '?' };
+// Цифровая клавиатура, индекс = код - 0x54. NumLock, как и в U-Boot, не
+// учитывается: цифровой блок всегда даёт цифры.
+static const char kbd_keypad[] = {
+    '/','*','-','+','\r','1','2','3','4','5','6','7','8','9','0','.', 0, 0, 0, '=' };
+
+constexpr uint8_t KBD_MOD_CTRL  = 0x11; // левый | правый Ctrl
+constexpr uint8_t KBD_MOD_SHIFT = 0x22; // левый | правый Shift
+constexpr uint8_t KBD_LOCK_NUM  = 0x01;
+constexpr uint8_t KBD_LOCK_CAPS = 0x02;
+constexpr uint32_t KBD_REPEAT_DELAY_MS = 400; // те же 400/40 мс, что у U-Boot
+constexpr uint32_t KBD_REPEAT_RATE_MS  = 40;
+// Пауза перед восстановлением Interrupt-эндпоинта после ошибки и предел
+// попыток подряд — общие для клавиатуры и хаба, см. usb_int_recover_tick и
+// ветки ошибок в poll_hub_interrupts.
+constexpr uint32_t KBD_RECOVER_DELAY_MS = 250;
+constexpr uint8_t  KBD_MAX_RECOVERIES   = 3;
+
+// Код клавиши -> байты, как их прислал бы терминал. Возвращает число байт.
+// Замки (CapsLock/NumLock) переключаются здесь же и символов не дают.
+static int kbd_translate(UsbDeviceSlot &dev, uint8_t code, uint8_t mods, char out[4]) {
+    bool shift = (mods & KBD_MOD_SHIFT) != 0;
+    bool ctrl  = (mods & KBD_MOD_CTRL) != 0;
+    if (code >= 0x04 && code <= 0x1d) { // буквы
+        char c = (char)('a' + (code - 0x04));
+        // Ctrl+буква — управляющий код (Ctrl+C = 0x03), как у терминала.
+        // U-Boot вычитает 3 из кода ЛЮБОЙ клавиши при зажатом Ctrl и для
+        // не-букв получает мусор; здесь — только для букв.
+        if (ctrl) { out[0] = (char)(c - 'a' + 1); return 1; }
+        bool upper = shift != ((dev.kbd_locks & KBD_LOCK_CAPS) != 0);
+        out[0] = upper ? (char)(c - 'a' + 'A') : c;
+        return 1;
+    }
+    if (code >= 0x1e && code <= 0x38) {
+        out[0] = shift ? kbd_numkey_shift[code - 0x1e] : kbd_numkey[code - 0x1e];
+        return 1;
+    }
+    // 0x64 — клавиша ISO-раскладки между левым Shift и Z (\ и |). Попадает
+    // в диапазон цифрового блока, где у U-Boot на её месте ноль, и на
+    // европейских/русских клавиатурах просто молчала бы.
+    if (code == 0x64) { out[0] = shift ? '|' : '\\'; return 1; }
+    if (code >= 0x54 && code <= 0x67) {
+        char c = kbd_keypad[code - 0x54];
+        if (!c) return 0;
+        out[0] = c;
+        return 1;
+    }
+    if (code >= 0x4f && code <= 0x52) { // стрелки -> ESC [ C/D/B/A, их шелл уже разбирает
+        static const char dir[4] = { 'C', 'D', 'B', 'A' }; // вправо, влево, вниз, вверх
+        out[0] = 0x1b; out[1] = '['; out[2] = dir[code - 0x4f];
+        return 3;
+    }
+    if (code == 0x39) { dev.kbd_locks ^= KBD_LOCK_CAPS; return 0; }
+    if (code == 0x53) { dev.kbd_locks ^= KBD_LOCK_NUM;  return 0; }
+    return 0;
+}
+
+// Разбор 8-байтного boot-отчёта. Отчёт — это СОСТОЯНИЕ ("какие клавиши
+// сейчас нажаты"), а не событие, поэтому новые нажатия — это коды, которых
+// не было в прошлом отчёте.
+static void kbd_process_report(int idx, uint32_t actual) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    volatile uint8_t *rep = bounce_vaddr(idx);
+    uint8_t now[8];
+    // Байты за пределами фактически пришедших — ноль ("клавиша не нажата"),
+    // а не то, что осталось в буфере.
+    for (int i = 0; i < 8; i++) now[i] = ((uint32_t)i < actual) ? rep[i] : 0;
+    // ErrorRollOver: нажато больше клавиш, чем помещается в отчёт, и
+    // клавиатура заполняет все шесть мест кодом 0x01. Информации в таком
+    // отчёте нет — пропускаем, не трогая прошлое состояние.
+    if (now[2] == 0x01) return;
+
+    uint8_t mods = now[0];
+    char out[32];
+    int n = 0;
+    uint8_t newest = 0;
+    for (int i = 2; i < 8; i++) {
+        uint8_t k = now[i];
+        if (k < 0x04) continue;
+        bool was = false;
+        for (int j = 2; j < 8; j++) if (dev.kbd_old[j] == k) { was = true; break; }
+        if (was) continue;
+        char tmp[4];
+        int m = kbd_translate(dev, k, mods, tmp);
+        for (int t = 0; t < m && n < (int)sizeof(out); t++) out[n++] = tmp[t];
+        if (m > 0) newest = k; // замки в автоповтор не попадают — они ничего не печатают
+    }
+    // Автоповтор ведётся по нашим часам (heartbeat), а не по SET_IDLE:
+    // клавиатура шлёт отчёт только при изменении, и повторять надо самим.
+    if (newest) {
+        dev.kbd_repeat_key = newest;
+        dev.kbd_repeat_mods = mods;
+        dev.kbd_repeat_at = read_cntvct() + (uint64_t)KBD_REPEAT_DELAY_MS * g_cntfrq / 1000;
+    } else if (dev.kbd_repeat_key) {
+        bool still = false;
+        for (int i = 2; i < 8; i++) if (now[i] == dev.kbd_repeat_key) { still = true; break; }
+        if (!still) dev.kbd_repeat_key = 0;
+        else dev.kbd_repeat_mods = mods; // Shift могли отпустить, а букву держать
+    }
+    for (int i = 0; i < 8; i++) dev.kbd_old[i] = now[i];
+    if (n > 0) kbd_inject(out, n);
+}
+
+// Автоповтор зажатой клавиши. Зовётся на каждом heartbeat-тике (~20 мс) и
+// к железу не обращается — только часы и память.
+static void kbd_repeat_tick(void) {
+    uint64_t now = read_cntvct();
+    for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
+        UsbDeviceSlot &dev = g_usb_devices[idx];
+        if (!dev.in_use || !dev.kbd || dev.kbd_repeat_key == 0) continue;
+        if (now < dev.kbd_repeat_at) continue;
+        char tmp[4];
+        int m = kbd_translate(dev, dev.kbd_repeat_key, dev.kbd_repeat_mods, tmp);
+        if (m > 0) kbd_inject(tmp, m);
+        dev.kbd_repeat_at = now + (uint64_t)KBD_REPEAT_RATE_MS * g_cntfrq / 1000;
+    }
+}
+
 // Milestone B2 (Фаза 15) — class-специфичные запросы К ПОРТУ хаба (не к
 // самому хабу) — bmRequestType для recipient="Other" (см. USB 2.0 spec
 // 9.4/11.24.2): 0xA3 (Device-to-Host|Class|Other) для GET_STATUS, 0x23
@@ -2524,6 +3002,19 @@ constexpr uint16_t USB_PORT_STAT_LOW_SPEED  = 0x0200;  // wPortStatus, бит9
 constexpr uint16_t USB_PORT_STAT_HIGH_SPEED = 0x0400;  // wPortStatus, бит10 (ни один из двух = Full-Speed)
 constexpr uint16_t USB_PORT_STAT_C_RESET    = 0x0010;  // wPortChange, бит4
 constexpr uint16_t USB_PORT_STAT_C_LINK_STATE = 0x0040; // wPortChange, бит6 (SS)
+// Остальные биты изменения порта (USB 2.0 Table 11-22, USB 3.x Table 10-12)
+// и их селекторы CLEAR_FEATURE (Table 11-17 / 10-9). Бит изменения, который
+// никто не сбросил, хаб репортит на КАЖДОМ опросе своего Interrupt-
+// эндпоинта — та же ловушка, что уже была с C_PORT_LINK_STATE.
+constexpr uint16_t USB_PORT_STAT_ENABLE          = 0x0002; // wPortStatus, бит1
+constexpr uint16_t USB_PORT_STAT_C_ENABLE        = 0x0002; // wPortChange (USB 2.0)
+constexpr uint16_t USB_PORT_STAT_C_SUSPEND       = 0x0004; // wPortChange (USB 2.0)
+constexpr uint16_t USB_PORT_STAT_C_OVER_CURRENT  = 0x0008; // wPortChange
+constexpr uint16_t USB_PORT_STAT_C_CONFIG_ERROR  = 0x0080; // wPortChange (SS)
+constexpr uint16_t USB_PORT_FEAT_C_PORT_ENABLE       = 17;
+constexpr uint16_t USB_PORT_FEAT_C_PORT_SUSPEND      = 18;
+constexpr uint16_t USB_PORT_FEAT_C_PORT_OVER_CURRENT = 19;
+constexpr uint16_t USB_PORT_FEAT_C_PORT_CONFIG_ERROR = 26;
 
 // GET_PORT_STATUS возвращает 4 байта: wPortStatus (0-1), wPortChange
 // (2-3) — тот же ctrlbuf(idx), что и у GET_DESCRIPTOR (переиспользуем,
@@ -2669,11 +3160,11 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
         bool high_speed = (status & USB_PORT_STAT_HIGH_SPEED) != 0;
         if (LOG_USB) sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
                                         : (high_speed ? "[USB]     Скорость: High-Speed\n" : "[USB]     Скорость: Full-Speed\n"));
-        if (!high_speed) {
-            sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: не High-Speed — Transaction Translator не реализован в этой фазе, монтирование этого устройства невозможно (честное ограничение, см. план).\n");
-            return;
-        }
-        device_speed = 3;
+        // Full/Low Speed за High Speed хабом теперь поддержаны: хаб
+        // проводит их через свой Transaction Translator, а драйвер
+        // сообщает xHCI, через какой хаб и порт это идёт (поля TT в Slot
+        // Context, см. slot_ctx_tt()). Раньше здесь был отказ.
+        device_speed = low_speed ? 2u : (high_speed ? 3u : 1u);
     }
     // Milestone B3 (Фаза 15) — устройство за хабом: тот же приём
     // выделения слота/освобождения при неудаче, что try_enumerate_port()
@@ -2702,7 +3193,8 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
     // портов (is_hub || is_storage), раньше здесь проверялся только
     // накопитель, и хаб-за-хабом ошибочно считался неудачей.
     bool child_is_hub = (g_usb_devices[child_idx].found.device_class == USB_CLASS_HUB);
-    bool child_ok = g_usb_devices[child_idx].found.found && (child_is_hub || g_usb_devices[child_idx].bulk_eps.found);
+    bool child_ok = g_usb_devices[child_idx].found.found && (child_is_hub || g_usb_devices[child_idx].bulk_eps.found
+                    || (g_usb_devices[child_idx].kbd && g_usb_devices[child_idx].kbd_dci != 0));
     if (!child_ok) {
         usb_slot_release_failed(console_ep, child_idx, "устройство за хабом не перечислилось");
         return;
@@ -2712,6 +3204,12 @@ static void hub_handle_port_connect(seL4_CPtr console_ep, int idx, uint8_t hp) {
         // honest-сообщение (та же логика, что уже есть в
         // poll_ports_for_hotplug() для хаба на корневом порту).
         if (LOG_USB) sys_puthex32(console_ep, "[USB]     Хаб за хабом подключён и опрошен, портов = ", g_usb_devices[child_idx].hub_num_ports);
+    } else if (g_usb_devices[child_idx].kbd) {
+        // Клавиатура — не накопитель, exFAT у неё нет и быть не может.
+        // Без этой ветки её, успешно настроенную, тут же освобождала бы
+        // проверка ниже — а на RPi4 клавиатура ВСЕГДА за хабом (весь USB2
+        // идёт через встроенный VIA-хаб). Сообщение уже напечатал
+        // step_kbd_configure().
     } else if (!g_usb_devices[child_idx].storage_mounted) {
         usb_slot_release_failed(console_ep, child_idx, "exFAT не смонтировался: не exFAT / повреждён / не тот раздел");
     } else {
@@ -2759,6 +3257,7 @@ static AsyncCtrl  g_hub_conn_actrl;
 static int        g_hub_conn_idx = 0;
 static uint8_t    g_hub_conn_port = 0;
 static bool       g_hub_conn_is_ss = false;
+static uint32_t   g_hub_conn_nonss_speed = 3; // скорость не-SS устройства: 1 Full, 2 Low, 3 High — решается в NONSS_CLEAR_C_CONN
 static bool       g_hub_conn_reset_needed = true; // (SS) false, если Port Link State уже 0 до всякого сброса
 static bool       g_hub_conn_reset_ok = false;
 static uint16_t   g_hub_conn_status = 0;          // последний прочитанный wPortStatus (для финального speed-check)
@@ -2935,10 +3434,9 @@ static void hub_conn_async_tick(seL4_CPtr console_ep) {
         bool high_speed = (g_hub_conn_status & USB_PORT_STAT_HIGH_SPEED) != 0;
         if (LOG_USB) sys_puts(console_ep, low_speed ? "[USB]     Скорость: Low-Speed\n"
                                         : (high_speed ? "[USB]     Скорость: High-Speed\n" : "[USB]     Скорость: Full-Speed\n"));
-        if (!high_speed) {
-            sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: не High-Speed — Transaction Translator не реализован в этой фазе, монтирование этого устройства невозможно (честное ограничение, см. план).\n");
-            g_hub_conn_state = HubConnSt::IDLE; return;
-        }
+        // См. тот же выбор в синхронном пути (hub_handle_port_connect):
+        // Full/Low Speed больше не отвергаются, их ведёт TT хаба.
+        g_hub_conn_nonss_speed = low_speed ? 2u : (high_speed ? 3u : 1u);
         g_hub_conn_state = HubConnSt::START_ENUM;
         return;
     }
@@ -2947,7 +3445,7 @@ static void hub_conn_async_tick(seL4_CPtr console_ep) {
         // Фаза 1 (см. комментарий у enum выше) — отсюда и глубже всё ещё
         // ОДИН синхронный блокирующий вызов, как в оригинальном
         // hub_handle_port_connect() (см. её же копию этого хвоста).
-        uint32_t device_speed = g_hub_conn_is_ss ? 4u : 3u;
+        uint32_t device_speed = g_hub_conn_is_ss ? 4u : g_hub_conn_nonss_speed;
         int child_idx = find_free_device_slot();
         if (child_idx < 0) {
             sys_puts(console_ep, "[USB]     ПРЕДУПРЕЖДЕНИЕ: нет свободных слотов под устройство за хабом (USB_MAX_DEVICES исчерпан).\n");
@@ -2977,11 +3475,15 @@ static void hub_conn_async_tick(seL4_CPtr console_ep) {
         if (LOG_USB) sys_puthex32(console_ep, "[USB]     DIAG device_protocol=", g_usb_devices[child_idx].found.device_protocol);
         if (LOG_USB) sys_puthex32(console_ep, "[USB]     DIAG found.found=", (uint32_t)g_usb_devices[child_idx].found.found);
         bool child_is_hub = (g_usb_devices[child_idx].found.device_class == USB_CLASS_HUB);
-        bool child_ok = g_usb_devices[child_idx].found.found && (child_is_hub || g_usb_devices[child_idx].bulk_eps.found);
+        bool child_ok = g_usb_devices[child_idx].found.found && (child_is_hub || g_usb_devices[child_idx].bulk_eps.found
+                    || (g_usb_devices[child_idx].kbd && g_usb_devices[child_idx].kbd_dci != 0));
         if (!child_ok) {
             usb_slot_release_failed(console_ep, child_idx, "устройство за хабом не перечислилось");
         } else if (child_is_hub) {
             if (LOG_USB) sys_puthex32(console_ep, "[USB]     Хаб за хабом подключён и опрошен, портов = ", g_usb_devices[child_idx].hub_num_ports);
+        } else if (g_usb_devices[child_idx].kbd) {
+            // Клавиатура — см. ту же ветку в hub_handle_port_connect():
+            // exFAT у неё нет, освобождать слот нельзя.
         } else if (!g_usb_devices[child_idx].storage_mounted) {
             // Перечислилось, но ФС не поднялась. Держать за это слот
             // занятым бессмысленно и вредно: он не отдаст ни одной
@@ -3076,6 +3578,13 @@ static int find_device_behind_hub(int hub_idx, uint8_t hub_port) {
 static void hub_handle_port_disconnect(seL4_CPtr console_ep, int hub_idx, uint8_t hub_port) {
     int idx = find_device_behind_hub(hub_idx, hub_port);
     if (idx < 0) return;
+    // У клавиатуры точки монтирования нет, а volume_name слота может
+    // остаться от прежнего накопителя — печатать его значило бы соврать.
+    if (g_usb_devices[idx].kbd) {
+        unmount_usb_storage(console_ep, idx);
+        sys_puts(console_ep, "[USB]   Клавиатура за хабом отключена.\n");
+        return;
+    }
     char old_name[32];
     my_strcpy(old_name, g_usb_devices[idx].volume_name);
     sys_puts(console_ep, "[USB]   Обнаружено отключение устройства за хабом — размонтирую /mnt/");
@@ -3083,6 +3592,33 @@ static void hub_handle_port_disconnect(seL4_CPtr console_ep, int hub_idx, uint8_
     sys_puts(console_ep, "\n");
     unmount_usb_storage(console_ep, idx);
     sys_puts(console_ep, "[USB]   Точка монтирования удалена.\n");
+}
+
+// Восстановление Interrupt-эндпоинта (клавиатура или хаб) после ошибки
+// передачи (см. poll_hub_interrupts). Зовётся на каждом heartbeat-тике.
+// Команды xHCI синхронные, поэтому не во время асинхронного подключения
+// за хабом: пока его стейт-машина ждёт свою control-передачу, чужое
+// ожидание команды вычитало бы её событие.
+static void usb_int_recover_tick(seL4_CPtr console_ep) {
+    if (g_hub_conn_state != HubConnSt::IDLE) return;
+    uint64_t now = read_cntvct();
+    for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
+        UsbDeviceSlot &dev = g_usb_devices[idx];
+        if (!dev.in_use) continue;
+        if (dev.kbd && dev.kbd_dci != 0 && dev.kbd_recover_at != 0 && now >= dev.kbd_recover_at) {
+            dev.kbd_recover_at = 0;
+            sys_puthex32(console_ep, "[USB] клавиатура: ошибка отчёта, восстанавливаю эндпоинт, код ", dev.kbd_err_cc);
+            recover_bulk_endpoint(console_ep, dev.slot_id, dev.kbd_dci, dev.bulkin_ring, 0);
+            kbd_enqueue_listen(idx);
+        }
+        if (dev.found.device_class == USB_CLASS_HUB && dev.hub_int_dci != 0
+            && dev.hub_recover_at != 0 && now >= dev.hub_recover_at) {
+            dev.hub_recover_at = 0;
+            sys_puthex32(console_ep, "[USB] хаб: ошибка interrupt-передачи, восстанавливаю эндпоинт, код ", dev.hub_int_err_cc);
+            recover_bulk_endpoint(console_ep, dev.slot_id, dev.hub_int_dci, dev.bulkin_ring, 0);
+            hub_enqueue_interrupt_listen(idx);
+        }
+    }
 }
 
 // Milestone B4 (Фаза 15) — динамический опрос interrupt-эндпоинтов ВСЕХ
@@ -3116,11 +3652,32 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
     uint8_t hub_cc[USB_MAX_DEVICES];
     uint32_t hub_residual[USB_MAX_DEVICES];
     bool hub_completed[USB_MAX_DEVICES];
+    // Клавиатура ловится ЗДЕСЬ ЖЕ, в одном проходе с хабами, и иначе нельзя:
+    // дренаж ниже вычитывает кольцо целиком и оставляет себе только свои
+    // TRB — отчёт клавиатуры, пришедший тем же прерыванием, был бы молча
+    // выброшен, и клавиатура замолчала бы после первого нажатия.
+    uint8_t kbd_cc[USB_MAX_DEVICES];
+    uint32_t kbd_res[USB_MAX_DEVICES];
+    bool kbd_completed[USB_MAX_DEVICES];
     bool any_target = false;
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
         hub_completed[i] = false;
+        kbd_completed[i] = false;
         UsbDeviceSlot &d = g_usb_devices[i];
-        if (d.in_use && d.found.device_class == USB_CLASS_HUB && d.hub_int_dci != 0 && d.hub_int_pending_trb != 0) any_target = true;
+        if (d.in_use && d.kbd && d.kbd_dci != 0 && d.kbd_pending_trb != 0) {
+            any_target = true;
+            // Событие могло прийти, пока драйвер синхронно ждал передачу
+            // накопителя: тогда wait_transfer_completion() положила его в
+            // кэш чужих событий, а не выбросила. Без этой проверки нажатие
+            // во время копирования файла останавливало бы клавиатуру.
+            if (uas_evt_cache_take(d.kbd_pending_trb, kbd_cc[i], kbd_res[i])) kbd_completed[i] = true;
+        }
+        if (d.in_use && d.found.device_class == USB_CLASS_HUB && d.hub_int_dci != 0 && d.hub_int_pending_trb != 0) {
+            any_target = true;
+            // То же для хаба: его событие могло осесть в кэше, пока шла
+            // команда (см. wait_command_completion) или синхронная передача.
+            if (uas_evt_cache_take(d.hub_int_pending_trb, hub_cc[i], hub_residual[i])) hub_completed[i] = true;
+        }
     }
     if (any_target) {
         Trb ev;
@@ -3128,16 +3685,34 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
         while (dequeue_event_trb(ev)) {
             update_erdp();
             uint32_t type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+            if (type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) note_port_status_change(ev);
             if (type != TRB_TYPE_TRANSFER_EVENT) continue;
-            for (int i = 0; i < USB_MAX_DEVICES; i++) {
+            bool matched = false;
+            for (int i = 0; i < USB_MAX_DEVICES && !matched; i++) {
                 UsbDeviceSlot &d = g_usb_devices[i];
                 if (!d.in_use || d.found.device_class != USB_CLASS_HUB || d.hub_int_dci == 0) continue;
                 if (ev.parameter == d.hub_int_pending_trb) {
                     hub_cc[i] = (uint8_t)(ev.status >> 24);
                     hub_residual[i] = ev.status & 0xFFFFFFu;
                     hub_completed[i] = true;
-                    break;
+                    matched = true;
                 }
+            }
+            for (int i = 0; i < USB_MAX_DEVICES && !matched; i++) {
+                UsbDeviceSlot &d = g_usb_devices[i];
+                if (!d.in_use || !d.kbd || d.kbd_pending_trb == 0) continue;
+                if (ev.parameter == d.kbd_pending_trb) {
+                    kbd_cc[i] = (uint8_t)(ev.status >> 24);
+                    kbd_res[i] = ev.status & 0xFFFFFFu;
+                    kbd_completed[i] = true;
+                    matched = true;
+                }
+            }
+            // Событие асинхронного control-запроса подключения за хабом
+            // (см. g_async_ctrl_data_trb) — в кэш, его заберёт
+            // async_ctrl_tick() на следующем тике.
+            if (!matched && is_async_listener_trb(ev.parameter)) {
+                uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
             }
             if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
                 sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring (poll_hub_interrupts) превысил защитный потолок — обрываю.\n");
@@ -3147,14 +3722,65 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
     }
     for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
         UsbDeviceSlot &dev = g_usb_devices[idx];
+        if (!dev.in_use || !dev.kbd || !kbd_completed[idx]) continue;
+        uint8_t cc = kbd_cc[idx];
+        if (cc == 1 || cc == 13) { // 13 = Short Packet, не ошибка
+            dev.kbd_errors = 0;
+            uint32_t len = kbd_report_len(dev);
+            uint32_t actual = (kbd_res[idx] <= len) ? len - kbd_res[idx] : 0;
+            // Пустой отчёт — не событие: так бывает на первом вооружении
+            // после Configure Endpoint (та же находка, что записана у хаба
+            // ниже). Разбирать нечего, просто перевооружаем.
+            if (actual > 0) kbd_process_report(idx, actual);
+            kbd_enqueue_listen(idx);
+        } else {
+            // Ошибка передачи переводит эндпоинт в Halted, а TRB на
+            // остановленном эндпоинте не исполняется — простое
+            // перевооружение оставило бы клавиатуру мёртвой до
+            // переподключения от одной помехи в кабеле. Нужны Reset Endpoint
+            // и Set TR Dequeue (recover_bulk_endpoint универсален).
+            //
+            // Не сразу, а через KBD_RECOVER_DELAY_MS (делает usb_int_recover_tick):
+            // та же ошибка приходит и при выдёргивании, раньше, чем хаб
+            // сообщит об отключении. За паузу отключение успевает снять слот,
+            // и восстанавливать (и шуметь в лог) не приходится. И с пределом
+            // попыток подряд — иначе бесконечный цикл отказов.
+            dev.kbd_pending_trb = 0; // эта TRB завершена, взведённой больше нет
+            dev.kbd_repeat_key = 0;  // не "нажимать" зажатую клавишу, пока опрос стоит
+            dev.kbd_err_cc = cc;
+            dev.kbd_errors++;
+            if (dev.kbd_errors <= KBD_MAX_RECOVERIES) {
+                dev.kbd_recover_at = read_cntvct() + (uint64_t)KBD_RECOVER_DELAY_MS * g_cntfrq / 1000;
+                if (dev.kbd_recover_at == 0) dev.kbd_recover_at = 1;
+            } else {
+                sys_puthex32(console_ep, "[USB] клавиатура: ошибки подряд — опрос остановлен до переподключения, код ", cc);
+            }
+        }
+    }
+    for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
+        UsbDeviceSlot &dev = g_usb_devices[idx];
         if (!dev.in_use || dev.found.device_class != USB_CLASS_HUB || dev.hub_int_dci == 0) continue;
         if (!hub_completed[idx]) continue;
         uint8_t cc = hub_cc[idx]; uint32_t residual = hub_residual[idx];
         if (cc != 1 && cc != 13) { // 13 = Short Packet, не ошибка (см. bulk_transfer)
-            sys_puthex32(console_ep, "[USB]   ПРЕДУПРЕЖДЕНИЕ: interrupt-передача хаба завершилась с кодом ", cc);
-            hub_enqueue_interrupt_listen(idx); // перевооружаем в любом случае — иначе эндпоинт замолчит навсегда
+            // Раньше здесь было простое перевооружение. Но ошибка передачи
+            // переводит эндпоинт в Halted, и TRB на нём не исполняется —
+            // хаб замолкал навсегда, а вместе с ним горячее подключение
+            // за ним. Та же схема, что у клавиатуры: восстановление через
+            // паузу (за неё успевает прийти отключение самого хаба) и с
+            // пределом попыток подряд — см. usb_int_recover_tick().
+            dev.hub_int_pending_trb = 0;
+            dev.hub_int_err_cc = cc;
+            dev.hub_int_errors++;
+            if (dev.hub_int_errors <= KBD_MAX_RECOVERIES) {
+                dev.hub_recover_at = read_cntvct() + (uint64_t)KBD_RECOVER_DELAY_MS * g_cntfrq / 1000;
+                if (dev.hub_recover_at == 0) dev.hub_recover_at = 1;
+            } else {
+                sys_puthex32(console_ep, "[USB] хаб: ошибки interrupt-передачи подряд — опрос хаба остановлен, код ", cc);
+            }
             continue;
         }
+        dev.hub_int_errors = 0;
         volatile uint8_t *bitmap = bounce_vaddr(idx);
         uint32_t mps = dev.hub_int_ep_mps ? dev.hub_int_ep_mps : 1;
         // issuse.txt №15 — НАЙДЕНО ЧТЕНИЕМ КОДА (ждёт hw-подтверждения):
@@ -3195,6 +3821,43 @@ static void poll_hub_interrupts(seL4_CPtr console_ep) {
             // (например, после отключения SS-устройства) на каждом опросе.
             if (change & USB_PORT_STAT_C_LINK_STATE) {
                 hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_LINK_STATE);
+            }
+            // Остальные биты изменения — ровно как hub_event() в Linux: иначе
+            // хаб репортит порт на каждом опросе бесконечно. C_PORT_RESET
+            // здесь НЕ трогаем: его ждёт и снимает асинхронная
+            // последовательность подключения (NONSS/SS_CLEAR_C_RESET), и
+            // сброс отсюда мог бы украсть у неё признак конца сброса.
+            bool ss_hub = (dev.link_speed == 4);
+            bool reenum_disabled_port = false;
+            if (!ss_hub && (change & USB_PORT_STAT_C_ENABLE)) {
+                // Хаб сам выключил порт при живом подключении (babble,
+                // помеха). Эталон (hub_event, "disabled by hub (EMI?),
+                // re-enabling...") считает это сменой подключения: снять
+                // устройство и перечислить заново. Если подключение за
+                // хабом уже идёт, бит не сбрасываем — хаб повторит событие,
+                // и разберём его, когда стейт-машина освободится.
+                bool disabled_by_hub = !(status & USB_PORT_STAT_ENABLE) && (status & USB_PORT_STAT_CONNECTION)
+                                       && !(change & USB_PORT_STAT_CONNECTION) && find_device_behind_hub(idx, hp) >= 0;
+                if (!(disabled_by_hub && g_hub_conn_state != HubConnSt::IDLE)) {
+                    hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_ENABLE);
+                    reenum_disabled_port = disabled_by_hub;
+                }
+            }
+            if (!ss_hub && (change & USB_PORT_STAT_C_SUSPEND)) {
+                hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_SUSPEND);
+            }
+            if (change & USB_PORT_STAT_C_OVER_CURRENT) {
+                sys_puthex32(console_ep, "[USB] Хаб: перегрузка по току на порту ", hp);
+                hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_OVER_CURRENT);
+            }
+            if (ss_hub && (change & USB_PORT_STAT_C_CONFIG_ERROR)) {
+                hub_clear_port_feature(console_ep, idx, dev.slot_id, hp, USB_PORT_FEAT_C_PORT_CONFIG_ERROR);
+            }
+            if (reenum_disabled_port) {
+                sys_puthex32(console_ep, "[USB] Хаб выключил порт при живом подключении (babble/помеха?) — переподключаю устройство, порт = ", hp);
+                hub_handle_port_disconnect(console_ep, idx, hp);
+                hub_conn_async_start(console_ep, idx, hp);
+                continue;
             }
             // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: раньше решение
             // "подключение или отключение" принималось ТОЛЬКО по текущему
@@ -3273,8 +3936,9 @@ static bool step10_configure_endpoints(seL4_CPtr console_ep, int idx, uint8_t sl
     // (Milestone B3, живая находка) — та же логика, обязана совпадать с
     // тем, что было записано на Address Device, иначе Parameter Error.
     uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
-    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
+    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | slot_ctx_mtt(dev, port_speed));
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
+    write_ctx_dword(inputctx(), 1, 2, slot_ctx_tt(dev, port_speed)); // ноль для всех, кроме Full/Low Speed за хабом
     // dword2 (Parent Hub Slot ID/Port/TT Think Time) — НАЙДЕНО НА ЖИВОМ
     // ЖЕЛЕЗЕ (Milestone B3, см. тот же комментарий в step7_address_device()):
     // эти поля — TT-ассоциация, нужна только для FS/LS устройств за
@@ -3328,6 +3992,107 @@ static bool step11_set_configuration(seL4_CPtr console_ep, int idx, uint8_t slot
         return false;
     }
     if (LOG_USB) sys_puts(console_ep, "[USB]   Устройство сконфигурировано, bulk-эндпоинты готовы к передачам.\n");
+    return true;
+}
+
+// Необязательный HID-запрос класса без данных (SET_PROTOCOL(0), SET_IDLE(0))
+// к интерфейсу клавиатуры. НЕ через ep0_control_no_data(): та на любой
+// отказ печатает ОШИБКУ, повторяет запрос и ставит устройство в очередь на
+// программное переподключение, а STALL на SET_IDLE — штатный ответ многих
+// клавиатур (U-Boot результат не проверяет вовсе). Но STALL переводит EP0
+// в Halted (xHCI 4.10.2.1), и следующий control-запрос на нём просто не
+// исполнился бы — поэтому при любом отказе эндпоинт сразу восстанавливаем,
+// тихо и без повтора.
+static bool kbd_optional_request(seL4_CPtr console_ep, int idx, uint8_t slot_id, uint8_t bRequest) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    uint64_t setup = 0x21ull /*Host-to-Device|Class|Interface*/ | ((uint64_t)bRequest << 8)
+                    | ((uint64_t)dev.kbd_if << 32); // wValue=0, wLength=0
+    ring_enqueue_trb(dev.ep0_ring, setup, 8u,
+                      trb_type(TRB_TYPE_SETUP_STAGE) | (1u << 6) /*IDT*/ | (0u << 16) /*TRT=No Data Stage*/);
+    uint64_t status_trb_addr = ring_enqueue_trb(dev.ep0_ring, 0, 0,
+                      trb_type(TRB_TYPE_STATUS_STAGE) | (1u << 16) /*DIR=IN*/ | TRB_IOC);
+    ring_endpoint_doorbell(slot_id, 1 /* DCI=1 — EP0 */);
+    uint8_t cc = 0;
+    uint32_t residual = 0;
+    if (wait_transfer_completion(console_ep, status_trb_addr, 500, cc, residual) && cc == 1) return true;
+    recover_bulk_endpoint(console_ep, slot_id, 1 /* DCI=1, EP0 */, dev.ep0_ring);
+    return false;
+}
+
+// Настройка HID-клавиатуры: Configure Endpoint (Interrupt IN), затем
+// SET_CONFIGURATION, SET_PROTOCOL(boot), SET_IDLE(0) и первая слушающая TRB.
+// Порядок "сначала xHCI, потом устройство" — тот же, что у накопителя
+// (step10 -> step11).
+static bool step_kbd_configure(seL4_CPtr console_ep, int idx, uint8_t slot_id, int root_port, uint32_t port_speed) {
+    UsbDeviceSlot &dev = g_usb_devices[idx];
+    uint8_t epnum = dev.kbd_ep_addr & 0x0Fu;
+    uint8_t dci = (uint8_t)(2u * epnum + 1u); // IN
+    dev.kbd_dci = dci;
+
+    // Интервал зависит от скорости (см. xhci_int_interval_field). Клавиатуры
+    // почти всегда USB 1.x с bInterval около 10 мс, и формула High Speed
+    // дала бы 64 мс опроса вместо 8, а boot-отчёт — это состояние, а не
+    // событие: клавиша, нажатая и отпущенная между опросами, терялась бы.
+    uint32_t interval_field = xhci_int_interval_field(dev.kbd_ep_interval, port_speed);
+    uint16_t mps = dev.kbd_ep_mps ? dev.kbd_ep_mps : 8;
+
+    // Input Context — как у хаба (step_hub_configure_slot), только без бита
+    // Hub в Slot Context. Если клавиатура стоит за хабом, dword2 несёт поля
+    // Transaction Translator (см. slot_ctx_tt); в корневом порту там ноль.
+    uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
+    for (int i = 0; i < 3; i++) for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), i, d, 0);
+    write_ctx_dword(inputctx(), 0, 1, (1u << 0) | (1u << dci)); // A0 (Slot) + A(dci)
+    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)dci << 27) | ((port_speed & 0xF) << 20)
+                     | slot_ctx_mtt(dev, port_speed));
+    write_ctx_dword(inputctx(), 1, 1, ((uint32_t)root_port << 16));
+    write_ctx_dword(inputctx(), 1, 2, slot_ctx_tt(dev, port_speed)); // TT хаба, если клавиатура за ним
+
+    init_trb_ring(dev.bulkin_ring, bulkinring_vaddr(idx), dev.bulkin_trring_paddr);
+    int ctx_index = (int)dci + 1;
+    for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), ctx_index, d, 0);
+    write_ctx_dword(inputctx(), ctx_index, 0, interval_field << 16);
+    write_ctx_dword(inputctx(), ctx_index, 1, (3u << 1) /*CErr*/ | (7u << 3) /*Interrupt In*/ | ((uint32_t)mps << 16));
+    write_ctx_dword(inputctx(), ctx_index, 2, (uint32_t)(dev.bulkin_ring.dev_base & 0xFFFFFFFFu) | 1u /*DCS*/);
+    write_ctx_dword(inputctx(), ctx_index, 3, (uint32_t)(dev.bulkin_ring.dev_base >> 32));
+    // dword4: Max ESIT Payload [31:16] и Average TRB Length [15:0]. Для
+    // периодического эндпоинта контроллер резервирует полосу по Max ESIT
+    // Payload (байт за интервал обслуживания); Linux (xhci_endpoint_init)
+    // кладёт в оба поля max_esit_payload = MaxPacketSize * (доп. транзакции
+    // + 1), у клавиатуры это просто MaxPacketSize.
+    write_ctx_dword(inputctx(), ctx_index, 4, ((uint32_t)mps << 16) | mps);
+
+    uint64_t cmd_paddr = enqueue_command_trb(to_dev_addr(g_inputctx_paddr), 0,
+                                              trb_type(TRB_TYPE_CONFIGURE_ENDPOINT_CMD) | ((uint32_t)slot_id << 24));
+    uint8_t completion_code = 0, ret_slot = 0;
+    if (!wait_command_completion(console_ep, cmd_paddr, 500, completion_code, ret_slot)) {
+        sys_puts(console_ep, "[USB] клавиатура: Configure Endpoint не завершился за 500 мс\n");
+        return false;
+    }
+    if (completion_code != 1) {
+        sys_puthex32(console_ep, "[USB] клавиатура: Configure Endpoint завершился с кодом ", completion_code);
+        return false;
+    }
+    if (!step11_set_configuration(console_ep, idx, slot_id)) return false;
+
+    // SET_PROTOCOL(0 = boot) и SET_IDLE(0 = отчёт только при изменении).
+    // Отказ ни того, ни другого не фатален: многие клавиатуры и так в boot-
+    // режиме после сброса, а SET_IDLE часть из них отвергает STALL'ом. Тот
+    // же принцип у U-Boot — он не проверяет результат ни одного из двух.
+    // SET_IDLE(0), а не U-Boot'овские 40 мс: автоповтор ведём сами по
+    // heartbeat (kbd_repeat_tick), и незачем получать 25 одинаковых
+    // отчётов в секунду, пока клавиша зажата.
+    if (!kbd_optional_request(console_ep, idx, slot_id, USB_HID_REQ_SET_PROTOCOL))
+        sys_puts(console_ep, "[USB] клавиатура: SET_PROTOCOL отклонён — работаю с тем протоколом, что есть\n");
+    kbd_optional_request(console_ep, idx, slot_id, USB_HID_REQ_SET_IDLE); // STALL здесь — норма
+
+    kbd_enqueue_listen(idx);
+    // Одна строка: где стоит и на какой скорости — по ней сразу видно,
+    // сработал ли путь через Transaction Translator (за хабом, Low/Full).
+    static const char *spd[5] = { "?", "Full", "Low", "High", "Super" };
+    sys_puts(console_ep, "[USB] клавиатура подключена: ");
+    sys_puts(console_ep, dev.behind_hub ? "за хабом (через TT), " : "в корневом порту, ");
+    sys_puts(console_ep, spd[port_speed <= 4 ? port_speed : 0]);
+    sys_puts(console_ep, " Speed\n");
     return true;
 }
 
@@ -3583,6 +4348,8 @@ static bool uas_poll_trb(uint64_t trb_addr, uint8_t &cc, uint32_t &res) {
             } else {
                 uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
             }
+        } else if (type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
+            note_port_status_change(ev);
         }
         if (++drained >= EVT_RING_DRAIN_SANITY_CAP) break;
     }
@@ -3958,8 +4725,9 @@ static bool step_uas_setup(seL4_CPtr console_ep, int idx, uint8_t slot_id, int p
     // поля и та же логика Route String, что в step10_configure_endpoints().
     for (int d = 0; d < g_ctx_size / 4; d++) write_ctx_dword(inputctx(), 1, d, 0);
     uint32_t route_string = dev.behind_hub ? dev.route_string_full : 0;
-    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | (dev.behind_hub && dev.parent_multi_tt ? (1u << 25) : 0));
+    write_ctx_dword(inputctx(), 1, 0, route_string | ((uint32_t)max_dci << 27) | ((port_speed & 0xF) << 20) | slot_ctx_mtt(dev, port_speed));
     write_ctx_dword(inputctx(), 1, 1, ((uint32_t)port << 16));
+    write_ctx_dword(inputctx(), 1, 2, slot_ctx_tt(dev, port_speed)); // ноль для всех, кроме Full/Low Speed за хабом
 
     // Нужны ли bulk streams. Решает НЕ наше желание, а связка "скорость +
     // что объявило устройство": на SuperSpeed трубы статуса и данных
@@ -4831,6 +5599,24 @@ static bool xhci_controller_init(seL4_CPtr console_ep, uint32_t &max_ports) {
 
     uint8_t caplen; uint32_t hcsparams1, hcsparams2, hccparams1;
     if (!step1_read_capabilities(console_ep, caplen, hcsparams1, hcsparams2, hccparams1)) return false;
+
+    // Версия прошивки VL805 — PCI config 0x50, как xhci_vl805_get_fw_version()
+    // в ядре Raspberry Pi. От неё зависит обход ошибки TT встроенного хаба
+    // (см. g_vl805_hub_tt_quirk). Индекс конфиг-окна на VL805 выставлен
+    // root'ом (см. read_vl805_devstatus_direct); проверяем Vendor/Device,
+    // чтобы не поверить чужому регистру.
+    {
+        uint32_t id = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_USB_VADDR + 0x00);
+        uint32_t fw = *(volatile uint32_t*)(PLAT_PCIE_CFG_DATA_USB_VADDR + 0x50);
+        if (id == 0x34831106u) { // Device 0x3483, Vendor 0x1106 (VIA)
+            g_vl805_hub_tt_quirk = (fw < VL805_FW_VER_0138C0);
+            sys_puthex32(console_ep, g_vl805_hub_tt_quirk
+                ? "[USB] VL805: прошивка старше 0x0138C0 — включаю обход ошибки TT встроенного хаба, версия = "
+                : "[USB] VL805: версия прошивки = ", fw);
+        } else {
+            sys_puthex32(console_ep, "[USB] VL805: конфиг-окно указывает не на VL805, Vendor/Device = ", id);
+        }
+    }
     g_max_psa_size = (hccparams1 >> 12) & 0xFu;
     if (LOG_USB) sys_puthex32(console_ep, "[USB]   Max Primary Stream Array Size (HCCPARAMS1[15:12]) = ", g_max_psa_size);
 
@@ -4945,6 +5731,17 @@ static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, ui
     g_usb_devices[idx].uas_eps_configured = false;
     g_usb_devices[idx].uas_use_streams = false;
     g_usb_devices[idx].uas = UsbUasPipes{};
+    g_usb_devices[idx].kbd = false;
+    g_usb_devices[idx].kbd_ep_addr = 0;
+    g_usb_devices[idx].kbd_dci = 0;
+    g_usb_devices[idx].kbd_pending_trb = 0;
+    g_usb_devices[idx].kbd_repeat_key = 0;
+    g_usb_devices[idx].kbd_locks = 0;
+    g_usb_devices[idx].kbd_errors = 0;
+    g_usb_devices[idx].kbd_recover_at = 0;
+    g_usb_devices[idx].hub_int_errors = 0;
+    g_usb_devices[idx].hub_recover_at = 0;
+    for (int k = 0; k < 8; k++) g_usb_devices[idx].kbd_old[k] = 0;
     step8_get_device_descriptor(console_ep, idx, slot_id);
     if (!g_usb_devices[idx].found.found) return;
     // Milestone 3 — bDeviceClass часто 0 (класс на уровне Interface, не
@@ -4975,6 +5772,12 @@ static void continue_enumeration_after_address(seL4_CPtr console_ep, int idx, ui
         // сразу после того, как узнали bNbrPorts; если Hub Descriptor не
         // прочитался, hub_num_ports==0 и цикл внутри просто не выполнится.
         step_hub_scan_downstream_ports(console_ep, idx, slot_id);
+        return;
+    }
+    // HID boot-клавиатура — своя ветка, как у хаба: bulk-эндпоинтов у неё
+    // законно нет, и путь накопителя ниже ей не подходит.
+    if (g_usb_devices[idx].kbd) {
+        if (!step_kbd_configure(console_ep, idx, slot_id, port, port_speed)) g_usb_devices[idx].kbd = false;
         return;
     }
     if (!g_usb_devices[idx].bulk_eps.found) return; // не Mass Storage/SCSI/BOT — try_enumerate_port сам решит, пробовать ли дальше
@@ -5070,6 +5873,23 @@ static void enumerate_device_behind_hub(seL4_CPtr console_ep, int hub_idx, uint8
     self.parent_port_number = hub_port;
     self.parent_multi_tt = (hub.found.device_protocol == 2); // см. USB 2.0 spec, Hub Class Device Descriptor bDeviceProtocol — для SS-хаба (protocol==3) остаётся false, MTT/TT не для SS
     self.parent_tt_think_time = hub.hub_tt_think_time;
+    // Чей Transaction Translator — ровно по правилу Linux (hub_port_init):
+    // если у родителя-хаба уже есть TT (он сам Full Speed и висит за High
+    // Speed хабом), ребёнок наследует ТОТ ЖЕ TT и тот же порт; иначе, если
+    // родитель High Speed, а ребёнок Full/Low — TT = родитель, порт = порт
+    // родителя. Первый случай — Full Speed хаб за High Speed: у ближайшего
+    // родителя TT нет вовсе, split-транзакции делает хаб уровнем выше.
+    // Так устроены, например, клавиатуры со встроенным USB 1.1 хабом.
+    if (hub.tt_hub_slot_id != 0) {
+        self.tt_hub_slot_id = hub.tt_hub_slot_id;
+        self.tt_port = hub.tt_port;
+    } else if (hub.link_speed == 3 && (device_speed == 1 || device_speed == 2)) {
+        self.tt_hub_slot_id = hub.slot_id;
+        self.tt_port = hub_port;
+    } else {
+        self.tt_hub_slot_id = 0;
+        self.tt_port = 0;
+    }
     // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ (первый раз, когда реально
     // дошли до 2 яруса вложенности — устройство за хабом пользователя,
     // который сам висит на встроенном root-hub'е VL805): hub.port у
@@ -5154,6 +5974,8 @@ static bool try_enumerate_port(seL4_CPtr console_ep, int port, int &out_idx) {
     g_usb_devices[idx].parent_hub_slot_id = 0;
     g_usb_devices[idx].parent_port_number = 0;
     g_usb_devices[idx].parent_multi_tt = false;
+    g_usb_devices[idx].tt_hub_slot_id = 0;
+    g_usb_devices[idx].tt_port = 0;
     g_usb_devices[idx].parent_tt_think_time = 0;
     g_usb_devices[idx].hub_tier = 0;
     g_usb_devices[idx].route_string_full = 0;
@@ -5170,7 +5992,8 @@ static bool try_enumerate_port(seL4_CPtr console_ep, int port, int &out_idx) {
     // два разных исхода).
     bool is_hub = g_usb_devices[idx].found.found && g_usb_devices[idx].found.device_class == USB_CLASS_HUB;
     bool is_storage = g_usb_devices[idx].found.found && !is_hub && g_usb_devices[idx].bulk_eps.found;
-    bool keep = is_hub || is_storage;
+    bool is_kbd = g_usb_devices[idx].found.found && g_usb_devices[idx].kbd && g_usb_devices[idx].kbd_dci != 0;
+    bool keep = is_hub || is_storage || is_kbd;
     if (!keep) {
         // Освобождаем слот в ЛЮБОМ случае отказа (не-MSC интерфейс,
         // ИЛИ любая другая неудача после Enable Slot) — иначе следующая
@@ -5207,7 +6030,7 @@ static void unmount_usb_storage(seL4_CPtr console_ep, int idx, bool hardware_ali
     driver_state_step(USB_STEP_UNMOUNT); // пошаговый watchdog, см. common.h/UsbStep
     UsbDeviceSlot &dev = g_usb_devices[idx];
     if (!dev.in_use) return; // Milestone B1 — было storage_mounted||slot_id!=0, но хаб не смонтирован в exFAT-смысле; in_use покрывает и его, и накопитель единообразно
-    if (LOG_USB && dev.found.device_class != USB_CLASS_HUB) { sys_puts(console_ep, "[USB] Hot-plug: размонтирую /mnt/"); sys_puts(console_ep, dev.volume_name); sys_puts(console_ep, "\n"); }
+    if (LOG_USB && dev.found.device_class != USB_CLASS_HUB && !dev.kbd) { sys_puts(console_ep, "[USB] Hot-plug: размонтирую /mnt/"); sys_puts(console_ep, dev.volume_name); sys_puts(console_ep, "\n"); }
     // issuse.txt №74/в — см. комментарий у объявления: после fundamental
     // reset (usbreset) звонить Disable Slot НЕКУДА (Command Ring/Event
     // Ring контроллера ещё не переинициализированы) — это и вешало
@@ -5224,6 +6047,7 @@ static void unmount_usb_storage(seL4_CPtr console_ep, int idx, bool hardware_ali
     dev.port = 0;
     dev.in_use = false;
     dev.hub_num_ports = 0;
+    dev.hub_tt_think_time = 0; // иначе хаб в этом слоте, не прочитавший дескриптор, унаследовал бы чужой
     dev.hub_pwr_on_to_pwr_good = 0;
     // issuse.txt №12: раньше топология хаба НЕ сбрасывалась — если этот
     // слот раньше был устройством ЗА хабом (behind_hub=true), а потом
@@ -5236,14 +6060,36 @@ static void unmount_usb_storage(seL4_CPtr console_ep, int idx, bool hardware_ali
     dev.parent_hub_slot_id = 0;
     dev.parent_port_number = 0;
     dev.parent_multi_tt = false;
+    dev.tt_hub_slot_id = 0;
+    dev.tt_port = 0;
     dev.parent_tt_think_time = 0;
     // Хабовский Interrupt-эндпоинт: DCI и адрес "слушающей" TRB. Раньше
     // не сбрасывались — оставались от прошлой инкарнации слота. Пока
     // in_use=false, poll_hub_interrupts() их не смотрит, но слот
     // переиспользуется под новое устройство, и совпадение адреса TRB со
     // старым значением дало бы ложное срабатывание на чужое событие.
+    // Событие, осевшее в кэше для этого слота, тоже выбрасываем: его TRB
+    // больше ничей, а новое устройство в том же слоте начнёт кольцо с
+    // того же адреса и приняло бы его за своё.
+    {
+        uint8_t ccc = 0; uint32_t cres = 0;
+        if (dev.hub_int_pending_trb) uas_evt_cache_take(dev.hub_int_pending_trb, ccc, cres);
+        if (dev.kbd_pending_trb) uas_evt_cache_take(dev.kbd_pending_trb, ccc, cres);
+    }
     dev.hub_int_dci = 0;
     dev.hub_int_pending_trb = 0;
+    dev.hub_int_errors = 0;
+    dev.hub_recover_at = 0;
+    // Клавиатура — по той же причине, что хаб выше: слот переиспользуется,
+    // и зависший kbd_repeat_key продолжал бы "нажимать" клавишу уже после
+    // отключения.
+    dev.kbd = false;
+    dev.kbd_dci = 0;
+    dev.kbd_ep_addr = 0;
+    dev.kbd_pending_trb = 0;
+    dev.kbd_repeat_key = 0;
+    dev.kbd_errors = 0;
+    dev.kbd_recover_at = 0;
     // Состояние смонтированной ФС: в fs лежат кэш загрузочного сектора,
     // размеры кластеров и текущий каталог. Оставлять его от прошлого
     // накопителя нельзя — следующий exfat_init() частично перезапишет
@@ -5262,6 +6108,91 @@ static void usb_slot_release_failed(seL4_CPtr console_ep, int idx, const char *r
     unmount_usb_storage(console_ep, idx, /*hardware_alive=*/true);
 }
 
+// Подключение / отключение в корневом порту — общие для обоих путей
+// обнаружения: Port Status Change Event (handle_port_status_change) и
+// секундного опроса PORTSC (poll_ports_for_hotplug). Раньше тела жили
+// только в опросе, а обработчик события перечислял и снимал устройство
+// молча и без каскада — дети отключённого хаба оставались висеть.
+static void root_port_connected(seL4_CPtr console_ep, uint32_t p) {
+    sys_puthex32(console_ep, "[USB] Обнаружено подключение, порт = ", p);
+    int idx = -1;
+    if (!try_enumerate_port(console_ep, (int)p, idx)) {
+        sys_puts(console_ep, "[USB]   Устройство на этом порту не подошло (не Mass Storage/не хаб) или свободных слотов не осталось.\n");
+    } else if (g_usb_devices[idx].found.device_class == USB_CLASS_HUB) {
+        // Milestone B1 (Фаза 15) — хаб теперь НЕ отбрасывается
+        // (см. try_enumerate_port()), но сам по себе не
+        // "смонтирован" в exFAT-смысле — отдельное honest-сообщение,
+        // не путать с "Флешка автоматически смонтирована".
+        sys_puthex32(console_ep, "[USB]   Хаб подключён и опрошен, портов = ", g_usb_devices[idx].hub_num_ports);
+        if (LOG_USB) sys_puts(console_ep, "[USB]   (перечисление downstream-устройств — Фаза B, следующие milestone'ы).\n");
+    } else if (g_usb_devices[idx].kbd) {
+        // Клавиатура: сообщение уже напечатал step_kbd_configure().
+    } else if (!g_usb_devices[idx].storage_mounted) {
+        // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ — try_enumerate_port() проверяет
+        // только успех USB-перечисления (класс/bulk-эндпоинты), а
+        // НЕ факт монтирования exFAT (step15 внутри
+        // enumerate_and_mount_device вызывается без проверки
+        // возврата) — реальный NVMe-переходник enumerated чисто,
+        // но exFAT не смонтировался, а лог всё равно писал
+        // "смонтирована". Разделяем эти два случая явно.
+        sys_puts(console_ep, "[USB]   Устройство перечислено, но exFAT не смонтировался (не exFAT / повреждён / не тот раздел).\n");
+    } else {
+        usb_print_device_summary(console_ep, idx);
+    }
+}
+
+static void root_port_disconnected(seL4_CPtr console_ep, uint32_t p) {
+    int idx = find_device_by_port((int)p);
+    if (idx >= 0) {
+        bool was_hub = (g_usb_devices[idx].found.device_class == USB_CLASS_HUB);
+        char old_name[32];
+        my_strcpy(old_name, g_usb_devices[idx].volume_name);
+        if (was_hub) {
+            sys_puts(console_ep, "[USB] Обнаружено отключение хаба — размонтирую его детей...\n");
+            // Milestone B4 — каскадное отключение: хаб уходит
+            // ЦЕЛИКОМ (root-порт CCS погас), все его дети
+            // (behind_hub && parent_hub_idx==idx) физически
+            // отключились ВМЕСТЕ с ним — их downstream-порты
+            // индивидуально ничего не заметят (сам хаб уже не
+            // отвечает), unmount_usb_storage() ДО хаба, иначе
+            // find_device_behind_hub() их не найдёт (in_use
+            // уже сброшен у самого хаба).
+            for (int c = 0; c < USB_MAX_DEVICES; c++) {
+                if (g_usb_devices[c].in_use && g_usb_devices[c].behind_hub && g_usb_devices[c].parent_hub_idx == idx) {
+                    if (g_usb_devices[c].kbd) {
+                        sys_puts(console_ep, "[USB]   Каскадное отключение: клавиатура\n");
+                    } else {
+                        char cname[32];
+                        my_strcpy(cname, g_usb_devices[c].volume_name);
+                        sys_puts(console_ep, "[USB]   Каскадное отключение: /mnt/");
+                        sys_puts(console_ep, cname);
+                        sys_puts(console_ep, "\n");
+                    }
+                    unmount_usb_storage(console_ep, c);
+                }
+            }
+        } else if (g_usb_devices[idx].kbd) {
+            sys_puts(console_ep, "[USB] Обнаружено отключение клавиатуры.\n");
+        } else {
+            sys_puts(console_ep, "[USB] Обнаружено отключение — размонтирую /mnt/");
+            sys_puts(console_ep, old_name);
+            sys_puts(console_ep, "\n");
+        }
+        bool was_kbd = g_usb_devices[idx].kbd;
+        unmount_usb_storage(console_ep, idx);
+        sys_puts(console_ep, was_hub ? "[USB]   Слот хаба освобождён.\n"
+                           : (was_kbd ? "[USB]   Слот клавиатуры освобождён.\n" : "[USB]   Точка монтирования удалена.\n"));
+    }
+}
+
+// Маска CCS корневых портов, которую видел последний раз опрос
+// poll_ports_for_hotplug() (комментарий — у него). Объявлена здесь, потому
+// что handle_port_status_change() обязан её обновлять: иначе подключение,
+// уже обработанное по событию, секундный опрос увидел бы как новое и
+// перечислил бы то же устройство второй раз.
+static uint32_t g_last_port_ccs_mask = 0;
+static bool g_port_ccs_mask_initialized = false;
+
 // Milestone 11 — реакция на Port Status Change Event (см. главный цикл):
 // CCS всегда нужно перепроверить ЖИВЫМ чтением PORTSC — само событие
 // сообщает только номер порта, не новое состояние (см. xHCI 6.4.2.3).
@@ -5273,23 +6204,30 @@ static void handle_port_status_change(seL4_CPtr console_ep, uint8_t port) {
     uintptr_t off = XHCI_OP_PORTSC_BASE + (uintptr_t)(port - 1) * 0x10;
     uint32_t portsc = *reg32(g_op_base, off);
     bool connected = (portsc & PORTSC_CCS) != 0;
+    bool csc = (portsc & PORTSC_CSC) != 0;
     *reg32(g_op_base, off) = (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | (portsc & PORTSC_CSC);
-
-    if (connected) {
-        if (LOG_USB) sys_puthex32(console_ep, "[USB] Hot-plug: обнаружено подключение, порт = ", port);
-        int idx = -1;
-        if (!try_enumerate_port(console_ep, (int)port, idx)) {
-            if (LOG_USB) sys_puts(console_ep, "[USB] Hot-plug: устройство на этом порту не подошло (hub / не Mass Storage) или свободных слотов не осталось.\n");
-        } else {
-            if (LOG_USB) sys_puts(console_ep, "[USB] Hot-plug: устройство смонтировано.\n");
-        }
-    } else {
-        int idx = find_device_by_port((int)port);
-        if (idx >= 0) {
-            if (LOG_USB) sys_puts(console_ep, "[USB] Hot-plug: обнаружено отключение смонтированного устройства.\n");
-            unmount_usb_storage(console_ep, idx);
-        }
+    if (port <= 32) {
+        uint32_t bit = 1u << (port - 1);
+        if (connected) g_last_port_ccs_mask |= bit; else g_last_port_ccs_mask &= ~bit;
     }
+
+    // Port Status Change Event приходит на ЛЮБОЙ бит изменения порта:
+    // завершение сброса (PRC — его ставит и наша собственная энумерация,
+    // step5_port_reset), смена состояния линка, включение порта… О
+    // подключении говорит только CSC — эталон (hub_event в Linux) тоже
+    // перечисляет устройство лишь по смене подключения. Раньше любое
+    // такое событие при CCS = 1 заново перечисляло УЖЕ работающее
+    // устройство: второй Address Device на том же порту (код 4) и сброс
+    // порта — на порту 1 это встроенный хаб, и вместе с ним отваливалось
+    // всё за ним. Живой отказ 2026-09-11; до этого почти не проявлялся,
+    // потому что прерывание xHCI фактически не доходило (IMAN.IP).
+    if (!csc) return;
+    // Устройство на порту уже есть — подключение успели обработать
+    // (секундным опросом или энумерацией при загрузке); второй раз нельзя.
+    if (connected && find_device_by_port((int)port) >= 0) return;
+
+    if (connected) root_port_connected(console_ep, port);
+    else root_port_disconnected(console_ep, port);
 }
 
 // Milestone 11 (доп., по запросу пользователя) — max_ports нужен и вне
@@ -5363,9 +6301,8 @@ static int run_bring_up(seL4_CPtr console_ep) {
 // слоте, т.е. либо событие не пришло, либо обработка не успела). Сравнение
 // со СНЯТЫМ НА ПРЕДЫДУЩЕМ тике состоянием — g_port_ccs_mask_initialized
 // гасит ложное "подключение" на самом первом тике (когда устройство уже
-// смонтировано с боевого bring-up).
-static uint32_t g_last_port_ccs_mask = 0;
-static bool g_port_ccs_mask_initialized = false;
+// смонтировано с боевого bring-up). Сама маска объявлена выше, у
+// handle_port_status_change(), — тот тоже её обновляет.
 
 // Разбор очереди на программное переподключение (см.
 // usb_request_reenumeration() выше — там же объяснено, почему пометка и
@@ -5478,9 +6415,13 @@ static void usb_service_reenum_requests(seL4_CPtr console_ep) {
         if (was_hub) {
             for (int c = 0; c < USB_MAX_DEVICES; c++) {
                 if (g_usb_devices[c].in_use && g_usb_devices[c].behind_hub && g_usb_devices[c].parent_hub_idx == idx) {
-                    sys_puts(console_ep, "[USB]   Каскадно снимаю ребёнка хаба: /mnt/");
-                    sys_puts(console_ep, g_usb_devices[c].volume_name);
-                    sys_puts(console_ep, "\n");
+                    if (g_usb_devices[c].kbd) {
+                        sys_puts(console_ep, "[USB]   Каскадно снимаю ребёнка хаба: клавиатура\n");
+                    } else {
+                        sys_puts(console_ep, "[USB]   Каскадно снимаю ребёнка хаба: /mnt/");
+                        sys_puts(console_ep, g_usb_devices[c].volume_name);
+                        sys_puts(console_ep, "\n");
+                    }
                     unmount_usb_storage(console_ep, c);
                 }
             }
@@ -5560,64 +6501,13 @@ static void poll_ports_for_hotplug(seL4_CPtr console_ep) {
         bool was_ccs = (g_last_port_ccs_mask & bit) != 0;
 
         if (g_port_ccs_mask_initialized && ccs != was_ccs) {
-            if (ccs) {
-                sys_puthex32(console_ep, "[USB] Обнаружено подключение (опрос), порт = ", p);
-                int idx = -1;
-                if (!try_enumerate_port(console_ep, (int)p, idx)) {
-                    sys_puts(console_ep, "[USB]   Устройство на этом порту не подошло (не Mass Storage/не хаб) или свободных слотов не осталось.\n");
-                } else if (g_usb_devices[idx].found.device_class == USB_CLASS_HUB) {
-                    // Milestone B1 (Фаза 15) — хаб теперь НЕ отбрасывается
-                    // (см. try_enumerate_port()), но сам по себе не
-                    // "смонтирован" в exFAT-смысле — отдельное honest-сообщение,
-                    // не путать с "Флешка автоматически смонтирована".
-                    sys_puthex32(console_ep, "[USB]   Хаб подключён и опрошен, портов = ", g_usb_devices[idx].hub_num_ports);
-                    if (LOG_USB) sys_puts(console_ep, "[USB]   (перечисление downstream-устройств — Фаза B, следующие milestone'ы).\n");
-                } else if (!g_usb_devices[idx].storage_mounted) {
-                    // НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ — try_enumerate_port() проверяет
-                    // только успех USB-перечисления (класс/bulk-эндпоинты), а
-                    // НЕ факт монтирования exFAT (step15 внутри
-                    // enumerate_and_mount_device вызывается без проверки
-                    // возврата) — реальный NVMe-переходник enumerated чисто,
-                    // но exFAT не смонтировался, а лог всё равно писал
-                    // "смонтирована". Разделяем эти два случая явно.
-                    sys_puts(console_ep, "[USB]   Устройство перечислено, но exFAT не смонтировался (не exFAT / повреждён / не тот раздел).\n");
-                } else {
-                    usb_print_device_summary(console_ep, idx);
-                }
+            if (ccs && find_device_by_port((int)p) >= 0) {
+                // Уже перечислено по Port Status Change Event
+                // (handle_port_status_change) — второй раз нельзя.
+            } else if (ccs) {
+                root_port_connected(console_ep, p);
             } else {
-                int idx = find_device_by_port((int)p);
-                if (idx >= 0) {
-                    bool was_hub = (g_usb_devices[idx].found.device_class == USB_CLASS_HUB);
-                    char old_name[32];
-                    my_strcpy(old_name, g_usb_devices[idx].volume_name);
-                    if (was_hub) {
-                        sys_puts(console_ep, "[USB] Обнаружено отключение хаба (опрос) — размонтирую его детей...\n");
-                        // Milestone B4 — каскадное отключение: хаб уходит
-                        // ЦЕЛИКОМ (root-порт CCS погас), все его дети
-                        // (behind_hub && parent_hub_idx==idx) физически
-                        // отключились ВМЕСТЕ с ним — их downstream-порты
-                        // индивидуально ничего не заметят (сам хаб уже не
-                        // отвечает), unmount_usb_storage() ДО хаба, иначе
-                        // find_device_behind_hub() их не найдёт (in_use
-                        // уже сброшен у самого хаба).
-                        for (int c = 0; c < USB_MAX_DEVICES; c++) {
-                            if (g_usb_devices[c].in_use && g_usb_devices[c].behind_hub && g_usb_devices[c].parent_hub_idx == idx) {
-                                char cname[32];
-                                my_strcpy(cname, g_usb_devices[c].volume_name);
-                                sys_puts(console_ep, "[USB]   Каскадное отключение: /mnt/");
-                                sys_puts(console_ep, cname);
-                                sys_puts(console_ep, "\n");
-                                unmount_usb_storage(console_ep, c);
-                            }
-                        }
-                    } else {
-                        sys_puts(console_ep, "[USB] Обнаружено отключение (опрос) — размонтирую /mnt/");
-                        sys_puts(console_ep, old_name);
-                        sys_puts(console_ep, "\n");
-                    }
-                    unmount_usb_storage(console_ep, idx);
-                    sys_puts(console_ep, was_hub ? "[USB]   Слот хаба освобождён.\n" : "[USB]   Точка монтирования удалена.\n");
-                }
+                root_port_disconnected(console_ep, p);
             }
         }
         if (ccs) g_last_port_ccs_mask |= bit; else g_last_port_ccs_mask &= ~bit;
@@ -5639,6 +6529,56 @@ static inline void usb_vfs_reply(seL4_MessageInfo_t info) {
 
 // --- Главный цикл ---
 
+// Разбор кольца событий — общий для прерывания и для heartbeat-тика.
+//
+// Почему и на тике: живой тест клавиатуры 2026-09-11 — отчёты
+// обрабатывались с задержкой около секунды (страховочный опрос), а зажатая
+// тем временем клавиша повторялась десятки раз. Значит, событие xHCI
+// доходило до нас не через прерывание. На тике это почти бесплатно: пока
+// событий нет, всё сводится к чтению cycle-бита следующего TRB из ОЗУ,
+// к контроллеру по PCIe не обращаемся вовсе (update_erdp — только если
+// что-то вычитали). Так задержка ограничена тиком (~20 мс), даже если
+// прерывание потеряно.
+static void usb_service_event_ring(seL4_CPtr console_ep, bool from_irq) {
+    // Порядок исторический и важен: стейт-машина подключения за хабом и
+    // опрос хабов/клавиатуры забирают свои Transfer Event'ы ДО общего
+    // дренажа ниже (иначе он бы их выбросил, см. issuse.txt №15).
+    hub_conn_async_tick(console_ep);
+    poll_hub_interrupts(console_ep);
+    Trb ev;
+    int drained = 0;
+    while (dequeue_event_trb(ev)) {
+        uint32_t ev_type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        if (ev_type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
+            note_port_status_change(ev);
+        } else if (ev_type == TRB_TYPE_TRANSFER_EVENT && is_async_listener_trb(ev.parameter)) {
+            // Событие слушающей TRB, пришедшее уже после poll_hub_interrupts()
+            // выше, — в кэш; заберёт следующий разбор.
+            uas_evt_cache_put(ev.parameter, (uint8_t)(ev.status >> 24), ev.status & 0xFFFFFFu);
+        }
+        // Command Completion / чужие Transfer Event'ы — их синхронные
+        // ожидающие уже сдались по таймауту; молча дренируем, как и раньше.
+        if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
+            sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring превысил защитный потолок — обрываю.\n");
+            break;
+        }
+    }
+    // ERDP (со сбросом Event Handler Busy) — если что-то вычитали, и всегда
+    // после прерывания: пока EHB = 1, контроллер новых прерываний не
+    // поднимает (xHCI 4.17.2), так же всегда пишет его и xhci_irq().
+    if (drained > 0 || from_irq) update_erdp();
+    // Port Status Change корневых портов — и собранные здесь, и отложенные
+    // любым другим дренажем (note_port_status_change). Обработка сама может
+    // вычитать новые — поэтому несколько кругов, но не бесконечно.
+    for (int round = 0; round < 4 && g_psc_pending_mask != 0; round++) {
+        uint32_t m = g_psc_pending_mask;
+        g_psc_pending_mask = 0;
+        for (uint32_t port = 1; port <= 32; port++) {
+            if (m & (1u << (port - 1))) handle_port_status_change(console_ep, (uint8_t)port);
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     seL4_IPCBuffer *ipc = get_local_ipc();
     seL4_SetIPCBuffer(ipc);
@@ -5653,6 +6593,9 @@ int main(int argc, char *argv[]) {
     driver_state_init(PLAT_DRIVER_STATE_USB_VADDR, 6, ipc->msg[BOOT_DRIVER_STATE_PRESENT]);
     seL4_CPtr console_ep = ipc->msg[BOOT_CONSOLE_EP];
     g_console_ep = console_ep; // Milestone 7 — hardware_usb_read/write берут его отсюда (сигнатура block_read_fn фиксирована)
+    // Источником клавиатурного ввода консоли usb_driver назначает ROOT
+    // (SYS_KBD_SET_SOURCE после каждого спавна/респавна) — сам он не
+    // регистрируется. Почему — см. SYS_KBD_SET_SOURCE в common.h.
     seL4_CPtr usb_cmd_ep = ipc->msg[BOOT_USB_EP];
     seL4_CPtr liveness_ntfn = ipc->msg[BOOT_USB_LIVENESS_NTFN_CAP]; // Фаза 3b плана "Сигналы драйверам", см. main.cpp
     g_usb_liveness_ntfn = liveness_ntfn; // issuse.txt №66 — hardware_usb_rw_generic_read/write() берут его отсюда, см. комментарий у объявления
@@ -5817,34 +6760,29 @@ int main(int argc, char *argv[]) {
                 // именно здесь: это единственная точка цикла, где ни одна
                 // операция с устройством не в полёте.
                 usb_service_reenum_requests(console_ep);
-                hub_conn_async_tick(console_ep);
-                // Hot-plug переведён на ПРЕРЫВАНИЕ (2026-09-06, по просьбе
-                // пользователя). Здесь остался только РЕДКИЙ страховочный
-                // опрос — см. USB_HOTPLUG_FALLBACK_POLL_EVERY_N_TICKS.
+                // Кольцо событий — на каждом тике, см. usb_service_event_ring:
+                // пока событий нет, это одно чтение ОЗУ, без обращения к xHCI.
+                usb_service_event_ring(console_ep, false);
+                // Автоповтор зажатой клавиши — на каждом тике: он к железу
+                // не обращается, только часы и память (см. kbd_repeat_tick).
+                kbd_repeat_tick();
+                // Восстановление Interrupt-эндпоинтов клавиатуры и хабов после
+                // ошибки — уже с командами xHCI, см. usb_int_recover_tick.
+                usb_int_recover_tick(console_ep);
+                // Корневые порты: страховочный опрос PORTSC раз в секунду.
+                // Основной путь — Port Status Change Event (прерывание или
+                // разбор кольца на тике выше).
                 //
-                // Зачем вообще меняли: каждое обращение к xHCI — это шанс
-                // попасть в аппаратный стопор шины, а стопор, как выяснено
-                // JTAG'ом 2026-09-06, убивает не USB, а всю плату (см.
-                // usb_bus_stalled_suspect() в main.cpp). Опрос корневых
-                // портов и хабов пять раз в секунду в режиме, когда НИЧЕГО
-                // не происходит, — чистый расход этих шансов впустую.
-                // Оба события, ради которых опрашивали, xHCI и так
-                // доставляет прерыванием: подключение/отключение в
-                // корневом порту — Port Status Change Event, изменение
-                // downstream-порта хаба — завершение постоянно
-                // армированной Interrupt-IN TRB (Transfer Event). Оба
-                // теперь обрабатываются в IRQ-ветке ниже.
-                //
-                // Почему страховочный опрос всё же оставлен: потеря
-                // события (пропущенный IRQ, событие, украденное чужим
-                // дренажем кольца) означала бы, что устройство не
-                // замечено НАВСЕГДА. Раз в секунду вместо пяти раз —
-                // трафик падает на порядок, а такой отказ остаётся
-                // самовосстанавливающимся.
+                // Почему не чаще: каждое чтение PORTSC — обращение к xHCI по
+                // PCIe, а стопор шины, как выяснено JTAG'ом 2026-09-06,
+                // убивает не USB, а всю плату (см. usb_bus_stalled_suspect()
+                // в main.cpp). Опрашивать порты пять раз в секунду, когда
+                // НИЧЕГО не происходит, — чистый расход этих шансов. Разбор
+                // кольца на тике этим не страдает: без событий он к
+                // контроллеру не обращается.
                 if (++heartbeat_tick_count >= USB_HOTPLUG_FALLBACK_POLL_EVERY_N_TICKS) {
                     heartbeat_tick_count = 0;
                     poll_ports_for_hotplug(console_ep);
-                    poll_hub_interrupts(console_ep);
                 }
             }
             if (!(badge & (USB_EVENT_XHCI_IRQ))) continue; // чистый heartbeat-тик, не реальный IRQ
@@ -5865,61 +6803,27 @@ int main(int argc, char *argv[]) {
             // на первом же следующем чтении всё равно происходил). IRQ
             // всё равно Ack'аем всегда — иначе застрянет сам GIC.
             if (!g_usb_hw_frozen) {
-                // issuse.txt №15 — НАЙДЕНО НА ЖИВОМ ЖЕЛЕЗЕ: реальное xHCI-
-                // прерывание от завершения control-transfer'а асинхронной
-                // hub-connect-последовательности (см. hub_conn_async_tick()
-                // выше) чаще всего приходит НА СВОЁМ бейдже, БЕЗ heartbeat-
-                // бита (аппаратура отвечает за микросекунды-миллисекунды,
-                // редко совпадая с 20мс-тиком) — а общий дренаж событий чуть
-                // ниже слепо вычитывает и отбрасывает ЛЮБОЕ событие, кроме
-                // Port Status Change (см. его же комментарий: "Transfer Event
-                // уже обрабатываются синхронно... сюда попасть не должны" —
-                // верно для СТАРОГО синхронного кода, но НЕ для нового
-                // асинхронного, у которого именно такие события в очереди —
-                // штатный случай). Без этого вызова здесь стейт-машина
-                // практически никогда не видела свой Transfer Event сама
-                // (общий дренаж успевал украсть его первым) и таймаутила по
-                // 500мс на КАЖДОМ шаге — hw-подтверждённая находка.
-                hub_conn_async_tick(console_ep);
-                // Hot-plug ЗА хабом — теперь основной путь, а не опрос.
-                // Обязательно ДО общего дренажа ниже: тот вычитывает
-                // кольцо целиком и оставляет себе только Port Status
-                // Change, а Transfer Event хабовского Interrupt-эндпоинта
-                // (то самое "изменился downstream-порт") молча выбросил бы
-                // — ровно та же ловушка, из-за которой выше по этой же
-                // ветке уже стоит hub_conn_async_tick().
-                poll_hub_interrupts(console_ep);
-                // Штатный событийный путь (после bring-up) — снять EINT,
-                // дочитать Event Ring, отдать назад ERDP, Ack'нуть IRQ (см.
-                // GENET-паттерн в net_driver.cpp — собственная линия, Ack сам).
+                // Снять признак прерывания ДО разбора событий — порядок
+                // xhci_irq() в ядре Raspberry Pi: EINT в USBSTS, затем
+                // IMAN.IP. Событие, пришедшее уже во время разбора, тогда
+                // поднимет прерывание заново, а не потеряется.
+                //
+                // IMAN.IP раньше не сбрасывался вообще. Эталон делает это
+                // при любом прерывании не через MSI ("if (!hcd->msi_enabled)
+                // ... irq_pending |= IMAN_IP"), а у нас именно так: MSI моста
+                // замаскированы (main.cpp), VL805 сигналит ножкой INTx. По
+                // xHCI 5.5.2.1 при pin-прерываниях IP сам не гаснет — только
+                // записью 1. Живой симптом 2026-09-11: клавиатура отвечала с
+                // задержкой около секунды, то есть события доходили только
+                // страховочным опросом.
                 uint32_t sts = *reg32(g_op_base, XHCI_OP_USBSTS);
                 if (sts & USBSTS_EINT) *reg32(g_op_base, XHCI_OP_USBSTS) = USBSTS_EINT; // RW1C
-                Trb ev;
-                // Milestone 11 (закрытие Фазы 14, hot-plug) — единственный
-                // тип события, который нас интересует здесь: Port Status
-                // Change (подключение/отключение). Command Completion и
-                // Transfer Event уже обрабатываются синхронно своими
-                // wait_command_completion()/wait_transfer_completion() в
-                // момент самой транзакции (bring-up/SCSI) — сюда, в
-                // асинхронный путь, они попасть не должны в норме, но если
-                // всё же попадут (устройство прислало событие ПОСЛЕ того, как
-                // синхронный ожидающий уже сдался по таймауту) — просто
-                // молча дренируем, как и раньше.
-                {
-                    int drained = 0;
-                    while (dequeue_event_trb(ev)) {
-                        uint32_t ev_type = (ev.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
-                        if (ev_type == TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
-                            uint8_t changed_port = (uint8_t)(ev.parameter >> 24);
-                            handle_port_status_change(console_ep, changed_port);
-                        }
-                        if (++drained >= EVT_RING_DRAIN_SANITY_CAP) {
-                            sys_puts(console_ep, "[USB]   ОШИБКА: дренаж event ring (XHCI_IRQ) превысил защитный потолок — обрываю.\n");
-                            break;
-                        }
-                    }
-                }
-                update_erdp();
+                uint32_t iman = *reg32(g_rt_base, XHCI_RT_IR0 + XHCI_IR_IMAN);
+                *reg32(g_rt_base, XHCI_RT_IR0 + XHCI_IR_IMAN) = iman | IMAN_IP; // RW1C, IE остаётся 1
+                // Стейт-машина подключения за хабом, опрос хабов/клавиатуры
+                // и Port Status Change — см. usb_service_event_ring (там же
+                // объяснено, почему именно в таком порядке).
+                usb_service_event_ring(console_ep, true);
             }
             seL4_IRQHandler_Ack(ipc->msg[BOOT_IRQ_EP]);
             continue;

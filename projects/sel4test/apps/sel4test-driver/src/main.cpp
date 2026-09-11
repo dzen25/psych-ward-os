@@ -6619,6 +6619,28 @@ int main(int argc, char *argv[]) {
                 }
                 if (drv == 6) {
                     g_usb_driver_ready = true;
+                    // Назначаем usb_driver источником клавиатурного ввода
+                    // консоли (см. SYS_KBD_SET_SOURCE в common.h).
+                    //
+                    // ИМЕННО ЗДЕСЬ, а не сразу после spawn_process(): там root
+                    // ещё не обслуживает IPC ("All sandboxes spawned" идёт до
+                    // "Serving IPC"), а uart_driver при старте висит в
+                    // блокирующем seL4_Call(root, SYS_DRIVER_READY) и в Recv
+                    // не придёт, пока root не начнёт отвечать. Вызов к нему
+                    // оттуда был бы взаимной блокировкой на загрузке. Здесь же
+                    // uart_driver давно в своём цикле, а блокирующие вызовы
+                    // внутри этого обработчика уже делает start_init_services.
+                    //
+                    // Заодно это само покрывает респавн: новый usb_driver
+                    // снова присылает DRIVER_READY, уже со своим НОВЫМ PID.
+                    // Прежнее назначение uart_driver снимает сам — по
+                    // SYS_CANCEL_PENDING_FOR_PID, который root шлёт ему до
+                    // уборки умершего процесса.
+                    if (console_ep != 0) {
+                        seL4_SetMR(0, SYS_KBD_SET_SOURCE);
+                        seL4_SetMR(1, (seL4_Word)sender_pid);
+                        seL4_Call(console_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+                    }
                 }
                 if (drv >= 1 && drv <= 4) {
                     driver_ready[drv] = true;

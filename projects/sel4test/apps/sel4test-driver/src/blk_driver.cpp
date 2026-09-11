@@ -53,6 +53,113 @@ static seL4_CPtr g_blk_liveness_ntfn = 0;
 // Глобальные переменные EMMC2 (см. h/platform.h — регистровая карта SDHCI)
 static volatile uint32_t* g_emmc_base = nullptr;
 static uint32_t g_emmc_rca = 0; // Relative Card Address, получаем в emmc_init()
+// issuse.txt №7 (UHS-I). Первый проход инициализации идёт с выставленным
+// S18R — это ЕДИНСТВЕННЫЙ способ узнать, умеет ли карта 1.8 В. Ответный
+// OCR сохраняется, чтобы main() мог посмотреть на бит S18A и решить, что
+// делать дальше.
+static seL4_CPtr g_timer_ep = 0; // владелец мейлбокса, см. exp_gpio()
+static seL4_CPtr g_console_ep_early = 0; // для сообщений с путей, куда console_ep не передаётся
+
+// Пин расширителя expgpio через timer_driver (он владеет мейлбоксом, см.
+// SYS_EXP_GPIO там же). Возвращает 0 при успехе.
+static int exp_gpio(uint32_t pin, bool is_set, uint32_t value, uint32_t *out_state) {
+    if (g_timer_ep == 0) return -1;
+    seL4_SetMR(0, 14); // SYS_EXP_GPIO
+    seL4_SetMR(1, pin);
+    seL4_SetMR(2, is_set ? 1 : 0);
+    seL4_SetMR(3, value);
+    seL4_Call(g_timer_ep, seL4_MessageInfo_new(0, 0, 0, 4));
+    int rc = (int)seL4_GetMR(0);
+    if (out_state) *out_state = (uint32_t)seL4_GetMR(1);
+    return rc;
+}
+
+// Занятое ожидание по системному счётчику — тот же приём, что уже
+// используется в emmc_wait_irpt_bit(); sleep через timer_driver здесь
+// недоступен, мы сами внутри его же обработчика быть не можем.
+static void blk_delay_ms(uint32_t ms) {
+    if (g_cntfrq == 0) return;
+    uint64_t deadline = read_cntvct() + (uint64_t)ms * g_cntfrq / 1000;
+    while (read_cntvct() < deadline) seL4_Yield();
+}
+
+// Снять и подать питание на карту (expgpio 6). Единственный способ вернуть
+// карту в исходное состояние после того, как она согласилась на 1.8 В:
+// обратного перехода у SD нет. Эталон (drivers/mmc/core/sd.c) на неудаче
+// перехода делает ровно это.
+// Печатает вызывающий: sys_puts здесь ещё не объявлена (эти помощники
+// стоят выше её включения), а тащить их вниз значило бы разлучить с
+// exp_gpio().
+static bool sd_power_cycle(void) {
+    uint32_t st = 0;
+    if (exp_gpio(RPI_EXP_GPIO_SD_VDD, true, 0, &st) != 0) return false;
+    blk_delay_ms(20);
+
+    // ОБЯЗАТЕЛЬНО, И ЭТОГО ЗДЕСЬ НЕ БЫЛО (hw 2026-09-11): вернуть
+    // сигнальную линию на 3.3 В. Смысл power cycle — отдать карту в
+    // состояние "как будто только вставили", а вставленная карта всегда
+    // начинает с 3.3 В. Без этого откат снимал питание, но поднимал карту
+    // при 1.8 В, и она молчала на CMD8 — в логе это выглядело как
+    // "FAIL: CMD8" при STATUS, показывающем исправные линии.
+    exp_gpio(RPI_EXP_GPIO_SD_IO_1V8, true, 0, &st);
+    // Биты 1.8 В и режима UHS в самом контроллере отдельно гасить не надо:
+    // emmc_init() начинается с полного сброса (SRST_HC), а g_uhs_active
+    // она сбрасывает сама перед проверкой S18A.
+    blk_delay_ms(10); // регулятору по DT нужно 5 мс на установление
+
+    if (exp_gpio(RPI_EXP_GPIO_SD_VDD, true, 1, &st) != 0) return false;
+    // Спецификация даёт карте до 250 мс на выход в готовность после подачи
+    // питания. Прежние 20 мс были маловаты: инициализация шла по ещё не
+    // устоявшейся карте, и контрольное чтение в конце не проходило.
+    blk_delay_ms(100);
+    return true;
+}
+
+// --- ОТСЛЕЖИВАНИЕ КАРТЫ В СЛОТЕ ---
+//
+// На RPi4 линии card-detect НЕТ: в DT у mmc@7e340000 стоит broken-cd, а в
+// слоте microSD нет механического контакта (в отличие от Pi 3). Поэтому
+// присутствие определяется единственным доступным способом — попыткой
+// поговорить с картой (CMD13 коротким таймаутом).
+//
+// Смысл флага: пока карты нет, VFS-команды отвечают ошибкой СРАЗУ, не
+// трогая железо. Без этого каждая команда уходила бы в таймауты и
+// печатала свою порцию ошибок — те самые "сотни ошибок".
+//
+// Флаг СОЗНАТЕЛЬНО отдельный от g_blk_stopped: тот — ручной сигнал
+// администратора (SYS_DRIVER_SIGNAL). Если их смешать, вставленная карта
+// молча отменит STOP, который оператор поставил намеренно.
+static bool g_card_absent = false;
+static uint64_t g_card_next_probe = 0; // троттлинг пробы на вставку
+// Пустой слот и неподнимающаяся карта — РАЗНЫЕ вещи, и считать их одним
+// счётчиком нельзя (hw 2026-09-11: карта, вынутая дольше чем на несколько
+// секунд, больше не подхватывалась). Дешёвая проба присутствия идёт
+// вечно — слот может пустовать сколько угодно. Счётчик неудач считает
+// ТОЛЬКО попытки поднять карту, которая уже отозвалась; он обнуляется,
+// как только слот снова окажется пустым.
+// ЗАМЕРЕНО 2026-09-11: Present State при ПУСТОМ слоте читается как
+// 0x1fff0000 — БАЙТ В БАЙТ то же, что со вставленной картой. То есть биты
+// Card Inserted / Card State Stable / Card Detect Pin Level и уровни линий
+// DAT/CMD на этой плате не значат ничего (ровно это и объявляет broken-cd
+// в DT). Бесплатного детектора присутствия здесь НЕТ, пробовать читать
+// регистр бессмысленно — только команда.
+// ЗАМЕРЕНО: сама проба стоит 466 мкс, то есть при опросе раз в 100 мс
+// драйвер занят ею 0.47% времени. Опрашивать чаще можно, но незачем:
+// карту вставляет человек рукой, и 100 мс он не заметит.
+constexpr uint32_t CARD_PROBE_PERIOD_MS = 100;
+static int g_card_init_fails = 0;
+constexpr int CARD_INIT_GIVE_UP = 5;
+static bool g_in_card_probe = false;   // защита от рекурсии, см. hardware_emmc_*
+// Идёт попытка поднять вернувшуюся карту. Нужен потому, что гейт
+// "карты нет" в hardware_emmc_* перекрывал и САМО восстановление:
+// контрольные чтения внутри emmc_init и чтение сектора 0 при
+// монтировании возвращали false, не доходя до контроллера. Снаружи это
+// выглядело как "карта вернулась, но не читается" — hw 2026-09-11.
+static bool g_card_recovering = false;
+
+static bool g_uhs_active = false; // сигнальная линия переведена на 1.8 В
+static bool g_acmd41_request_1v8 = true;
+static uint32_t g_acmd41_ocr = 0;
 
 // Фаза 4.5/ADMA2 (см. ROADMAP.md) — приватный НЕКЭШИРУЕМЫЙ DMA bounce-буфер
 // (физические адреса приходят через BOOT_BLK_DMA_PADDR/BOOT_BLK_DMA2_PADDR
@@ -291,19 +398,42 @@ static void notify_root_irq_handled() {
 //    ниже в норме проходит на первой же проверке, без единой реальной
 //    итерации seL4_Yield(). Выигрыш от событийной версии здесь околонулевой
 //    при не-нулевом риске — решили не трогать.
-static bool emmc_wait_cmd_ready() {
-    uint32_t timeout = 1000000;
+// ТАЙМАУТ ЗДЕСЬ — НАСТОЯЩЕЕ ВРЕМЯ, А НЕ ЧИСЛО ИТЕРАЦИЙ. Раньше стоял
+// счётчик в миллион с seL4_Yield() на каждом шаге. Пока карта на месте,
+// цикл выходит с первой же проверки и это не мешало; но стоит карту
+// вынуть — CMD_INHIBIT не снимается никогда, и миллион перепланировок
+// занимает МИНУТЫ. Драйвер однопоточный, клиент всё это время держит
+// vfs_lock, и снаружи это выглядит как зависание всей системы, а не как
+// ошибка одной команды (hw 2026-09-11).
+static bool emmc_wait_cmd_ready(uint32_t timeout_ms = 200) {
+    if (g_cntfrq == 0) { // до чтения CNTFRQ_EL0 — прежнее поведение
+        uint32_t t = 1000000;
+        while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_CMD_INHIBIT) {
+            if (--t == 0) return false;
+            seL4_Yield();
+        }
+        return true;
+    }
+    uint64_t deadline = read_cntvct() + ((uint64_t)timeout_ms * g_cntfrq) / 1000;
     while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_CMD_INHIBIT) {
-        if (--timeout == 0) return false;
+        if (read_cntvct() >= deadline) return false;
         seL4_Yield();
     }
     return true;
 }
 
-static bool emmc_wait_dat_ready() {
-    uint32_t timeout = 1000000;
+static bool emmc_wait_dat_ready(uint32_t timeout_ms = 200) { // см. emmc_wait_cmd_ready про таймаут
+    if (g_cntfrq == 0) {
+        uint32_t t = 1000000;
+        while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_DAT_INHIBIT) {
+            if (--t == 0) return false;
+            seL4_Yield();
+        }
+        return true;
+    }
+    uint64_t deadline = read_cntvct() + ((uint64_t)timeout_ms * g_cntfrq) / 1000;
     while (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_DAT_INHIBIT) {
-        if (--timeout == 0) return false;
+        if (read_cntvct() >= deadline) return false;
         seL4_Yield();
     }
     return true;
@@ -327,8 +457,11 @@ static bool emmc_wait_dat_ready() {
 // Опрашивает регистр в цикле с seL4_Yield() между итерациями — гранулярность
 // ограничена только скоростью самого цикла (десятки-сотни МКС), а не тиком
 // heartbeat, и таймаут — настоящее время, а не число итераций.
-static bool emmc_wait_irpt_bit(uint32_t bit) {
-    uint64_t timeout_ticks = (600ull * g_cntfrq) / 1000; // ~600мс — тот же потолок, что был у heartbeat-версии
+// timeout_ms по умолчанию 600 — прежний потолок. Короткий таймаут нужен
+// пробе присутствия карты: она выполняется раз в секунду, и ждать на ней
+// по 600 мс значило бы держать драйвер занятым больше половины времени.
+static bool emmc_wait_irpt_bit(uint32_t bit, uint32_t timeout_ms = 600) {
+    uint64_t timeout_ticks = ((uint64_t)timeout_ms * g_cntfrq) / 1000;
     uint64_t deadline = read_cntvct() + timeout_ticks;
     while (true) {
         uint32_t irpt = *emmc_reg(EMMC_INTERRUPT_OFFSET);
@@ -347,12 +480,13 @@ static bool emmc_wait_irpt_bit(uint32_t bit) {
     }
 }
 
-static bool emmc_send_cmd(uint32_t cmd_flags, uint32_t index, uint32_t arg) {
+static bool emmc_send_cmd(uint32_t cmd_flags, uint32_t index, uint32_t arg,
+                          uint32_t timeout_ms = 600) {
     if (!emmc_wait_cmd_ready()) return false;
     *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF; // сброс старых статусов
     *emmc_reg(EMMC_ARG1_OFFSET) = arg;
     *emmc_reg(EMMC_CMDTM_OFFSET) = (index << EMMC_CMD_INDEX_SHIFT) | cmd_flags;
-    return emmc_wait_irpt_bit(EMMC_INT_CMD_DONE);
+    return emmc_wait_irpt_bit(EMMC_INT_CMD_DONE, timeout_ms);
 }
 
 // Меняет делитель тактовой частоты (Divided Clock Mode). Клок обязательно
@@ -366,9 +500,12 @@ static void emmc_set_clock_divider(uint32_t divisor) {
     c1 |= (divisor & 0xFFu) << EMMC_C1_CLK_FREQ_SHIFT;
     *emmc_reg(EMMC_CONTROL1_OFFSET) = c1;
 
-    uint32_t timeout = 1000000;
+    // Тот же урок, что у emmc_wait_cmd_ready(): счётчик итераций с
+    // seL4_Yield() на пустом слоте превращается в минуты.
+    uint64_t clk_deadline = g_cntfrq ? read_cntvct() + (50ull * g_cntfrq) / 1000 : 0;
+    uint32_t clk_iters = 1000000;
     while (!(*emmc_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_CLK_STABLE)) {
-        if (--timeout == 0) break; // не фатально само по себе — увидим по дальнейшим таймаутам команд
+        if (g_cntfrq ? (read_cntvct() >= clk_deadline) : (--clk_iters == 0)) break;
         seL4_Yield();
     }
 
@@ -403,6 +540,59 @@ static bool emmc_switch_func(uint32_t arg, uint8_t out[64]) {
     return true;
 }
 
+// Переход сигнальной линии на 1.8 В (issuse.txt №7). Вызывается СРАЗУ
+// после ACMD41, до CMD2 — так требует спецификация, порядок здесь не
+// вопрос вкуса.
+//
+// Ключевой момент, на котором легко ошибиться: на этой плате напряжение
+// переключает НЕ регистр контроллера, а внешний регулятор на пине 4
+// расширителя expgpio (vqmmc-supply в bcm2711-rpi-4-b.dts), доступный
+// только через мейлбокс VideoCore. Бит в Host Control 2 говорит о смене
+// самому контроллеру, а физически уровень меняет GPIO — нужны оба.
+//
+// Проверка успеха — не код возврата, а уровень линий DAT[3:0]: карта
+// прижимает их к нулю на время перехода и отпускает после. Если не
+// отпустила, переход не состоялся, и вернуть карту можно только снятием
+// питания (обратного перехода у SD нет) — это делает вызывающий.
+static bool emmc_voltage_switch_1v8(seL4_CPtr console_ep) {
+    if (!emmc_send_cmd(EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN,
+                        EMMC_CMD_VOLTAGE_SWITCH, 0)) {
+        sys_puts(console_ep, "[BLK][EMMC] 1.8В: CMD11 не прошла\n");
+        return false;
+    }
+
+    // Тактовую на время смены напряжения обязательно остановить.
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = *emmc_reg(EMMC_CONTROL1_OFFSET) & ~EMMC_C1_CLK_EN;
+    blk_delay_ms(1);
+
+    uint32_t dat = (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_DAT_LEVEL_MASK)
+                 >> EMMC_STATUS_DAT_LEVEL_SHIFT;
+    if (dat != 0) {
+        sys_puthex32(console_ep, "[BLK][EMMC] 1.8В: карта не прижала DAT к нулю, уровень = ", dat);
+        return false;
+    }
+
+    // Сначала физический регулятор, потом бит в контроллере.
+    uint32_t st = 1;
+    if (exp_gpio(RPI_EXP_GPIO_SD_IO_1V8, true, 1, &st) != 0) {
+        sys_puts(console_ep, "[BLK][EMMC] 1.8В: регулятор (expgpio 4) не переключился\n");
+        return false;
+    }
+    *emmc_reg(EMMC_CONTROL2_OFFSET) = *emmc_reg(EMMC_CONTROL2_OFFSET) | EMMC_C2_1V8_SIGNALING;
+    blk_delay_ms(10); // в DT у регулятора regulator-settling-time-us = 5000
+
+    *emmc_reg(EMMC_CONTROL1_OFFSET) = *emmc_reg(EMMC_CONTROL1_OFFSET) | EMMC_C1_CLK_EN;
+    blk_delay_ms(2);
+
+    dat = (*emmc_reg(EMMC_STATUS_OFFSET) & EMMC_STATUS_DAT_LEVEL_MASK)
+        >> EMMC_STATUS_DAT_LEVEL_SHIFT;
+    if (dat != 0xF) {
+        sys_puthex32(console_ep, "[BLK][EMMC] 1.8В: карта не отпустила DAT, уровень = ", dat);
+        return false;
+    }
+    return true;
+}
+
 // Стандартная последовательность инициализации SD-карты (см. план Фазы 3.3):
 // software reset -> идентификационный клок (~400kHz) -> CMD0 -> CMD8 ->
 // ACMD41 (ждём готовности OCR) -> CMD2 -> CMD3 (получаем RCA) -> CMD7
@@ -428,9 +618,10 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     }
 
     *emmc_reg(EMMC_CONTROL1_OFFSET) = EMMC_C1_SRST_HC;
+    uint64_t srst_deadline = g_cntfrq ? read_cntvct() + (200ull * g_cntfrq) / 1000 : 0;
     uint32_t timeout = 1000000;
     while (*emmc_reg(EMMC_CONTROL1_OFFSET) & EMMC_C1_SRST_HC) {
-        if (--timeout == 0) {
+        if (g_cntfrq ? (read_cntvct() >= srst_deadline) : (--timeout == 0)) {
             sys_puts(console_ep, "[BLK][EMMC] FAIL: software reset (SRST_HC) never cleared\n");
             sys_puthex32(console_ep, "[BLK][EMMC]   CONTROL1 = ", *emmc_reg(EMMC_CONTROL1_OFFSET));
             return false;
@@ -516,7 +707,8 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
             return false;
         }
         if (!emmc_send_cmd(EMMC_CMD_RSPNS_48, EMMC_ACMD_SD_SEND_OP_COND,
-                            EMMC_ACMD41_HCS | EMMC_ACMD41_VOLTAGE)) {
+                            EMMC_ACMD41_HCS | EMMC_ACMD41_VOLTAGE |
+                            (g_acmd41_request_1v8 ? EMMC_ACMD41_S18R : 0u))) {
             sys_puts(console_ep, "[BLK][EMMC] FAIL: ACMD41 — команда сама не прошла\n");
             sys_puthex32(console_ep, "[BLK][EMMC]   iteration = ", (uint32_t)i);
             return false;
@@ -525,6 +717,7 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
         if (last_ocr & EMMC_OCR_READY) ready = true;
         else seL4_Yield();
     }
+    g_acmd41_ocr = last_ocr; // см. g_acmd41_request_1v8 — бит S18A разбирает main()
     if (LOG_BLK) {
         sys_puthex32(console_ep, "[BLK][EMMC] ACMD41 last OCR = ", last_ocr);
         sys_puthex32(console_ep, "[BLK][EMMC] ACMD41 iterations = ", (uint32_t)acmd41_iters);
@@ -534,6 +727,15 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
         return false;
     }
     if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] ACMD41 OK, card ready\n");
+
+    // Карта согласилась на 1.8 В (S18A) — переходим НЕМЕДЛЕННО, до CMD2:
+    // так устроен порядок в спецификации.
+    g_uhs_active = false;
+    if (g_acmd41_request_1v8 && (last_ocr & EMMC_OCR_S18A)) {
+        if (!emmc_voltage_switch_1v8(console_ep)) return false; // откат — на вызывающем
+        g_uhs_active = true;
+        if (LOG_BLK) sys_puts(console_ep, "[BLK][EMMC] сигнальная линия переведена на 1.8 В\n");
+    }
 
     if (!emmc_send_cmd(EMMC_CMD_RSPNS_136, EMMC_CMD_ALL_SEND_CID, 0)) {
         sys_puts(console_ep, "[BLK][EMMC] FAIL: CMD2 (ALL_SEND_CID)\n");
@@ -598,7 +800,7 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     // и только потом переключаем (mode=1). Аргумент: бит 31 = режим,
     // остальные ниббли по группам, 0xF = "не менять", группа 1 в младшем.
     bool high_speed = false;
-    if (four_bit) { // на одном бите за скоростью не гонимся — сначала пусть заработает база
+    if (four_bit && !g_uhs_active) { // при 1.8 В режим доступа выбирается ниже, отдельно (DDR50)
         uint8_t sw[64];
         if (!emmc_switch_func(0x00FFFFF1u, sw)) {
             sys_puts(console_ep, "[BLK][EMMC] CMD6 (опрос функций) не прошла — остаёмся на 25 МГц\n");
@@ -615,9 +817,52 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
             } else {
                 high_speed = true;
             }
+            // issuse.txt №7 (UHS-I): прежде чем писать переключение
+            // напряжения, надо знать, возможно ли оно здесь вообще. Три
+            // числа отвечают на это целиком и ничего при этом не меняют:
+            // CAP0 бит 26 — умеет ли контроллер 1.8 В; CAP1 биты 0/1/2 —
+            // объявляет ли он SDR50/SDR104/DDR50; маска группы 1 из
+            // ответа CMD6 — что умеет сама карта (бит 2 = SDR50,
+            // бит 3 = SDR104). Если хоть одна сторона говорит "нет",
+            // пункт 7 закрывается как невозможный, и вся работа с
+            // мейлбоксом и tuning не начинается.
+            if (LOG_BLK) {
+                sys_puthex32(console_ep, "[BLK][EMMC] CAP0 = ", *emmc_reg(EMMC_CAP0_OFFSET));
+                sys_puthex32(console_ep, "[BLK][EMMC] CAP1 = ", *emmc_reg(EMMC_CAP1_OFFSET));
+                sys_puthex32(console_ep, "[BLK][EMMC] маска функций группы 1 у карты = ", grp1_supported);
+            }
         }
     }
-    if (high_speed) {
+    if (g_uhs_active) {
+        // DDR50, а НЕ SDR50, хотя полоса у них одинаковая (50 МБ/с):
+        // CAP1 бит 13 ("Use Tuning for SDR50") у этого контроллера стоит,
+        // то есть SDR50 потребовал бы цикла tuning через CMD19 с обратной
+        // связью. DDR50 tuning не требует — те же 50 МБ/с бесплатно.
+        // SDR104 отпадает сам: CAP1 бит 1 у контроллера сброшен.
+        uint8_t sw[64];
+        bool ddr = false;
+        if (!emmc_switch_func(0x00FFFFF1u, sw)) {
+            sys_puts(console_ep, "[BLK][EMMC] 1.8В: CMD6 (опрос функций) не прошла\n");
+        } else {
+            // Теперь, на 1.8 В, карта наконец показывает режимы UHS —
+            // на 3.3 В та же маска молчала про них по спецификации.
+            uint16_t mask = (uint16_t)(((uint16_t)sw[12] << 8) | sw[13]);
+            if (LOG_BLK) sys_puthex32(console_ep, "[BLK][EMMC] 1.8В: маска функций группы 1 = ", mask);
+            if (!(mask & 0x0010u)) {
+                sys_puts(console_ep, "[BLK][EMMC] 1.8В: карта не заявила DDR50 (бит 4)\n");
+            } else if (!emmc_switch_func(0x80FFFFF4u, sw)) {
+                sys_puts(console_ep, "[BLK][EMMC] 1.8В: CMD6 (переключение в DDR50) не прошла\n");
+            } else if ((sw[16] & 0x0Fu) != 4u) {
+                sys_puthex32(console_ep, "[BLK][EMMC] 1.8В: DDR50 не принят, выбранная функция = ", sw[16] & 0x0Fu);
+            } else {
+                ddr = true;
+            }
+        }
+        if (!ddr) return false; // откат (снятие питания) делает вызывающий
+        *emmc_reg(EMMC_CONTROL2_OFFSET) =
+            (*emmc_reg(EMMC_CONTROL2_OFFSET) & ~EMMC_C2_UHS_MODE_MASK) | EMMC_C2_UHS_DDR50;
+        emmc_set_clock_divider(0x02); // DDR50 — те же 50 МГц, но данные по обоим фронтам
+    } else if (high_speed) {
         *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) | EMMC_C0_HS_EN;
         emmc_set_clock_divider(0x01); // 100MHz/(2*1) = 50MHz
     } else {
@@ -630,17 +875,25 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
     // High Speed", а на 50 МГц читаться с ошибками CRC — тогда система
     // просто не загрузится: root читает отсюда load_chain и /sbin.
     // Пробуем настоящее чтение и при отказе возвращаемся на 25 МГц.
-    if (high_speed) {
+    {
         uint8_t probe[512];
         if (!hardware_emmc_read(0, 1, probe)) {
+            if (g_uhs_active) {
+                // На 1.8 В откатиться внутри нельзя: обратного перехода у
+                // SD нет, нужен power cycle. Честно отказываемся, вызывающий
+                // снимет питание и повторит на 3.3 В.
+                sys_puts(console_ep, "[BLK][EMMC] 1.8В/DDR50: контрольное чтение не прошло\n");
+                return false;
+            }
             sys_puts(console_ep, "[BLK][EMMC] 50 МГц не читается — откат на 25 МГц\n");
             *emmc_reg(EMMC_CONTROL0_OFFSET) = *emmc_reg(EMMC_CONTROL0_OFFSET) & ~EMMC_C0_HS_EN;
             emmc_set_clock_divider(0x02);
             high_speed = false;
         }
     }
-    sys_puts(console_ep, high_speed ? "[BLK][EMMC] шина 4 бита, 50 МГц (high speed)\n"
-                                    : "[BLK][EMMC] шина 25 МГц\n");
+    sys_puts(console_ep, g_uhs_active ? "[BLK][EMMC] шина 4 бита, DDR50 1.8 В (50 МГц, оба фронта)\n"
+                       : high_speed   ? "[BLK][EMMC] шина 4 бита, 50 МГц (high speed)\n"
+                                      : "[BLK][EMMC] шина 25 МГц\n");
 
     return true;
 }
@@ -664,6 +917,61 @@ bool emmc_init(void *vaddr, seL4_CPtr console_ep) {
 // через EMMC_DATA. Один memcpy на весь диапазон между bounce-буфером и
 // buffer вызывающего (может быть на стеке fat32.cpp) — дёшево по сравнению с
 // самим SD-обменом.
+// Карта ещё отвечает? CMD13 с КОРОТКИМ таймаутом. Вызывается только после
+// отказа настоящей операции: гонять её просто так значило бы тратить
+// команду на каждое обращение к диску.
+static bool blk_card_responds(void) {
+    return emmc_send_cmd(EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN,
+                          EMMC_CMD_SEND_STATUS, g_emmc_rca, 50);
+}
+
+// Привести контроллер в состояние, в котором свежевставленная карта вообще
+// СПОСОБНА ответить.
+//
+// Найдено на железе 2026-09-11 ("после возврата карты ноль реакции"):
+// карта, только что попавшая в слот, находится в режиме идентификации и
+// принимает команды ТОЛЬКО на частоте до 400 кГц. Проба же шла на рабочей
+// тактовой — 50 МГц, оставшейся от прежней карты, — и CMD8 не отвечала
+// никогда. Плюс после отказавших команд в линиях CMD/DAT залипают биты
+// ошибок, их надо сбросить, иначе контроллер не примет и правильную
+// команду.
+static void emmc_prepare_for_identification(void) {
+    *emmc_reg(EMMC_CONTROL1_OFFSET) =
+        *emmc_reg(EMMC_CONTROL1_OFFSET) | EMMC_C1_SRST_CMD | EMMC_C1_SRST_DATA;
+    uint64_t deadline = g_cntfrq ? read_cntvct() + (50ull * g_cntfrq) / 1000 : 0;
+    uint32_t iters = 100000;
+    while (*emmc_reg(EMMC_CONTROL1_OFFSET) & (EMMC_C1_SRST_CMD | EMMC_C1_SRST_DATA)) {
+        if (g_cntfrq ? (read_cntvct() >= deadline) : (--iters == 0)) break;
+        seL4_Yield();
+    }
+    *emmc_reg(EMMC_INTERRUPT_OFFSET) = 0xFFFFFFFF; // снять залипшие статусы
+    emmc_set_clock_divider(0x80); // ~390 кГц — скорость идентификации
+}
+
+// Зафиксировать, что карты в слоте больше нет.
+static void blk_card_gone(void) {
+    if (g_card_absent) return;
+    g_card_absent = true;
+    // Вернуть сигнальную линию на 3.3 В. Следующая карта будет вставлена
+    // "холодной" и ожидает именно 3.3 В — оставить 1.8 В значило бы подать
+    // на неё неверный уровень ещё до первой команды.
+    if (g_uhs_active) {
+        uint32_t st = 0;
+        exp_gpio(RPI_EXP_GPIO_SD_IO_1V8, true, 0, &st);
+        *emmc_reg(EMMC_CONTROL2_OFFSET) = *emmc_reg(EMMC_CONTROL2_OFFSET)
+                                        & ~(EMMC_C2_1V8_SIGNALING | EMMC_C2_UHS_MODE_MASK);
+        g_uhs_active = false;
+    }
+    // Заранее переводим контроллер в состояние идентификации: на рабочей
+    // тактовой новая карта не отзовётся (см. emmc_prepare_for_identification).
+    emmc_prepare_for_identification();
+    if (g_console_ep_early)
+        sys_puts(g_console_ep_early, "[BLK] карта извлечена — файловые операции заблокированы до её возврата\n");
+    g_card_init_fails = 0;
+    g_card_next_probe = read_cntvct() + (CARD_PROBE_PERIOD_MS * g_cntfrq) / 1000;
+
+}
+
 // Одна команда SD: дескриптор ADMA2 на dma_pa, CMD17/18 или CMD24/25,
 // ожидание конца переноса. Вынесено из hardware_emmc_read/write, потому что
 // с появлением zero-copy у каждой из них стало ДВА пути (прямо в буфер
@@ -692,7 +1000,20 @@ static bool emmc_xfer_one(uint32_t sector, uint32_t count, uint32_t dma_pa, bool
     // ADMA2 сам гоняет данные между картой и памятью — READ_RDY (чисто
     // PIO-семантика "слово готово в FIFO") здесь не ждём, только конец
     // всего переноса.
-    return emmc_wait_irpt_bit(EMMC_INT_DATA_DONE);
+    if (emmc_wait_irpt_bit(EMMC_INT_DATA_DONE)) return true;
+    // Разбор отказа ТОЛЬКО во время восстановления после вставки карты
+    // (иначе засорял бы обычную работу). Нужен, чтобы отличить два разных
+    // случая, которые снаружи выглядят одинаково: INTERRUPT с битом ошибки
+    // (данные идут, но битые/таймаут на линии) против INTERRUPT == 0
+    // (передача вообще не началась — тогда дело в ADMA/дескрипторе, а не
+    // в карте).
+    if (g_card_absent && g_console_ep_early) {
+        sys_puthex32(g_console_ep_early, "[BLK][EMMC] данные не прошли, INTERRUPT = ", *emmc_reg(EMMC_INTERRUPT_OFFSET));
+        sys_puthex32(g_console_ep_early, "[BLK][EMMC]   STATUS = ", *emmc_reg(EMMC_STATUS_OFFSET));
+        sys_puthex32(g_console_ep_early, "[BLK][EMMC]   CONTROL0/CONTROL1 = ",
+                     (*emmc_reg(EMMC_CONTROL0_OFFSET) & 0xFFFFu) | (*emmc_reg(EMMC_CONTROL1_OFFSET) << 16));
+    }
+    return false;
 }
 
 bool hardware_emmc_read_inner(uint32_t sector, uint32_t count, void* buffer);
@@ -700,11 +1021,25 @@ bool hardware_emmc_read_inner(uint32_t sector, uint32_t count, void* buffer);
 // функцией, а не RAII-таймером: деструктор тянет раскрутку стека, а образ
 // линкуется -nostdlib.
 bool hardware_emmc_read(uint32_t sector, uint32_t count, void* buffer) {
+    // ЕДИНАЯ ТОЧКА для всех операций над содержимым карты: через эти две
+    // функции проходит ЛЮБОЕ обращение exFAT к диску. Пока карты нет —
+    // отказываем сразу, не трогая контроллер. Гейта в диспетчере команд
+    // мало: одна VFS-команда читает несколько секторов, и без проверки
+    // здесь каждый следующий сектор той же команды снова уходил бы в
+    // таймауты.
+    if (g_card_absent && !g_card_recovering) return false;
     uint32_t tag = g_exfat_io_tag;
     uint64_t t0 = read_cntvct();
     if (tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[tag]++; g_tag_bytes[tag] += (uint64_t)count * 512u; }
     bool ok = hardware_emmc_read_inner(sector, count, buffer);
     if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += blk_us_since(t0);
+    // Отказ операции сам по себе ещё не значит "карты нет" — это может быть
+    // и разовая ошибка. Спрашиваем саму карту; молчит — значит вынули.
+    if (!ok && !g_card_absent && !g_in_card_probe) {
+        g_in_card_probe = true;
+        if (!blk_card_responds()) blk_card_gone();
+        g_in_card_probe = false;
+    }
     return ok;
 }
 bool hardware_emmc_read_inner(uint32_t sector, uint32_t count, void* buffer) {
@@ -736,11 +1071,25 @@ bool hardware_emmc_write_inner(uint32_t sector, uint32_t count, const void* buff
 // функцией, а не RAII-таймером: деструктор тянет раскрутку стека, а образ
 // линкуется -nostdlib.
 bool hardware_emmc_write(uint32_t sector, uint32_t count, const void* buffer) {
+    // ЕДИНАЯ ТОЧКА для всех операций над содержимым карты: через эти две
+    // функции проходит ЛЮБОЕ обращение exFAT к диску. Пока карты нет —
+    // отказываем сразу, не трогая контроллер. Гейта в диспетчере команд
+    // мало: одна VFS-команда читает несколько секторов, и без проверки
+    // здесь каждый следующий сектор той же команды снова уходил бы в
+    // таймауты.
+    if (g_card_absent && !g_card_recovering) return false;
     uint32_t tag = g_exfat_io_tag;
     uint64_t t0 = read_cntvct();
     if (tag < EXFAT_IO_TAG_MAX) { g_tag_cmds[tag]++; g_tag_bytes[tag] += (uint64_t)count * 512u; }
     bool ok = hardware_emmc_write_inner(sector, count, buffer);
     if (tag < EXFAT_IO_TAG_MAX) g_tag_us[tag] += blk_us_since(t0);
+    // Отказ операции сам по себе ещё не значит "карты нет" — это может быть
+    // и разовая ошибка. Спрашиваем саму карту; молчит — значит вынули.
+    if (!ok && !g_card_absent && !g_in_card_probe) {
+        g_in_card_probe = true;
+        if (!blk_card_responds()) blk_card_gone();
+        g_in_card_probe = false;
+    }
     return ok;
 }
 bool hardware_emmc_write_inner(uint32_t sector, uint32_t count, const void* buffer) {
@@ -868,6 +1217,49 @@ static bool blk_mount_exfat(seL4_CPtr console_ep) {
     }
 }
 
+// Карта вернулась? Сначала ДЕШЁВАЯ проба: CMD0 + CMD8 коротким таймаутом.
+// Свежевставленная карта на CMD8 отвечает, пустой слот молчит. Полную
+// инициализацию — долгую и шумную — запускаем только после положительного
+// ответа, иначе каждая секунда ожидания печатала бы простыню отказов.
+// ДЕШЁВАЯ проба: есть ли вообще что-то в слоте. Ходит вечно, её отказ —
+// это просто "слот пуст", а не неудача.
+static bool blk_slot_has_card(void) {
+    // Каждая неудачная проба оставляет биты ошибок в линиях, поэтому
+    // готовим контроллер перед КАЖДОЙ попыткой, а не только при пропаже.
+    emmc_prepare_for_identification();
+    emmc_send_cmd(EMMC_CMD_RSPNS_NONE, EMMC_CMD_GO_IDLE, 0, 50);
+    // Таймаут 5 мс, а не 50: на скорости идентификации (390 кГц) полный
+    // обмен CMD8 занимает меньше миллисекунды — 48 бит команды, до 64
+    // тактов ожидания ответа, 48 бит ответа. Пятикратный запас есть, а
+    // цена пробы падает на порядок. Обычно контроллер и вовсе поднимает
+    // собственный бит ошибки таймаута команды раньше нашего дедлайна.
+    return emmc_send_cmd(EMMC_CMD_RSPNS_48 | EMMC_CMD_CRCCHK_EN | EMMC_CMD_IXCHK_EN,
+                          EMMC_CMD_SEND_IF_COND, 0x000001AAu, 5);
+}
+
+// Поднять карту, которая уже отозвалась на дешёвую пробу.
+static bool blk_try_card_back(seL4_CPtr console_ep) {
+    // На время попытки снимаем собственный запрет на обращения к железу —
+    // иначе контрольные чтения и монтирование не смогут ничего прочитать
+    // (см. g_card_recovering).
+    g_card_recovering = true;
+
+    // Отклик есть. Снимаем и подаём питание: карту могли вставить при живом
+    // питании, и собственный сброс в этом случае не гарантирован.
+    g_acmd41_request_1v8 = true; // новой карте снова предлагаем 1.8 В
+    bool ok = sd_power_cycle() && emmc_init((void*)PLAT_EMMC_VADDR, console_ep);
+    if (!ok && g_acmd41_request_1v8) { // тот же откат, что и при старте
+        g_acmd41_request_1v8 = false;
+        ok = sd_power_cycle() && emmc_init((void*)PLAT_EMMC_VADDR, console_ep);
+    }
+    if (!ok || !blk_mount_exfat(console_ep)) { g_card_recovering = false; return false; }
+
+    g_card_recovering = false;
+    g_card_absent = false;
+    sys_puts(console_ep, "[BLK] карта вставлена — том смонтирован, операции разблокированы\n");
+    return true;
+}
+
 // issuse.txt №69 — заменяет seL4_Reply() для ВСЕХ настоящих VFS-команд
 // (см. вызов seL4_CNode_SaveCaller(SELF_CNODE_SLOT, VFS_PENDING_REPLY_SLOT,
 // 8) в главном цикле, прямо перед разбором cmd). Reply-капа текущего
@@ -911,6 +1303,26 @@ int main(int argc, char *argv[]) {
     g_mmc_irq_handler = ipc->msg[BOOT_MMC_IRQ_HANDLER_CAP]; // фикс дедлока — см. notify_root_irq_handled()
     g_blk_dma_paddr = ipc->msg[BOOT_BLK_DMA_PADDR]; // Фаза 4.5/ADMA2, см. blk_dma_buf()/blk_dma_desc() выше
     g_blk_dma2_paddr = ipc->msg[BOOT_BLK_DMA2_PADDR]; // фикс задержки — вторая страница, см. blk_dma_desc()
+
+    // issuse.txt №7 (UHS-I), шаг «проверить путь, ничего не трогая». Оба
+    // пина, которые понадобятся для переключения на 1.8 В, сейчас только
+    // ЧИТАЮТСЯ — это доказывает и работоспособность IPC к владельцу
+    // мейлбокса (timer_driver), и правильность нумерации со смещением 128,
+    // не меняя ни напряжения, ни питания карты. Ожидаем: питание (пин 6)
+    // включено, сигнальная линия (пин 4) на 3.3 В, то есть 0.
+    g_timer_ep = timer_ep;
+    g_console_ep_early = console_ep; // см. blk_card_gone()
+    if (timer_ep != 0) {
+        for (int k = 0; k < 2; k++) {
+            uint32_t pin = k ? RPI_EXP_GPIO_SD_VDD : RPI_EXP_GPIO_SD_IO_1V8;
+            uint32_t st = 0;
+            int rc = exp_gpio(pin, false, 0, &st);
+            if (LOG_BLK)
+                sys_puthex32(console_ep, k ? "[BLK][EMMC] expgpio 6 (питание карты), rc<<8|состояние = "
+                                           : "[BLK][EMMC] expgpio 4 (линия 1.8В), rc<<8|состояние = ",
+                             ((uint32_t)(rc & 0xFF) << 8) | (st & 0xFF));
+        }
+    }
     g_blk_liveness_ntfn = ipc->msg[BOOT_BLK_LIVENESS_NTFN_CAP]; // Фаза 3b, см. main.cpp
     g_cntfrq = read_cntfrq(); // ДО emmc_init() — emmc_wait_irpt_bit() уже использует g_cntfrq для таймаута
 
@@ -939,7 +1351,26 @@ int main(int argc, char *argv[]) {
     }
 
     // 2. Инициализация железа (EMMC2, PIO/polling — см. h/platform.h, emmc_init() выше)
-    if (!emmc_init((void*)PLAT_EMMC_VADDR, console_ep)) {
+    //
+    // issuse.txt №7: первый проход идёт с выставленным S18R, чтобы узнать,
+    // согласна ли карта на 1.8 В (бит S18A в ответном OCR). Сам переход
+    // (CMD11) пока НЕ делается — это следующий шаг. Но и оставлять карту,
+    // ответившую "согласна", нельзя: по спецификации хост обязан либо
+    // продолжить переход, либо снять питание. Поэтому при S18A=1 ниже идёт
+    // power cycle и повторная инициализация уже без S18R. При S18A=0 карта
+    // просто проигнорировала предложение — ничего делать не нужно.
+    bool blk_ok = emmc_init((void*)PLAT_EMMC_VADDR, console_ep);
+    if (!blk_ok && g_acmd41_request_1v8) {
+        // Переход на 1.8 В/DDR50 не удался на каком-то из шагов. Обратного
+        // перехода у SD нет — единственный выход снять с карты питание
+        // (expgpio 6) и начать заново, уже не предлагая 1.8 В. Механизм
+        // проверен отдельным прогоном до того, как им стали пользоваться
+        // по-настоящему.
+        sys_puts(console_ep, "[BLK][EMMC] 1.8В не получилось — снимаю питание карты и повторяю на 3.3 В\n");
+        g_acmd41_request_1v8 = false;
+        blk_ok = sd_power_cycle() && emmc_init((void*)PLAT_EMMC_VADDR, console_ep);
+    }
+    if (!blk_ok) {
         sys_puts(console_ep, "[BLK] ERROR: EMMC2 init failed.\n");
         // Как и выше — сигналим готовность перед выходом, иначе rootserver
         // навечно зависнет и не запустит остальные модули/shell.
@@ -1034,6 +1465,30 @@ int main(int argc, char *argv[]) {
         // ОТДЕЛЬНОМ (не разделяемом ни с чем, см. common.h) объекте.
         if (sender_badge == BLK_LIVENESS_TICK_BADGE) {
             if (g_blk_liveness_ntfn != 0) seL4_Signal(g_blk_liveness_ntfn);
+            // Карты нет — раз в секунду проверяем, не вернулась ли. Чаще
+            // смысла нет: карту вставляет человек руками. Реже — заметно
+            // на глаз. Тик приходит каждые 20 мс, поэтому троттлинг здесь
+            // обязателен, иначе это были бы 50 полных переинициализаций
+            // в секунду.
+            if (g_card_absent) {
+                uint64_t now = read_cntvct();
+                if (now >= g_card_next_probe) {
+                    if (!blk_slot_has_card()) {
+                        // Слот пуст. Это НЕ неудача: карта может лежать на
+                        // столе сколько угодно. Заодно обнуляем счётчик
+                        // неудачных подъёмов — следующая вставка начнёт с
+                        // чистого листа.
+                        g_card_init_fails = 0;
+                    } else if (g_card_init_fails < CARD_INIT_GIVE_UP) {
+                        if (!blk_try_card_back(console_ep)) {
+                            g_card_init_fails++;
+                            if (g_card_init_fails >= CARD_INIT_GIVE_UP)
+                                sys_puts(console_ep, "[BLK] карта отзывается, но не поднимается — попытки приостановлены до её извлечения\n");
+                        }
+                    }
+                    g_card_next_probe = read_cntvct() + ((uint64_t)CARD_PROBE_PERIOD_MS * g_cntfrq) / 1000;
+                }
+            }
             continue;
         }
 
@@ -1066,6 +1521,15 @@ int main(int argc, char *argv[]) {
         }
         if (g_blk_stopped) {
             seL4_SetMR(0, (seL4_Word)-1); // остановлен сигналом STOP — см. SYS_DRIVER_SIGNAL выше
+            seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            continue;
+        }
+        // Карты в слоте нет — отвечаем ошибкой СРАЗУ, не трогая железо.
+        // Это и есть смысл всей затеи: без этого гейта каждая команда
+        // уходила бы в таймауты контроллера и печатала свою порцию
+        // ошибок. Разблокирует проба по heartbeat выше.
+        if (g_card_absent) {
+            seL4_SetMR(0, (seL4_Word)-1);
             seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             continue;
         }

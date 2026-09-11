@@ -43,6 +43,7 @@ static bool g_uart_stopped = false;
 // быстро вставленной длинной строки уже создавало нужное окно.
 static char g_kbd_buffer[128];
 static int g_kbd_head = 0, g_kbd_tail = 0;
+static seL4_Word g_kbd_source_pid = 0; // единственный разрешённый источник SYS_KBD_INJECT, см. common.h
 
 // Общий с IRQ-веткой в main() код вычитывания FIFO — вызывается И оттуда
 // (после реальной IRQ-нотификации), И из uart_putc() (см. выше). Дважды
@@ -287,7 +288,8 @@ int main(int argc, char *argv[]) {
             // история (тоже шлёт root через неминченную копию, см.
             // generic_recover_process()/common.h) — целевой PID передаётся
             // явно в MR1, а не через badge.
-            if (sys != SYS_BENCHMARK_RESET_LOCAL && sys != SYS_BENCHMARK_FINALIZE_LOCAL && sys != SYS_CANCEL_PENDING_FOR_PID) {
+            if (sys != SYS_BENCHMARK_RESET_LOCAL && sys != SYS_BENCHMARK_FINALIZE_LOCAL && sys != SYS_CANCEL_PENDING_FOR_PID
+                && sys != SYS_KBD_SET_SOURCE) {
                 if (sender_pid <= 0 || sender_pid >= MAX_CLIENTS) {
                     // Невалидный PID, игнорируем
                     seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
@@ -336,6 +338,38 @@ int main(int argc, char *argv[]) {
                 uart_flush_word();
 
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+            } else if (sys == SYS_KBD_SET_SOURCE) {
+                // Только root (badge 0), см. SYS_KBD_SET_SOURCE в common.h.
+                if (sender_pid == 0) {
+                    g_kbd_source_pid = seL4_GetMR(1);
+                    seL4_SetMR(0, 0);
+                } else {
+                    seL4_SetMR(0, (seL4_Word)-1);
+                }
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
+            } else if (sys == SYS_KBD_INJECT) {
+                // Байты с USB-клавиатуры — в тот же буфер, что и UART RX.
+                if (sender_pid != g_kbd_source_pid || g_kbd_source_pid == 0) {
+                    seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                    continue;
+                }
+                int n = (int)seL4_MessageInfo_get_length(info) - 1;
+                for (int i = 0; i < n; i++) {
+                    int next_head = (head + 1) % 128;
+                    if (next_head == tail) break; // буфер полон — как и у UART RX, честно отбрасываем
+                    kbd_buffer[head] = (char)seL4_GetMR(i + 1); head = next_head;
+                }
+                // Сначала отпускаем usb_driver — его reply-капа сейчас
+                // текущая, и её обязан получить именно он.
+                seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
+                // Затем будим ждущего читателя РОВНО так же, как ветка
+                // прерывания UART выше — шелл не должен замечать разницы.
+                if (pending_reader && head != tail) {
+                    seL4_SetMR(0, kbd_buffer[tail]); tail = (tail + 1) % 128;
+                    seL4_Send(UART_PENDING_REPLY_SLOT, seL4_MessageInfo_new(0, 0, 0, 1));
+                    seL4_CNode_Delete(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8);
+                    pending_reader = false;
+                }
             } else if (sys == 9) { // SYS_FLUSH — issuse.txt №29: честный no-op, см. комментарий в начале файла
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 0));
             } else if (sys == 6) { // SYS_READ
@@ -385,6 +419,10 @@ int main(int argc, char *argv[]) {
                     seL4_CNode_Delete(SELF_CNODE_SLOT, UART_PENDING_REPLY_SLOT, 8);
                     pending_reader = false;
                 }
+                // Умирает источник клавиатуры — снимаем назначение СРАЗУ,
+                // до того как его PID может достаться другому процессу.
+                // Новый usb_driver root назначит заново после респавна.
+                if (g_kbd_source_pid != 0 && g_kbd_source_pid == target_pid) g_kbd_source_pid = 0;
                 seL4_SetMR(0, 0);
                 seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 1));
             } else {
